@@ -72,7 +72,7 @@ xml = ["xberg/xml"]
 
 [dependencies]
 async-trait = "0.1"
-crawlberg = { default-features = false, version = "1.5.2" }
+crawlberg = { default-features = false, version = "1.6.1" }
 html-to-markdown-rs = { default-features = false, version = "3.12" }
 magnus = "0.8"
 rb-sys = ">=0.9.130, <0.10"
