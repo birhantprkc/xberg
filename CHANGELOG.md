@@ -29,6 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Ruby binding's `FormatMetadata.from_hash` and `DiffLine.from_hash` read a `_0` key that no
+  longer exists on the wire, so **every variant deserialized with a `nil` payload**. All 24 call
+  sites are corrected: the 21 `FormatMetadata` variants now build their payload from the flattened
+  hash, and the 3 `DiffLine` variants read the `text` key the enum's `#[serde(content = "text")]`
+  actually emits ([#1594](https://github.com/xberg-io/xberg/issues/1594)).
+
+- The Python type stub declared format-metadata payloads as `_0` (for example
+  `_0: ExcelMetadata`), a key present neither on the wire nor on the runtime object -- the runtime
+  per-variant getters such as `.excel` were always correct. The stub now names the real fields, so
+  type checkers stop reporting valid code as an error. Runtime behaviour is unchanged
+  ([#1594](https://github.com/xberg-io/xberg/issues/1594)).
+
+- The Elixir `Xberg.FormatMetadata` typespec documented a `metadata:` payload key that matched
+  neither the NIF struct nor the serialized wire. It now matches the struct the NIF actually
+  returns ([#1594](https://github.com/xberg-io/xberg/issues/1594)).
+
 - A Type0 (composite) font's content-stream character codes are now translated to CIDs before glyph
   widths and vertical metrics are looked up, instead of being used as if they already were CIDs.
   The two coincide only for `Identity-H`/`Identity-V`, which is presumably why this went unnoticed.
@@ -235,6 +251,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list of Tesseract-supported codes, so this class of divergence cannot recur (GH#1621).
 
 ### Changed
+
+- **Breaking (Node, Swift bindings):** `FormatMetadata` now serializes flat in every binding --
+  `{"format_type": "pdf", "page_count": 12, ...}` -- matching what the core Rust enum has always
+  serialized (`#[serde(tag = "format_type")]`), what the OpenAPI discriminator describes, and what
+  the REST API serves. Two bindings disagreed with that wire and have been corrected:
+  - **Node** nested the payload one level down under a property named for the variant, so
+    `doc.metadata.format.pdf.pageCount` becomes `doc.metadata.format.page_count`. Note the field
+    names are **snake_case**, unlike the camelCase Node uses elsewhere: the variants carry
+    mutually incompatible field types (`headers` is `string[]` for text and an object array for
+    HTML), so no single Node class can describe them and the value is passed through as serde
+    emits it. `format` is typed as a discriminated union in `index.d.ts`, so narrowing on
+    `format_type` still gives a fully typed payload. This also resolves the Node and WebAssembly
+    bindings disagreeing with each other -- WASM was already passing serde's shape through, so the
+    two now emit an identical `format` object for the same document.
+  - **Swift**'s `FormatMetadata` was a `typealias` to an opaque bridge class carrying no payload,
+    so the JSON in `Metadata.format` could not be decoded into anything useful. It is now a real
+    `Codable`/`Sendable` enum with one case per format, making the payload reachable:
+
+    ```swift
+    if let json = doc.metadata?.format,
+       case .excel(let meta) = try formatMetadataFromJson(json) {
+        print(meta.sheetCount)
+    }
+    ```
+
+    `Metadata.format` still hands back the serialized JSON `String`; what changed is that
+    `formatMetadataFromJson` now yields a pattern-matchable enum carrying the payload instead of
+    an opaque handle. The wire was already correct here -- the Swift type system was the part
+    that was missing.
+
+  Python, Go, Java, C#, Kotlin, PHP and Ruby are unaffected on the wire: they either already
+  emitted the flat shape or expose native per-variant accessors over it
+  ([#1594](https://github.com/xberg-io/xberg/issues/1594)).
 
 - **Breaking (Rust source, Java):** `ServerConfig` adds `job_timeout_secs`. Exhaustive Rust struct
   literals must set the field or use `..ServerConfig::default()`, and the Java record's canonical

@@ -5125,11 +5125,11 @@ extension CodeDataNodeRef {
         { let val = __swift_bridge__$CodeDataNode$value(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
-    public func attributes() -> RustVec<CodeDataAttribute> {
+    public func attributes() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$CodeDataNode$attributes(ptr))
     }
 
-    public func children() -> RustVec<CodeDataNode> {
+    public func children() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$CodeDataNode$children(ptr))
     }
 
@@ -5222,7 +5222,7 @@ public class CodeMetadataRef {
     }
 }
 extension CodeMetadataRef {
-    public func chunks() -> RustVec<CodeChunkInfo> {
+    public func chunks() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$CodeMetadata$chunks(ptr))
     }
 
@@ -8050,7 +8050,7 @@ extension DocumentNodeRef {
         { let val = __swift_bridge__$DocumentNode$bbox(ptr); if val != nil { return BoundingBox(ptr: val!) } else { return nil } }()
     }
 
-    public func annotations() -> RustVec<TextAnnotation> {
+    public func annotations() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$DocumentNode$annotations(ptr))
     }
 
@@ -8327,7 +8327,7 @@ public class DocumentStructureRef {
     }
 }
 extension DocumentStructureRef {
-    public func nodes() -> RustVec<DocumentNode> {
+    public func nodes() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$DocumentStructure$nodes(ptr))
     }
 
@@ -8335,7 +8335,7 @@ extension DocumentStructureRef {
         { let val = __swift_bridge__$DocumentStructure$source_format(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
-    public func relationships() -> RustVec<DocumentRelationship> {
+    public func relationships() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$DocumentStructure$relationships(ptr))
     }
 
@@ -10197,7 +10197,7 @@ public class ExcelWorkbookRef {
     }
 }
 extension ExcelWorkbookRef {
-    public func sheets() -> RustVec<ExcelSheet> {
+    public func sheets() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$ExcelWorkbook$sheets(ptr))
     }
 
@@ -11942,7 +11942,7 @@ extension FootnoteRef {
         RustString(ptr: __swift_bridge__$Footnote$label(ptr))
     }
 
-    public func content() -> RustVec<FormattedBlock> {
+    public func content() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$Footnote$content(ptr))
     }
 }
@@ -12287,7 +12287,7 @@ extension FormattedBlockRef {
         __swift_bridge__$FormattedBlock$level(ptr).intoSwiftRepr()
     }
 
-    public func inlineContent() -> RustVec<InlineElement> {
+    public func inlineContent() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$FormattedBlock$inline_content(ptr))
     }
 
@@ -12303,7 +12303,7 @@ extension FormattedBlockRef {
         { let val = __swift_bridge__$FormattedBlock$code(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
-    public func children() -> RustVec<FormattedBlock> {
+    public func children() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$FormattedBlock$children(ptr))
     }
 }
@@ -13480,19 +13480,19 @@ extension HtmlMetadataRef {
         RustString(ptr: __swift_bridge__$HtmlMetadata$meta_tags(ptr))
     }
 
-    public func headers() -> RustVec<HeaderMetadata> {
+    public func headers() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$HtmlMetadata$headers(ptr))
     }
 
-    public func links() -> RustVec<LinkMetadata> {
+    public func links() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$HtmlMetadata$links(ptr))
     }
 
-    public func images() -> RustVec<ImageMetadataType> {
+    public func images() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$HtmlMetadata$images(ptr))
     }
 
-    public func structuredData() -> RustVec<StructuredData> {
+    public func structuredData() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$HtmlMetadata$structured_data(ptr))
     }
 }
@@ -14525,7 +14525,7 @@ extension JatsMetadataRef {
         RustString(ptr: __swift_bridge__$JatsMetadata$history_dates(ptr))
     }
 
-    public func contributorRoles() -> RustVec<ContributorRole> {
+    public func contributorRoles() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$JatsMetadata$contributor_roles(ptr))
     }
 }
@@ -17954,7 +17954,7 @@ extension OcrExtractionResultRef {
         RustString(ptr: __swift_bridge__$OcrExtractionResult$metadata(ptr))
     }
 
-    public func tables() -> RustVec<OcrTable> {
+    public func tables() -> RustVec<RustString> {
         RustVec(ptr: __swift_bridge__$OcrExtractionResult$tables(ptr))
     }
 

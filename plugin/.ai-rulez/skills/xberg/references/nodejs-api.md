@@ -319,14 +319,24 @@ interface Keyword {
 
 Metadata is **not** flat. Common fields (`title`, `subject`, `authors`, `keywords`, `language`, `createdAt`/`modifiedAt`, `pages`, etc.) sit at the top level, but format-specific fields nest under `metadata.format` (a `FormatMetadata` discriminated union keyed by `format_type`), and custom post-processor fields nest under `metadata.additional`. There is no `page_count`/`pageCount` member on `Metadata`, and use `authors` (an array), not `author`. Read page count from format-specific metadata or from `metadata.pages` (PageStructure):
 
+The variant payload sits directly on `format`: `format_type` narrows the union and the payload
+fields are read at the same level, matching the JSON the core library serializes.
+
 ```typescript
 const doc = output.results[0];
 if (doc.metadata?.format?.format_type === "pdf") {
-  console.log(`Pages: ${doc.metadata.format.pageCount}`);
+  console.log(`Pages: ${doc.metadata.format.page_count}`);
 } else if (doc.metadata?.pages) {
-  console.log(`Pages: ${doc.metadata.pages}`);
+  console.log(`Pages: ${doc.metadata.pages.totalCount}`);
 }
 ```
+
+> **Changed in 1.1.6:** the payload used to nest one level down under a property named for the
+> variant (`format.pdf.pageCount`). It is now flat (`format.page_count`), which aligns the Node
+> binding with the WebAssembly binding and with the wire format every other binding emits.
+> `format_type` remains the discriminant. The payload fields are **snake_case** here, unlike the
+> camelCase Node uses elsewhere -- the variants carry mutually incompatible field types, so the
+> value is passed through exactly as the core serializes it rather than being remapped.
 
 ---
 
