@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.1.6] - 2026-09-12
+## [1.2.0] - 2026-09-13
 
 ### Added
 
@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change (GH#1626).
 
 ### Fixed
+
+- `OutputFormat.custom` in the Python binding always returned `None`, even when the value genuinely
+  was a custom format. The accessor derived a discriminator from the enum's JSON, which works for
+  every tagged representation but not for this variant, whose payload is untagged and so carries no
+  discriminator to find. It now matches on the variant directly and returns the label.
+
+- The Python type stub declared a `type: str` attribute on 23 enum classes that have no such
+  attribute at runtime. The stub emitted it for every data enum, while the runtime only exposes it
+  for enums carrying an explicit serde tag -- so for externally tagged enums (`EntityCategory`,
+  `PiiCategory`, `OutputFormat`) a type checker accepted `category.type`, which raised
+  `AttributeError` on use. Stub-only change; no runtime behaviour moved.
 
 - The Ruby binding's `FormatMetadata.from_hash` and `DiffLine.from_hash` read a `_0` key that no
   longer exists on the wire, so **every variant deserialized with a `nil` payload**. All 24 call
@@ -251,6 +262,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list of Tesseract-supported codes, so this class of divergence cannot recur (GH#1621).
 
 ### Changed
+
+- **Breaking (Java binding):** enum constants now follow Java's own convention and are
+  `SCREAMING_SNAKE_CASE` instead of carrying Rust's PascalCase verbatim -- `LinkStyle.Inline`
+  becomes `LinkStyle.INLINE`, across roughly 75 generated enums. **The JSON wire value is
+  unchanged**; only the Java identifier moves, so serialized documents and stored payloads are
+  unaffected. Update references to the constants themselves; generated default values
+  (`ChunkType.Unknown`, `OutputFormat.Plain`) moved with the declarations.
+
+- **Breaking (Ruby binding):** an externally tagged enum variant carrying a single payload
+  (`EntityCategory::Custom`, `PiiCategory::Custom`, `OutputFormat::Custom`) now serializes the way
+  the Rust core always did -- `{"custom" => "my-label"}` -- instead of wrapping the payload in an
+  extra object keyed by a synthesized positional name, `{"custom" => {"_0" => "my-label"}}`. Code
+  reading `hash[:custom][:_0]` should read `hash[:custom]`. The previous shape matched no other
+  binding and no core output.
+
+- **Breaking (PHP binding):** `EntityCategory`, `PiiCategory` and `OutputFormat` change from
+  constants-only classes to classes with static factories, because the old shape could not carry a
+  payload at all: a caller-supplied label was silently discarded in both directions, so
+  `Custom($label)` always round-tripped as an empty string. Use `EntityCategory::custom($label)`
+  and `EntityCategory::person()` in place of the old `Xberg\EntityCategory::PERSON` constants; the
+  label is readable from the readonly `$custom` property.
+
+- **Breaking (Node binding):** the JSON surface is camelCase throughout, nested types included, and
+  `FormatMetadata` is a flat discriminated union keyed by `formatType` whose variant payload fields
+  sit directly on the object (`{ formatType: "excel", sheetCount: 2 }`). The binding previously
+  exposed two parallel shapes for one Rust type -- an idiomatic camelCase interface beside a
+  snake_case structural twin -- and only the latter was reachable from a result.
 
 - **Breaking (Node, Swift bindings):** `FormatMetadata` now serializes flat in every binding --
   `{"format_type": "pdf", "page_count": 12, ...}` -- matching what the core Rust enum has always
