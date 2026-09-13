@@ -53,7 +53,11 @@ includes:
     flatten: true
 
 vars:
-  AI_RULEZ_VERSION: "4.11.3"
+  # MUST match the pin in .github/workflows/ci-lint.yaml's "Verify generated plugin bundles are
+  # current" step, whose own comment requires the two move in lockstep. They had drifted since
+  # v1.1.0 (here 4.11.3, CI 4.11.0) and 4.11.3's output does NOT satisfy 4.11.0's verify -- so
+  # running `task plugin:generate` and committing the result turned CI red. Bump both together.
+  AI_RULEZ_VERSION: "4.11.0"
 
 tasks:
   default:
