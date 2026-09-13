@@ -226,10 +226,47 @@ async fn test_tar_gz_extraction() {
     assert!(result2.metadata.format.is_some());
 }
 
-/// Test 7z extraction.
+/// Test 7z extraction against a real archive.
+///
+/// This is the only test that exercises sevenz-rust2's LZMA decoder, and so the only regression
+/// net for the `[profile.release.package.sevenz-rust2]` opt-level cap in the root manifest -- the
+/// crate miscompiles at higher optimization on macOS ARM64. It cannot be built programmatically
+/// the way the ZIP/TAR fixtures above are, so it reads a committed archive. ~keep
 #[tokio::test]
 async fn test_7z_extraction() {
-    println!("7z test requires real 7z file - skipping programmatic creation");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/archives/documents.7z");
+    let Ok(sevenz_bytes) = std::fs::read(&path) else {
+        panic!("7z fixture must exist at {}", path.display());
+    };
+
+    let config = ExtractionConfig::default();
+    let result = extract_bytes_document(&sevenz_bytes, "application/x-7z-compressed", &config)
+        .await
+        .expect("Should extract 7z successfully");
+
+    assert_eq!(result.mime_type, "application/x-7z-compressed");
+    assert!(
+        result.content.contains("text/simple.txt"),
+        "member listing: {:?}",
+        result.content
+    );
+    assert!(
+        result.content.contains("text/multilingual.txt"),
+        "member listing: {:?}",
+        result.content
+    );
+    // Decompressed member bodies, not just the listing -- a miscompiled LZMA decoder still
+    // produces the header-derived listing above, so only this distinguishes it. ~keep
+    assert!(
+        result.content.contains("contract_test.txt"),
+        "member body: {:?}",
+        result.content
+    );
+    assert!(
+        result.content.contains("fake_text.txt"),
+        "member body: {:?}",
+        result.content
+    );
 }
 
 /// Test nested archive (ZIP inside ZIP).

@@ -195,7 +195,7 @@ xberg-paddle-ocr = { path = "crates/xberg-paddle-ocr" }
 xberg-candle-ocr = { path = "crates/xberg-candle-ocr" }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 opt-level = 3
 strip = true
@@ -203,6 +203,8 @@ strip = true
 # Archive crates crash with SIGBUS under opt-level=3 on macOS ARM64.
 # Reduce optimization to prevent miscompilation of unsafe code.
 # sevenz-rust2 requires opt-level=1 specifically (opt-level=2 still SIGBUS'd in go:e2e).
+# Retained under `lto = "fat"`: a local 7z round-trip passes at opt-level=3, but the crash was
+# only ever observed through go:e2e's cgo boundary, which that probe does not cover.
 [profile.release.package.sevenz-rust2]
 opt-level = 1
 
