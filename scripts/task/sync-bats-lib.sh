@@ -7,7 +7,7 @@
 # local-green/CI-red class the library exists to prevent.
 #
 # This script only refreshes that file (`sync`) or proves it has not drifted (`--check`). It is
-# never invoked by the test path.
+# never invoked by the test path. ~keep
 set -euo pipefail
 
 readonly SOURCE_REPOSITORY="xberg-io/actions"
@@ -25,7 +25,7 @@ if [ -z "$ref" ]; then
 fi
 
 # An immutable ref only. A branch name would make `--check` compare against whatever that branch
-# points at today, which is the opposite of a drift gate.
+# points at today, which is the opposite of a drift gate. ~keep
 if ! printf '%s' "$ref" | grep -qE '^(v[0-9]+(\.[0-9]+){2}|[0-9a-f]{40})$'; then
   echo "BATS_LIB_REF must be a vX.Y.Z tag or a full 40-character commit sha, not '${ref}'." >&2
   exit 1
