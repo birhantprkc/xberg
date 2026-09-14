@@ -155,3 +155,30 @@ fn a_wrapped_heading_still_closes_before_the_body() {
         "the wrapped heading was never closed and pulled the body in after it:\n{content}"
     );
 }
+
+/// Flush-left prose that merely begins with a decimal figure. It is not a
+/// heading and must not be split, however many lines it runs to.
+fn page_decimal_prefixed_prose() -> String {
+    text_at(
+        MARGIN_X,
+        314.0,
+        9.36,
+        "3.2 million users were affected across the region this quarter,",
+    ) + &text_at(
+        MARGIN_X,
+        302.0,
+        9.36,
+        "according to figures published by the regulator on Tuesday",
+    ) + &text_at(MARGIN_X, 290.0, 9.36, "after a review.")
+}
+
+#[test]
+fn prose_beginning_with_a_decimal_figure_is_not_split_as_a_heading() {
+    let content = extract("decimal-prose", &[page_decimal_prefixed_prose()]);
+    println!("--- extracted ---\n{content}\n---");
+    assert!(
+        content.contains("according to figures published by the regulator on Tuesday after a review"),
+        "flush-left prose starting with a decimal figure was split as though it were a numbered \
+         heading -- is_numbered_section_heading returns true for any two-level number:\n{content}"
+    );
+}

@@ -229,8 +229,14 @@ pub fn parse_content_stream_paths_only(data: &[u8]) -> Result<Vec<Operator>> {
                         b'f' | b'F' => Some(Operator::Fill),
                         b'B' => Some(Operator::FillStroke),
                         b'b' => Some(Operator::CloseFillStroke),
-                        // s = close path + stroke (not a named variant, emit ClosePath + Stroke)
-                        // ~keep
+                        // s = close path + stroke. This byte-level fast path emits the
+                        // decomposed ClosePath + Stroke pair; the object parser emits the
+                        // single Operator::CloseStroke variant instead. The split is
+                        // deliberate -- consumers handle both, and PathExtractor's
+                        // close_and_stroke() is exactly close_path() + stroke() -- but it
+                        // means a CloseStroke arm is unreachable from THIS parser. Do not
+                        // "tidy" those arms away. See GH#1633 and the matching note in
+                        // rendering/page_renderer.rs. ~keep
                         b's' => {
                             operators.push(Operator::ClosePath);
                             Some(Operator::Stroke)
