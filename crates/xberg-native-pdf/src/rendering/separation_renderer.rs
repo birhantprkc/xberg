@@ -1717,7 +1717,10 @@ fn execute_separation_operators(
                 current_path.close();
             }
 
-            Operator::Stroke => {
+            Operator::Stroke | Operator::CloseStroke => {
+                if matches!(op, Operator::CloseStroke) {
+                    current_path.close();
+                }
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,

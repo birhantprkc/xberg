@@ -197,6 +197,9 @@ impl PdfDocument {
                 Operator::FillEvenOdd => {
                     extractor.fill(FillRule::EvenOdd);
                 }
+                Operator::CloseStroke => {
+                    extractor.close_and_stroke();
+                }
                 Operator::CloseFillStroke => {
                     extractor.close_fill_and_stroke(FillRule::NonZero);
                 }
@@ -633,6 +636,7 @@ impl PdfDocument {
                 Operator::ClosePath => extractor.close_path(),
 
                 Operator::Stroke => extractor.stroke(),
+                Operator::CloseStroke => extractor.close_and_stroke(),
                 Operator::Fill => extractor.fill(FillRule::NonZero),
                 Operator::FillEvenOdd => extractor.fill(FillRule::EvenOdd),
                 Operator::CloseFillStroke => extractor.close_fill_and_stroke(FillRule::NonZero),

@@ -1532,10 +1532,14 @@ impl PageRenderer {
                     current_path.close();
                 }
 
-                Operator::Stroke => {
+                Operator::Stroke | Operator::CloseStroke => {
                     if excluded_layer_depth == 0 {
                         apply_pending_clip(&mut pending_clip, &mut clip_stack, pixmap, base_transform, &gs_stack);
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
+                        // ISO 32000-1 §8.5.3.2 Table 60: `s` is exactly `h S`. ~keep
+                        if matches!(op, Operator::CloseStroke) {
+                            current_path.close();
+                        }
                         if let Some(path) = current_path.finish() {
                             let gs_clone = gs_stack.current().clone();
                             // Stroke side mirrors the path-fill routing —
@@ -1671,11 +1675,12 @@ impl PageRenderer {
                         apply_pending_clip(&mut pending_clip, &mut clip_stack, pixmap, base_transform, &gs_stack);
                         let clip = clip_stack.last().and_then(|c| c.as_ref());
                         // ISO 32000-1 §8.5.3.1 Table 60: `b` and `b*` close
-                        // the path before fill+stroke. The parser does not
-                        // decompose them (unlike `s`, which is emitted as
-                        // `ClosePath` + `Stroke`), so the dispatcher must
-                        // perform the close itself or the final segment of
-                        // an open subpath will not be painted by the stroke. ~keep
+                        // the path before fill+stroke. Neither parser
+                        // decomposes them, so the dispatcher must perform the
+                        // close itself or the final segment of an open subpath
+                        // will not be painted by the stroke. The same holds for
+                        // `s` via `Operator::CloseStroke`: only the byte-level
+                        // parser decomposes it, the object parser does not. ~keep
                         if matches!(op, Operator::CloseFillStroke | Operator::CloseFillStrokeEvenOdd) {
                             current_path.close();
                         }
@@ -8431,6 +8436,7 @@ fn is_paint_operator(op: &Operator) -> bool {
         Operator::Fill
             | Operator::FillEvenOdd
             | Operator::Stroke
+            | Operator::CloseStroke
             | Operator::FillStroke
             | Operator::FillStrokeEvenOdd
             | Operator::CloseFillStroke

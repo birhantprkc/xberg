@@ -304,6 +304,12 @@ pub enum Operator {
     },
     /// Stroke path (S)
     Stroke,
+    /// Close current subpath, then stroke it (s)
+    ///
+    /// ISO 32000-1 §8.5.3.2 Table 60 defines `s` as exactly `h S`. It is a
+    /// distinct variant rather than a decomposition because
+    /// `build_path_operator` returns a single operator per token. ~keep
+    CloseStroke,
     /// Fill path (f)
     Fill,
     /// Fill path (even-odd) (f*)
