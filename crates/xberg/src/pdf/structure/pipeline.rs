@@ -2036,9 +2036,24 @@ fn blocks_to_paragraphs(
             // `heading_wraps_onto` exempts a heading that is itself still wrapping onto
             // its next physical line rather than handing off to unrelated content. See
             // #1467. ~keep
+            // GH#1634: `current_is_single_visual_line` also switches the closing
+            // term off once a genuine heading wrap has been absorbed, so a
+            // two-line heading was never closed and pulled the whole body in
+            // after it. A numbered heading that spans exactly one wrap is still
+            // a heading and must still close. ~keep
+            let heading_absorbed_one_wrap = !current_is_single_visual_line
+                && visual_line_count(&current_lines) == 2
+                && current_lines
+                    .first()
+                    .is_some_and(|first| super::classify::is_numbered_section_heading(first.text.trim()));
+            // For a wrapped heading `prev` is the continuation line, whose own
+            // text carries no number -- so the numbered-heading test has to look
+            // at the paragraph's first segment instead, which
+            // `heading_absorbed_one_wrap` already does. ~keep
             let follows_section = starts_new_line
-                && current_is_single_visual_line
-                && super::classify::is_numbered_section_heading(&visual_line_texts[prev_idx])
+                && ((current_is_single_visual_line
+                    && super::classify::is_numbered_section_heading(&visual_line_texts[prev_idx]))
+                    || heading_absorbed_one_wrap)
                 && !heading_wraps_onto(prev, line)
                 && !current_lines
                     .first()
@@ -2272,6 +2287,28 @@ pub(super) fn heading_wraps_onto(prev: &SegmentData, line: &SegmentData) -> bool
 /// `heading_start` and `prev` coincide, no indent is established, and the pair still
 /// splits. `starts_section` is evaluated independently of all this, so a following
 /// line that is itself a numbered heading breaks regardless. ~keep
+/// Number of distinct visual lines (baselines) among `segments`.
+///
+/// Used to tell a numbered heading that has absorbed exactly one wrap from a
+/// paragraph that is genuinely several lines long. See GH#1634. ~keep
+pub(super) fn visual_line_count(segments: &[&SegmentData]) -> usize {
+    let mut count = 0usize;
+    let mut last_baseline: Option<f32> = None;
+    for segment in segments {
+        let baseline = segment.upright_baseline();
+        if !baseline.is_finite() {
+            continue;
+        }
+        let is_new_line =
+            last_baseline.is_none_or(|previous| (baseline - previous).abs() > INLINE_STYLE_BASELINE_TOLERANCE);
+        if is_new_line {
+            count += 1;
+            last_baseline = Some(baseline);
+        }
+    }
+    count
+}
+
 pub(super) fn heading_continuation_is_hanging_indent(
     heading_start: &SegmentData,
     prev: &SegmentData,
@@ -2291,7 +2328,17 @@ pub(super) fn heading_continuation_is_hanging_indent(
     }
     let tolerance =
         HEADING_HANGING_INDENT_LEFT_EDGE_TOLERANCE_FONT_FACTOR * prev.font_size.max(line.font_size).max(1.0);
-    prev_left - heading_left > tolerance && (prev_left - line_left).abs() <= tolerance
+    if prev_left - heading_left <= tolerance || (prev_left - line_left).abs() > tolerance {
+        return false;
+    }
+    // GH#1634: left edges alone cannot tell a wrapped heading from a body
+    // indented to the title's edge -- number in the margin, title and body
+    // alike at one edge, which is how contracts, tenders and many installation
+    // manuals are set. A line only wraps when the line before it ran out of
+    // room, so require that too: a heading that stops well short of the
+    // following line's width did not wrap, it ended. ~keep
+    let (_, line_end) = line.upright_advance_extent();
+    line_end.is_finite() && heading_fills_column(prev, line_end)
 }
 
 pub(super) fn heading_fills_column(prev: &SegmentData, next_right_edge: f32) -> bool {
