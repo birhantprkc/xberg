@@ -180,3 +180,15 @@ indent_size = 2
 # Markdown files
 [*.md]
 trim_trailing_whitespace = false
+
+# Shell sources are two-space, which is what the tree already is: shfmt's tab default would
+# rewrite 102 files, two-space rewrites 27. shfmt reads this natively when no -i flag is passed,
+# so `task lint:shell` needs no indent argument.
+#
+# .bats is deliberately NOT listed. Those suites are fanned out byte-identical to kreuzberg-lts
+# and crawlberg, neither of which has an .editorconfig, so they follow shfmt's tab default -- the
+# same dialect the suites in xberg-io/actions use. Adding .bats here would reformat a file that
+# has to stay identical in three repositories. ~keep
+[*.{sh,bash}]
+indent_style = space
+indent_size = 2
