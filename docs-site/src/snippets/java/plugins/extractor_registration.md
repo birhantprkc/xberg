@@ -11,7 +11,7 @@ public class CustomExtractorExample {
     public static void main(String[] args) {
         try {
             ExtractionResult output = Xberg.extract(
-                ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("document.json").build(),
+                ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("document.json").build(),
                 ExtractionConfig.builder().build()
             );
             ExtractedDocument result = output.results().get(0);

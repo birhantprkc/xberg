@@ -50,7 +50,7 @@ public class MinLengthValidatorExample implements IValidator {
         try {
             Xberg.registerValidator(new MinLengthValidatorExample(100));
             ExtractionResult output = Xberg.extract(
-                ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("document.pdf").build(),
+                ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("document.pdf").build(),
                 ExtractionConfig.builder().build()
             );
             ExtractedDocument result = output.results().get(0);

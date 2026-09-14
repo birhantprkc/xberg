@@ -20,7 +20,7 @@ public class Main {
                     .build())
                 .build();
             ExtractionResult output = Xberg.extract(
-                ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("scanned.pdf").build(),
+                ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("scanned.pdf").build(),
                 config
             );
             ExtractedDocument result = output.results().get(0);

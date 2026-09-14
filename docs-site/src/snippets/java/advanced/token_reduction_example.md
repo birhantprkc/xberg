@@ -15,7 +15,7 @@ ExtractionConfig config = ExtractionConfig.builder()
         .build())
     .build();
 ExtractionResult output = Xberg.extract(
-    ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("verbose_document.pdf").build(),
+    ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("verbose_document.pdf").build(),
     config
 );
 ExtractedDocument result = output.results().get(0);

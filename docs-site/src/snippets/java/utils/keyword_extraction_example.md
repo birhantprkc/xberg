@@ -14,14 +14,14 @@ public class KeywordExtractionExample {
     public static void main(String[] args) {
         ExtractionConfig config = ExtractionConfig.builder()
             .withKeywords(KeywordConfig.builder()
-                .withAlgorithm(KeywordAlgorithm.Yake)
+                .withAlgorithm(KeywordAlgorithm.YAKE)
                 .withMaxKeywords(10L)
                 .withMinScore(0.3f)
                 .build())
             .build();
 
         ExtractInput input = ExtractInput.builder()
-            .withKind(ExtractInputKind.Uri)
+            .withKind(ExtractInputKind.URI)
             .withUri("research_paper.pdf")
             .build();
 

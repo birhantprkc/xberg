@@ -11,7 +11,7 @@ import io.xberg.ExtractInput;
 // yourself and parse it) and pass it to `extract`.
 ExtractionConfig config = ExtractionConfig.builder().build();
 ExtractionResult output = Xberg.extract(
-    ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("document.pdf").build(),
+    ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("document.pdf").build(),
     config
 );
 ExtractedDocument result = output.results().get(0);

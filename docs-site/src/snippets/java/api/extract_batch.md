@@ -7,11 +7,11 @@ import java.util.List;
 
 var inputs = List.of(
     ExtractInput.builder()
-        .withKind(ExtractInputKind.Uri)
+        .withKind(ExtractInputKind.URI)
         .withUri("report.pdf")
         .build(),
     ExtractInput.builder()
-        .withKind(ExtractInputKind.Uri)
+        .withKind(ExtractInputKind.URI)
         .withUri("notes.txt")
         .build()
 );
