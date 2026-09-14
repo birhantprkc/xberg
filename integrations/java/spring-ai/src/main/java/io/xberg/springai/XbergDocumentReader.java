@@ -267,14 +267,14 @@ public final class XbergDocumentReader implements DocumentReader {
   private ExtractInput toInput(Resource resource) throws IOException {
     if (resource instanceof FileSystemResource) {
       return ExtractInput.builder()
-          .withKind(ExtractInputKind.Uri)
+          .withKind(ExtractInputKind.URI)
           .withUri(resource.getFile().getAbsolutePath())
           .withFilename(resource.getFilename())
           .build();
     }
     byte[] bytes = resource.getInputStream().readAllBytes();
     return ExtractInput.builder()
-        .withKind(ExtractInputKind.Bytes)
+        .withKind(ExtractInputKind.BYTES)
         .withBytes(bytes)
         .withMimeType(resolveMimeType(resource))
         .withFilename(resource.getFilename())

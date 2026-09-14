@@ -158,7 +158,7 @@ class XbergDocumentReaderTest {
         mocked.verify(
             () -> Xberg.extract(captor.capture(), any(ExtractionConfig.class)));
         ExtractInput input = captor.getValue();
-        assertThat(input.kind()).isEqualTo(ExtractInputKind.Uri);
+        assertThat(input.kind()).isEqualTo(ExtractInputKind.URI);
         assertThat(input.uri()).endsWith("sample.pdf");
         assertThat(input.filename()).isEqualTo("sample.pdf");
       }
@@ -223,7 +223,7 @@ class XbergDocumentReaderTest {
         mocked.verify(
             () -> Xberg.extract(captor.capture(), any(ExtractionConfig.class)));
         ExtractInput input = captor.getValue();
-        assertThat(input.kind()).isEqualTo(ExtractInputKind.Bytes);
+        assertThat(input.kind()).isEqualTo(ExtractInputKind.BYTES);
         assertThat(input.mimeType()).isEqualTo("application/pdf");
         assertThat(input.bytes()).isEqualTo(data);
       }
@@ -284,7 +284,7 @@ class XbergDocumentReaderTest {
             ArgumentCaptor.forClass(ExtractInput.class);
         mocked.verify(
             () -> Xberg.extract(captor.capture(), any(ExtractionConfig.class)));
-        assertThat(captor.getValue().kind()).isEqualTo(ExtractInputKind.Bytes);
+        assertThat(captor.getValue().kind()).isEqualTo(ExtractInputKind.BYTES);
       }
     }
 

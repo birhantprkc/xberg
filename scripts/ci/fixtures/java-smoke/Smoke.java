@@ -41,7 +41,7 @@ public final class Smoke {
         final String expectedSubstring = args[1];
 
         final ExtractInput input = ExtractInput.builder()
-            .withKind(ExtractInputKind.Uri)
+            .withKind(ExtractInputKind.URI)
             .withUri(fixturePath)
             .build();
         final ExtractionConfig config = JsonUtil.fromJson("{}", ExtractionConfig.class);
