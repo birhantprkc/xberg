@@ -92,5 +92,18 @@ jobs:
       - name: Install Task
         uses: xberg-io/actions/install-task@v1
 
+      # shfmt is not on the runner image and `task lint:shell` invokes it directly, so this job
+      # exited 127 -- "executable file not found in $PATH" -- and reported a shell FORMATTING
+      # failure while having formatted nothing. It had never once run. Pinned to the version used
+      # locally so a developer's `task lint:shell` and CI cannot disagree about what is clean.
+      # ~keep
+      - name: Install shfmt
+        run: |
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.14.1
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+
       - name: Check shell formatting
-        run: task lint:shell
+        run: |
+          command -v shfmt >/dev/null || { echo "shfmt still not on PATH" >&2; exit 1; }
+          shfmt --version
+          task lint:shell
