@@ -22,11 +22,12 @@ permissions:
   contents: read
 
 env:
-  # The same version task test:scripts:bats expects locally, so a green run here means the same
-  # Bats a developer has. install-bats defaults to a pin now, but the input is passed explicitly:
-  # a default only helps the caller who omits it, and omitting it is how a workflow ends up
-  # reading as pinned while installing whatever the release API served that morning.
+  # The same versions the Taskfile expects locally, so a green run here means the same tools a
+  # developer has. Both are passed explicitly rather than relying on the action defaults: a
+  # default only helps the caller who omits it, and omitting it is how a workflow ends up reading
+  # as pinned while installing whatever the registry served that morning.
   BATS_VERSION: "1.14.0"
+  PESTER_VERSION: "6.2.0"
 
 jobs:
   bats:
@@ -58,6 +59,29 @@ jobs:
           args: |-
             --recursive
             --print-output-on-failure
+
+  pester:
+    name: Pester on windows-latest
+    # windows-latest only. These scripts exist to run on Windows, and the path semantics their
+    # assertions depend on -- backslash separators, case-insensitive comparison -- only differ
+    # there. The suite passes under pwsh on Linux too, but a green run on Linux is not evidence
+    # about the behaviour this job exists to cover. ~keep
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Pester
+        id: pester
+        uses: xberg-io/actions/install-pester@v1
+        with:
+          version: ${{ env.PESTER_VERSION }}
+
+      - name: Run the PowerShell contract tests
+        uses: xberg-io/actions/run-pester@v1
+        with:
+          path: scripts/tests/pester
+          module-path: ${{ steps.pester.outputs.module-path }}
+          version: ${{ env.PESTER_VERSION }}
 
   format:
     name: Shell formatting

@@ -357,3 +357,7 @@ poly.local.toml
 # BEGIN ai-rulez (DO NOT EDIT - managed by ai-rulez)
 .ai-rulez/.generated-manifest.json
 # END ai-rulez
+
+# `Invoke-Pester -CI` enables NUnit output and defaults its path to ./testResults.xml, so any
+# local run with that flag drops an artifact in the repo root.
+testResults.xml
