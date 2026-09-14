@@ -1592,35 +1592,44 @@ impl TextRasterizer {
             if gid == 0 && !char_at_pos.is_whitespace() {
                 dropped.record("no glyph id", u32::from(char_code), gid);
             }
-            if gid != 0 || char_at_pos.is_whitespace() {
-                if !char_at_pos.is_whitespace() {
-                    let mut pb = PathBuilder::new();
-                    let mut builder = SkiaOutlineBuilder(&mut pb);
-                    // Outlined once: `outline_glyph` appends to the builder,
-                    // so calling it twice would draw the glyph twice. ~keep
-                    let outlined = ttf_face.outline_glyph(GlyphId::from(gid), &mut builder).is_some();
-                    if !outlined {
-                        dropped.record("no outline", u32::from(char_code), gid);
-                    }
-                    if outlined {
-                        if let Some(path) = pb.finish() {
-                            let (rise_x, rise_y) = if wmode == 0 {
-                                (0.0, gs.text_rise)
-                            } else {
-                                (gs.text_rise, 0.0)
-                            };
-                            let px = (x_cursor + paint_origin_dx) * h_scale + rise_x;
-                            let py = y_cursor + paint_origin_dy + rise_y;
-                            let glyph_transform = combined_base.pre_translate(px, py).pre_scale(scale, scale);
-                            guarded_fill_path(
-                                pixmap,
-                                &path,
-                                paint,
-                                tiny_skia::FillRule::Winding,
-                                glyph_transform,
-                                clip_mask,
-                            );
-                        }
+            // GH#1632: paint decided by whether there is an outline to draw,
+            // NOT by what character the code is inferred to represent. For a
+            // byte-indexed font with no /Encoding that inference is the GID
+            // reverse-mapped through the font's own (1, 0) subtable and read as
+            // ASCII/Mac Roman -- private glyph ordering read as an encoding it
+            // never expressed. When it landed on whitespace (0x09-0x0D, 0x20,
+            // or 0xCA -> U+00A0) a perfectly good outline was discarded while
+            // the advance still ran. A genuine space needs no special case: its
+            // glyph has no outline, so `outline_glyph` returns None below. ~keep
+            if gid != 0 {
+                let mut pb = PathBuilder::new();
+                let mut builder = SkiaOutlineBuilder(&mut pb);
+                // Outlined once: `outline_glyph` appends to the builder,
+                // so calling it twice would draw the glyph twice. ~keep
+                let outlined = ttf_face.outline_glyph(GlyphId::from(gid), &mut builder).is_some();
+                // A genuine space legitimately has no outline; reporting it as
+                // dropped would bury the real misses in false positives. ~keep
+                if !outlined && !char_at_pos.is_whitespace() {
+                    dropped.record("no outline", u32::from(char_code), gid);
+                }
+                if outlined {
+                    if let Some(path) = pb.finish() {
+                        let (rise_x, rise_y) = if wmode == 0 {
+                            (0.0, gs.text_rise)
+                        } else {
+                            (gs.text_rise, 0.0)
+                        };
+                        let px = (x_cursor + paint_origin_dx) * h_scale + rise_x;
+                        let py = y_cursor + paint_origin_dy + rise_y;
+                        let glyph_transform = combined_base.pre_translate(px, py).pre_scale(scale, scale);
+                        guarded_fill_path(
+                            pixmap,
+                            &path,
+                            paint,
+                            tiny_skia::FillRule::Winding,
+                            glyph_transform,
+                            clip_mask,
+                        );
                     }
                 }
             }
