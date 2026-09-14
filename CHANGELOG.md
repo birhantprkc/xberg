@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now also requires that the preceding line actually ran out of room. Separately, a heading that had
   absorbed a genuine wrap could never be closed, so the sub-heading and entire body below were
   pulled in after it. (GH#1634)
+- **(cli): the Linux musl CLI binaries are published again.**
+  Since 1.2.0 the `aarch64-unknown-linux-musl` CLI build has been killed mid-link, and because
+  the upload job requires every musl leg to succeed, *no* CLI assets were attached to the 1.2.0
+  or 1.2.1 releases. The cause was the switch to fat LTO: over the `all` feature set the final
+  whole-program link exceeded what the arm64 runner could complete. That build now uses a
+  `release-musl` profile with thin LTO; every other target keeps fat LTO.
 
 ---
 

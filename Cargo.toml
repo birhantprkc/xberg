@@ -215,6 +215,29 @@ opt-level = 2
 [profile.release.package.xberg-wasm]
 opt-level = "z"
 
+# Thin LTO for the musl CLI, the one build fat LTO cannot finish. With `--features all` the
+# aarch64 job reaches the final crate and then emits nothing for 45 minutes -- fat LTO produces
+# no output while it links -- until the runner is reclaimed with SIGTERM. Bracketed two ways:
+# the job succeeded on 1.1.4 and 1.1.5 and has failed on every release since fat LTO landed, and
+# within a single run the smaller `binstall` feature set links fine on the identical triple and
+# runner. Everything else keeps fat LTO.
+#
+# Position is load-bearing in both directions. cargo-sort requires it here, after the
+# `[profile.release.package.*]` group; Dockerfile.musl-build used to delete from the xberg-wasm
+# header to end of file, which would have silently eaten it, so that deletion was narrowed to
+# the one block it actually needs to remove. The package overrides are restated rather than left
+# to `inherits`, so the sevenz-rust2 pin cannot be dropped by a change in how Cargo propagates
+# them. ~keep
+[profile.release-musl]
+inherits = "release"
+lto = "thin"
+
+[profile.release-musl.package.sevenz-rust2]
+opt-level = 1
+
+[profile.release-musl.package.zip]
+opt-level = 2
+
 [profile.dev]
 opt-level = 0
 debug = true

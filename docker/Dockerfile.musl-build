@@ -58,10 +58,10 @@ COPY crates/xberg-native-pdf/ crates/xberg-native-pdf/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
 COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 
-RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /e2e\/rust/d' Cargo.toml
+RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /"crates\/xberg-wasm"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,/^$/d; /benchmark-harness/d; /e2e-generator/d; /e2e\/rust/d' Cargo.toml
 
-RUN cargo build --release --package xberg-cli --features all && \
-    cp target/release/xberg /build/xberg && \
+RUN cargo build --profile release-musl --package xberg-cli --features all && \
+    cp target/release-musl/xberg /build/xberg && \
     strip /build/xberg
 
 RUN patchelf --set-rpath '$ORIGIN/lib' /build/xberg
