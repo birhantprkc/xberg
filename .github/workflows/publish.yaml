@@ -2590,16 +2590,31 @@ jobs:
           # loader then refuses to install. ~keep
           assets: xberg-dart-*.tar.gz*
 
-  swift-artifactbundle:
-    name: Build Swift artifact bundle
+  swift-target:
+    name: Build Swift library (${{ matrix.target }})
     needs: prepare
     if: ${{ needs.prepare.outputs.release_swift == 'true' }}
     runs-on: macos-15
-    # This job legitimately takes ~4h -- it succeeded in 251m in run 33623195090, by far the
-    # longest in the workflow (next is 92m). The bound exists only so a genuine hang fails in
-    # 5.5h instead of burning GitHub's 6h default; it is NOT sized to catch a slow build, and
-    # anything below ~300m would kill a healthy one. Re-measure before lowering it. ~keep
-    timeout-minutes: 330
+    # One triple per job. The monolithic job built all five back to back and was killed by its
+    # own 330-minute cap twice running (a timeout kill reports as `cancelled`, which is why it
+    # read as a spurious cancellation for two releases). Its four successful runs took 227-294
+    # minutes, so the true post-fat-LTO duration was never measured -- both post-LTO runs hit
+    # the cap. Per triple the work is a fifth of that even before the parallelism, and an
+    # Apple-only job additionally skips the cargo-zigbuild and Zig install. ~keep
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exactly the triples the bundle ships: include-macos-x86_64 and include-ios-x86_64 are
+        # both false below, so x86_64-apple-darwin and x86_64-apple-ios are deliberately absent.
+        # A triple listed here but not built by the assemble step would fail that step, not this
+        # one. ~keep
+        target:
+          - aarch64-apple-darwin
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2609,6 +2624,46 @@ jobs:
       - uses: xberg-io/actions/setup-rust@v1
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
+
+      - uses: xberg-io/actions/build-swift-artifactbundle@v1
+        id: libs
+        with:
+          crate-name: xberg-swift
+          artifact-name: Xberg-rs
+          include-macos-x86_64: "false"
+          include-ios-x86_64: "false"
+          # Build-only: stages `<triple>/libxberg_swift.a` under libs-dir and assembles nothing.
+          targets: ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: swift-lib-${{ matrix.target }}
+          path: ${{ steps.libs.outputs.libs-dir }}
+          if-no-files-found: error
+          retention-days: 14
+
+  swift-artifactbundle:
+    name: Build Swift artifact bundle
+    # Keeps its name: upload-swift-bundle and update-swift-package-manifest both gate on this
+    # job's result, so renaming it would silently skip the release upload. ~keep
+    needs: [prepare, swift-target]
+    if: ${{ needs.prepare.outputs.release_swift == 'true' }}
+    runs-on: macos-15
+    # Assemble mode compiles nothing -- it lipos, zips and checksums already-built libraries, so
+    # neither Rust nor the system deps are installed here. ~keep
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          submodules: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: swift-lib-*
+          merge-multiple: true
+          path: swift-libs
 
       - uses: xberg-io/actions/build-swift-artifactbundle@v1
         id: bundle
@@ -2621,6 +2676,8 @@ jobs:
           artifact-name: Xberg-rs
           include-macos-x86_64: "false"
           include-ios-x86_64: "false"
+          prebuilt-libs-dir: swift-libs
+
       - uses: actions/upload-artifact@v7
         with:
           name: swift-artifactbundle
