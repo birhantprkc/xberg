@@ -21,7 +21,7 @@ public class Main {
                 .build();
 
             ExtractInput input = ExtractInput.builder()
-                .withKind(ExtractInputKind.Uri)
+                .withKind(ExtractInputKind.URI)
                 .withUri("scanned.pdf")
                 .build();
 

@@ -81,12 +81,12 @@ public class CloudOcrExample implements IOcrBackend {
     // raster, so declare the least-capable option for both descriptors.
     @Override
     public ConfidenceSemantics confidence_semantics() throws Exception {
-        return ConfidenceSemantics.Uncalibrated;
+        return ConfidenceSemantics.UNCALIBRATED;
     }
 
     @Override
     public PageOrientationHandling page_orientation_handling() throws Exception {
-        return PageOrientationHandling.RequiresUpright;
+        return PageOrientationHandling.REQUIRES_UPRIGHT;
     }
 
     @Override
@@ -106,7 +106,7 @@ public class CloudOcrExample implements IOcrBackend {
             // Note: Requires ExtractionConfig with OCR enabled
             var resultOutput = Xberg.extract(
                 io.xberg.ExtractInput.builder()
-                    .withKind(io.xberg.ExtractInputKind.Uri)
+                    .withKind(io.xberg.ExtractInputKind.URI)
                     .withUri("scanned.pdf")
                     .build(),
                 io.xberg.ExtractionConfig.builder().build()

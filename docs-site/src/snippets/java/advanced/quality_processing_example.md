@@ -11,7 +11,7 @@ ExtractionConfig config = ExtractionConfig.builder()
     .withEnableQualityProcessing(true)
     .build();
 ExtractionResult output = Xberg.extract(
-    ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("scanned_document.pdf").build(),
+    ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("scanned_document.pdf").build(),
     config
 );
 ExtractedDocument result = output.results().get(0);

@@ -9,7 +9,7 @@ ExtractionConfig config = ExtractionConfig.builder()
     .build();
 var resultOutput = Xberg.extract(
     io.xberg.ExtractInput.builder()
-        .withKind(io.xberg.ExtractInputKind.Uri)
+        .withKind(io.xberg.ExtractInputKind.URI)
         .withUri("document.pdf")
         .build(),
     config

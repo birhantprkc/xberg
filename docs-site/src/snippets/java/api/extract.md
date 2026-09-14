@@ -5,7 +5,7 @@ import io.xberg.ExtractionConfig;
 import io.xberg.Xberg;
 
 var input = ExtractInput.builder()
-    .withKind(ExtractInputKind.Uri)
+    .withKind(ExtractInputKind.URI)
     .withUri("document.pdf")
     .build();
 

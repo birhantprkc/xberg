@@ -32,7 +32,7 @@ public class VectorDatabaseIntegration {
                     .build())
                 .build())
             .build();
-        ExtractionResult output = Xberg.extract(ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri(documentPath).build(), config);
+        ExtractionResult output = Xberg.extract(ExtractInput.builder().withKind(ExtractInputKind.URI).withUri(documentPath).build(), config);
         ExtractedDocument result = output.results().get(0);
         List<Chunk> chunks = result.chunks() != null ? result.chunks() : List.of();
         List<VectorRecord> vectorRecords = new java.util.ArrayList<>();

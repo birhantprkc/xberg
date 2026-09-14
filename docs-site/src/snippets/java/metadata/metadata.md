@@ -12,7 +12,7 @@ public class Main {
         try {
             var resultOutput = Xberg.extract(
                 io.xberg.ExtractInput.builder()
-                    .withKind(io.xberg.ExtractInputKind.Uri)
+                    .withKind(io.xberg.ExtractInputKind.URI)
                     .withUri("document.pdf")
                     .build(),
                 io.xberg.ExtractionConfig.builder().build()
@@ -34,7 +34,7 @@ public class Main {
             // Access HTML metadata
             var htmlResultOutput = Xberg.extract(
                 io.xberg.ExtractInput.builder()
-                    .withKind(io.xberg.ExtractInputKind.Uri)
+                    .withKind(io.xberg.ExtractInputKind.URI)
                     .withUri("page.html")
                     .build(),
                 io.xberg.ExtractionConfig.builder().build()

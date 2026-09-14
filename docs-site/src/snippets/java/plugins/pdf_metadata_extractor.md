@@ -64,7 +64,7 @@ public class PdfMetadataExtractorExample implements IPostProcessor {
             Xberg.registerPostProcessor(pdfMetadata);
             logger.info("PDF metadata extractor initialized");
             ExtractionResult output = Xberg.extract(
-                ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("document.pdf").build(),
+                ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("document.pdf").build(),
                 ExtractionConfig.builder().build()
             );
             ExtractedDocument result = output.results().get(0);

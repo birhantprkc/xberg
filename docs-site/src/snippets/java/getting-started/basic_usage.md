@@ -10,7 +10,7 @@ import io.xberg.XbergRsException;
 public class BasicUsage {
     public static void main(String[] args) throws XbergRsException {
         ExtractInput input = ExtractInput.builder()
-            .withKind(ExtractInputKind.Uri)
+            .withKind(ExtractInputKind.URI)
             .withUri("document.pdf")
             .build();
 

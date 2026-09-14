@@ -28,14 +28,14 @@ import java.util.Optional;
 
 ExtractionConfig config = ExtractionConfig.builder()
     .withChunking(ChunkingConfig.builder()
-        .withChunkerType(ChunkerType.Markdown)
+        .withChunkerType(ChunkerType.MARKDOWN)
         .withMaxCharacters(500L)
         .withOverlap(50L)
         .withSizing(new ChunkSizing.Tokenizer("Xenova/gpt-4o", Optional.empty()))
         .build())
     .build();
 ExtractionResult output = Xberg.extract(
-    ExtractInput.builder().withKind(ExtractInputKind.Uri).withUri("document.md").build(),
+    ExtractInput.builder().withKind(ExtractInputKind.URI).withUri("document.md").build(),
     config
 );
 ExtractedDocument result = output.results().get(0);
