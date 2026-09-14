@@ -19,7 +19,7 @@ const htmlResult = htmlOutput.results?.[0];
 console.log(`HTML Metadata: ${JSON.stringify(htmlResult?.metadata)}`);
 
 const htmlFormat = htmlResult?.metadata?.format;
-const htmlMeta = htmlFormat?.format_type === "html" ? htmlFormat.html : undefined;
+const htmlMeta = htmlFormat?.formatType === "html" ? htmlFormat : undefined;
 if (htmlMeta?.title) {
   console.log(`Title: ${htmlMeta.title}`);
 }

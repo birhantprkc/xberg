@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.1] - 2026-09-14
+
+### Fixed
+
+- **(swift): externally tagged enums now decode the wire the core types actually emit.** Regenerated
+  on alef 0.87.1. `EntityCategory`, `PiiCategory` and `ConfidenceSemantics` relied on Swift's
+  synthesized `Codable`, which keys every variant (`{"person":{}}`), while serde writes a bare
+  string for a fieldless variant and a single-keyed object whose value is the payload
+  (`{"custom":"foo"}`). Every bridge-constructed value carrying one of these threw
+  `DecodingError.typeMismatch` — `Entity` and `PiiEntity` decode their `category` into a
+  non-optional field, so any result containing an entity failed. `OutputFormat` is handled
+  separately: its `Custom(String)` variant carries `#[serde(untagged)]`, so it round-trips as a
+  bare string rather than a keyed object.
+
+### Changed
+
+- Dependencies upgraded across the workspace, including `crawlberg` 1.6.1 → 1.6.3 and
+  `tree-sitter-language-pack` 1.19.0 → 1.19.1. `skrifa` stays pinned at 0.46: 0.47 moves to
+  read-fonts 0.44 while harfrust 0.13.3 is still on 0.43, and the PDF text rasterizer passes a
+  harfrust `FontRef` to skrifa's `OutlineFace`.
+
 ## [1.2.0] - 2026-09-13
 
 ### Added
