@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **(pdf render): `s` (close-and-stroke) is no longer dropped, and no longer floods the next fill.**
+  The object-level content parser had arms for every path-painting operator in ISO 32000-1 Table 60
+  except `s`, which fell through to an operator every consumer ignores. Two things followed: the
+  stroke was never painted, and — because only a painting arm resets the path builder — the
+  abandoned geometry stayed in the builder and was painted by the **next** fill. A stroked frame
+  followed by an ordinary white label fill therefore flooded the frame's whole interior, wiping
+  anything already drawn inside it. Text extraction was unaffected: the byte-level fast path always
+  decomposed `s` correctly. (GH#1633)
+- **(pdf render): a glyph is no longer discarded because its *inferred* Unicode is whitespace.**
+  The byte-indexed rasterizer decided whether to paint by asking what character a code represents
+  rather than whether there was an outline to draw. For a simple TrueType font with a byte-indexed
+  cmap and no `/Encoding` that character is the glyph id reverse-mapped through the font's own
+  `(1, 0)` subtable and read as ASCII or Mac Roman — private glyph ordering decoded as an encoding
+  it never expressed. Six byte values were affected (`0x09`–`0x0D`, `0x20`, and `0xCA` → U+00A0);
+  re-indexed subsets numbering their glyphs from `0x01` upward walked through a whole run unpainted
+  while the advance still applied, leaving gaps that read as spaces. (GH#1632)
+- **(pdf): a hanging-number heading no longer swallows body text indented to its title's edge.**
+  A line was treated as a numbered heading's continuation whenever the heading had a hanging indent
+  and the line began at the title's left edge — which is equally the geometry of any layout that
+  indents the whole clause, as contracts, tenders and many installation manuals are set. Wrapping
+  now also requires that the preceding line actually ran out of room. Separately, a heading that had
+  absorbed a genuine wrap could never be closed, so the sub-heading and entire body below were
+  pulled in after it. (GH#1634)
+
+---
+
 ## [1.2.1] - 2026-09-14
 
 ### Fixed
