@@ -11,7 +11,10 @@
 set -euo pipefail
 
 log() { echo "smoke-test-musl-node-binding: $*" >&2; }
-die() { log "$*"; exit 1; }
+die() {
+  log "$*"
+  exit 1
+}
 
 STAGED_DIR="${1:?usage: $0 <staged-platform-dir-containing-.node-and-.so-files>}"
 [ -d "$STAGED_DIR" ] || die "staged platform directory not found: $STAGED_DIR"

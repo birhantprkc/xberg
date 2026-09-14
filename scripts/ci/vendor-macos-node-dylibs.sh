@@ -18,10 +18,10 @@ DIR="$(cd "$DIR" && pwd)"
 # @executable_path are already relocatable and left alone. ~keep
 is_vendorable() {
   case "$1" in
-    /usr/lib/*|/System/*) return 1 ;;
-    @*)                   return 1 ;;
-    /*)                   return 0 ;;
-    *)                    return 1 ;;
+  /usr/lib/* | /System/*) return 1 ;;
+  @*) return 1 ;;
+  /*) return 0 ;;
+  *) return 1 ;;
   esac
 }
 
@@ -33,8 +33,8 @@ deps_of() {
   self_id="$(otool -D "$1" | tail -n +2 | head -1 | sed 's/^[[:space:]]*//')"
   # Drop the header (line 1) and exclude the binary's own id. `|| true` keeps a
   # binary with no vendorable deps from failing the pipeline under `set -e`. ~keep
-  otool -L "$1" | tail -n +2 | sed 's/^[[:space:]]*//; s/ (compatibility.*//' \
-    | grep -vxF -e "$self_id" || true
+  otool -L "$1" | tail -n +2 | sed 's/^[[:space:]]*//; s/ (compatibility.*//' |
+    grep -vxF -e "$self_id" || true
 }
 
 resolve() { readlink -f "$1" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
@@ -42,26 +42,38 @@ resolve() { readlink -f "$1" 2>/dev/null || python3 -c 'import os,sys;print(os.p
 # that call is suppressed. The re-sign itself must not be, and its exit status is
 # not enough: an unsigned or invalid signature is fatal at dlopen on arm64, so
 # assert the resulting signature actually verifies. ~keep
-resign()  {
+resign() {
   codesign --remove-signature "$1" 2>/dev/null || true
   codesign -f -s - "$1"
   codesign --verify --strict "$1" ||
-    { echo "::error::no valid code signature on $(basename "$1") after ad-hoc re-signing"; exit 1; }
+    {
+      echo "::error::no valid code signature on $(basename "$1") after ad-hoc re-signing"
+      exit 1
+    }
 }
 
 declare -A seen
 queue=()
 for node in "$DIR"/*.node; do
   [ -e "$node" ] || continue
-  base="$(basename "$node")"; queue+=("$base"); seen["$base"]=1
+  base="$(basename "$node")"
+  queue+=("$base")
+  seen["$base"]=1
 done
-[ ${#queue[@]} -gt 0 ] || { echo "::error::no .node in $DIR to vendor for"; exit 1; }
+[ ${#queue[@]} -gt 0 ] || {
+  echo "::error::no .node in $DIR to vendor for"
+  exit 1
+}
 
 i=0
 while [ $i -lt ${#queue[@]} ]; do
-  bin="${queue[$i]}"; i=$((i+1))
+  bin="${queue[$i]}"
+  i=$((i + 1))
   target="$DIR/$bin"
-  [ -f "$target" ] || { echo "::warning::$bin queued but not present"; continue; }
+  [ -f "$target" ] || {
+    echo "::warning::$bin queued but not present"
+    continue
+  }
   changed=0
   while IFS= read -r dep; do
     [ -n "$dep" ] || continue
@@ -72,18 +84,27 @@ while [ $i -lt ${#queue[@]} ]; do
       # Homebrew bottles target the runner's own macOS and would raise the
       # package's floor; the heif closure comes from build-macos-heif-deps.sh. ~keep
       case "$src" in
-        /opt/homebrew/*|/usr/local/*)
-          echo "::error::refusing to vendor Homebrew dylib $dep"; exit 1 ;;
+      /opt/homebrew/* | /usr/local/*)
+        echo "::error::refusing to vendor Homebrew dylib $dep"
+        exit 1
+        ;;
       esac
-      cp -f "$src" "$DIR/$b"; chmod u+w "$DIR/$b"
+      cp -f "$src" "$DIR/$b"
+      chmod u+w "$DIR/$b"
       echo "vendored $b"
     fi
     install_name_tool -change "$dep" "@loader_path/$b" "$target"
     changed=1
-    if [ -z "${seen[$b]:-}" ]; then seen["$b"]=1; queue+=("$b"); fi
+    if [ -z "${seen[$b]:-}" ]; then
+      seen["$b"]=1
+      queue+=("$b")
+    fi
   done < <(deps_of "$target")
   case "$bin" in
-    *.dylib) install_name_tool -id "@loader_path/$bin" "$target"; changed=1 ;;
+  *.dylib)
+    install_name_tool -id "@loader_path/$bin" "$target"
+    changed=1
+    ;;
   esac
   [ $changed -eq 1 ] && resign "$target"
 done
@@ -92,10 +113,16 @@ leaks=0
 for f in "$DIR"/*.node "$DIR"/*.dylib; do
   [ -e "$f" ] || continue
   while IFS= read -r dep; do
-    is_vendorable "$dep" && { echo "::error::unvendored dep $(basename "$f") -> $dep"; leaks=$((leaks+1)); }
+    is_vendorable "$dep" && {
+      echo "::error::unvendored dep $(basename "$f") -> $dep"
+      leaks=$((leaks + 1))
+    }
   done < <(deps_of "$f")
 done
-[ $leaks -eq 0 ] || { echo "::error::$leaks unvendored absolute deps remain"; exit 1; }
+[ $leaks -eq 0 ] || {
+  echo "::error::$leaks unvendored absolute deps remain"
+  exit 1
+}
 
 # The .node must sit at the declared floor. Vendored dylibs we did not compile
 # (ONNX Runtime) are reported so the package's effective floor is visible. ~keep
@@ -105,8 +132,10 @@ if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ]; then
     m="$(minos_of "$f")"
     echo "minos $m $(basename "$f")"
     case "$f" in
-      *.node) [ "$m" = "$MACOSX_DEPLOYMENT_TARGET" ] || {
-        echo "::error::$(basename "$f") targets macOS $m, expected $MACOSX_DEPLOYMENT_TARGET"; exit 1; } ;;
+    *.node) [ "$m" = "$MACOSX_DEPLOYMENT_TARGET" ] || {
+      echo "::error::$(basename "$f") targets macOS $m, expected $MACOSX_DEPLOYMENT_TARGET"
+      exit 1
+    } ;;
     esac
   done
 fi

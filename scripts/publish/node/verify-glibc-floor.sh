@@ -2,7 +2,6 @@
 
 set -euo pipefail
 
-
 target="${TARGET:?TARGET not set}"
 
 case "$target" in

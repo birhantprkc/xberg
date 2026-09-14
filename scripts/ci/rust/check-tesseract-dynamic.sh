@@ -39,7 +39,7 @@ if grep -Eq 'custom_out_dir:|Downloading .* from https?://' "$BUILD_LOG"; then
   exit 1
 fi
 
-if ! grep -Fq "test $RUNTIME_TEST ... ok" "$BUILD_LOG" || \
+if ! grep -Fq "test $RUNTIME_TEST ... ok" "$BUILD_LOG" ||
   ! grep -Fq "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;" "$BUILD_LOG"; then
   echo "::error::The dynamic Tesseract runtime smoke test did not execute exactly once"
   tail -n "$FAILURE_LOG_LINES" "$BUILD_LOG"

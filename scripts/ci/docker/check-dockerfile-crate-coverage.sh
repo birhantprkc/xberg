@@ -36,48 +36,48 @@ mapfile -t members < <(grep -oE '"crates/[a-zA-Z0-9_-]+"' Cargo.toml | tr -d '"'
 status=0
 
 for dockerfile in docker/Dockerfile.*; do
-    [ -f "$dockerfile" ] || continue
+  [ -f "$dockerfile" ] || continue
 
-    for crate in "${members[@]}"; do
-        if grep -q "COPY crates/${crate}/ " "$dockerfile"; then
-            continue
-        fi
-        # Match a real sed delete ADDRESS for this exact crate, not a bare
-        # substring. `grep -q -- "$crate"` made the core member `xberg` a
-        # substring of every `/xberg-py/d`, `/xberg-node/d`, ... directive, so
-        # `xberg` counted as sed-excluded in all ten Dockerfiles and a missing
-        # `COPY crates/xberg/` could never be reported -- the #325 outage this
-        # script exists to prevent. The two address shapes in use are
-        # `/<crate>/d`, `/"crates\/<crate>"/d`, and -- in Dockerfile.cli, whose
-        # sed runs inside a double-quoted shell string -- the backslash-escaped
-        # `/\"crates\/<crate>\"/d`. The optional `\\?` covers that dialect; without
-        # it xberg-wasm reads as un-excluded and the check false-positives. ~keep
-        if grep "sed -i" "$dockerfile" | grep -qE "[/\"]${crate}\\\\?\"?/d"; then
-            continue
-        fi
-        echo "::error file=${dockerfile}::workspace member 'crates/${crate}' is neither COPYd nor sed-excluded"
-        status=1
-    done
+  for crate in "${members[@]}"; do
+    if grep -q "COPY crates/${crate}/ " "$dockerfile"; then
+      continue
+    fi
+    # Match a real sed delete ADDRESS for this exact crate, not a bare
+    # substring. `grep -q -- "$crate"` made the core member `xberg` a
+    # substring of every `/xberg-py/d`, `/xberg-node/d`, ... directive, so
+    # `xberg` counted as sed-excluded in all ten Dockerfiles and a missing
+    # `COPY crates/xberg/` could never be reported -- the #325 outage this
+    # script exists to prevent. The two address shapes in use are
+    # `/<crate>/d`, `/"crates\/<crate>"/d`, and -- in Dockerfile.cli, whose
+    # sed runs inside a double-quoted shell string -- the backslash-escaped
+    # `/\"crates\/<crate>\"/d`. The optional `\\?` covers that dialect; without
+    # it xberg-wasm reads as un-excluded and the check false-positives. ~keep
+    if grep "sed -i" "$dockerfile" | grep -qE "[/\"]${crate}\\\\?\"?/d"; then
+      continue
+    fi
+    echo "::error file=${dockerfile}::workspace member 'crates/${crate}' is neither COPYd nor sed-excluded"
+    status=1
+  done
 done
 
 # Reverse direction: every `COPY crates/<x>/` must name a real workspace member.
 # Guards against a deleted crate leaving a dangling COPY behind.
 for dockerfile in docker/Dockerfile.*; do
-    [ -f "$dockerfile" ] || continue
+  [ -f "$dockerfile" ] || continue
 
-    while read -r copied; do
-        [ -n "$copied" ] || continue
-        for member in "${members[@]}"; do
-            if [ "$member" = "$copied" ]; then
-                copied=""
-                break
-            fi
-        done
-        [ -n "$copied" ] || continue
-        echo "::error file=${dockerfile}::COPY names 'crates/${copied}', which is not a Cargo workspace member (deleted crate?)"
-        status=1
-    done < <(grep -oE '^COPY crates/[a-zA-Z0-9_-]+/' "$dockerfile" \
-             | sed 's#^COPY crates/##; s#/$##' | sort -u)
+  while read -r copied; do
+    [ -n "$copied" ] || continue
+    for member in "${members[@]}"; do
+      if [ "$member" = "$copied" ]; then
+        copied=""
+        break
+      fi
+    done
+    [ -n "$copied" ] || continue
+    echo "::error file=${dockerfile}::COPY names 'crates/${copied}', which is not a Cargo workspace member (deleted crate?)"
+    status=1
+  done < <(grep -oE '^COPY crates/[a-zA-Z0-9_-]+/' "$dockerfile" |
+    sed 's#^COPY crates/##; s#/$##' | sort -u)
 done
 
 # Third direction: every COPYd crates/ path must survive .dockerignore, and every
@@ -85,33 +85,33 @@ done
 mapfile -t allowed < <(grep -oE '^!crates/[a-zA-Z0-9_-]+' .dockerignore | sed 's#^!crates/##')
 
 for dockerfile in docker/Dockerfile.*; do
-    [ -f "$dockerfile" ] || continue
-    while read -r copied; do
-        [ -n "$copied" ] || continue
-        for entry in "${allowed[@]}"; do
-            if [ "$entry" = "$copied" ]; then
-                copied=""
-                break
-            fi
-        done
-        [ -n "$copied" ] || continue
-        echo "::error file=${dockerfile}::COPY names 'crates/${copied}', which .dockerignore excludes from the build context; buildx will fail with '\"/crates/${copied}\": not found'. Add '!crates/${copied}/' to .dockerignore"
-        status=1
-    done < <(grep -oE '^COPY crates/[a-zA-Z0-9_-]+/' "$dockerfile" \
-             | sed 's#^COPY crates/##; s#/$##' | sort -u)
+  [ -f "$dockerfile" ] || continue
+  while read -r copied; do
+    [ -n "$copied" ] || continue
+    for entry in "${allowed[@]}"; do
+      if [ "$entry" = "$copied" ]; then
+        copied=""
+        break
+      fi
+    done
+    [ -n "$copied" ] || continue
+    echo "::error file=${dockerfile}::COPY names 'crates/${copied}', which .dockerignore excludes from the build context; buildx will fail with '\"/crates/${copied}\": not found'. Add '!crates/${copied}/' to .dockerignore"
+    status=1
+  done < <(grep -oE '^COPY crates/[a-zA-Z0-9_-]+/' "$dockerfile" |
+    sed 's#^COPY crates/##; s#/$##' | sort -u)
 done
 
 for entry in "${allowed[@]}"; do
-    if [ ! -d "crates/${entry}" ]; then
-        echo "::error file=.dockerignore::allowlists 'crates/${entry}', which no longer exists. Stale entries hide real omissions"
-        status=1
-    fi
+  if [ ! -d "crates/${entry}" ]; then
+    echo "::error file=.dockerignore::allowlists 'crates/${entry}', which no longer exists. Stale entries hide real omissions"
+    status=1
+  fi
 done
 
 if [ "$status" -eq 0 ]; then
-    echo "All Cargo workspace members are covered by every docker/Dockerfile.*,"
-    echo "every docker COPY of a crates/ path names a real workspace member,"
-    echo "and every COPYd path survives .dockerignore."
+  echo "All Cargo workspace members are covered by every docker/Dockerfile.*,"
+  echo "every docker COPY of a crates/ path names a real workspace member,"
+  echo "and every COPYd path survives .dockerignore."
 fi
 
 exit "$status"

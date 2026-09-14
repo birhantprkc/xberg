@@ -12,7 +12,10 @@
 set -euo pipefail
 
 log() { echo "smoke-test-musl-python-wheel: $*" >&2; }
-die() { log "$*"; exit 1; }
+die() {
+  log "$*"
+  exit 1
+}
 
 WHEEL="${1:?usage: $0 <path-to-wheel>}"
 [ -f "$WHEEL" ] || die "wheel not found: $WHEEL"

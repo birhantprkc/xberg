@@ -59,11 +59,11 @@ verify_dylib() {
   fi
   while IFS= read -r dep; do
     case "$dep" in
-      "$PREFIX"/lib/* | /usr/lib/* | /System/*) ;;
-      *)
-        echo "::error::$(basename "$lib") links outside the prefix: $dep"
-        return 1
-        ;;
+    "$PREFIX"/lib/* | /usr/lib/* | /System/*) ;;
+    *)
+      echo "::error::$(basename "$lib") links outside the prefix: $dep"
+      return 1
+      ;;
     esac
   done < <(deps_of "$lib")
 }

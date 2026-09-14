@@ -101,7 +101,7 @@ main() {
 
   # Nothing outside the bundle may remain (mirrors the Intel ONNX Runtime check).
   local residual
-  residual="$( {
+  residual="$({
     otool -L "$binary"
     while IFS= read -r base; do otool -L "$base_dir/$base"; done <"$seen"
   } | awk '{print $1}' | grep -E '^(/opt/|/usr/local/)' || true)"

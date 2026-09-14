@@ -27,14 +27,14 @@ ON_FETCH_FAILURE="fail"
 
 for arg in "$@"; do
   case "$arg" in
-    --on-fetch-failure=warn | --on-fetch-failure=fail)
-      ON_FETCH_FAILURE="${arg#--on-fetch-failure=}"
-      ;;
-    *)
-      echo "error: unrecognized argument '$arg'" >&2
-      echo "usage: $0 [--on-fetch-failure=warn|fail]" >&2
-      exit 2
-      ;;
+  --on-fetch-failure=warn | --on-fetch-failure=fail)
+    ON_FETCH_FAILURE="${arg#--on-fetch-failure=}"
+    ;;
+  *)
+    echo "error: unrecognized argument '$arg'" >&2
+    echo "usage: $0 [--on-fetch-failure=warn|fail]" >&2
+    exit 2
+    ;;
   esac
 done
 

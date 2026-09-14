@@ -116,8 +116,8 @@ frameworks_include_xberg() {
 validate_benchmark_profile_inputs() {
   local framework remaining
 
-  if [ "$BENCH_PROFILE_LABEL" = "pdf-heuristic" ] \
-    && { [ -n "$OCR_FIXTURES" ] || [ -n "$BATCH_OCR_FIXTURES" ]; }; then
+  if [ "$BENCH_PROFILE_LABEL" = "pdf-heuristic" ] &&
+    { [ -n "$OCR_FIXTURES" ] || [ -n "$BATCH_OCR_FIXTURES" ]; }; then
     echo "[bench:local] pdf-heuristic cannot run OCR cohorts; use XBERG_BENCH_PROFILE=pdf-ocr." >&2
     return 1
   fi

@@ -20,18 +20,21 @@ binding_manifest="${repo_root}/packages/ruby/ext/xberg_rb/native/Cargo.toml"
 workflow="${repo_root}/.github/workflows/publish.yaml"
 
 for required in "$core_manifest" "$binding_manifest" "$workflow"; do
-  [ -f "$required" ] || { echo "error: missing $required" >&2; exit 1; }
+  [ -f "$required" ] || {
+    echo "error: missing $required" >&2
+    exit 1
+  }
 done
 
 work="$(mktemp -d)"
 trap 'rm -rf -- "$work"' EXIT
 
-awk '/^windows-gnu-target = \[/,/^\]/' "$core_manifest" \
-  | grep -oE '"[a-z0-9-]+"' | tr -d '"' | sort -u > "$work/bundle"
-awk '/^\[features\]/,/^\[(dependencies|target)/' "$binding_manifest" \
-  | grep -oE '^[a-z0-9-]+ = \[' | sed 's/ = \[//' | sort -u > "$work/binding"
-grep "ruby_cargo_args" "$workflow" | sed 's/.*--features //' \
-  | tr ',' '\n' | tr -d ' ' | grep -E '^[a-z0-9-]+$' | sort -u > "$work/selected"
+awk '/^windows-gnu-target = \[/,/^\]/' "$core_manifest" |
+  grep -oE '"[a-z0-9-]+"' | tr -d '"' | sort -u >"$work/bundle"
+awk '/^\[features\]/,/^\[(dependencies|target)/' "$binding_manifest" |
+  grep -oE '^[a-z0-9-]+ = \[' | sed 's/ = \[//' | sort -u >"$work/binding"
+grep "ruby_cargo_args" "$workflow" | sed 's/.*--features //' |
+  tr ',' '\n' | tr -d ' ' | grep -E '^[a-z0-9-]+$' | sort -u >"$work/selected"
 
 # Each set must be non-empty. An extraction that silently matched nothing would make every
 # comparison below trivially pass -- the same shape of vacuous green this check exists to catch.
@@ -44,7 +47,7 @@ for name in bundle binding selected; do
   echo "ruby windows feature check: ${name}=${count}"
 done
 
-comm -12 "$work/bundle" "$work/binding" | comm -23 - "$work/selected" > "$work/missing"
+comm -12 "$work/bundle" "$work/binding" | comm -23 - "$work/selected" >"$work/missing"
 if [ -s "$work/missing" ]; then
   echo "error: windows-gnu-target enables these core features whose xberg-rb counterparts are NOT" >&2
   echo "       in ruby_cargo_args, so the generated conversions will not compile:" >&2

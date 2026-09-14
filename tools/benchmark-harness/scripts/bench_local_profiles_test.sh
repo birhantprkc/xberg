@@ -23,12 +23,12 @@ full_target="$BENCH_PROFILE_TARGET_DIR"
 
 configure_benchmark_profile pdf-heuristic
 heuristic_target="$BENCH_PROFILE_TARGET_DIR"
-[ "${BENCH_PROFILE_CARGO_ARGS[*]}" = "--no-default-features --features pdf-heuristic" ] \
-  || fail "pdf-heuristic Cargo arguments"
+[ "${BENCH_PROFILE_CARGO_ARGS[*]}" = "--no-default-features --features pdf-heuristic" ] ||
+  fail "pdf-heuristic Cargo arguments"
 
 configure_benchmark_profile pdf-ocr
-[ "${BENCH_PROFILE_CARGO_ARGS[*]}" = "--no-default-features --features pdf-ocr" ] \
-  || fail "pdf-ocr Cargo arguments"
+[ "${BENCH_PROFILE_CARGO_ARGS[*]}" = "--no-default-features --features pdf-ocr" ] ||
+  fail "pdf-ocr Cargo arguments"
 [ "$full_target" != "$heuristic_target" ] || fail "full and heuristic targets overlap"
 [ "$heuristic_target" != "$BENCH_PROFILE_TARGET_DIR" ] || fail "heuristic and OCR targets overlap"
 
@@ -186,8 +186,8 @@ printf 'mode-sensitive\n' >"$identity_repo/mode-sensitive"
 chmod 0644 "$identity_repo/mode-sensitive"
 non_executable_hash="$(git_worktree_sha256)"
 chmod 0755 "$identity_repo/mode-sensitive"
-[ "$(git_worktree_sha256)" != "$non_executable_hash" ] \
-  || fail "untracked executable mode omitted from worktree hash"
+[ "$(git_worktree_sha256)" != "$non_executable_hash" ] ||
+  fail "untracked executable mode omitted from worktree hash"
 rm "$identity_repo/mode-sensitive"
 
 exclude_file="$test_directory/excludes"
@@ -281,8 +281,8 @@ git -C "$super_repo" -c protocol.file.allow=always submodule update -q --init --
 REPO_ROOT="$super_repo"
 clean_submodule_hash="$(git_worktree_sha256)"
 printf 'nested untracked\n' >"$super_repo/nested/middle/nested/leaf/untracked.txt"
-[ "$(git_worktree_sha256)" != "$clean_submodule_hash" ] \
-  || fail "recursive submodule untracked content omitted from worktree hash"
+[ "$(git_worktree_sha256)" != "$clean_submodule_hash" ] ||
+  fail "recursive submodule untracked content omitted from worktree hash"
 rm "$super_repo/nested/middle/nested/leaf/untracked.txt"
 middle_head="$(git -C "$super_repo/nested/middle" rev-parse HEAD)"
 git -C "$super_repo" update-index --force-remove nested/middle
@@ -290,16 +290,16 @@ printf '160000 %s 1\tnested/middle\n160000 %s 2\tnested/middle\n160000 %s 3\tnes
   "$middle_head" "$middle_head" "$middle_head" | git -C "$super_repo" update-index --index-info
 conflicted_submodule_hash="$(git_worktree_sha256)"
 printf 'conflicted submodule payload\n' >"$super_repo/nested/middle/untracked-payload"
-[ "$(git_worktree_sha256)" != "$conflicted_submodule_hash" ] \
-  || fail "conflicted submodule worktree content omitted from worktree hash"
+[ "$(git_worktree_sha256)" != "$conflicted_submodule_hash" ] ||
+  fail "conflicted submodule worktree content omitted from worktree hash"
 rm "$super_repo/nested/middle/untracked-payload"
 git -C "$super_repo" update-index --force-remove nested/middle
 printf '160000 %s 0\tnested/middle\n' "$middle_head" | git -C "$super_repo" update-index --index-info
 mv "$super_repo/nested/middle" "$test_directory/saved-middle-submodule"
 uninitialized_submodule_hash="$(git_worktree_sha256)"
 [ -n "$uninitialized_submodule_hash" ] || fail "uninitialized submodule state could not be hashed"
-[ "$uninitialized_submodule_hash" != "$clean_submodule_hash" ] \
-  || fail "uninitialized submodule state omitted from worktree hash"
+[ "$uninitialized_submodule_hash" != "$clean_submodule_hash" ] ||
+  fail "uninitialized submodule state omitted from worktree hash"
 mkdir -p "$super_repo/nested/middle"
 printf 'unhashed payload\n' >"$super_repo/nested/middle/payload"
 if git_worktree_sha256 >/dev/null 2>&1; then

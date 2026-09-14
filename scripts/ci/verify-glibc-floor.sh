@@ -5,7 +5,10 @@ set -euo pipefail
 MAX_GLIBC="${2:-2.28}"
 
 log() { echo "verify-glibc-floor: $*" >&2; }
-die() { log "$*"; exit 1; }
+die() {
+  log "$*"
+  exit 1
+}
 cleanup() { [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"; }
 
 gt() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ] && [ "$1" != "$2" ]; }
@@ -55,9 +58,18 @@ main() {
   trap cleanup EXIT
 
   case "$artifact" in
-  *.whl) unzip -qo "$artifact" -d "$WORKDIR"; verify_tree "$WORKDIR" ;;
-  *.tar.gz | *.tgz) tar -xzf "$artifact" -C "$WORKDIR"; verify_tree "$WORKDIR" ;;
-  *) [ -d "$artifact" ] || die "unsupported artifact '$artifact'"; verify_tree "$artifact" ;;
+  *.whl)
+    unzip -qo "$artifact" -d "$WORKDIR"
+    verify_tree "$WORKDIR"
+    ;;
+  *.tar.gz | *.tgz)
+    tar -xzf "$artifact" -C "$WORKDIR"
+    verify_tree "$WORKDIR"
+    ;;
+  *)
+    [ -d "$artifact" ] || die "unsupported artifact '$artifact'"
+    verify_tree "$artifact"
+    ;;
   esac
   log "artifact passes the glibc floor gate"
 }

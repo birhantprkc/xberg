@@ -2,7 +2,10 @@
 set -euo pipefail
 
 log() { echo "vendor-native-closure: $*" >&2; }
-die() { log "$*"; exit 1; }
+die() {
+  log "$*"
+  exit 1
+}
 cleanup() { [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR"; }
 
 # --- diagnostics for task #490 (mysterious exit 127 late in the vendor loop) ---

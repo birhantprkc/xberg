@@ -14,7 +14,10 @@
 set -euo pipefail
 
 log() { echo "smoke-test-musl-elixir-nif: $*" >&2; }
-die() { log "$*"; exit 1; }
+die() {
+  log "$*"
+  exit 1
+}
 
 NATIVE_DIR="${1:?usage: $0 <dir-containing-libxberg_nif.so-and-vendored-.so-closure>}"
 [ -d "$NATIVE_DIR" ] || die "native asset directory not found: $NATIVE_DIR"

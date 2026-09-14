@@ -34,7 +34,7 @@ publish_one() {
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
-  cat > "$tmp/package.json" <<JSON
+  cat >"$tmp/package.json" <<JSON
 {
   "name": "${pkg}",
   "version": "${VERSION}",
@@ -45,7 +45,7 @@ publish_one() {
 }
 JSON
 
-  cat > "$tmp/README.md" <<MD
+  cat >"$tmp/README.md" <<MD
 # ${pkg}
 
 **Placeholder release.** This 0.0.1 reserves the name; the functional package
@@ -53,7 +53,7 @@ publishes in lockstep with [Xberg](https://github.com/xberg-io/xberg).
 MD
 
   echo "Publishing ${pkg}@${VERSION} (placeholder) to npm..."
-  ( cd "$tmp" && npm publish --access public )
+  (cd "$tmp" && npm publish --access public)
 }
 
 targets=("$@")
@@ -70,7 +70,10 @@ else
         found=1
       fi
     done
-    [ -n "$found" ] || { echo "unknown package: $want" >&2; exit 1; }
+    [ -n "$found" ] || {
+      echo "unknown package: $want" >&2
+      exit 1
+    }
   done
 fi
 

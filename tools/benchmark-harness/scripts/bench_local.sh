@@ -184,8 +184,8 @@ if [ "$BATCH_FRAMEWORKS_EXPLICIT" = 0 ]; then
   BATCH_FRAMEWORKS="$(native_batch_frameworks "$FRAMEWORKS")"
 fi
 
-if { [ -n "$HEURISTIC_FIXTURES$OCR_FIXTURES" ] && frameworks_include_xberg "$FRAMEWORKS"; } \
-  || { [ -n "$BATCH_HEURISTIC_FIXTURES$BATCH_OCR_FIXTURES" ] && frameworks_include_xberg "$BATCH_FRAMEWORKS"; }; then
+if { [ -n "$HEURISTIC_FIXTURES$OCR_FIXTURES" ] && frameworks_include_xberg "$FRAMEWORKS"; } ||
+  { [ -n "$BATCH_HEURISTIC_FIXTURES$BATCH_OCR_FIXTURES" ] && frameworks_include_xberg "$BATCH_FRAMEWORKS"; }; then
   activate_xberg_profile
   echo "[bench:local] xberg profile: $BENCH_PROFILE_LABEL ($BENCH_PROFILE_BINARY)"
 fi

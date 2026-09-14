@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-
 EXTENSION_DIR=$(php -r 'echo ini_get("extension_dir");')
 
 for path in target/release/libxberg_php.dylib target/release/libxberg_php.so target/release/xberg_php.dll; do

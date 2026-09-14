@@ -96,8 +96,8 @@ fi
 # Competitor runs may retain useful measurements when isolated supported-document
 # extractions fail, but still reject a framework that fails most attempted documents.
 case "$FRAMEWORK" in
-  xberg | xberg-*) ;;
-  *) EXTRA_ARGS+=("--min-success-rate" "${MIN_SUCCESS_RATE:-0.5}") ;;
+xberg | xberg-*) ;;
+*) EXTRA_ARGS+=("--min-success-rate" "${MIN_SUCCESS_RATE:-0.5}") ;;
 esac
 if [ -n "$SHARD" ]; then
   EXTRA_ARGS+=("--shard" "${SHARD}")

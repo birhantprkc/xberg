@@ -13,7 +13,10 @@
 set -euo pipefail
 
 log() { echo "smoke-test-musl-java-ffi: $*" >&2; }
-die() { log "$*"; exit 1; }
+die() {
+  log "$*"
+  exit 1
+}
 
 BUILD_OUTPUT_DIR="${1:?usage: $0 <build-output-dir-containing-libxberg_ffi.so>}"
 [ -d "$BUILD_OUTPUT_DIR" ] || die "build-output directory not found: $BUILD_OUTPUT_DIR"

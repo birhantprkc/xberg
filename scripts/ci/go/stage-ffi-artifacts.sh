@@ -41,7 +41,7 @@ cp crates/xberg-ffi/include/xberg.h "${STAGING_DIR}/include/"
 echo "✓ Staged header: xberg.h"
 
 ffi_version="$(grep -m1 '^version' crates/xberg-ffi/Cargo.toml | cut -d '"' -f2)"
-cat > "${STAGING_DIR}/share/pkgconfig/xberg-ffi.pc" <<EOF
+cat >"${STAGING_DIR}/share/pkgconfig/xberg-ffi.pc" <<EOF
 prefix=/usr/local
 exec_prefix=\${prefix}
 libdir=\${exec_prefix}/lib
