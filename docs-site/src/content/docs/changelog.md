@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.2] - 2026-09-14
+
+### Fixed
+
+- **(pdf render): `s` (close-and-stroke) is no longer dropped, and no longer floods the next fill.**
+  The object-level content parser had arms for every path-painting operator in ISO 32000-1 Table 60
+  except `s`, which fell through to an operator every consumer ignores. Two things followed: the
+  stroke was never painted, and — because only a painting arm resets the path builder — the
+  abandoned geometry stayed in the builder and was painted by the **next** fill. A stroked frame
+  followed by an ordinary white label fill therefore flooded the frame's whole interior, wiping
+  anything already drawn inside it. Text extraction was unaffected: the byte-level fast path always
+  decomposed `s` correctly. (GH#1633)
+- **(pdf render): a glyph is no longer discarded because its *inferred* Unicode is whitespace.**
+  The byte-indexed rasterizer decided whether to paint by asking what character a code represents
+  rather than whether there was an outline to draw. For a simple TrueType font with a byte-indexed
+  cmap and no `/Encoding` that character is the glyph id reverse-mapped through the font's own
+  `(1, 0)` subtable and read as ASCII or Mac Roman — private glyph ordering decoded as an encoding
+  it never expressed. Six byte values were affected (`0x09`–`0x0D`, `0x20`, and `0xCA` → U+00A0);
+  re-indexed subsets numbering their glyphs from `0x01` upward walked through a whole run unpainted
+  while the advance still applied, leaving gaps that read as spaces. (GH#1632)
+- **(pdf): a hanging-number heading no longer swallows body text indented to its title's edge.**
+  A line was treated as a numbered heading's continuation whenever the heading had a hanging indent
+  and the line began at the title's left edge — which is equally the geometry of any layout that
+  indents the whole clause, as contracts, tenders and many installation manuals are set. Wrapping
+  now also requires that the preceding line actually ran out of room. Separately, a heading that had
+  absorbed a genuine wrap could never be closed, so the sub-heading and entire body below were
+  pulled in after it. (GH#1634)
+- **(cli): the Linux musl CLI binaries are published again.**
+  Since 1.2.0 the `aarch64-unknown-linux-musl` CLI build has been killed mid-link, and because
+  the upload job requires every musl leg to succeed, *no* CLI assets were attached to the 1.2.0
+  or 1.2.1 releases. The cause was the switch to fat LTO: over the `all` feature set the final
+  whole-program link exceeded what the arm64 runner could complete. That build now uses a
+  `release-musl` profile with thin LTO; every other target keeps fat LTO.
+
+---
+
+## [1.2.1] - 2026-09-14
+
+### Fixed
+
+- **(swift): externally tagged enums now decode the wire the core types actually emit.** Regenerated
+  on alef 0.87.1. `EntityCategory`, `PiiCategory` and `ConfidenceSemantics` relied on Swift's
+  synthesized `Codable`, which keys every variant (`{"person":{}}`), while serde writes a bare
+  string for a fieldless variant and a single-keyed object whose value is the payload
+  (`{"custom":"foo"}`). Every bridge-constructed value carrying one of these threw
+  `DecodingError.typeMismatch` — `Entity` and `PiiEntity` decode their `category` into a
+  non-optional field, so any result containing an entity failed. `OutputFormat` is handled
+  separately: its `Custom(String)` variant carries `#[serde(untagged)]`, so it round-trips as a
+  bare string rather than a keyed object.
+
+### Changed
+
+- Dependencies upgraded across the workspace, including `crawlberg` 1.6.1 → 1.6.3 and
+  `tree-sitter-language-pack` 1.19.0 → 1.19.1. `skrifa` stays pinned at 0.46: 0.47 moves to
+  read-fonts 0.44 while harfrust 0.13.3 is still on 0.43, and the PDF text rasterizer passes a
+  harfrust `FontRef` to skrifa's `OutlineFace`.
+
 ## [1.2.0] - 2026-09-13
 
 ### Added

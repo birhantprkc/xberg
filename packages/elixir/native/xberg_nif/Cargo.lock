@@ -9034,7 +9034,7 @@ dependencies = [
 
 [[package]]
 name = "xberg"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -9170,7 +9170,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-candle-ocr"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "base64 0.23.1",
  "candle-core",
@@ -9190,7 +9190,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-gliner"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -9204,7 +9204,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libheif"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "cfg-if",
  "enumn",
@@ -9215,7 +9215,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libwpd"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "cc",
  "flate2",
@@ -9228,7 +9228,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-native-pdf"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "aes 0.9.3",
  "base64 0.23.1",
@@ -9273,7 +9273,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-paddle-ocr"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "geo-clipper",
  "geo-types",
@@ -9288,7 +9288,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-tesseract"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "cc",
  "cmake",
@@ -9303,7 +9303,7 @@ dependencies = [
 
 [[package]]
 name = "xberg_nif"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "alloc-no-stdlib 3.0.0",
  "alloc-stdlib 0.3.0",
