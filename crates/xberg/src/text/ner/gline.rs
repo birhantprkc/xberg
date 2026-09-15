@@ -363,11 +363,8 @@ where
     K: Clone + Eq + Hash,
     F: FnOnce() -> Result<V>,
 {
-    {
-        let cache = cache.read();
-        if let Some(value) = cache.get(&key) {
-            return Ok(Arc::clone(value));
-        }
+    if let Some(value) = cached_arc(cache, &key) {
+        return Ok(value);
     }
 
     let mut cache = cache.write();
@@ -378,6 +375,13 @@ where
     let value = Arc::new(build()?);
     cache.insert(key, Arc::clone(&value));
     Ok(value)
+}
+
+fn cached_arc<K, V>(cache: &RwLock<AHashMap<K, Arc<V>>>, key: &K) -> Option<Arc<V>>
+where
+    K: Eq + Hash,
+{
+    cache.read().get(key).cloned()
 }
 
 /// `xberg-gliner` ONNX backend wrapper.
@@ -451,13 +455,20 @@ pub(crate) fn get_or_init_backend_blocking(model_name: Option<&str>) -> Result<A
 /// Model download and ONNX initialization run on Tokio's blocking pool. Concurrent
 /// callers requesting the same canonical model and runtime thread budget receive
 /// clones of the same Arc. Initialization errors are not cached, so a later call
-/// can retry after a transient download or filesystem failure.
+/// can retry after a transient download or filesystem failure. Warm cache hits return
+/// immediately without scheduling work on the blocking pool.
 ///
 /// # Errors
 ///
 /// Returns an error when the model name is invalid, its artifacts cannot be loaded,
 /// ONNX initialization fails, or the blocking initialization task cannot complete.
 pub async fn get_or_init_backend(model_name: Option<&str>) -> Result<Arc<GlineBackend>> {
+    let thread_budget = crate::core::config::concurrency::resolve_thread_budget(None);
+    let key = backend_cache_key(model_name, thread_budget)?;
+    if let Some(backend) = cached_arc(&BACKEND_CACHE, &key) {
+        return Ok(backend);
+    }
+
     let model_name = model_name.map(str::to_owned);
     tokio::task::spawn_blocking(move || get_or_init_backend_blocking(model_name.as_deref()))
         .await
