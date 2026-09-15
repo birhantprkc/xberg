@@ -68,21 +68,17 @@ fn leading_lines_matching(body: &str, title: &str) -> usize {
 }
 
 impl PptExtractor {
-    /// Build an `InternalDocument` from PPT extracted slides, speaker notes,
-    /// and embedded images.
+    /// Build an `InternalDocument` from PPT extracted slides and embedded images.
     ///
-    /// `slides` carries the deck's real per-slide structure (persist order
-    /// and numbering, from `extraction::ppt::extract_texts_from_records`) --
-    /// slide numbers are read from that structure, never re-derived by
-    /// splitting rendered text (#1418).
-    fn build_internal_document(
-        slides: &[PptSlideText],
-        speaker_notes: &[String],
-        images: &[ExtractedImage],
-    ) -> InternalDocument {
+    /// `slides` carries the deck's real per-slide structure (persist order and numbering,
+    /// from `extraction::ppt::extract_texts_from_records`) -- slide numbers are read from
+    /// that structure, never re-derived by splitting rendered text (#1418), and each
+    /// slide's speaker notes come from `PptSlideText::notes`, resolved by `slideIdRef`
+    /// rather than by position among the deck's non-empty notes pages (#1640).
+    fn build_internal_document(slides: &[PptSlideText], images: &[ExtractedImage]) -> InternalDocument {
         let mut builder = InternalDocumentBuilder::new("ppt");
 
-        for (i, slide) in slides.iter().enumerate() {
+        for slide in slides.iter() {
             let trimmed = slide.text.trim();
             // The file's own outline title (#1635) wins when it states one; the first-line
             // guess below is the fallback for a deck whose title is drawn on the canvas and
@@ -128,7 +124,7 @@ impl PptExtractor {
                 builder.push_image(None, image.clone(), image.page_number, None);
             }
 
-            if let Some(notes) = speaker_notes.get(i)
+            if let Some(notes) = slide.notes.as_deref()
                 && !notes.is_empty()
             {
                 let key = format!("slide-{}-notes", slide.number);
@@ -274,7 +270,7 @@ impl InternalDocumentExtractor for PptExtractor {
             None
         };
 
-        let mut doc = Self::build_internal_document(&result.slides, &result.speaker_notes, &result.images);
+        let mut doc = Self::build_internal_document(&result.slides, &result.images);
         doc.mime_type = mime_type.to_string();
         doc.processing_warnings.extend(result.processing_warnings);
         doc.metadata = Metadata {
@@ -325,22 +321,25 @@ mod tests {
                 number: 1,
                 text: "First".to_string(),
                 title: None,
+                notes: None,
             },
             // Picture-only: no text at all, so before the fix this slide had no content.
             PptSlideText {
                 number: 2,
                 text: String::new(),
                 title: None,
+                notes: None,
             },
             PptSlideText {
                 number: 3,
                 text: "Third".to_string(),
                 title: None,
+                notes: None,
             },
         ];
         let images = vec![image_on(Some(2), 0), image_on(None, 1)];
 
-        let document = PptExtractor::build_internal_document(&slides, &[], &images);
+        let document = PptExtractor::build_internal_document(&slides, &images);
 
         let order: Vec<String> = document
             .elements
@@ -503,8 +502,9 @@ mod tests {
             number: 1,
             text: "Section Divider".to_string(),
             title: Some("Section Divider".to_string()),
+            notes: None,
         }];
-        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+        let doc = PptExtractor::build_internal_document(&slides, &[]);
 
         assert_eq!(slide_element_title(&doc, 1), Some("Section Divider".to_string()));
         assert!(
@@ -523,8 +523,9 @@ mod tests {
             number: 1,
             text: "Special Databases:\nREACTIONS\nBody bullet one".to_string(),
             title: Some("Special Databases:\nREACTIONS".to_string()),
+            notes: None,
         }];
-        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+        let doc = PptExtractor::build_internal_document(&slides, &[]);
 
         assert_eq!(
             slide_element_title(&doc, 1),
@@ -547,8 +548,9 @@ mod tests {
             number: 1,
             text: format!("{long_title}\nBody text"),
             title: Some(long_title.to_string()),
+            notes: None,
         }];
-        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+        let doc = PptExtractor::build_internal_document(&slides, &[]);
 
         assert_eq!(slide_element_title(&doc, 1), Some(long_title.to_string()));
         assert_eq!(paragraph_texts(&doc), vec!["Body text".to_string()]);
@@ -563,8 +565,9 @@ mod tests {
             number: 1,
             text: "Drawn Title\nDrawn body".to_string(),
             title: None,
+            notes: None,
         }];
-        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+        let doc = PptExtractor::build_internal_document(&slides, &[]);
 
         assert_eq!(slide_element_title(&doc, 1), Some("Drawn Title".to_string()));
         assert_eq!(paragraph_texts(&doc), vec!["Drawn body".to_string()]);
@@ -580,8 +583,9 @@ mod tests {
             number: 1,
             text: "Title\n\nBody".to_string(),
             title: None,
+            notes: None,
         }];
-        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+        let doc = PptExtractor::build_internal_document(&slides, &[]);
 
         let slide_numbers: Vec<u32> = doc
             .elements
@@ -609,19 +613,22 @@ mod tests {
                 number: 1,
                 text: "Slide One".to_string(),
                 title: None,
+                notes: None,
             },
             PptSlideText {
                 number: 2,
                 text: String::new(),
                 title: None,
+                notes: None,
             },
             PptSlideText {
                 number: 3,
                 text: "Slide Three".to_string(),
                 title: None,
+                notes: None,
             },
         ];
-        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+        let doc = PptExtractor::build_internal_document(&slides, &[]);
 
         let slide_numbers: Vec<u32> = doc
             .elements
@@ -643,6 +650,7 @@ mod tests {
             number: 1,
             text: "Slide One".to_string(),
             title: None,
+            notes: None,
         }];
         let image = ExtractedImage {
             data: bytes::Bytes::from_static(b"\xFF\xD8\xFFfake-jpeg"),
@@ -665,7 +673,7 @@ mod tests {
             qr_codes: None,
             data_base64: None,
         };
-        let doc = PptExtractor::build_internal_document(&slides, &[], std::slice::from_ref(&image));
+        let doc = PptExtractor::build_internal_document(&slides, std::slice::from_ref(&image));
 
         assert_eq!(doc.images.len(), 1);
         assert_eq!(doc.images[0].format, "jpeg");
