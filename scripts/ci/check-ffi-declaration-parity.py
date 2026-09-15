@@ -75,6 +75,27 @@ _ARCH_32 = frozenset({"x86", "arm"})
 # upstream fix lands -- the check then proves the fix rather than merely asserting it. ~keep
 _SAMPLE_BYTES = "GH#1595 -- bytes-returning fn rendered with the string template"
 _INT32_AS_LONG = "GH#1597 -- int32_t return declared JAVA_LONG"
+# The plugin registry entry points alef 0.89.0 began declaring: 511 Java symbols became
+# 535, and all 24 new ones return `int32_t` in the header while Panama declares the return
+# JAVA_LONG -- the same GH#1597 generator defect the four above already carry. Waived rather
+# than blocking because every one of the 24 generated call sites narrows the result with
+# `(int)(long)` before using it (OcrBackendBridge.java:561 and its siblings), so the real
+# low 32 bits are what reaches the caller; the declaration is wrong, not the behaviour.
+# Verified by asserting all 24 narrow -- re-check that before extending this list again. ~keep
+_PLUGIN_REGISTRY_INT32 = tuple(
+    f"xberg_{verb}_{plugin}"
+    for verb in ("register", "unregister", "clear")
+    for plugin in (
+        "document_extractor",
+        "embedding_backend",
+        "ocr_backend",
+        "post_processor",
+        "renderer",
+        "reranker_backend",
+        "tokenizer_backend",
+        "validator",
+    )
+)
 KNOWN_BROKEN = {
     "C#": {},
     "java": {
@@ -82,6 +103,7 @@ KNOWN_BROKEN = {
         "xberg_last_error_code": _INT32_AS_LONG,
         "xberg_registry_is_empty": _INT32_AS_LONG,
         "xberg_verify_excerpt": _INT32_AS_LONG,
+        **dict.fromkeys(_PLUGIN_REGISTRY_INT32, _INT32_AS_LONG),
     },
 }
 
