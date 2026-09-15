@@ -3057,9 +3057,9 @@ checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "html-to-markdown-rs"
-version = "3.12.4"
+version = "3.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b23a554b38b32ad84fb055c794ca2e36824a15a43efda8e549766e3a99c80a9b"
+checksum = "6d7a15d966d18c9e245708eb4aa10d2c395dd7a1eae5776d83b0f31a82fb2ecc"
 dependencies = [
  "ahash",
  "astral-tl",
@@ -4000,9 +4000,9 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "liter-llm"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af953eb2f67fcf14a1c7602b6ff3939f797e477701efbcc15a6005b4c8b8098a"
+checksum = "6e87bea9e3d8b965ce969925043918b51efc268e449ac2930f1a7f27b6f99d54"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -8102,9 +8102,9 @@ checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
 
 [[package]]
 name = "tree-sitter-language-pack"
-version = "1.19.1"
+version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2ef727ce76f0f355a9e8a22ffa11163c61aa8b2b3bbb66a748d3d7ce309343f"
+checksum = "a360d1c9fd92fc96d9802ce77422d1a90d59d2ec767ef2c0833691f9ac86689c"
 dependencies = [
  "ahash",
  "cc",
