@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.2.2] - 2026-09-14
+## [1.2.2] - 2026-09-15
 
 ### Fixed
 
@@ -42,6 +42,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or 1.2.1 releases. The cause was the switch to fat LTO: over the `all` feature set the final
   whole-program link exceeded what the arm64 runner could complete. That build now uses a
   `release-musl` profile with thin LTO; every other target keeps fat LTO.
+- **(php): setting `outputFormat` no longer throws.** Every call that passed an output format —
+  `ExtractionConfig::from_json(json_encode(["outputFormat" => "markdown"]))`, and any
+  `extract`/`extractBatch` carrying a per-input config — raised
+  `invalid type: string "markdown", expected struct OutputFormat`. The generated `Xberg\OutputFormat`
+  class carried a derived serde implementation that read and wrote its own storage shape,
+  `{"type":"markdown"}`, while the core enum is externally tagged and writes a bare string, so no
+  real value ever deserialized. `EntityCategory` and `PiiCategory` carried the same defect.
+  Introduced in 1.2.0 alongside the flat-class change and shipped in three releases.
+- **(wasm): `metadata.format` fields are readable again.** `metadata.format.title` returned `''` and
+  `metadata.format.sheetCount` returned `NaN` for every document, because the value reached
+  JavaScript as a `Map` rather than the plain object `index.d.ts` declares — `serde-wasm-bindgen`
+  renders every serde map that way, and serde's internally tagged enum representation is a map.
+  Property access on a `Map` is `undefined`. Introduced in 1.2.0 with the `FormatMetadata` flatten.
+
+### Changed
+
+- **Breaking (PHP binding):** `OutputFormat`, `EntityCategory` and `PiiCategory` now serialize to the
+  wire their Rust counterparts emit — `"markdown"` for a fieldless variant and `{"custom":"latex"}`
+  for one carrying a label — instead of the flat `{"type":"markdown"}` object. `from_json` still
+  accepts the object form, so existing input keeps working; output moves.
+- **Breaking (WebAssembly binding):** a JSON-passthrough field such as `metadata.format` is now a
+  plain object rather than a `Map`. This is the shape `index.d.ts` has always declared; code that
+  worked around the discrepancy with `.get()` must switch to property access.
+- **Breaking (C#, Dart, Go, Java, Kotlin, Python, Swift bindings):** an enum variant whose name ends
+  in a multi-letter acronym followed by a single lowercase letter is spelled correctly now.
+  `StructuredDataType.RdFa` becomes `Rdfa` (C#, Dart, Go, Swift), Kotlin's `R_D_FA` becomes `RDFA`
+  and `PADDLE_O_C_R` becomes `PADDLE_OCR`, and Python's stub and runtime agree on `RDFA`. Wire
+  values are unchanged — only the identifiers move. Names without that shape (`IOError`,
+  `HTMLParser`, `JSONLD`) are unaffected.
 
 ---
 
