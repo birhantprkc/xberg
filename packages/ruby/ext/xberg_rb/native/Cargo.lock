@@ -1509,9 +1509,9 @@ dependencies = [
 
 [[package]]
 name = "crawlberg"
-version = "1.6.3"
+version = "1.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c2732b5e15b3cea849e371834d6394d4c38e08d24012cd4400d76a2d6dfcfb5"
+checksum = "23af95dc59a3ffaa4746714dbc51e2f05490e692350ee824eef7ef4292332016"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -9127,7 +9127,7 @@ dependencies = [
 
 [[package]]
 name = "xberg"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -9263,7 +9263,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-candle-ocr"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "base64 0.23.1",
  "candle-core",
@@ -9283,7 +9283,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-gliner"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -9297,7 +9297,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libheif"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "cfg-if",
  "enumn",
@@ -9308,7 +9308,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libwpd"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "cc",
  "flate2",
@@ -9321,7 +9321,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-native-pdf"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "aes 0.9.3",
  "base64 0.23.1",
@@ -9366,7 +9366,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-paddle-ocr"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "geo-clipper",
  "geo-types",
@@ -9381,7 +9381,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-rb"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "async-trait",
  "crawlberg",
@@ -9397,7 +9397,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-tesseract"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "cc",
  "cmake",
