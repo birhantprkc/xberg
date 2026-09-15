@@ -433,8 +433,13 @@ preserve-patterns = ["SAFETY", "SPDX", "Copyright", "License", "licensed under",
 alue = "alue"
 # PDF text-extraction test fixture ~keep
 beng = "beng"
+# `msofbtBSE` / MSOFBT_BSE 0xF007 -- the Office Drawing "BLIP Store Entry" record the PPT
+# extractor walks to resolve a shape's `pib` to picture bytes. A spec identifier, not BASE. ~keep
+bse = "bse"
 # Dutch-language table-detection test fixture ~keep
 conversie = "conversie"
+# Dutch-language hanging-indent heading fixture (GH#1634) ~keep
+innovaties = "innovaties"
 # PDF text-extraction test fixture ~keep
 liev = "liev"
 # These exact tokens are audited corpus/language terms, tokenizer or hyphenation fragments,

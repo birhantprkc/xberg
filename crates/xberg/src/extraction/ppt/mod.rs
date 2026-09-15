@@ -1859,7 +1859,7 @@ mod tests {
         let mut pictures_stream = first_blip.clone();
         pictures_stream.extend_from_slice(&second_blip);
 
-        // `pib` 1 -> the blip at 0, `pib` 2 -> the blip after it.
+        // `pib` is 1-based: 1 -> the blip at offset 0, 2 -> the blip after it. ~keep
         let mut bstore = bse_record(0);
         bstore.extend_from_slice(&bse_record(second_offset));
         let drawing_group = container(0xF001, &bstore);
