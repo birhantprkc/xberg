@@ -1282,10 +1282,10 @@ fn page_low_occupancy_corridors(
         }
         if crossing_lines.len() <= max_crossing_lines {
             open.get_or_insert(lo);
-        } else if let Some(start) = open.take() {
-            if lo - start >= min_gutter {
-                corridors.push((start, lo));
-            }
+        } else if let Some(start) = open.take()
+            && lo - start >= min_gutter
+        {
+            corridors.push((start, lo));
         }
     }
     if let Some(start) = open {
