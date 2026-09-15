@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **(release): the `xberg-cli` archives are attached again.** v1.2.0 published 12 assets and
+  v1.2.1 published 54, both with none of the nine `xberg-cli-*` archives, so `mise`, `cargo binstall`
+  and every direct download had nothing to fetch. One matrix leg (the aarch64-musl link) failed, and
+  the upload job required all three CLI build jobs to succeed, so a single leg zeroed the whole asset
+  class — as a *skipped* job, which reports no failure and left both releases looking green. The
+  upload now attaches whatever built, and a following step fails the release when any of the nine is
+  missing. (GH#1638)
 - **(pdf render): `s` (close-and-stroke) is no longer dropped, and no longer floods the next fill.**
   The object-level content parser had arms for every path-painting operator in ISO 32000-1 Table 60
   except `s`, which fell through to an operator every consumer ignores. Two things followed: the
