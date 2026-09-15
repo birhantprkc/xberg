@@ -177,7 +177,7 @@ wheels = [
 
 [[package]]
 name = "xberg"
-version = "1.2.0"
+version = "1.2.2"
 source = { directory = "../../packages/python" }
 
 [package.metadata]
