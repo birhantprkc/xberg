@@ -13,6 +13,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **(pdf): a two-column page is no longer split down the middle of a column because one line
+  crosses its gutter.** The corridor search treated whitespace as "no span's bbox", so a single
+  centred footer, caption, or heading set across both columns closed the page's real gutter for
+  every line on the page. The per-line median then placed the split *inside* the left column, every
+  line it crossed became a band boundary, and the reordered text interleaved the two columns
+  mid-word — producing spliced tokens such as `activamodel` and `demandviating`. A split that six or
+  more lines run through now also considers corridors at most one line crosses, still bounded by the
+  same distance cap and still refused when either side does not read as a column. Measured over 490
+  corpus PDFs: 7 documents change, all of them repairing cross-column splices, and none loses
+  vocabulary. Reported and fixed by Data Polder. (GH#1619)
+- **(pdf): a wrapped numbered heading now closes above the run-in beneath it.** The GH#1634 fix's
+  closing term also required a right-edge test that only applies to the un-indented case. A hanging
+  indent heading's wrap and a run-in sub-heading below it are both short lines by definition, so
+  their right edges land within tolerance of each other by coincidence, which overrode the correct
+  left-edge answer and held the heading open across the run-in and the body under it. (GH#1637)
+- **(ppt): a legacy `.ppt` slide's title is read from the file rather than guessed.** The title came
+  from the first line of the slide's merged text, gated on a second line existing and the first being
+  at most 80 characters — so a title-only slide had no title, a two-line title was truncated to its
+  first line, and a longer title was dropped. The outline collection's own `TextHeaderAtom` states
+  which text is the title; that is now read, with the first-line rule kept only for decks that state
+  no title. (GH#1635)
+- **(ppt): the live save's slides are read, not the oldest save's.** The persist chain resolved the
+  current revision correctly and then scanned the stream for the *first* `SlideListWithText`, which on
+  a deck saved more than once belongs to the earliest save — so edited titles and outline text
+  reverted to a superseded revision. (GH#1639)
+- **(ppt): speaker notes attach to the slide that owns them, and the notes master is no longer one.**
+  The notes master's placeholder text ("Click to edit Master text styles…") was emitted as the first
+  slide's speaker note, and the remaining notes were zipped to slides by position, so every note
+  after a slide without one landed on the wrong slide. Notes are now keyed by the `NotesAtom`'s own
+  `slideIdRef`. (GH#1640)
 - **(release): the `xberg-cli` archives are attached again.** v1.2.0 published 12 assets and
   v1.2.1 published 54, both with none of the nine `xberg-cli-*` archives, so `mise`, `cargo binstall`
   and every direct download had nothing to fetch. One matrix leg (the aarch64-musl link) failed, and
@@ -65,6 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`extraction::ppt::PptSlideText` carries the slide's stated title and notes.** The struct gains
+  `title: Option<String>` and `notes: Option<String>`, so Rust callers constructing it with an
+  exhaustive struct literal must add the two fields. The type is not exposed through any binding.
 - **Breaking (PHP binding):** `OutputFormat`, `EntityCategory` and `PiiCategory` now serialize to the
   wire their Rust counterparts emit — `"markdown"` for a fieldless variant and `{"custom":"latex"}`
   for one carrying a label — instead of the flat `{"type":"markdown"}` object. `from_json` still
