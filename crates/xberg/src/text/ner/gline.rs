@@ -436,7 +436,7 @@ impl GlineBackend {
     }
 }
 
-pub(crate) fn get_or_init_backend(model_name: Option<&str>) -> Result<Arc<GlineBackend>> {
+pub(crate) fn get_or_init_backend_blocking(model_name: Option<&str>) -> Result<Arc<GlineBackend>> {
     let thread_budget = crate::core::config::concurrency::resolve_thread_budget(None);
     let key = backend_cache_key(model_name, thread_budget)?;
     let model_id = key.model_id.clone();
@@ -444,6 +444,22 @@ pub(crate) fn get_or_init_backend(model_name: Option<&str>) -> Result<Arc<GlineB
     get_or_insert_arc(&BACKEND_CACHE, key, || {
         GlineBackend::new_with_thread_budget(Some(&model_id), thread_budget)
     })
+}
+
+/// Return the process-wide cached GLiNER backend for the requested model.
+///
+/// Model download and ONNX initialization run on Tokio's blocking pool. Concurrent
+/// callers requesting the same canonical model and runtime thread budget receive
+/// clones of the same Arc. Initialization errors are not cached, so a later call
+/// can retry after a transient download or filesystem failure.
+pub async fn get_or_init_backend(model_name: Option<&str>) -> Result<Arc<GlineBackend>> {
+    let model_name = model_name.map(str::to_owned);
+    tokio::task::spawn_blocking(move || get_or_init_backend_blocking(model_name.as_deref()))
+        .await
+        .map_err(|error| crate::XbergError::Plugin {
+            message: format!("GLiNER initialization task panicked: {error}"),
+            plugin_name: "ner-gliner".to_string(),
+        })?
 }
 
 #[async_trait]
