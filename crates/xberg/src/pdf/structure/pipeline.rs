@@ -2050,11 +2050,23 @@ fn blocks_to_paragraphs(
             // text carries no number -- so the numbered-heading test has to look
             // at the paragraph's first segment instead, which
             // `heading_absorbed_one_wrap` already does. ~keep
+            // GH#1637: `heading_wraps_onto` is a RIGHT-edge test and must stay
+            // scoped to the `current_is_single_visual_line` branch (#1467's
+            // no-indent heading, where a right edge is the only signal available).
+            // A hanging-indent heading that has absorbed its one wrap already has a
+            // LEFT-edge answer from `heading_continuation_is_hanging_indent` below,
+            // and that answer is authoritative: a wrap's last line and a run-in
+            // sub-heading beneath it are both short by definition, so their right
+            // edges land within tolerance of each other by coincidence on real
+            // documents, not because the run-in continues the heading. Applying
+            // `heading_wraps_onto` to `heading_absorbed_one_wrap` too let that
+            // coincidence override the correct left-edge answer and kept the
+            // heading open across the run-in and the body beneath it. ~keep
             let follows_section = starts_new_line
                 && ((current_is_single_visual_line
-                    && super::classify::is_numbered_section_heading(&visual_line_texts[prev_idx]))
+                    && super::classify::is_numbered_section_heading(&visual_line_texts[prev_idx])
+                    && !heading_wraps_onto(prev, line))
                     || heading_absorbed_one_wrap)
-                && !heading_wraps_onto(prev, line)
                 && !current_lines
                     .first()
                     .is_some_and(|heading_start| heading_continuation_is_hanging_indent(heading_start, prev, line));
@@ -7762,6 +7774,62 @@ mod tests {
         assert_eq!(
             paragraph_segment_text(&paragraphs[0]),
             "5.7.5 Roof terminal combined duct vertical and"
+        );
+    }
+
+    /// GH#1637: `heading_absorbed_one_wrap`'s closing term (added by GH#1634 /
+    /// `8681d72ec`) still required `!heading_wraps_onto(prev, line)`, which compares
+    /// RIGHT edges. A hanging-indent wrap's own last line is short by definition, and
+    /// so is a run-in sub-heading at the margin beneath it -- when the two happen to
+    /// end within `HEADING_WRAP_RIGHT_EDGE_TOLERANCE_FONT_FACTOR` of each other, the
+    /// heading looks like it is "still wrapping" and never closes, pulling the
+    /// sub-heading and the body under it in as well.
+    ///
+    /// Geometry transcribed from the issue's real-manual measurement (PDF user space,
+    /// y descending down the page): the wrap ends at x 133.1, the run-in beneath it
+    /// ends at x 114.2 -- 18.9pt apart at 10.5pt, inside the 21pt tolerance.
+    #[test]
+    fn wrapped_heading_closes_even_when_the_run_in_beneath_it_shares_its_right_edge() {
+        let segments = vec![
+            column_seg("4.4.2", 45.4, 30.0, 700.0),
+            column_seg(
+                "Opdeling CV-installatie in groepen bij aanwezigheid extra",
+                80.8,
+                245.7,
+                700.0,
+            ),
+            column_seg("warmtebron", 81.4, 51.7, 685.5),
+            column_seg("Werkingsprincipe", 45.4, 68.8, 657.0),
+            column_seg(
+                "Indien de kamerthermostaat het toestel uitschakelt doordat de temperatuur is bereikt",
+                45.4,
+                244.2,
+                642.5,
+            ),
+        ];
+        let segments: Vec<SegmentData> = segments
+            .into_iter()
+            .map(|mut segment| {
+                segment.font_size = 10.5;
+                segment.height = 10.5;
+                segment
+            })
+            .collect();
+
+        let paragraphs = blocks_to_paragraphs(segments, &[], &[]);
+
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "the wrapped heading must close before the run-in sub-heading and body beneath it"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[0]),
+            "4.4.2 Opdeling CV-installatie in groepen bij aanwezigheid extra warmtebron"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[1]),
+            "Werkingsprincipe Indien de kamerthermostaat het toestel uitschakelt doordat de temperatuur is bereikt"
         );
     }
 
