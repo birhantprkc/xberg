@@ -33,6 +33,40 @@ impl Default for PptExtractor {
     }
 }
 
+/// Join a title's outline paragraphs -- kept as `\n` inside `PptSlideText::title`, one
+/// `\r` paragraph mark per break -- into the single line a `Slide` node's title is
+/// displayed as (xberg-io/xberg#1635): `"Special Databases:\nREACTIONS"` becomes
+/// `"Special Databases: REACTIONS"`, not two lines that read as two different slides.
+fn join_title_paragraphs(title: &str) -> String {
+    title
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How many of `body`'s leading lines, joined by a single space and trimmed, equal
+/// `title`. The outline merge always prepends a recovered title at the very front of the
+/// slide's text, and a title the drawing already carried is normally its first shape too --
+/// so this looks from the front, and `0` means the title's lines were not found there.
+fn leading_lines_matching(body: &str, title: &str) -> usize {
+    if title.is_empty() {
+        return 0;
+    }
+    let mut joined = String::new();
+    for (index, line) in body.lines().enumerate() {
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(line.trim());
+        if joined == title {
+            return index + 1;
+        }
+    }
+    0
+}
+
 impl PptExtractor {
     /// Build an `InternalDocument` from PPT extracted slides, speaker notes,
     /// and embedded images.
@@ -50,18 +84,33 @@ impl PptExtractor {
 
         for (i, slide) in slides.iter().enumerate() {
             let trimmed = slide.text.trim();
-            let mut lines = trimmed.lines();
-            let first_line = lines.next().unwrap_or("");
-            let title = if !first_line.is_empty() && first_line.len() <= 80 && lines.clone().next().is_some() {
-                Some(first_line)
-            } else {
-                None
+            // The file's own outline title (#1635) wins when it states one; the first-line
+            // guess below is the fallback for a deck whose title is drawn on the canvas and
+            // never entered in the outline view, which has no outline title to read at all.
+            let (title, header_lines): (Option<String>, usize) = match slide.title.as_deref() {
+                Some(file_title) => {
+                    let joined = join_title_paragraphs(file_title);
+                    let matched = leading_lines_matching(trimmed, &joined);
+                    (Some(joined), matched)
+                }
+                None => {
+                    let mut lines = trimmed.lines();
+                    let first_line = lines.next().unwrap_or("");
+                    if !first_line.is_empty() && first_line.len() <= 80 && lines.clone().next().is_some() {
+                        (Some(first_line.to_string()), 1)
+                    } else {
+                        (None, 0)
+                    }
+                }
             };
-            builder.push_slide(slide.number, title, None);
+            builder.push_slide(slide.number, title.as_deref(), None);
 
             if !trimmed.is_empty() {
-                if title.is_some() {
-                    for line in lines {
+                if title.is_some() && header_lines > 0 {
+                    // Skip the lines the title already accounts for -- whether the outline
+                    // merge prepended them or the drawing already carried them -- so the
+                    // title text is never also emitted as a body paragraph.
+                    for line in trimmed.lines().skip(header_lines) {
                         let lt = line.trim();
                         if !lt.is_empty() {
                             builder.push_paragraph(lt, vec![], None, None);
@@ -275,15 +324,18 @@ mod tests {
             PptSlideText {
                 number: 1,
                 text: "First".to_string(),
+                title: None,
             },
             // Picture-only: no text at all, so before the fix this slide had no content.
             PptSlideText {
                 number: 2,
                 text: String::new(),
+                title: None,
             },
             PptSlideText {
                 number: 3,
                 text: "Third".to_string(),
+                title: None,
             },
         ];
         let images = vec![image_on(Some(2), 0), image_on(None, 1)];
@@ -423,6 +475,101 @@ mod tests {
         }
     }
 
+    /// Slide-element `text` (the title, for `ElementKind::Slide`) for slide `number`, or
+    /// `None` if no such slide element exists.
+    fn slide_element_title(doc: &crate::types::internal::InternalDocument, number: u32) -> Option<String> {
+        doc.elements.iter().find_map(|e| match &e.kind {
+            ElementKind::Slide { number: n } if *n == number => Some(e.text.clone()),
+            _ => None,
+        })
+    }
+
+    /// Paragraph texts, in document order.
+    fn paragraph_texts(doc: &crate::types::internal::InternalDocument) -> Vec<String> {
+        doc.elements
+            .iter()
+            .filter(|e| matches!(e.kind, ElementKind::Paragraph))
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// xberg-io/xberg#1635: a slide whose only text is its title -- a picture, a diagram, a
+    /// section divider -- previously guessed `title: None` because the first-line heuristic
+    /// required a *second* line to trust the first as a title. The file's own outline title
+    /// carries no such requirement.
+    #[test]
+    fn should_use_the_outline_title_when_the_slide_has_no_other_text() {
+        let slides = vec![PptSlideText {
+            number: 1,
+            text: "Section Divider".to_string(),
+            title: Some("Section Divider".to_string()),
+        }];
+        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+
+        assert_eq!(slide_element_title(&doc, 1), Some("Section Divider".to_string()));
+        assert!(
+            paragraph_texts(&doc).is_empty(),
+            "a title-only slide must not also get a body paragraph repeating the title"
+        );
+    }
+
+    /// xberg-io/xberg#1635: a title stored as two outline paragraphs (one PowerPoint `\r`
+    /// break) must reach the node whole, space-joined -- not truncated to its first line
+    /// the way the old first-line heuristic cut `"Special Databases:\nREACTIONS"` down to
+    /// `"Special Databases:"`.
+    #[test]
+    fn should_join_a_two_paragraph_outline_title_instead_of_truncating_it() {
+        let slides = vec![PptSlideText {
+            number: 1,
+            text: "Special Databases:\nREACTIONS\nBody bullet one".to_string(),
+            title: Some("Special Databases:\nREACTIONS".to_string()),
+        }];
+        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+
+        assert_eq!(
+            slide_element_title(&doc, 1),
+            Some("Special Databases: REACTIONS".to_string())
+        );
+        assert_eq!(
+            paragraph_texts(&doc),
+            vec!["Body bullet one".to_string()],
+            "only the body bullet remains a paragraph; the title's two lines must not appear there too"
+        );
+    }
+
+    /// xberg-io/xberg#1635: the old heuristic dropped a title longer than 80 characters
+    /// outright (`title: None`). An outline title has no such length cap.
+    #[test]
+    fn should_use_an_outline_title_longer_than_eighty_characters() {
+        let long_title = "A section title that runs well past the eighty character heuristic cutoff used before";
+        assert!(long_title.len() > 80, "fixture must exercise the old length cutoff");
+        let slides = vec![PptSlideText {
+            number: 1,
+            text: format!("{long_title}\nBody text"),
+            title: Some(long_title.to_string()),
+        }];
+        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+
+        assert_eq!(slide_element_title(&doc, 1), Some(long_title.to_string()));
+        assert_eq!(paragraph_texts(&doc), vec!["Body text".to_string()]);
+    }
+
+    /// A deck whose title is drawn on the canvas and never entered in the outline view has
+    /// no outline title to read (`PptSlideText::title` is `None`); the first-line heuristic
+    /// must still apply exactly as before (xberg-io/xberg#1635 fallback contract).
+    #[test]
+    fn should_fall_back_to_the_first_line_heuristic_without_an_outline_title() {
+        let slides = vec![PptSlideText {
+            number: 1,
+            text: "Drawn Title\nDrawn body".to_string(),
+            title: None,
+        }];
+        let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
+
+        assert_eq!(slide_element_title(&doc, 1), Some("Drawn Title".to_string()));
+        assert_eq!(paragraph_texts(&doc), vec!["Drawn body".to_string()]);
+    }
+
     /// #1418 root-cause regression at the consumer side: `build_internal_document`
     /// must trust the structured `slides` list, never re-split a slide's own
     /// text on `"\n\n"`. A single slide whose text happens to contain an
@@ -432,6 +579,7 @@ mod tests {
         let slides = vec![PptSlideText {
             number: 1,
             text: "Title\n\nBody".to_string(),
+            title: None,
         }];
         let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
 
@@ -460,14 +608,17 @@ mod tests {
             PptSlideText {
                 number: 1,
                 text: "Slide One".to_string(),
+                title: None,
             },
             PptSlideText {
                 number: 2,
                 text: String::new(),
+                title: None,
             },
             PptSlideText {
                 number: 3,
                 text: "Slide Three".to_string(),
+                title: None,
             },
         ];
         let doc = PptExtractor::build_internal_document(&slides, &[], &[]);
@@ -491,6 +642,7 @@ mod tests {
         let slides = vec![PptSlideText {
             number: 1,
             text: "Slide One".to_string(),
+            title: None,
         }];
         let image = ExtractedImage {
             data: bytes::Bytes::from_static(b"\xFF\xD8\xFFfake-jpeg"),

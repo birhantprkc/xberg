@@ -56,6 +56,12 @@ pub struct PptSlideText {
     /// The slide's text (its atoms joined by `\n`). Empty for a slide with
     /// no text.
     pub text: String,
+    /// The slide's title, read from the outline collection's own `TextHeaderAtom` (`Title` /
+    /// `CenterTitle`) rather than guessed from `text`'s first line (xberg-io/xberg#1635).
+    /// `None` when the file states no outline title for this slide -- a deck whose title is
+    /// drawn on the canvas and never entered in the outline view still has one, just not
+    /// here; the consumer's first-line fallback covers that case.
+    pub title: Option<String>,
 }
 
 /// Metadata extracted from PPT files.
@@ -90,6 +96,16 @@ const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 /// the outline records belonging to the nth slide, which is how outline text is attributed. ~keep
 const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
 const RT_NOTES: u16 = 0x03F0;
+/// Precedes a text atom inside [`RT_SLIDE_LIST_WITH_TEXT`] and types it (MS-PPT 2.13.33
+/// `TextTypeEnum`); read here only to tell a slide's outline *title* apart from its outline
+/// *body* (xberg-io/xberg#1635). ~keep
+const RT_TEXT_HEADER_ATOM: u16 = 0x0F9F;
+/// `TextHeaderAtom.textType == Title`. ~keep
+const TEXT_TYPE_TITLE: u32 = 0;
+/// `TextHeaderAtom.textType == CenterTitle` -- a title-slide's centred title placeholder.
+/// `5` is `CenterBody` (body text, not a title); confirmed against Apache POI's
+/// `TextHeaderAtom` constants, which the MS-PPT spec text alone does not make obvious. ~keep
+const TEXT_TYPE_CENTER_TITLE: u32 = 6;
 
 /// `OfficeArtBlip` record types for the raster formats a `Pictures` stream
 /// can hold (MS-ODRAW 2.2.23). `RT_BLIP_JPEG_ALT` (0xF02A) is an alternate
@@ -223,6 +239,7 @@ pub(crate) fn extract_ppt_text_with_options(
         slides.push(PptSlideText {
             number: 1,
             text: loose_texts.join("\n"),
+            title: None,
         });
     }
     let slide_count = slides.len();
@@ -425,6 +442,23 @@ fn slide_persist_ids_in_presentation_order(ppt_stream: &[u8]) -> Option<Vec<u32>
 ///
 /// When `include_master_slides` is `true`, master slide containers are not
 /// skipped, allowing their placeholder text to appear in the output.
+/// Push one outline atom's cleaned text into `outline_texts[index]`, and -- when
+/// `text_type` names the slide's title (`Title` / `CenterTitle`) and no title has been
+/// captured for this slide yet -- also into `outline_titles[index]` (#1635). The first
+/// title-typed atom wins: an outline states a slide's title once.
+fn record_outline_text(
+    outline_texts: &mut [Vec<String>],
+    outline_titles: &mut [Option<String>],
+    index: usize,
+    text_type: Option<u32>,
+    cleaned: String,
+) {
+    if matches!(text_type, Some(TEXT_TYPE_TITLE | TEXT_TYPE_CENTER_TITLE)) && outline_titles[index].is_none() {
+        outline_titles[index] = Some(cleaned.clone());
+    }
+    outline_texts[index].push(cleaned);
+}
+
 fn extract_texts_from_records(
     data: &[u8],
     include_master_slides: bool,
@@ -446,6 +480,12 @@ fn extract_texts_from_records(
     let mut outline_texts: Vec<Vec<String>> = Vec::new();
     let mut outline_end: Option<usize> = None;
     let mut outline_slide_index: Option<usize> = None;
+    // The outline's own title, one atom per slide, typed by the `TextHeaderAtom` that
+    // precedes it (#1635) -- `None` where the file's outline states no title.
+    let mut outline_titles: Vec<Option<String>> = Vec::new();
+    // `TextHeaderAtom.textType` of the outline atom about to follow; reset after every text
+    // atom so an untyped run never inherits a stale type from an earlier one. ~keep
+    let mut outline_text_type: Option<u32> = None;
 
     while pos + 8 <= data.len() {
         // A slide/notes container's text only spans its own declared byte
@@ -462,6 +502,7 @@ fn extract_texts_from_records(
             slides.push(PptSlideText {
                 number: current_slide_number,
                 text: current_slide_texts.join("\n"),
+                title: None,
             });
             current_slide_texts.clear();
             in_slide_text = false;
@@ -526,6 +567,7 @@ fn extract_texts_from_records(
                     slides.push(PptSlideText {
                         number: current_slide_number,
                         text: current_slide_texts.join("\n"),
+                        title: None,
                     });
                     current_slide_texts.clear();
                 }
@@ -564,6 +606,17 @@ fn extract_texts_from_records(
                 outline_slide_index = Some(next);
                 if outline_texts.len() <= next {
                     outline_texts.resize(next + 1, Vec::new());
+                    outline_titles.resize(next + 1, None);
+                }
+                outline_text_type = None;
+                pos = content_end;
+                continue;
+            }
+            RT_TEXT_HEADER_ATOM => {
+                if outline_slide_index.is_some()
+                    && let Some(bytes) = data.get(content_start..content_start + 4)
+                {
+                    outline_text_type = Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
                 }
                 pos = content_end;
                 continue;
@@ -582,7 +635,13 @@ fn extract_texts_from_records(
                             // Outline text belongs to a slide, not to `loose_texts` -- which is
                             // discarded whenever any slide exists, and is where every legacy
                             // title used to end up (#1612).
-                            outline_texts[index].push(cleaned);
+                            record_outline_text(
+                                &mut outline_texts,
+                                &mut outline_titles,
+                                index,
+                                outline_text_type,
+                                cleaned,
+                            );
                         } else {
                             if in_notes {
                                 current_notes_texts.push(cleaned.clone());
@@ -594,6 +653,7 @@ fn extract_texts_from_records(
                             }
                         }
                     }
+                    outline_text_type = None;
                 }
                 pos = content_end;
                 continue;
@@ -608,7 +668,13 @@ fn extract_texts_from_records(
                             // Outline text belongs to a slide, not to `loose_texts` -- which is
                             // discarded whenever any slide exists, and is where every legacy
                             // title used to end up (#1612).
-                            outline_texts[index].push(cleaned);
+                            record_outline_text(
+                                &mut outline_texts,
+                                &mut outline_titles,
+                                index,
+                                outline_text_type,
+                                cleaned,
+                            );
                         } else {
                             if in_notes {
                                 current_notes_texts.push(cleaned.clone());
@@ -620,6 +686,7 @@ fn extract_texts_from_records(
                             }
                         }
                     }
+                    outline_text_type = None;
                 }
                 pos = content_end;
                 continue;
@@ -641,6 +708,7 @@ fn extract_texts_from_records(
         slides.push(PptSlideText {
             number: current_slide_number,
             text: current_slide_texts.join("\n"),
+            title: None,
         });
     }
 
@@ -669,6 +737,9 @@ fn extract_texts_from_records(
         let Some(slide) = slides.get_mut(index) else {
             continue;
         };
+        // The file's own outline title (#1635), not the first-line guess the caller falls
+        // back to when this is `None`.
+        slide.title = outline_titles.get(index).cloned().flatten();
         let recovered: Vec<&str> = outline
             .iter()
             .map(String::as_str)
@@ -1206,6 +1277,14 @@ mod tests {
         buf
     }
 
+    /// Build a `TextHeaderAtom` (MS-PPT 2.13.33) declaring the `TextTypeEnum` value the
+    /// text atom that follows is typed as.
+    fn text_header_atom(text_type: u32) -> Vec<u8> {
+        let mut buf = record_header(0x0000, RT_TEXT_HEADER_ATOM, 4);
+        buf.extend_from_slice(&text_type.to_le_bytes());
+        buf
+    }
+
     /// Build a `SlidePersistAtom` naming `persist_id`. Only the leading `persistIdRef`
     /// matters to the reader; the remaining 16 bytes are the documented tail.
     fn slide_persist_atom(persist_id: u32) -> Vec<u8> {
@@ -1498,6 +1577,76 @@ mod tests {
 
         assert_eq!(slides.len(), 1);
         assert_eq!(slides[0].text, "Title Slide\nWith a subtitle");
+    }
+
+    /// xberg-io/xberg#1635: the outline's own `TextHeaderAtom` says which run is the slide's
+    /// title (`Title` = 0) -- not the first line of whatever text ends up on the slide. A
+    /// body-typed atom (`Body` = 1) in the same outline entry must not be mistaken for one.
+    #[test]
+    fn test_extract_texts_reads_the_outline_title_type_not_the_first_line() {
+        let mut outline = Vec::new();
+        outline.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
+        outline.extend_from_slice(&text_header_atom(TEXT_TYPE_TITLE));
+        outline.extend_from_slice(&text_chars_atom("Search strategy development"));
+        outline.extend_from_slice(&text_header_atom(1)); // Body
+        outline.extend_from_slice(&text_chars_atom("a body bullet, not the title"));
+        let slwt = container(RT_SLIDE_LIST_WITH_TEXT, &outline);
+
+        let slide1 = container(RT_SLIDE, &text_chars_atom("=> FILE HCAPLUS"));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&slwt);
+        data.extend_from_slice(&slide1);
+
+        let mut warnings = Vec::new();
+        let (slides, _loose, _notes) =
+            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
+
+        assert_eq!(slides.len(), 1);
+        assert_eq!(
+            slides[0].title.as_deref(),
+            Some("Search strategy development"),
+            "the Title-typed atom is the title, not the body bullet or the drawing's first line"
+        );
+    }
+
+    /// xberg-io/xberg#1635, negative control: `CenterTitle` is `6`, not `5` -- `5` is
+    /// `CenterBody`, ordinary body text. Reading the wrong value would silently promote a
+    /// slide's body to its title. ~keep
+    #[test]
+    fn test_extract_texts_treats_center_title_as_six_not_five() {
+        let mut center_title = Vec::new();
+        center_title.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
+        center_title.extend_from_slice(&text_header_atom(TEXT_TYPE_CENTER_TITLE));
+        center_title.extend_from_slice(&text_chars_atom("Refworks"));
+        let mut data = Vec::new();
+        data.extend_from_slice(&container(RT_SLIDE_LIST_WITH_TEXT, &center_title));
+        data.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("some body")));
+
+        let mut warnings = Vec::new();
+        let (slides, _, _) =
+            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
+        assert_eq!(
+            slides[0].title.as_deref(),
+            Some("Refworks"),
+            "textType 6 (CenterTitle) is the centred-title placeholder"
+        );
+
+        let mut center_body = Vec::new();
+        center_body.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
+        center_body.extend_from_slice(&text_header_atom(5));
+        center_body.extend_from_slice(&text_chars_atom("body, not a title"));
+        let mut data5 = Vec::new();
+        data5.extend_from_slice(&container(RT_SLIDE_LIST_WITH_TEXT, &center_body));
+        data5.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("drawn body")));
+
+        let mut warnings5 = Vec::new();
+        let (slides5, _, _) =
+            extract_texts_from_records(&data5, false, None, &mut warnings5).expect("record parsing should succeed");
+        assert_eq!(
+            slides5[0].title, None,
+            "textType 5 is CenterBody, not CenterTitle -- must not become the title"
+        );
     }
 
     /// A `Notes` container's text must not bleed into the slide that follows
