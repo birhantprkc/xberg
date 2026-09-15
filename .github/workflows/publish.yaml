@@ -2973,7 +2973,13 @@ jobs:
   upload-cli-release:
     name: Upload CLI binaries to GitHub Release
     needs: [prepare, cli-binaries, cli-binaries-musl, cli-binaries-binstall]
-    if: ${{ needs.prepare.outputs.is_tag == 'true' && needs.cli-binaries.result == 'success' && needs.cli-binaries-musl.result == 'success' && needs.cli-binaries-binstall.result == 'success' }}
+    # Requiring all three to succeed meant one failed matrix leg skipped this job
+    # outright, publishing a release with NONE of the nine CLI archives: v1.2.0
+    # shipped 12 assets and v1.2.1 shipped 54, both with zero `xberg-cli-*`, off a
+    # single hung aarch64-musl link (#1638). A skipped job reports no failure, so
+    # two releases went out before anyone noticed. Upload whatever did build, and
+    # let the completeness step below fail the run on the shortfall. ~keep
+    if: ${{ !cancelled() && needs.prepare.outputs.is_tag == 'true' && (needs.cli-binaries.result == 'success' || needs.cli-binaries-musl.result == 'success' || needs.cli-binaries-binstall.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v3
@@ -3001,6 +3007,40 @@ jobs:
           assets: |
             xberg-cli-*.tar.gz
             xberg-cli-*.zip
+
+      # The upload above attaches whatever built. Without this the run stays green
+      # on a partial CLI set, which is the half of #1638 that let it recur: the
+      # release itself looked fine and only a user's `mise install` surfaced it.
+      # Listed explicitly rather than counted, so a renamed target fails loudly
+      # instead of being silently swapped for another archive. ~keep
+      - name: Fail the release when a CLI archive is missing
+        run: |
+          set -euo pipefail
+          expected="xberg-cli-aarch64-apple-darwin.tar.gz
+          xberg-cli-x86_64-apple-darwin.tar.gz
+          xberg-cli-aarch64-unknown-linux-gnu.tar.gz
+          xberg-cli-x86_64-unknown-linux-gnu.tar.gz
+          xberg-cli-aarch64-unknown-linux-musl.tar.gz
+          xberg-cli-x86_64-unknown-linux-musl.tar.gz
+          xberg-cli-x86_64-pc-windows-msvc.zip
+          xberg-cli-binstall-aarch64-unknown-linux-musl.tar.gz
+          xberg-cli-binstall-x86_64-unknown-linux-musl.tar.gz"
+          total=0
+          missing=0
+          while read -r asset; do
+            [ -n "$asset" ] || continue
+            total=$((total + 1))
+            if [ ! -f "dist/cli/${asset}" ]; then
+              echo "::error::CLI archive missing from the release: ${asset}"
+              missing=$((missing + 1))
+            fi
+          done <<<"$(echo "$expected" | tr -d ' ')"
+          echo "expected=${total} missing=${missing} present=$((total - missing))"
+          if [ "$total" -ne 9 ]; then
+            echo "::error::the expected-asset list did not parse (counted ${total}, want 9)"
+            exit 1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
 
   # Prove a consumer can actually `cargo binstall xberg-cli` the freshly uploaded
   # (--manifest-path) so it verifies the exact metadata against the release assets
