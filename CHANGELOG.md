@@ -60,9 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wire their Rust counterparts emit — `"markdown"` for a fieldless variant and `{"custom":"latex"}`
   for one carrying a label — instead of the flat `{"type":"markdown"}` object. `from_json` still
   accepts the object form, so existing input keeps working; output moves.
-- **Breaking (WebAssembly binding):** a JSON-passthrough field such as `metadata.format` is now a
-  plain object rather than a `Map`. This is the shape `index.d.ts` has always declared; code that
-  worked around the discrepancy with `.get()` must switch to property access.
+- **Breaking (WebAssembly binding):** `metadata.format` — and any other field carrying a flattened,
+  camelCased enum — is now a plain object rather than a `Map`. This is the shape `index.d.ts` has
+  always declared; code that worked around the discrepancy with `.get()` must switch to property
+  access. Fields carrying an enum that is not flattened, such as `chunking.sizing`, keep the
+  `serde-wasm-bindgen` bridge and are unchanged.
 - **Breaking (C#, Dart, Go, Java, Kotlin, Python, Swift bindings):** an enum variant whose name ends
   in a multi-letter acronym followed by a single lowercase letter is spelled correctly now.
   `StructuredDataType.RdFa` becomes `Rdfa` (C#, Dart, Go, Swift), Kotlin's `R_D_FA` becomes `RDFA`
