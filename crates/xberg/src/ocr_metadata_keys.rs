@@ -32,3 +32,9 @@ pub(crate) const OCR_AUTO_ROTATED_METADATA_KEY: &str = "auto_rotated";
 /// `ocr::processor::execution` and `is_dictionary_invalid_noise` in `extractors::pdf::ocr`.
 pub(crate) const OCR_TESSERACT_DICT_INVALID_WORD_RATIO_METADATA_KEY: &str = "tesseract_dict_invalid_word_ratio";
 pub(crate) const OCR_IMAGE_PREPROCESSING_METADATA_KEY: &str = "image_preprocessing";
+/// One JSON object per OCR page with public elements, each carrying `page_number`,
+/// processed-raster `width`/`height`, `unit`, and `origin` (GH#1645). The document-wide
+/// `OCR_PROCESSED_IMAGE_WIDTH/HEIGHT_METADATA_KEY` pair above cannot describe differently
+/// sized, preprocessed, or rotated pages in a multi-page document; a consumer joins this
+/// array to an `OcrElement` through the element's own `page_number` instead.
+pub(crate) const OCR_PAGE_COORDINATE_FRAMES_METADATA_KEY: &str = "ocr_page_coordinate_frames";

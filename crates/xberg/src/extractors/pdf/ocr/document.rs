@@ -147,6 +147,23 @@ pub(super) fn attach_page_ocr_payload(
         doc.prebuilt_ocr_elements.get_or_insert_with(Vec::new).extend(elements);
     }
 }
+/// Copy the payload fields that a page document already carried before the document-global
+/// restructuring heuristic (`heuristically_restructured_ocr_pages`, in `pipeline.rs`) rebuilt
+/// it: the heuristic's combined document has no notion of the backend's raw per-word OCR
+/// elements, this page's earlier warnings, or its OCR coordinate frame -- all three come from
+/// the page document `build_mixed_ocr_page_document`/`build_pipeline_ocr_page_document` already
+/// built. Missing the frame here silently drops it from every non-`Plain` mixed-route output
+/// while every other unit test stays green, because the heuristic only runs when structured
+/// output is requested (GH#1645).
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+pub(super) fn carry_page_ocr_payload_forward(
+    existing: &crate::types::internal::InternalDocument,
+    new_page_doc: &mut crate::types::internal::InternalDocument,
+) {
+    new_page_doc.prebuilt_ocr_elements = existing.prebuilt_ocr_elements.clone();
+    new_page_doc.processing_warnings = existing.processing_warnings.clone();
+    new_page_doc.ocr_coordinate_frame = existing.ocr_coordinate_frame;
+}
 /// Rescale an OCR backend's pixel-space bounding boxes into the PDF page's own
 /// coordinate space before its structured document is assembled (#1423).
 ///
@@ -350,7 +367,8 @@ pub(super) fn build_mixed_ocr_page_document(
 )> {
     let mut backend_tables = std::mem::take(&mut result.tables);
     let mut raw_backend_elements = result.ocr_elements.take().unwrap_or_default();
-    let (_, element_layout_height) = resolved_ocr_layout_dimensions(&result.metadata, image_width_px, image_height_px);
+    let (element_layout_width, element_layout_height) =
+        resolved_ocr_layout_dimensions(&result.metadata, image_width_px, image_height_px);
     let (backend_elements, element_margin_outcome) = public_ocr_elements_for_pdf_page(
         &mut raw_backend_elements,
         public_ocr_config,
@@ -402,6 +420,19 @@ pub(super) fn build_mixed_ocr_page_document(
         );
     }
     attach_page_ocr_payload(&mut assembled, Vec::new(), backend_elements, page_number);
+    // ~keep The frame is sourced from the same `resolved_ocr_layout_dimensions` call above
+    // that decided where `backend_elements`' bboxes live, so the frame and the elements
+    // cannot disagree by construction (GH#1645). Never fabricated: `resolved_ocr_layout_dimensions`
+    // only falls back to the render raster when page-local processed metadata is absent or
+    // invalid -- that fallback is still the raster the elements actually live in, not a
+    // guess -- and a degenerate render raster (0x0) leaves both zero, so no frame is recorded.
+    if element_layout_width != 0 && element_layout_height != 0 {
+        assembled.ocr_coordinate_frame = Some(crate::types::internal::OcrPageCoordinateFrame::new(
+            page_number,
+            element_layout_width,
+            element_layout_height,
+        ));
+    }
     Some((assembled, paragraphs))
 }
 /// Convert one OCR formula bbox to PDF points.
@@ -510,6 +541,17 @@ pub(super) fn build_pipeline_ocr_page_document(
     );
 
     attach_page_ocr_payload(&mut doc, tables, elements, page_number);
+    // ~keep Unlike `build_mixed_ocr_page_document`, this route has no page-local processed-
+    // image metadata to resolve against: `doc`'s OCR elements are in `raster_size_px` pixel
+    // space at this point (see this function's doc comment), so the raster IS the frame
+    // (GH#1645). Never fabricated: skipped entirely when the raster is degenerate (0x0).
+    if raster_width_px != 0 && raster_height_px != 0 {
+        doc.ocr_coordinate_frame = Some(crate::types::internal::OcrPageCoordinateFrame::new(
+            page_number,
+            raster_width_px,
+            raster_height_px,
+        ));
+    }
     normalize_mixed_ocr_document_page(&mut doc, page_number);
     Some(doc)
 }

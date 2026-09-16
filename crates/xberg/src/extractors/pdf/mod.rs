@@ -111,6 +111,29 @@ fn accepted_mixed_ocr_tables(structured_pages: &ahash::AHashMap<u32, InternalDoc
         .collect()
 }
 
+/// One coordinate frame per OCR page that has both a captured frame (GH#1645) and public
+/// elements -- a page whose elements were all filtered out (margins, quality gate) has
+/// nothing for a consumer to join the frame to, so it is omitted rather than emitted with an
+/// empty element set. Sorted by page number for a deterministic, reader-facing array; the
+/// backing `structured_pages` is an `AHashMap`, whose iteration order is unspecified.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(crate) fn accepted_mixed_ocr_coordinate_frames(
+    structured_pages: &ahash::AHashMap<u32, InternalDocument>,
+) -> Vec<crate::types::internal::OcrPageCoordinateFrame> {
+    let mut page_numbers = structured_pages.keys().copied().collect::<Vec<_>>();
+    page_numbers.sort_unstable();
+    page_numbers
+        .into_iter()
+        .filter_map(|page_number| structured_pages.get(&page_number))
+        .filter(|page| {
+            page.prebuilt_ocr_elements
+                .as_ref()
+                .is_some_and(|elements| !elements.is_empty())
+        })
+        .filter_map(|page| page.ocr_coordinate_frame)
+        .collect()
+}
+
 #[cfg(feature = "pdf")]
 const PDF_OUTLINES_MARKER: &[u8] = b"/Outlines";
 #[cfg(feature = "pdf")]
@@ -1810,6 +1833,8 @@ impl PdfExtractor {
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_elements: Vec<crate::types::OcrElement> = Vec::new();
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        let mut ocr_coordinate_frames: Vec<crate::types::internal::OcrPageCoordinateFrame> = Vec::new();
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_internal_doc: Option<InternalDocument> = None;
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         let mut ocr_llm_usage: Vec<crate::types::LlmUsage> = Vec::new();
@@ -2407,6 +2432,7 @@ impl PdfExtractor {
         {
             ocr_elements = accepted_mixed_ocr_elements(accepted_pages);
             replace_tables_with_ocr_output(&mut tables, accepted_mixed_ocr_tables(accepted_pages));
+            ocr_coordinate_frames = accepted_mixed_ocr_coordinate_frames(accepted_pages);
         }
         #[cfg(not(any(feature = "ocr", feature = "ocr-pipeline")))]
         let (mut doc, document_is_structured) =
@@ -2510,6 +2536,20 @@ impl PdfExtractor {
         // literal they would otherwise have been lost to already exists.
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
         doc.metadata.additional.extend(ocr_backend_additional_metadata);
+
+        // GH#1645: one authoritative processed-raster coordinate frame per OCR page with
+        // public elements, so a multi-page consumer can normalize `OcrElement` geometry
+        // without relying on the single document-wide `ocr_processed_image_width/height`
+        // pair, which cannot describe differently sized, preprocessed, or rotated pages.
+        // Rides in `additional` rather than a new public binding type, same as the
+        // `page_labels` key below (issue #66).
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        if !ocr_coordinate_frames.is_empty() {
+            doc.metadata.additional.insert(
+                std::borrow::Cow::Borrowed(crate::ocr_metadata_keys::OCR_PAGE_COORDINATE_FRAMES_METADATA_KEY),
+                serde_json::json!(ocr_coordinate_frames),
+            );
+        }
 
         // Issue #66: `/PageLabels` — one display label per page, index-aligned
         // with `pdf_metadata.page_structure`/`PageBoundary::page_number`.

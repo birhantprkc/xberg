@@ -8659,4 +8659,273 @@ Name: ___
             "text already present verbatim must not be duplicated as a second paragraph"
         );
     }
+
+    /// GH#1645 fixtures: an `ExtractedDocument` with one OCR-backend word element, ready to
+    /// hand to `build_mixed_ocr_page_document`.
+    #[cfg(feature = "pdf")]
+    fn backend_result_with_one_element(page_number: u32) -> crate::types::ExtractedDocument {
+        crate::types::ExtractedDocument {
+            content: "scanned prose".to_string(),
+            ocr_elements: Some(vec![crate::types::OcrElement {
+                text: "word".to_string(),
+                page_number,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "pdf")]
+    fn ocr_config_including_elements() -> crate::core::config::OcrConfig {
+        crate::core::config::OcrConfig {
+            element_config: Some(crate::types::OcrElementConfig {
+                include_elements: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// GH#1645 -- distinct pages must expose distinct coordinate frames, each pinned to its
+    /// own render raster's exact dimensions, with the fixed `unit`/`origin` literals present
+    /// on the serialized JSON. Breaks if the capture reads a document-wide default instead
+    /// of this call's own `image_width_px`/`image_height_px`, or if `unit`/`origin` are
+    /// dropped from the record.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn two_pages_expose_distinct_coordinate_frames() {
+        let public_config = ocr_config_including_elements();
+
+        let mut page1_result = backend_result_with_one_element(1);
+        let (page1_doc, _) = build_mixed_ocr_page_document(
+            &mut page1_result,
+            &public_config,
+            1,
+            1700,
+            2200,
+            612.0,
+            792.0,
+            disabled_page_margins(),
+        )
+        .expect("page 1 backend result must produce a page document");
+
+        let mut page2_result = backend_result_with_one_element(2);
+        let (page2_doc, _) = build_mixed_ocr_page_document(
+            &mut page2_result,
+            &public_config,
+            2,
+            1240,
+            1754,
+            612.0,
+            792.0,
+            disabled_page_margins(),
+        )
+        .expect("page 2 backend result must produce a page document");
+
+        let frame1 = page1_doc
+            .ocr_coordinate_frame
+            .expect("page 1 must have a coordinate frame");
+        let frame2 = page2_doc
+            .ocr_coordinate_frame
+            .expect("page 2 must have a coordinate frame");
+
+        assert_eq!((frame1.page_number, frame1.width, frame1.height), (1, 1700, 2200));
+        assert_eq!((frame2.page_number, frame2.width, frame2.height), (2, 1240, 1754));
+
+        let json1 = serde_json::to_value(frame1).expect("frame must serialize");
+        assert_eq!(json1["unit"], "pixel");
+        assert_eq!(json1["origin"], "top_left");
+    }
+
+    /// GH#1645 -- `accepted_mixed_ocr_coordinate_frames` must sort its output by page
+    /// number rather than trusting `AHashMap` iteration order, which is unspecified.
+    /// Inserting pages out of order (3, then 1, then 2) pins that: removing the explicit
+    /// sort would make this test flaky rather than reliably failing, which is itself
+    /// evidence the sort is load-bearing.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn coordinate_frames_are_ordered_by_page_number() {
+        fn page_with_frame(page_number: u32, width: u32, height: u32) -> crate::types::internal::InternalDocument {
+            let mut doc = crate::types::internal::InternalDocument::new("pdf");
+            doc.prebuilt_ocr_elements = Some(vec![crate::types::OcrElement {
+                text: "word".to_string(),
+                page_number,
+                ..Default::default()
+            }]);
+            doc.ocr_coordinate_frame = Some(crate::types::internal::OcrPageCoordinateFrame::new(
+                page_number,
+                width,
+                height,
+            ));
+            doc
+        }
+
+        let mut structured_pages = ahash::AHashMap::new();
+        structured_pages.insert(3u32, page_with_frame(3, 300, 300));
+        structured_pages.insert(1u32, page_with_frame(1, 100, 100));
+        structured_pages.insert(2u32, page_with_frame(2, 200, 200));
+
+        let frames = crate::extractors::pdf::accepted_mixed_ocr_coordinate_frames(&structured_pages);
+
+        let page_numbers: Vec<u32> = frames.iter().map(|frame| frame.page_number).collect();
+        assert_eq!(
+            page_numbers,
+            vec![1, 2, 3],
+            "frames must be sorted by page number regardless of insertion/iteration order"
+        );
+    }
+
+    /// GH#1645 -- three ways a frame must NOT appear, none of which is "invalid input
+    /// crashes":
+    /// (a) a page with public elements but no captured frame is omitted, not defaulted to
+    ///     a zeroed record;
+    /// (b) `build_mixed_ocr_page_document` itself must not fabricate a frame when both the
+    ///     page-local processed metadata and the render raster are degenerate (0x0);
+    /// (c) a page with a valid frame but no public elements is omitted -- nothing for a
+    ///     consumer to join it to.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn a_page_without_valid_dimensions_does_not_get_a_frame() {
+        {
+            let mut page = crate::types::internal::InternalDocument::new("pdf");
+            page.prebuilt_ocr_elements = Some(vec![crate::types::OcrElement {
+                text: "word".to_string(),
+                page_number: 1,
+                ..Default::default()
+            }]);
+            assert!(page.ocr_coordinate_frame.is_none(), "test setup: no frame captured");
+
+            let mut structured_pages = ahash::AHashMap::new();
+            structured_pages.insert(1u32, page);
+
+            let frames = crate::extractors::pdf::accepted_mixed_ocr_coordinate_frames(&structured_pages);
+            assert!(
+                frames.is_empty(),
+                "a page with no captured frame must not appear in the output"
+            );
+        }
+
+        {
+            let mut result = backend_result_with_one_element(1);
+            let public_config = ocr_config_including_elements();
+
+            let page_doc = build_mixed_ocr_page_document(
+                &mut result,
+                &public_config,
+                1,
+                0,
+                0,
+                1000.0,
+                1000.0,
+                disabled_page_margins(),
+            );
+
+            if let Some((page_doc, _)) = page_doc {
+                assert!(
+                    page_doc.ocr_coordinate_frame.is_none(),
+                    "a degenerate 0x0 raster with no valid processed metadata must not fabricate a frame"
+                );
+            }
+        }
+
+        {
+            let mut page = crate::types::internal::InternalDocument::new("pdf");
+            page.ocr_coordinate_frame = Some(crate::types::internal::OcrPageCoordinateFrame::new(1, 1700, 2200));
+            assert!(
+                page.prebuilt_ocr_elements.is_none(),
+                "test setup: no public elements on this page"
+            );
+
+            let mut structured_pages = ahash::AHashMap::new();
+            structured_pages.insert(1u32, page);
+
+            let frames = crate::extractors::pdf::accepted_mixed_ocr_coordinate_frames(&structured_pages);
+            assert!(
+                frames.is_empty(),
+                "a valid frame with no public elements must not appear in the output"
+            );
+        }
+    }
+
+    /// GH#1645 -- the frame must come from the page-local *processed* raster
+    /// (`OCR_PROCESSED_IMAGE_WIDTH/HEIGHT_METADATA_KEY`), not the rendered raster passed as
+    /// `image_width_px`/`image_height_px`, proving capture happens before that page-local
+    /// metadata is discarded. Deliberately mismatched (1000x1400 processed vs 800x1000
+    /// rendered) so reading the wrong source is distinguishable from reading the right one.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn the_frame_comes_from_the_page_local_processed_raster_not_the_render_raster() {
+        let mut result = backend_result_with_one_element(1);
+        result.metadata.additional.insert(
+            crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_WIDTH_METADATA_KEY.into(),
+            serde_json::json!(1000),
+        );
+        result.metadata.additional.insert(
+            crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_HEIGHT_METADATA_KEY.into(),
+            serde_json::json!(1400),
+        );
+        let public_config = ocr_config_including_elements();
+
+        let (page_doc, _) = build_mixed_ocr_page_document(
+            &mut result,
+            &public_config,
+            1,
+            800,
+            1000,
+            1000.0,
+            1000.0,
+            disabled_page_margins(),
+        )
+        .expect("a backend result with elements must produce a page document");
+
+        let frame = page_doc
+            .ocr_coordinate_frame
+            .expect("valid processed metadata must produce a frame");
+        assert_eq!(
+            (frame.width, frame.height),
+            (1000, 1400),
+            "the frame must come from the page-local processed metadata (1000x1400), not the render raster (800x1000)"
+        );
+    }
+
+    /// GH#1645 -- guards the `pipeline.rs` trap where the document-global restructuring
+    /// heuristic rebuilds a page's document and only hand-copied two fields
+    /// (`prebuilt_ocr_elements`, `processing_warnings`) forward, silently dropping the
+    /// coordinate frame on every non-`Plain` mixed-route output. `carry_page_ocr_payload_forward`
+    /// is the single choke point both call sites now use.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn carry_page_ocr_payload_forward_keeps_the_frame() {
+        let mut existing = crate::types::internal::InternalDocument::new("pdf");
+        existing.ocr_coordinate_frame = Some(crate::types::internal::OcrPageCoordinateFrame::new(4, 1700, 2200));
+        existing.prebuilt_ocr_elements = Some(vec![crate::types::OcrElement {
+            text: "word".to_string(),
+            page_number: 4,
+            ..Default::default()
+        }]);
+        existing.processing_warnings = vec![ocr_margin_filter_capability_warning()];
+
+        let mut new_page_doc = crate::types::internal::InternalDocument::new("pdf");
+        assert!(
+            new_page_doc.ocr_coordinate_frame.is_none(),
+            "test setup: the heuristic's freshly rebuilt document starts with no frame"
+        );
+
+        carry_page_ocr_payload_forward(&existing, &mut new_page_doc);
+
+        assert_eq!(
+            new_page_doc.ocr_coordinate_frame, existing.ocr_coordinate_frame,
+            "the frame must survive being carried forward onto the heuristic's rebuilt document"
+        );
+        assert_eq!(
+            new_page_doc.prebuilt_ocr_elements.as_ref().map(Vec::len),
+            Some(1),
+            "OCR elements must also still be carried forward"
+        );
+        assert_eq!(
+            new_page_doc.processing_warnings.len(),
+            1,
+            "processing warnings must also still be carried forward"
+        );
+    }
 }

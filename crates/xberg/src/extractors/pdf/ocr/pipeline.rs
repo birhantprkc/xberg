@@ -27,9 +27,10 @@ use super::document::{
 use super::document::{apply_ocr_layout_content_filter, ocr_points_per_pixel};
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 use super::document::{
-    build_mixed_ocr_page_document, build_pipeline_ocr_page_document, formula_bbox_to_page_points,
-    ocr_margin_filter_capability_warning, public_ocr_elements_for_pdf_page, rescale_ocr_bboxes_to_page_points,
-    should_use_document_processing, split_document_global_ocr_structure_by_page, undo_auto_rotate_point,
+    build_mixed_ocr_page_document, build_pipeline_ocr_page_document, carry_page_ocr_payload_forward,
+    formula_bbox_to_page_points, ocr_margin_filter_capability_warning, public_ocr_elements_for_pdf_page,
+    rescale_ocr_bboxes_to_page_points, should_use_document_processing, split_document_global_ocr_structure_by_page,
+    undo_auto_rotate_point,
 };
 #[cfg(all(
     any(feature = "ocr", feature = "ocr-pipeline"),
@@ -973,13 +974,12 @@ pub(crate) async fn extract_mixed_ocr_native(
             };
             let new_page_doc = match split_pages.remove(page_number) {
                 // The heuristic's combined document has no notion of the backend's raw
-                // per-word OCR elements or this page's earlier warnings -- both come
-                // from the fallback per-page document already built above; only the
-                // *structural* elements (headings/paragraphs/list items/tables) come
-                // from the document-global pass.
+                // per-word OCR elements, this page's earlier warnings, or its OCR coordinate
+                // frame -- all three come from the fallback per-page document already built
+                // above (`carry_page_ocr_payload_forward`); only the *structural* elements
+                // (headings/paragraphs/list items/tables) come from the document-global pass.
                 Some(mut new_page_doc) => {
-                    new_page_doc.prebuilt_ocr_elements = existing.prebuilt_ocr_elements.clone();
-                    new_page_doc.processing_warnings = existing.processing_warnings.clone();
+                    carry_page_ocr_payload_forward(existing, &mut new_page_doc);
                     new_page_doc
                 }
                 // The heuristic either didn't run at all for this document (Plain output, or
@@ -1013,8 +1013,7 @@ pub(crate) async fn extract_mixed_ocr_native(
                         &[],
                         &Default::default(),
                     );
-                    new_page_doc.prebuilt_ocr_elements = existing.prebuilt_ocr_elements.clone();
-                    new_page_doc.processing_warnings = existing.processing_warnings.clone();
+                    carry_page_ocr_payload_forward(existing, &mut new_page_doc);
                     new_page_doc
                 }
             };

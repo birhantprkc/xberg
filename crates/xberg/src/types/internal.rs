@@ -115,6 +115,60 @@ impl AsRef<str> for InternalElementId {
     }
 }
 
+/// One OCR page's authoritative processed-raster coordinate frame (GH#1645).
+///
+/// Public `OcrElement` geometry stays in the OCR backend's own raster pixel space even
+/// after the rest of a page's document is normalized into PDF page points, and
+/// `Metadata::additional`'s document-wide `ocr_processed_image_width/height` pair cannot
+/// describe differently sized, preprocessed, or rotated pages. This record is the per-page
+/// authority a multi-page consumer joins to an `OcrElement` through the element's own
+/// `page_number`.
+///
+/// Crate-private and carried on [`InternalDocument::ocr_coordinate_frame`] with
+/// `#[serde(skip)]` so it never crosses the plugin-bridge JSON wire format or gets an alef
+/// binding DTO; it is folded into `Metadata::additional` under
+/// `ocr_metadata_keys::OCR_PAGE_COORDINATE_FRAMES_METADATA_KEY` once a page's document is
+/// final (`extractors::pdf::mod`).
+// Gated to match the only code that writes or reads it, in `extractors::pdf::ocr`.
+// Ungated, the `ocr`-without-`pdf` feature leg compiles the field with no writer and no
+// reader, which `-D warnings` rejects as dead_code — and CI builds that leg. ~keep
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+// `pub` + alef(skip), not `pub(crate)`: `InternalDocument` is a `pub` struct whose every
+// other field is `pub`, and struct-update syntax requires ALL fields to be visible at the
+// construction site. One `pub(crate)` field therefore breaks the 12 integration tests that
+// build one with `..Default::default()`, since those are separate crates. alef(skip)
+// keeps it out of the generated bindings, and `#[serde(skip)]` on the field keeps it off
+// the plugin-bridge wire. ~keep
+#[cfg_attr(alef, alef(skip))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct OcrPageCoordinateFrame {
+    /// 1-based page this frame describes.
+    pub page_number: u32,
+    /// Processed raster width in pixels.
+    pub width: u32,
+    /// Processed raster height in pixels.
+    pub height: u32,
+    /// Always `"pixel"`.
+    pub unit: &'static str,
+    /// Always `"top_left"`.
+    pub origin: &'static str,
+}
+
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+impl OcrPageCoordinateFrame {
+    /// `width`/`height` must already be known non-zero -- callers gate on that before
+    /// constructing one, so this never represents a degenerate/fabricated frame.
+    pub fn new(page_number: u32, width: u32, height: u32) -> Self {
+        Self {
+            page_number,
+            width,
+            height,
+            unit: "pixel",
+            origin: "top_left",
+        }
+    }
+}
+
 #[cfg_attr(alef, alef(skip))]
 /// The internal flat document representation.
 ///
@@ -282,6 +336,16 @@ pub struct InternalDocument {
     /// pipeline from `ExtractionConfig::table_anchors`. Defaults to `false`.
     #[serde(skip)]
     pub table_anchors: bool,
+
+    /// This OCR page's authoritative processed-raster coordinate frame, captured before
+    /// the page-local metadata it comes from is discarded (GH#1645). `#[serde(skip)]` for
+    /// the same reason as the fields above -- it never crosses the plugin-bridge JSON wire
+    /// format -- and is folded into `Metadata::additional` once the page document is final
+    /// rather than becoming a new public binding type. `None` for every non-OCR document,
+    /// and for an OCR'd page whose render raster was degenerate (0x0).
+    #[serde(skip)]
+    #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+    pub ocr_coordinate_frame: Option<OcrPageCoordinateFrame>,
 }
 
 impl From<crate::types::extraction::ExtractedDocument> for InternalDocument {
@@ -368,6 +432,8 @@ impl InternalDocument {
             form_fields: Vec::new(),
             formulas: Vec::new(),
             recorded_formulas: Vec::new(),
+            #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+            ocr_coordinate_frame: None,
         }
     }
 
