@@ -327,6 +327,7 @@ fn merge_words_into_cell_tokens(words: &[HocrWord], row_positions: &[u32]) -> Ve
 /// need the grid; use that function instead when the column x-positions used
 /// to build the grid must stay correlated with it (e.g. a caller that later
 /// indexes `column_positions[column]` against `grid[row][column]`).
+#[cfg(any(feature = "pdf", paddle_ocr, test))]
 pub(crate) fn reconstruct_table(
     words: &[HocrWord],
     column_threshold: u32,
