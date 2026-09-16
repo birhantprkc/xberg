@@ -902,7 +902,7 @@ fn complete_output_formats(prefix: &str) -> Vec<String> {
 
 #[tool_handler]
 impl ServerHandler for XbergMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
