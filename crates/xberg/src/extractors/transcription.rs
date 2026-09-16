@@ -126,6 +126,38 @@ where
     }
 }
 
+/// Runs `task` on the blocking pool while holding a permit from `semaphore`.
+///
+/// The permit is moved *into* the blocking closure rather than held by this future. A
+/// `spawn_blocking` task cannot be cancelled — dropping its `JoinHandle` detaches it and the
+/// closure still runs to completion — so a permit owned by the awaiting future is released the
+/// moment a caller times out or drops, while the Whisper inference it was bounding continues.
+/// `run_transcription_pipeline` is wrapped in [`apply_timeout`], so a `transcription.timeout_ms`
+/// expiry drops that future on a live, designed-in code path, not a hypothetical one. Repeated
+/// abandoned calls then exceed the configured concurrency and keep several models resident on
+/// the blocking pool (same defect as GH#1641, which fixed the reranker; this is the transcription
+/// half). Taking the semaphore as a parameter also gives the tests a locally-owned semaphore,
+/// since the global one's permit count is 1 on a small host. ~keep
+async fn transcribe_holding_permit<T, E, F>(semaphore: Arc<tokio::sync::Semaphore>, task: F) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|e| XbergError::transcription(format!("semaphore closed: {e}")))?;
+
+    task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|e| XbergError::transcription(format!("whisper task panicked: {e}")))?
+    .map_err(|e| XbergError::transcription(format!("whisper inference failed: {e}")))
+}
+
 /// Decode audio, resolve/load the Whisper model, and run inference.
 ///
 /// This is the portion of transcription that [`TranscriptionExtractor::extract_content`]
@@ -169,22 +201,15 @@ async fn run_transcription_pipeline(
 
     let engine = get_or_build_engine(&paths)?;
 
-    let _permit = TRANSCRIPTION_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|e| XbergError::transcription(format!("semaphore closed: {e}")))?;
-
     let pcm_clone = pcm.clone();
     let lang_clone = tcfg.language.clone();
     let timestamps = tcfg.timestamps;
     let engine_for_task = Arc::clone(&engine);
 
-    let segments = task::spawn_blocking(move || {
+    let segments = transcribe_holding_permit(TRANSCRIPTION_SEMAPHORE.clone(), move || {
         engine_for_task.transcribe_segments(&pcm_clone, lang_clone.as_deref(), timestamps)
     })
-    .await
-    .map_err(|e| XbergError::transcription(format!("whisper task panicked: {e}")))?
-    .map_err(|e| XbergError::transcription(format!("whisper inference failed: {e}")))?;
+    .await?;
 
     let mut doc = build_audio_document(tags, &pcm, mime_type);
     push_transcript_elements(&mut doc, &segments, tcfg.timestamps);
@@ -349,6 +374,104 @@ fn build_audio_document(tags: AudioTags, pcm: &PcmAudio, mime_type: &str) -> Int
     doc.metadata.language = tags.language;
     doc.metadata.format = Some(FormatMetadata::Audio(audio_meta));
     doc
+}
+
+#[cfg(test)]
+mod permit_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Barrier;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn permit_stays_with_the_blocking_task_when_the_waiter_is_cancelled() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let release = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let mut waiter = Box::pin(transcribe_holding_permit(Arc::clone(&semaphore), {
+            let release = Arc::clone(&release);
+            move || -> std::result::Result<Vec<(u32, u32, String)>, String> {
+                let _ = started_tx.send(());
+                release.wait();
+                Ok(Vec::new())
+            }
+        }));
+
+        let first = std::future::poll_fn(|cx| Poll::Ready(Future::poll(waiter.as_mut(), cx))).await;
+        assert!(
+            first.is_pending(),
+            "the blocking task must still be running after the first poll"
+        );
+        started_rx.await.expect("the blocking task must have started");
+
+        drop(waiter);
+
+        // Observe first, release the barrier second, assert last. Asserting before the
+        // `release.wait()` below parks the blocking-pool thread on the barrier forever when the
+        // assertion fails, so the test binary never exits and the whole job dies on a timeout --
+        // which CI reports as `cancelled`, not as this failure. ~keep
+        let permit_withheld = Arc::clone(&semaphore).try_acquire_owned().is_err();
+
+        release.wait();
+
+        assert!(
+            permit_withheld,
+            "a cancelled waiter must not return the permit while its blocking task is still running"
+        );
+        let regained = tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire()).await;
+        assert!(
+            regained.is_ok(),
+            "the permit must return once the blocking task finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_is_returned_after_a_completed_call() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let results = transcribe_holding_permit(
+            Arc::clone(&semaphore),
+            || -> std::result::Result<Vec<(u32, u32, String)>, String> { Ok(Vec::new()) },
+        )
+        .await
+        .expect("the task must succeed");
+
+        assert_eq!(results.len(), 0, "the stub task returns no segments");
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "a completed call must release its permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn semaphore_closed_error_names_the_semaphore() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        semaphore.close();
+
+        let err = transcribe_holding_permit(semaphore, || -> std::result::Result<Vec<(u32, u32, String)>, String> {
+            Ok(Vec::new())
+        })
+        .await
+        .expect_err("a closed semaphore must be surfaced as an error");
+
+        assert!(err.to_string().contains("semaphore closed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn inference_error_is_surfaced_separately_from_a_join_error() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let err = transcribe_holding_permit(semaphore, || -> std::result::Result<Vec<(u32, u32, String)>, String> {
+            Err("decoder rejected the clip".to_string())
+        })
+        .await
+        .expect_err("the inner error must propagate");
+
+        assert!(err.to_string().contains("whisper inference failed"), "{err}");
+        assert!(err.to_string().contains("decoder rejected the clip"), "{err}");
+    }
 }
 
 #[cfg(test)]
