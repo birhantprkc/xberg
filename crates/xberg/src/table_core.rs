@@ -435,30 +435,26 @@ fn header_fragment_targets(table: &[Vec<String>], column_positions: &[u32], supp
         let Some(right) = right else {
             continue;
         };
-        if support[column] != 0 || !is_uppercase_header_fragment(&table[0][column]) {
+        if support[column] != 0 || !is_split_invoice_fragment(&table[0][column], &table[0][right]) {
             targets[column] = None;
             continue;
         }
-        targets[column] = sufficiently_near_supported_column(column_positions, left, column, right);
+        targets[column] = sufficiently_near_matching_column(column_positions, left, column, right);
     }
     targets
 }
 
-fn is_uppercase_header_fragment(text: &str) -> bool {
-    let mut letters = text.chars().filter(|character| character.is_alphabetic()).peekable();
-    letters.peek().is_some() && letters.all(|character| character.is_uppercase())
+fn is_split_invoice_fragment(fragment: &str, destination: &str) -> bool {
+    let fragment = fragment.trim();
+    let destination = destination.trim();
+    (fragment.eq_ignore_ascii_case("UNIT") && destination.eq_ignore_ascii_case("PRICE"))
+        || (fragment.eq_ignore_ascii_case("LINE") && destination.eq_ignore_ascii_case("TOTAL"))
 }
 
-fn sufficiently_near_supported_column(positions: &[u32], left: usize, fragment: usize, right: usize) -> Option<usize> {
+fn sufficiently_near_matching_column(positions: &[u32], left: usize, fragment: usize, right: usize) -> Option<usize> {
     let span = positions[right].abs_diff(positions[left]);
-    let left_distance = positions[fragment].abs_diff(positions[left]);
     let right_distance = positions[fragment].abs_diff(positions[right]);
-    let (target, distance) = if right_distance < left_distance {
-        (right, right_distance)
-    } else {
-        (left, left_distance)
-    };
-    (distance.saturating_mul(3) < span).then_some(target)
+    (right_distance.saturating_mul(3) < span).then_some(right)
 }
 
 fn rebuild_table_without_header_fragments(
@@ -1180,11 +1176,11 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_table_keeps_header_fragment_with_closer_left_column() {
+    fn reconstruct_table_keeps_fragment_far_from_matching_right_column() {
         let words = vec![
             word("DESCRIPTION", 100, 100, 250, 40),
             word("QTY", 1_000, 100, 90, 40),
-            word("UNIT", 1_090, 100, 105, 40),
+            word("UNIT", 1_150, 100, 105, 40),
             word("PRICE", 1_500, 100, 135, 40),
             word("Item A", 100, 200, 160, 40),
             word("10", 1_000, 200, 48, 40),
@@ -1196,8 +1192,8 @@ mod tests {
 
         let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
 
-        assert_eq!(table[0], vec!["DESCRIPTION", "QTY UNIT", "PRICE"]);
-        assert_eq!(column_positions, vec![100, 1_000, 1_500]);
+        assert_eq!(table[0], vec!["DESCRIPTION", "QTY", "UNIT", "PRICE"]);
+        assert_eq!(column_positions, vec![100, 1_000, 1_150, 1_500]);
     }
 
     #[test]
@@ -1252,6 +1248,25 @@ mod tests {
         let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
 
         assert_eq!(table[0], vec!["QTY", "note", "UNIT PRICE"]);
+        assert_eq!(column_positions, vec![0, 700, 1_000]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_unrelated_uppercase_header_column() {
+        let words = vec![
+            word("QTY", 0, 100, 80, 40),
+            word("DISCOUNT", 700, 100, 120, 40),
+            word("UNIT", 850, 100, 80, 40),
+            word("PRICE", 1_000, 100, 100, 40),
+            word("1", 0, 200, 30, 40),
+            word("$10", 1_000, 200, 60, 40),
+            word("2", 0, 300, 30, 40),
+            word("$20", 1_000, 300, 60, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["QTY", "DISCOUNT", "UNIT PRICE"]);
         assert_eq!(column_positions, vec![0, 700, 1_000]);
     }
 
