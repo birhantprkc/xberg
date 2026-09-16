@@ -1735,6 +1735,214 @@ fn wrapped_heading_closes_even_when_the_run_in_beneath_it_shares_its_right_edge(
     );
 }
 
+/// Helper: a heading-tier segment at `x`, ending at `x + width`, on `baseline_y`.
+fn heading_seg(text: &str, x: f32, width: f32, baseline_y: f32) -> SegmentData {
+    SegmentData {
+        is_bold: true,
+        font_size: 12.0,
+        height: 12.0,
+        ..column_seg(text, x, width, baseline_y)
+    }
+}
+
+/// Helper: an 8pt body-tier segment at `x`, ending at `x + width`, on `baseline_y`.
+fn narrow_body_seg(text: &str, x: f32, width: f32, baseline_y: f32) -> SegmentData {
+    SegmentData {
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(text, x, width, baseline_y)
+    }
+}
+
+/// GH#1650 page 1. A numbered section heading set in the HEADING font (12pt,
+/// bold) wraps onto a second, unnumbered line at the page margin -- no
+/// hanging indent, so neither of `follows_section`'s two existing exemptions
+/// can see the wrap: `heading_continuation_is_hanging_indent` fails at its
+/// first test (no indent), and `heading_wraps_onto` compares the two lines'
+/// RIGHT edges, which a wrap's short last line never matches (144.7pt apart
+/// here against a 24pt tolerance). The same pair set in the BODY font already
+/// survives via GH#1605's merge-pass exemption, which never runs here because
+/// `finalize_paragraph` has already classified this pair as a heading by font
+/// size before that pass sees it.
+///
+/// `crossed_gap` is the second, independent break term: the heading's own
+/// 16.8pt pitch outruns the page's 10.56pt body leading (threshold 15.84pt),
+/// so even a `follows_section` that accepted the pair would still be cut here.
+/// Geometry transcribed from the issue (reproducer page 1, PDF user space).
+#[test]
+fn wrapped_numbered_heading_in_heading_font_keeps_its_second_line() {
+    let segments = vec![
+        narrow_body_seg(
+            "Lead-in prose above the section, at the body's own pitch",
+            64.34,
+            230.0,
+            900.0,
+        ),
+        narrow_body_seg(
+            "continuing one more line before the heading begins",
+            64.34,
+            230.0,
+            889.44,
+        ),
+        heading_seg("Section 6. Maintenance and support of", 64.34, 220.04, 800.0),
+        heading_seg("software", 64.34, 49.34, 783.2),
+        narrow_body_seg(
+            "The provisions in this section 'Maintenance and support of",
+            64.34,
+            234.34,
+            772.64,
+        ),
+        narrow_body_seg(
+            "software' apply, apart from the general provisions",
+            64.34,
+            220.0,
+            762.08,
+        ),
+    ];
+    let gap_ys = compute_paragraph_gap_ys(&segments);
+    let paragraphs = segments_to_paragraphs(
+        segments,
+        &[(12.0, Some(1)), (8.0, None)],
+        &gap_ys,
+        &TextRepairWitnesses::default(),
+    );
+
+    let title_paragraph = paragraphs
+        .iter()
+        .find(|p| paragraph_segment_text(p).starts_with("Section 6."))
+        .expect("the numbered heading must produce a paragraph");
+    assert_eq!(
+        paragraph_segment_text(title_paragraph),
+        "Section 6. Maintenance and support of software",
+        "GH#1650: a heading-font wrap must keep its second line, the same as a body-font one does"
+    );
+}
+
+/// GH#1650 page 2, the reporter's own control: the identical pair, set in the
+/// BODY font (8pt bold) rather than the heading font, is GH#1605's shape and
+/// already comes out whole via the merge-pass exemption. Must keep working
+/// after the grouper-side fix for the heading-font case above.
+#[test]
+fn wrapped_numbered_heading_in_body_font_keeps_its_second_line() {
+    let segments = vec![
+        SegmentData {
+            is_bold: true,
+            ..narrow_body_seg("Section 6. Maintenance and support of", 64.34, 220.04, 800.0)
+        },
+        SegmentData {
+            is_bold: true,
+            ..narrow_body_seg("software", 64.34, 49.34, 789.44)
+        },
+    ];
+    let gap_ys = compute_paragraph_gap_ys(&segments);
+    let paragraphs = segments_to_paragraphs(
+        segments,
+        &[(12.0, Some(1)), (8.0, None)],
+        &gap_ys,
+        &TextRepairWitnesses::default(),
+    );
+
+    assert_eq!(
+        paragraphs.len(),
+        1,
+        "GH#1605 control: a body-font wrapped numbered heading must stay one element"
+    );
+    assert_eq!(
+        paragraph_segment_text(&paragraphs[0]),
+        "Section 6. Maintenance and support of software"
+    );
+}
+
+/// GH#1650 page 3. A hanging-indent numbered heading (`Article 15` at the
+/// margin, `Termination of the` indented) already passes `follows_section`'s
+/// existing `heading_continuation_is_hanging_indent` exemption -- the trace in
+/// the issue confirms it -- but is still cut, because `crossed_gap` is not
+/// exempted by any of the three continuation tests: the heading's 16.8pt pitch
+/// outruns the surrounding body's 10.56pt leading (threshold 15.84pt) the same
+/// way it does on page 1. This isolates term 2 from term 1.
+#[test]
+fn hanging_indent_numbered_heading_survives_its_own_leading() {
+    let segments = vec![
+        narrow_body_seg(
+            "Lead-in prose above the article, at the body's own pitch",
+            64.34,
+            230.0,
+            900.0,
+        ),
+        narrow_body_seg(
+            "continuing one more line before the article begins",
+            64.34,
+            230.0,
+            889.44,
+        ),
+        heading_seg("Article 15", 64.34, 50.0, 869.44),
+        heading_seg("Termination of the", 142.34, 140.0, 869.44),
+        heading_seg("agreement for breach", 142.34, 120.0, 852.64),
+        narrow_body_seg(
+            "The provisions in this article apply from the effective",
+            64.34,
+            230.0,
+            828.16,
+        ),
+        narrow_body_seg("date of this agreement, unless stated otherwise", 64.34, 230.0, 817.6),
+    ];
+    let gap_ys = compute_paragraph_gap_ys(&segments);
+    let paragraphs = segments_to_paragraphs(
+        segments,
+        &[(12.0, Some(1)), (8.0, None)],
+        &gap_ys,
+        &TextRepairWitnesses::default(),
+    );
+
+    let title_paragraph = paragraphs
+        .iter()
+        .find(|p| paragraph_segment_text(p).starts_with("Article 15"))
+        .expect("the numbered heading must produce a paragraph");
+    assert_eq!(
+        paragraph_segment_text(title_paragraph),
+        "Article 15 Termination of the agreement for breach",
+        "GH#1650: crossed_gap must not cut a continuation follows_section already accepted"
+    );
+}
+
+/// GH#1650 page 4, the required control: a COMPLETE short numbered heading
+/// (one line, does not fill its column) followed by a separate, unrelated
+/// bold line must stay two elements. The heading stops 43.37pt short of its
+/// right edge matching the next line's, so `heading_wraps_onto` already
+/// rejects it; the heading also stops well short of the body column beneath
+/// it (124pt in the issue's own numbers), so the new `heading_continuation_at_margin`
+/// exemption must reject it too, or every complete heading followed by
+/// another bold line would be welded together.
+#[test]
+fn complete_numbered_heading_followed_by_unrelated_bold_line_still_splits() {
+    let segments = vec![
+        heading_seg("Section 4. Software", 64.34, 110.7, 800.0),
+        heading_seg("eIDAS and related services", 64.34, 154.07, 783.2),
+        narrow_body_seg("Software as defined in this section covers all", 64.34, 234.34, 772.64),
+        narrow_body_seg(
+            "licensed components delivered under this agreement",
+            64.34,
+            220.0,
+            762.08,
+        ),
+    ];
+    let gap_ys = compute_paragraph_gap_ys(&segments);
+    let paragraphs = segments_to_paragraphs(
+        segments,
+        &[(12.0, Some(1)), (8.0, None)],
+        &gap_ys,
+        &TextRepairWitnesses::default(),
+    );
+
+    assert_eq!(
+        paragraphs.len(),
+        3,
+        "GH#1650 control: a complete heading, an unrelated bold line, and body text must stay separate"
+    );
+    assert_eq!(paragraph_segment_text(&paragraphs[0]), "Section 4. Software");
+    assert_eq!(paragraph_segment_text(&paragraphs[1]), "eIDAS and related services");
+}
+
 /// GH#1608 page 9: with the predicate blind to the keyword form, a run of
 /// such headings has no break signal at all and collapses into one element --
 /// the exact failure the `starts_section` term exists to prevent.

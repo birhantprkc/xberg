@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Whisper inference it was bounding kept running. Transcription is timeout-wrapped by default
   (`transcription.timeout_ms`), so an expiry there was a live, designed-in path to the same
   concurrency breach, not a hypothetical one. (GH#1641)
+- **(pdf): a wrapped numbered heading set in a heading-size font no longer loses its second line.**
+  `follows_section`'s two continuation exemptions only recognized a wrap via a hanging indent or via
+  matching right edges, both of which a no-indent heading's short last line fails by construction. A
+  third exemption, `heading_continuation_at_margin`, now recognizes a wrap by measuring the heading's
+  own line against the width of the body column beneath it, the same signal the paragraph-merge pass
+  already uses for a body-sized heading. Independently, the paragraph-gap detector could still cut a
+  continuation these exemptions accepted, because a heading's own line pitch legitimately exceeds the
+  body's and was read as a blank-line break; the gap check is now suppressed at exactly the boundary a
+  continuation exemption already accepted. (GH#1650)
 - **(packaging): the Helm chart is published again.** The chart publish was gated such that a failed
   Docker build leg skipped it entirely, while the container images themselves published and the
   release still reported success. No chart was published for 1.1.4, 1.1.5, 1.2.0, 1.2.1 or 1.2.2, so
