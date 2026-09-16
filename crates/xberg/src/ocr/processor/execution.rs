@@ -353,11 +353,9 @@ fn quantity_column_geometry(words: &[HocrWord], column_positions: &[u32], index:
     }
     let left = left.unwrap_or(column_positions[index]);
     let right = right.unwrap_or(column_positions[index].saturating_add(mean_height));
-    let word_width = if width_count == 0 {
-        mean_height
-    } else {
-        u32::try_from(width_sum / width_count).unwrap_or(u32::MAX)
-    };
+    let word_width = width_sum
+        .checked_div(width_count)
+        .map_or(mean_height, |mean| u32::try_from(mean).unwrap_or(u32::MAX));
     (left, right, mean_height, word_width)
 }
 
@@ -365,11 +363,8 @@ fn nonzero_mean(values: impl Iterator<Item = u32>, fallback: u32) -> u32 {
     let (sum, count) = values
         .filter(|&value| value > 0)
         .fold((0u64, 0u64), |(sum, count), value| (sum + u64::from(value), count + 1));
-    if count == 0 {
-        fallback
-    } else {
-        u32::try_from(sum / count).unwrap_or(u32::MAX)
-    }
+    sum.checked_div(count)
+        .map_or(fallback, |mean| u32::try_from(mean).unwrap_or(u32::MAX))
 }
 
 fn cell_axis_bounds(positions: &[u32], index: usize, limit: u32) -> (u32, u32) {
