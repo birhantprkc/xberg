@@ -1173,7 +1173,14 @@ mod tests {
 
         assert_eq!(table[0], vec!["DESCRIPTION", "QTY", "UNIT PRICE", "LINE TOTAL"]);
         assert_eq!(table[3], vec!["Cleaning Tablets", "", "$18.50", "$92.50"]);
-        assert_eq!(column_positions, vec![279, 1_709, 2_219, 2_744]);
+        // The merged column keeps `detect_columns`' own anchor for the data cluster (2_206, the
+        // median of the "$45.00"/"$1.20"/"$18.50" lefts), not the PRICE header word's own left
+        // (2_219). `assign_words_to_cells` already used that anchor -- not the header word's
+        // position -- to decide every word's column membership, and downstream geometry (the OCR
+        // blank-quantity retry's `cell_axis_bounds`) derives an adjacent cell's crop boundary from
+        // this same value, so it must track where the data actually sits, not where the header text
+        // happened to land. ~keep
+        assert_eq!(column_positions, vec![279, 1_709, 2_206, 2_744]);
     }
 
     #[test]
