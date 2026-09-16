@@ -446,7 +446,7 @@ fn recover_blank_quantity_word(
     image_height: u32,
 ) -> Option<HocrWord> {
     let region = region?;
-    if api.set_page_seg_mode(TessPageSegMode::PSM_SINGLE_WORD).is_err() {
+    if api.set_page_seg_mode(TessPageSegMode::PSM_SINGLE_LINE).is_err() {
         return None;
     }
     let recovered = recognize_quantity_region(api, config, region);
@@ -2440,6 +2440,73 @@ mod tests {
         HOCR_FONT_SIZE_ATTRIBUTE, parse_hocr_to_internal_document_with_page_offset_and_stats,
     };
     use tempfile::tempdir;
+
+    #[cfg(feature = "bundle-tessdata-eng")]
+    fn recover_quantity_from_image(image: &image::RgbImage) -> Option<HocrWord> {
+        let tessdata = tempfile::tempdir().expect("temporary tessdata directory must be created");
+        std::fs::write(
+            tessdata.path().join("eng.traineddata"),
+            xberg_tesseract::bundled_eng_traineddata().expect("English tessdata must be bundled for this test"),
+        )
+        .expect("bundled English tessdata must be materialized");
+        let api = xberg_tesseract::TesseractAPI::new().expect("Tesseract API must initialize");
+        api.init(
+            tessdata.path().to_str().expect("temporary tessdata path must be UTF-8"),
+            "eng",
+        )
+        .expect("English tessdata must initialize");
+        api.set_page_seg_mode(TessPageSegMode::PSM_SPARSE_TEXT)
+            .expect("sparse page segmentation mode must apply");
+        api.set_image(
+            image.as_raw(),
+            image.width() as i32,
+            image.height() as i32,
+            3,
+            (image.width() * 3) as i32,
+        )
+        .expect("quantity image must load");
+        api.recognize().expect("initial sparse recognition must complete");
+        let config = TesseractConfig {
+            psm: TessPageSegMode::PSM_SPARSE_TEXT as u8,
+            ..TesseractConfig::default()
+        };
+        let region = QuantityRetryRegion {
+            row: 0,
+            column: 0,
+            left: 0,
+            top: 0,
+            width: image.width(),
+            height: image.height(),
+            word_left: 0,
+            word_top: 0,
+            word_width: image.width(),
+            word_height: image.height(),
+        };
+        recover_blank_quantity_word(&api, &config, Some(&region), image.width(), image.height())
+    }
+
+    #[cfg(feature = "bundle-tessdata-eng")]
+    fn isolated_quantity_image() -> image::RgbImage {
+        image::load_from_memory(include_bytes!("../../../test_data/ocr/isolated_quantity_cell.png"))
+            .expect("embedded quantity PNG must load")
+            .into_rgb8()
+    }
+
+    #[test]
+    #[cfg(feature = "bundle-tessdata-eng")]
+    fn blank_quantity_retry_recognizes_single_and_multi_digit_cells() {
+        let single_digit = isolated_quantity_image();
+        let recovered = recover_quantity_from_image(&single_digit).expect("isolated quantity must be recovered");
+        assert_eq!(recovered.text, "5");
+
+        let digit = image::imageops::crop_imm(&single_digit, 106, 25, 24, 36).to_image();
+        let mut multi_digit = image::RgbImage::from_pixel(170, 91, image::Rgb([255, 255, 255]));
+        for left in [45_i64, 69, 93] {
+            image::imageops::overlay(&mut multi_digit, &digit, left, 25);
+        }
+        let recovered = recover_quantity_from_image(&multi_digit).expect("multi-digit quantity must be recovered");
+        assert_eq!(recovered.text, "555");
+    }
 
     fn confidence_word(text: &str, confidence: f32) -> xberg_tesseract::WordData {
         xberg_tesseract::WordData {
