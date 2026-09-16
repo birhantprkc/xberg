@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.0] - 2026-09-16
+
+### Added
+
+- **(ocr): the registry reports each backend's declared languages.** `list_ocr_backends()` returned
+  only names, so a caller validating an OCR language against the installed backends had to maintain
+  a second language table of its own. `list_ocr_backend_capabilities()` returns one
+  `OcrBackendCapabilities` record per registered backend — its name and the languages it reports —
+  ordered by backend name. An empty `supported_languages` means the backend does not enumerate its
+  languages, *not* that it supports none, so `ocr_backend_supports_language()` is provided for
+  callers that need a decision rather than a list. (GH#1643)
+- **(ocr): mixed-page PDF extraction reports one coordinate frame per OCR'd page.** Public
+  `ocr_elements` carry the OCR backend's raster coordinates, but the per-page processed raster size
+  lived only in the page-local result and was discarded before the elements reached the final
+  document. A multi-page consumer was left with the document-level
+  `ocr_processed_image_width`/`ocr_processed_image_height`, which is not authoritative for pages of
+  differing size, preprocessing, or rotation, and so could not normalize a box safely.
+  `metadata.additional.ocr_page_coordinate_frames` now carries one record per OCR page that has
+  public elements — `page_number`, `width`, `height`, `unit: "pixel"`, `origin: "top_left"` — ordered
+  by page number and joined to an element through the element's own `page_number`. No record is
+  emitted for a page whose raster dimensions are absent or invalid. (GH#1645)
+
+### Fixed
+
+- **(reranker): a cancelled `rerank_async` no longer releases its concurrency permit while its
+  inference is still running.** The permit was held by the awaiting future rather than by the
+  `spawn_blocking` task, and a blocking task cannot be cancelled — dropping its handle merely
+  detaches it. A caller that timed out or dropped therefore returned the permit immediately while the
+  model load and inference it was bounding continued, so repeated abandoned calls could exceed the
+  configured reranker concurrency and keep several models resident after every caller had returned.
+  (GH#1641)
+- **(packaging): the Helm chart is published again.** The chart publish was gated such that a failed
+  Docker build leg skipped it entirely, while the container images themselves published and the
+  release still reported success. No chart was published for 1.1.4, 1.1.5, 1.2.0, 1.2.1 or 1.2.2, so
+  `helm install --version <current>` could not resolve. The chart for 1.2.2 has been published
+  retroactively, and a release now fails loudly if its chart is missing rather than shipping without
+  one.
+
 ## [1.2.2] - 2026-09-15
 
 ### Fixed
