@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public elements — `page_number`, `width`, `height`, `unit: "pixel"`, `origin: "top_left"` — ordered
   by page number and joined to an element through the element's own `page_number`. No record is
   emitted for a page whose raster dimensions are absent or invalid. (GH#1645)
+- **(ner): Rust callers can share xberg's process-wide GLiNER backend cache.**
+  `text::ner::gline::get_or_init_backend` performs model initialization on Tokio's blocking pool,
+  returns the same `Arc` for the same model and thread budget, and leaves failed initializations
+  retryable.
 
 ### Fixed
 

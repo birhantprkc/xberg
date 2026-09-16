@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public elements — `page_number`, `width`, `height`, `unit: "pixel"`, `origin: "top_left"` — ordered
   by page number and joined to an element through the element's own `page_number`. No record is
   emitted for a page whose raster dimensions are absent or invalid. (GH#1645)
+- **(ner): Rust callers can share xberg's process-wide GLiNER backend cache.**
+  `text::ner::gline::get_or_init_backend` performs model initialization on Tokio's blocking pool,
+  returns the same `Arc` for the same model and thread budget, and leaves failed initializations
+  retryable.
 
 ### Fixed
 
@@ -40,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model load and inference it was bounding continued, so repeated abandoned calls could exceed the
   configured reranker concurrency and keep several models resident after every caller had returned.
   (GH#1641)
+- **(embeddings, transcription): the same cancelled-permit leak fixed above for the reranker is now
+  fixed for `embed_texts_async` and audio/video transcription.** Both bound a `spawn_blocking`
+  inference call with a concurrency permit held by the awaiting future rather than by the blocking
+  task, so a caller that dropped its future released the permit while the ONNX embedding batch or
+  Whisper inference it was bounding kept running. Transcription is timeout-wrapped by default
+  (`transcription.timeout_ms`), so an expiry there was a live, designed-in path to the same
+  concurrency breach, not a hypothetical one. (GH#1641)
 - **(packaging): the Helm chart is published again.** The chart publish was gated such that a failed
   Docker build leg skipped it entirely, while the container images themselves published and the
   release still reported success. No chart was published for 1.1.4, 1.1.5, 1.2.0, 1.2.1 or 1.2.2, so
