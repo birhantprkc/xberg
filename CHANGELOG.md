@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **(ocr): an isolated blank quantity cell in an invoice table can be recovered from its own
+  pixels.** A table whose `QTY` column has strong integer support — at least two recognized
+  whole-number quantities — but exactly one blank cell now gets a single targeted retry that
+  re-reads only that cell's bounded pixel region in single-line segmentation mode. The retry never
+  derives a quantity from a price or total column, and any table outside this narrow shape takes
+  the existing fast path unchanged. A header split across two words (`UNIT`/`PRICE`,
+  `LINE`/`TOTAL`) is also reassembled into one header cell when the fragment sits nearer a
+  data-supported column than any standalone column of its own. This OCR quality change ships
+  without a corpus-wide A/B measurement.
 - **(reranker): a cancelled `rerank_async` no longer releases its concurrency permit while its
   inference is still running.** The permit was held by the awaiting future rather than by the
   `spawn_blocking` task, and a blocking task cannot be cancelled — dropping its handle merely
