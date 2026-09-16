@@ -25,7 +25,7 @@ use crate::ocr::preprocessing::preprocess_pix;
 use crate::ocr::preprocessing::should_invert_for_polarity;
 #[cfg(feature = "pdf")]
 use crate::ocr::table::post_process_table;
-use crate::ocr::table::{extract_words_from_tsv, reconstruct_table, table_to_markdown};
+use crate::ocr::table::{extract_words_from_tsv, reconstruct_table_with_columns, table_to_markdown};
 #[cfg(test)]
 use crate::ocr::types::BatchItemResult;
 use crate::ocr::types::TesseractConfig;
@@ -52,7 +52,7 @@ fn doc_orientation_detector() -> &'static crate::doc_orientation::DocOrientation
     &DETECTOR
 }
 
-use crate::table_core::{MIN_TABLE_CANDIDATE_WORDS, cluster_words_into_table_regions};
+use crate::table_core::{HocrWord, MIN_TABLE_CANDIDATE_WORDS, cluster_words_into_table_regions, detect_rows};
 use crate::types::OcrElement;
 
 #[cfg(auto_rotate)]
@@ -224,6 +224,267 @@ fn should_adopt_table_rebuild(original_content: &str, rebuilt_content: &str) -> 
     let original_word_count = original_content.split_whitespace().count();
     let rebuilt_word_count = rebuilt_content.split_whitespace().count();
     rebuilt_word_count + TABLE_REBUILD_MIN_WORD_RETENTION >= original_word_count
+}
+
+const MIN_QUANTITY_COLUMN_SUPPORT: usize = 2;
+const MAX_RETRY_QUANTITY_DIGITS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuantityRetryRegion {
+    row: usize,
+    column: usize,
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+    word_left: u32,
+    word_top: u32,
+    word_width: u32,
+    word_height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuantityRetryColumn {
+    index: usize,
+    left: u32,
+    right: u32,
+    median_height: u32,
+    word_width: u32,
+    cell_left: u32,
+    cell_right: u32,
+}
+
+fn nearest_position_index(positions: &[u32], value: u32) -> Option<usize> {
+    if positions.is_empty() {
+        return None;
+    }
+    match positions.binary_search(&value) {
+        Ok(index) => Some(index),
+        Err(0) => Some(0),
+        Err(index) if index == positions.len() => Some(index - 1),
+        Err(index) => {
+            let left = index - 1;
+            Some(if positions[left].abs_diff(value) <= positions[index].abs_diff(value) {
+                left
+            } else {
+                index
+            })
+        }
+    }
+}
+
+/// Retry only an empty cell in a literal `QTY` column supported by at least two recognized
+/// integer quantities. The retry reads pixels from that cell; it never derives a value from
+/// prices or totals, so an intentionally blank quantity remains blank. ~keep
+fn quantity_retry_region(
+    words: &[HocrWord],
+    quantity_column: usize,
+    blank_row: usize,
+    row_positions: &[u32],
+    column_positions: &[u32],
+    image_width: u32,
+    image_height: u32,
+) -> Option<QuantityRetryRegion> {
+    if blank_row >= row_positions.len() || quantity_column >= column_positions.len() {
+        return None;
+    }
+    let column = quantity_retry_column(words, column_positions, quantity_column, image_width);
+    retry_region_for_row(words, blank_row, column, row_positions, image_width, image_height)
+}
+
+fn quantity_retry_column_index(table: &[Vec<String>]) -> Option<(usize, usize)> {
+    let quantity_column = table
+        .first()?
+        .iter()
+        .position(|header| header.trim().eq_ignore_ascii_case("qty"))?;
+    let mut support = 0usize;
+    let mut blank_row = None;
+    for (row_index, row) in table.iter().enumerate().skip(1) {
+        let quantity = row.get(quantity_column)?.trim();
+        if quantity.is_empty() {
+            if blank_row.replace(row_index).is_some() {
+                return None;
+            }
+        } else if quantity.bytes().all(|byte| byte.is_ascii_digit()) {
+            support += 1;
+        } else {
+            return None;
+        }
+    }
+    (support >= MIN_QUANTITY_COLUMN_SUPPORT).then_some((quantity_column, blank_row?))
+}
+
+fn quantity_retry_column(
+    words: &[HocrWord],
+    column_positions: &[u32],
+    index: usize,
+    image_width: u32,
+) -> QuantityRetryColumn {
+    let (left, right, median_height, word_width) = quantity_column_geometry(words, column_positions, index);
+    let (cell_left, cell_right) = cell_axis_bounds(column_positions, index, image_width);
+    QuantityRetryColumn {
+        index,
+        left,
+        right,
+        median_height,
+        word_width,
+        cell_left,
+        cell_right,
+    }
+}
+
+fn quantity_column_geometry(words: &[HocrWord], column_positions: &[u32], index: usize) -> (u32, u32, u32, u32) {
+    let mean_height = nonzero_mean(words.iter().map(|word| word.height), 1);
+    let mut left = None;
+    let mut right = None;
+    let mut width_sum = 0u64;
+    let mut width_count = 0u64;
+    for word in words {
+        if nearest_position_index(column_positions, word.left) != Some(index) {
+            continue;
+        }
+        left = Some(left.map_or(word.left, |current: u32| current.min(word.left)));
+        let word_right = word.left.saturating_add(word.width);
+        right = Some(right.map_or(word_right, |current: u32| current.max(word_right)));
+        if word.width > 0 {
+            width_sum += u64::from(word.width);
+            width_count += 1;
+        }
+    }
+    let left = left.unwrap_or(column_positions[index]);
+    let right = right.unwrap_or(column_positions[index].saturating_add(mean_height));
+    let word_width = width_sum
+        .checked_div(width_count)
+        .map_or(mean_height, |mean| u32::try_from(mean).unwrap_or(u32::MAX));
+    (left, right, mean_height, word_width)
+}
+
+fn nonzero_mean(values: impl Iterator<Item = u32>, fallback: u32) -> u32 {
+    let (sum, count) = values
+        .filter(|&value| value > 0)
+        .fold((0u64, 0u64), |(sum, count), value| (sum + u64::from(value), count + 1));
+    sum.checked_div(count)
+        .map_or(fallback, |mean| u32::try_from(mean).unwrap_or(u32::MAX))
+}
+
+fn cell_axis_bounds(positions: &[u32], index: usize, limit: u32) -> (u32, u32) {
+    let midpoint = |left: u32, right: u32| u32::try_from((u64::from(left) + u64::from(right)) / 2).unwrap_or(limit);
+    let lower = index
+        .checked_sub(1)
+        .map_or(0, |left| midpoint(positions[left], positions[index]));
+    let upper = positions
+        .get(index + 1)
+        .map_or(limit, |&right| midpoint(positions[index], right));
+    (lower.min(limit), upper.min(limit))
+}
+
+fn retry_region_for_row(
+    words: &[HocrWord],
+    row: usize,
+    column: QuantityRetryColumn,
+    row_positions: &[u32],
+    image_width: u32,
+    image_height: u32,
+) -> Option<QuantityRetryRegion> {
+    let mut row_top = None;
+    let mut row_bottom = None;
+    for word in words {
+        if nearest_position_index(row_positions, word.y_center() as u32) != Some(row) {
+            continue;
+        }
+        row_top = Some(row_top.map_or(word.top, |current: u32| current.min(word.top)));
+        let word_bottom = word.top.saturating_add(word.height);
+        row_bottom = Some(row_bottom.map_or(word_bottom, |current: u32| current.max(word_bottom)));
+    }
+    let row_top = row_top?;
+    let row_bottom = row_bottom?;
+    let horizontal_padding = column.median_height;
+    let vertical_padding = column.median_height / 2;
+    let (row_cell_top, row_cell_bottom) = cell_axis_bounds(row_positions, row, image_height);
+    let left = column.left.saturating_sub(horizontal_padding).max(column.cell_left);
+    let right = column
+        .right
+        .saturating_add(horizontal_padding)
+        .min(image_width)
+        .min(column.cell_right);
+    let top = row_top.saturating_sub(vertical_padding).max(row_cell_top);
+    let bottom = row_bottom
+        .saturating_add(vertical_padding)
+        .min(image_height)
+        .min(row_cell_bottom);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(QuantityRetryRegion {
+        row,
+        column: column.index,
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+        word_left: column.left,
+        word_top: row_positions[row].saturating_sub(column.median_height / 2),
+        word_width: column.word_width,
+        word_height: column.median_height,
+    })
+}
+
+fn parse_retry_quantity(text: &str) -> Option<&str> {
+    let quantity = text.trim();
+    (!quantity.is_empty()
+        && quantity.len() <= MAX_RETRY_QUANTITY_DIGITS
+        && quantity.bytes().all(|byte| byte.is_ascii_digit())
+        && quantity.bytes().any(|byte| byte != b'0'))
+    .then_some(quantity)
+}
+
+fn recover_blank_quantity_word(
+    api: &TesseractAPI,
+    config: &TesseractConfig,
+    region: Option<&QuantityRetryRegion>,
+    image_width: u32,
+    image_height: u32,
+) -> Option<HocrWord> {
+    let region = region?;
+    if api.set_page_seg_mode(TessPageSegMode::PSM_SINGLE_LINE).is_err() {
+        return None;
+    }
+    let recovered = recognize_quantity_region(api, config, region);
+    let _ = api.set_rectangle(
+        0,
+        0,
+        i32::try_from(image_width).unwrap_or(i32::MAX),
+        i32::try_from(image_height).unwrap_or(i32::MAX),
+    );
+    let _ = api.set_page_seg_mode(TessPageSegMode::from_int(config.psm as i32));
+    recovered
+}
+
+fn recognize_quantity_region(
+    api: &TesseractAPI,
+    config: &TesseractConfig,
+    region: &QuantityRetryRegion,
+) -> Option<HocrWord> {
+    let left = i32::try_from(region.left).ok()?;
+    let top = i32::try_from(region.top).ok()?;
+    let width = i32::try_from(region.width).ok()?;
+    let height = i32::try_from(region.height).ok()?;
+    api.set_rectangle(left, top, width, height).ok()?;
+    api.recognize().ok()?;
+    let text = api.get_utf8_text().ok()?;
+    let quantity = parse_retry_quantity(&text)?;
+    let confidence = api.mean_text_conf().unwrap_or(-1);
+    if f64::from(confidence) < config.table_min_confidence {
+        return None;
+    }
+    Some(HocrWord {
+        text: quantity.to_string(),
+        left: region.word_left,
+        top: region.word_top,
+        width: region.word_width,
+        height: region.word_height,
+        confidence: f64::from(confidence),
+    })
 }
 
 /// Build content with OCR tables inlined at their correct vertical positions.
@@ -1712,8 +1973,46 @@ pub(super) fn perform_ocr(
         }
     }
 
-    let mut tables = Vec::new();
+    let mut content = strip_control_characters(&raw_content).into_owned();
+    let retained_text = (config.output_format == "text").then_some(content.as_str());
+    let iterator_extraction =
+        extract_elements_via_iterator(&api, config.page_number, config.min_confidence, retained_text);
     let mut ocr_elements = None;
+    if let Ok(extraction) = &iterator_extraction
+        && let Some(stats) = extraction.retained_text_confidence_stats.as_ref()
+    {
+        insert_retained_word_confidence_metadata(&mut metadata, stats);
+    }
+    match iterator_extraction {
+        Ok(extraction) if !extraction.elements.is_empty() => {
+            insert_word_iterator_skipped_count_metadata(&mut metadata, extraction.skipped_words);
+            if extraction.non_text_block_word_count > 0 {
+                metadata.insert(
+                    "non_text_block_word_count".to_string(),
+                    serde_json::Value::Number(extraction.non_text_block_word_count.into()),
+                );
+            }
+            if let Some(ratio) = extraction.dict_invalid_word_ratio {
+                metadata.insert(
+                    crate::ocr_metadata_keys::OCR_TESSERACT_DICT_INVALID_WORD_RATIO_METADATA_KEY.to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(ratio).unwrap_or(serde_json::Number::from(0)),
+                    ),
+                );
+            }
+            ocr_elements = Some(extraction.elements);
+        }
+        _ => {
+            if let Some(ref tsv_data) = tsv_data_for_tables {
+                let elements = parse_tsv_to_elements(tsv_data, config.min_confidence, config.page_number);
+                if !elements.is_empty() {
+                    ocr_elements = Some(elements);
+                }
+            }
+        }
+    }
+
+    let mut tables = Vec::new();
 
     if config.enable_table_detection {
         let tsv_data = tsv_data_for_tables.as_ref().unwrap();
@@ -1721,7 +2020,7 @@ pub(super) fn perform_ocr(
         let words = extract_words_from_tsv(tsv_data, config.table_min_confidence)?;
         let regions = cluster_words_into_table_regions(&words);
 
-        for (region_index, region_words) in regions.into_iter().enumerate() {
+        for (region_index, mut region_words) in regions.into_iter().enumerate() {
             if region_words.len() < MIN_TABLE_CANDIDATE_WORDS {
                 tracing::debug!(
                     target: "xberg::ocr::tables",
@@ -1747,11 +2046,39 @@ pub(super) fn perform_ocr(
                 .take(200)
                 .collect();
 
-            let table = reconstruct_table(
+            let (mut table, column_positions) = reconstruct_table_with_columns(
                 &region_words,
                 config.table_column_threshold,
                 config.table_row_threshold_ratio,
             );
+            let retry_region = if let Some((quantity_column, blank_row)) = quantity_retry_column_index(&table) {
+                let row_positions = detect_rows(&region_words, config.table_row_threshold_ratio);
+                if row_positions.len() == table.len() {
+                    quantity_retry_region(
+                        &region_words,
+                        quantity_column,
+                        blank_row,
+                        &row_positions,
+                        &column_positions,
+                        width,
+                        height,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let recovered = recover_blank_quantity_word(&api, config, retry_region.as_ref(), width, height);
+            if let Some(recovered) = recovered {
+                region_words.push(recovered);
+                table = reconstruct_table_with_columns(
+                    &region_words,
+                    config.table_column_threshold,
+                    config.table_row_threshold_ratio,
+                )
+                .0;
+            }
 
             tracing::debug!(
                 target: "xberg::ocr::tables",
@@ -1823,44 +2150,6 @@ pub(super) fn perform_ocr(
 
     if let Some(document) = hocr_document.as_mut() {
         document.elements = filter_elements_covered_by_tables(std::mem::take(&mut document.elements), &tables);
-    }
-
-    let mut content = strip_control_characters(&raw_content).into_owned();
-    let retained_text = (config.output_format == "text").then_some(content.as_str());
-    let iterator_extraction =
-        extract_elements_via_iterator(&api, config.page_number, config.min_confidence, retained_text);
-    if let Ok(extraction) = &iterator_extraction
-        && let Some(stats) = extraction.retained_text_confidence_stats.as_ref()
-    {
-        insert_retained_word_confidence_metadata(&mut metadata, stats);
-    }
-    match iterator_extraction {
-        Ok(extraction) if !extraction.elements.is_empty() => {
-            insert_word_iterator_skipped_count_metadata(&mut metadata, extraction.skipped_words);
-            if extraction.non_text_block_word_count > 0 {
-                metadata.insert(
-                    "non_text_block_word_count".to_string(),
-                    serde_json::Value::Number(extraction.non_text_block_word_count.into()),
-                );
-            }
-            if let Some(ratio) = extraction.dict_invalid_word_ratio {
-                metadata.insert(
-                    crate::ocr_metadata_keys::OCR_TESSERACT_DICT_INVALID_WORD_RATIO_METADATA_KEY.to_string(),
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(ratio).unwrap_or(serde_json::Number::from(0)),
-                    ),
-                );
-            }
-            ocr_elements = Some(extraction.elements);
-        }
-        _ => {
-            if let Some(ref tsv_data) = tsv_data_for_tables {
-                let elements = parse_tsv_to_elements(tsv_data, config.min_confidence, config.page_number);
-                if !elements.is_empty() {
-                    ocr_elements = Some(elements);
-                }
-            }
-        }
     }
 
     let is_markdown_output = extraction_config
@@ -2151,6 +2440,73 @@ mod tests {
         HOCR_FONT_SIZE_ATTRIBUTE, parse_hocr_to_internal_document_with_page_offset_and_stats,
     };
     use tempfile::tempdir;
+
+    #[cfg(feature = "bundle-tessdata-eng")]
+    fn recover_quantity_from_image(image: &image::RgbImage) -> Option<HocrWord> {
+        let tessdata = tempfile::tempdir().expect("temporary tessdata directory must be created");
+        std::fs::write(
+            tessdata.path().join("eng.traineddata"),
+            xberg_tesseract::bundled_eng_traineddata().expect("English tessdata must be bundled for this test"),
+        )
+        .expect("bundled English tessdata must be materialized");
+        let api = xberg_tesseract::TesseractAPI::new().expect("Tesseract API must initialize");
+        api.init(
+            tessdata.path().to_str().expect("temporary tessdata path must be UTF-8"),
+            "eng",
+        )
+        .expect("English tessdata must initialize");
+        api.set_page_seg_mode(TessPageSegMode::PSM_SPARSE_TEXT)
+            .expect("sparse page segmentation mode must apply");
+        api.set_image(
+            image.as_raw(),
+            image.width() as i32,
+            image.height() as i32,
+            3,
+            (image.width() * 3) as i32,
+        )
+        .expect("quantity image must load");
+        api.recognize().expect("initial sparse recognition must complete");
+        let config = TesseractConfig {
+            psm: TessPageSegMode::PSM_SPARSE_TEXT as u8,
+            ..TesseractConfig::default()
+        };
+        let region = QuantityRetryRegion {
+            row: 0,
+            column: 0,
+            left: 0,
+            top: 0,
+            width: image.width(),
+            height: image.height(),
+            word_left: 0,
+            word_top: 0,
+            word_width: image.width(),
+            word_height: image.height(),
+        };
+        recover_blank_quantity_word(&api, &config, Some(&region), image.width(), image.height())
+    }
+
+    #[cfg(feature = "bundle-tessdata-eng")]
+    fn isolated_quantity_image() -> image::RgbImage {
+        image::load_from_memory(include_bytes!("../../../test_data/ocr/isolated_quantity_cell.png"))
+            .expect("embedded quantity PNG must load")
+            .into_rgb8()
+    }
+
+    #[test]
+    #[cfg(feature = "bundle-tessdata-eng")]
+    fn blank_quantity_retry_recognizes_single_and_multi_digit_cells() {
+        let single_digit = isolated_quantity_image();
+        let recovered = recover_quantity_from_image(&single_digit).expect("isolated quantity must be recovered");
+        assert_eq!(recovered.text, "5");
+
+        let digit = image::imageops::crop_imm(&single_digit, 106, 25, 24, 36).to_image();
+        let mut multi_digit = image::RgbImage::from_pixel(170, 91, image::Rgb([255, 255, 255]));
+        for left in [45_i64, 69, 93] {
+            image::imageops::overlay(&mut multi_digit, &digit, left, 25);
+        }
+        let recovered = recover_quantity_from_image(&multi_digit).expect("multi-digit quantity must be recovered");
+        assert_eq!(recovered.text, "555");
+    }
 
     fn confidence_word(text: &str, confidence: f32) -> xberg_tesseract::WordData {
         xberg_tesseract::WordData {
@@ -2745,6 +3101,158 @@ mod tests {
         let hash2 = crate::cache::blake3_hash_bytes(&image_bytes2);
 
         assert_ne!(hash1, hash2);
+    }
+
+    fn invoice_word(text: &str, left: u32, top: u32, width: u32) -> crate::table_core::HocrWord {
+        crate::table_core::HocrWord {
+            text: text.to_string(),
+            left,
+            top,
+            width,
+            height: 40,
+            confidence: 95.0,
+        }
+    }
+
+    #[test]
+    fn blank_quantity_retry_is_bounded_to_the_missing_quantity_cell() {
+        let words = vec![
+            invoice_word("DESCRIPTION", 279, 100, 250),
+            invoice_word("QTY", 1_699, 100, 90),
+            invoice_word("UNIT PRICE", 2_096, 100, 258),
+            invoice_word("LINE TOTAL", 2_663, 100, 258),
+            invoice_word("Espresso Beans", 279, 200, 400),
+            invoice_word("10", 1_740, 200, 48),
+            invoice_word("$45.00", 2_206, 200, 150),
+            invoice_word("$450.00", 2_744, 200, 175),
+            invoice_word("Cups", 279, 300, 100),
+            invoice_word("200", 1_709, 300, 75),
+            invoice_word("$1.20", 2_233, 300, 125),
+            invoice_word("$240.00", 2_744, 300, 175),
+            invoice_word("Cleaning Tablets", 279, 400, 360),
+            invoice_word("$18.50", 2_206, 400, 150),
+            invoice_word("$92.50", 2_772, 400, 150),
+        ];
+        let table = vec![
+            vec!["DESCRIPTION", "QTY", "UNIT PRICE", "LINE TOTAL"],
+            vec!["Espresso Beans", "10", "$45.00", "$450.00"],
+            vec!["Cups", "200", "$1.20", "$240.00"],
+            vec!["Cleaning Tablets", "", "$18.50", "$92.50"],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_string).collect())
+        .collect::<Vec<Vec<String>>>();
+
+        let (quantity_column, blank_row) =
+            quantity_retry_column_index(&table).expect("fixture qualifies for one retry");
+        let region = quantity_retry_region(
+            &words,
+            quantity_column,
+            blank_row,
+            &[120, 220, 320, 420],
+            &[279, 1_709, 2_219, 2_744],
+            3_200,
+            4_089,
+        )
+        .expect("captured invoice has one bounded retry region");
+
+        assert_eq!(region.row, 3);
+        assert_eq!(region.column, 1);
+        assert_eq!((region.left, region.top), (1_659, 380));
+        assert_eq!((region.width, region.height), (170, 80));
+    }
+
+    #[test]
+    fn blank_quantity_retry_requires_two_recognized_quantity_rows() {
+        let table = vec![
+            vec!["DESCRIPTION", "QTY", "UNIT PRICE", "LINE TOTAL"],
+            vec!["Espresso Beans", "10", "$45.00", "$450.00"],
+            vec!["Cleaning Tablets", "", "$18.50", "$92.50"],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_string).collect())
+        .collect::<Vec<Vec<String>>>();
+
+        assert!(quantity_retry_column_index(&table).is_none());
+    }
+
+    #[test]
+    fn blank_quantity_retry_skips_tables_with_multiple_blank_quantities() {
+        let table = vec![
+            vec!["DESCRIPTION", "QTY", "PRICE"],
+            vec!["Item A", "10", "$10.00"],
+            vec!["Item B", "20", "$20.00"],
+            vec!["Shipping", "", "$25.00"],
+            vec!["Tax", "", "$5.00"],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_string).collect())
+        .collect::<Vec<Vec<String>>>();
+
+        assert!(quantity_retry_column_index(&table).is_none());
+    }
+
+    #[test]
+    fn blank_quantity_retry_clamps_crop_to_adjacent_cells() {
+        let words = vec![
+            invoice_word("DESCRIPTION", 100, 100, 160),
+            invoice_word("QTY", 500, 100, 40),
+            invoice_word("PRICE", 560, 100, 90),
+            invoice_word("Item A", 100, 180, 100),
+            invoice_word("10", 500, 180, 40),
+            invoice_word("$10", 560, 180, 60),
+            invoice_word("Missing", 100, 210, 120),
+            invoice_word("$5", 560, 210, 50),
+            invoice_word("Item B", 100, 240, 100),
+            invoice_word("20", 500, 240, 40),
+            invoice_word("$20", 560, 240, 60),
+        ];
+        let table = vec![
+            vec!["DESCRIPTION", "QTY", "PRICE"],
+            vec!["Item A", "10", "$10"],
+            vec!["Missing", "", "$5"],
+            vec!["Item B", "20", "$20"],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_string).collect())
+        .collect::<Vec<Vec<String>>>();
+        let (quantity_column, blank_row) =
+            quantity_retry_column_index(&table).expect("fixture qualifies for one retry");
+
+        let region = quantity_retry_region(
+            &words,
+            quantity_column,
+            blank_row,
+            &[120, 200, 230, 260],
+            &[100, 500, 560],
+            800,
+            600,
+        )
+        .expect("tight table has one bounded retry region");
+
+        assert_eq!((region.left, region.top), (460, 215));
+        assert_eq!((region.width, region.height), (70, 30));
+    }
+
+    #[test]
+    fn non_quantity_table_does_not_enter_retry_geometry() {
+        let table = vec![
+            vec!["NAME".to_string(), "PRICE".to_string()],
+            vec!["Item A".to_string(), "$10".to_string()],
+            vec!["Item B".to_string(), "$20".to_string()],
+        ];
+
+        assert!(quantity_retry_column_index(&table).is_none());
+    }
+
+    #[test]
+    fn quantity_retry_text_accepts_only_a_short_positive_integer() {
+        assert_eq!(parse_retry_quantity(" 5\n"), Some("5"));
+        assert_eq!(parse_retry_quantity("200"), Some("200"));
+        assert_eq!(parse_retry_quantity(""), None);
+        assert_eq!(parse_retry_quantity("$5"), None);
+        assert_eq!(parse_retry_quantity("5.0"), None);
+        assert_eq!(parse_retry_quantity("000000000"), None);
     }
 
     #[test]

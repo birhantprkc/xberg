@@ -327,6 +327,7 @@ fn merge_words_into_cell_tokens(words: &[HocrWord], row_positions: &[u32]) -> Ve
 /// need the grid; use that function instead when the column x-positions used
 /// to build the grid must stay correlated with it (e.g. a caller that later
 /// indexes `column_positions[column]` against `grid[row][column]`).
+#[cfg(any(feature = "pdf", paddle_ocr, test))]
 pub(crate) fn reconstruct_table(
     words: &[HocrWord],
     column_threshold: u32,
@@ -357,13 +358,14 @@ pub(crate) fn reconstruct_table_with_columns(
 
     let row_positions = detect_rows(words, row_threshold_ratio);
     let cell_tokens = merge_words_into_cell_tokens(words, &row_positions);
-    let col_positions = detect_columns(&cell_tokens, column_threshold);
+    let mut col_positions = detect_columns(&cell_tokens, column_threshold);
 
     if col_positions.is_empty() || row_positions.is_empty() {
         return (Vec::new(), Vec::new());
     }
 
-    let result = assign_words_to_cells(words, &row_positions, &col_positions);
+    let mut result = assign_words_to_cells(words, &row_positions, &col_positions);
+    merge_header_fragments_by_geometry(&mut result, &mut col_positions);
 
     let non_empty_cols = non_empty_column_mask(&result);
     let kept_col_positions: Vec<u32> = col_positions
@@ -374,6 +376,154 @@ pub(crate) fn reconstruct_table_with_columns(
         .collect();
 
     (remove_empty_rows_and_columns(result), kept_col_positions)
+}
+
+const MIN_HEADER_NEIGHBOR_SUPPORT: usize = 2;
+
+/// A header word can start left of the data values it labels and form a header-only x-track.
+/// Attach that fragment to the nearest column supported by multiple data rows, while retaining
+/// the correlated x-position vector used by downstream table geometry checks. ~keep
+fn merge_header_fragments_by_geometry(table: &mut [Vec<String>], column_positions: &mut Vec<u32>) {
+    let column_count = table.first().map_or(0, Vec::len);
+    if table.len() < 3 || column_count < 3 || column_positions.len() != column_count {
+        return;
+    }
+    if !has_split_invoice_header(&table[0]) {
+        return;
+    }
+
+    let support: Vec<usize> = (0..column_count)
+        .map(|column| {
+            table
+                .iter()
+                .skip(1)
+                .filter(|row| row.get(column).is_some_and(|cell| !cell.trim().is_empty()))
+                .count()
+        })
+        .collect();
+    let targets = header_fragment_targets(table, column_positions, &support);
+    if targets.iter().all(Option::is_none) {
+        return;
+    }
+    rebuild_table_without_header_fragments(table, column_positions, &targets);
+}
+
+fn has_split_invoice_header(header: &[String]) -> bool {
+    let has = |expected: &str| header.iter().any(|cell| cell.trim().eq_ignore_ascii_case(expected));
+    has("QTY") && ((has("UNIT") && has("PRICE")) || (has("LINE") && has("TOTAL")))
+}
+
+fn header_fragment_targets(table: &[Vec<String>], column_positions: &[u32], support: &[usize]) -> Vec<Option<usize>> {
+    let column_count = support.len();
+    let mut targets = vec![None; column_count];
+    let mut left = None;
+    for column in 0..column_count {
+        targets[column] = left;
+        if support[column] >= MIN_HEADER_NEIGHBOR_SUPPORT {
+            left = Some(column);
+        }
+    }
+    let mut right = None;
+    for column in (0..column_count).rev() {
+        if support[column] >= MIN_HEADER_NEIGHBOR_SUPPORT {
+            targets[column] = None;
+            right = Some(column);
+            continue;
+        }
+        let Some(left) = targets[column] else {
+            continue;
+        };
+        let Some(right) = right else {
+            continue;
+        };
+        if support[column] != 0 || !is_split_invoice_fragment(&table[0][column], &table[0][right]) {
+            targets[column] = None;
+            continue;
+        }
+        targets[column] = sufficiently_near_matching_column(column_positions, left, column, right);
+    }
+    targets
+}
+
+fn is_split_invoice_fragment(fragment: &str, destination: &str) -> bool {
+    let fragment = fragment.trim();
+    let destination = destination.trim();
+    (fragment.eq_ignore_ascii_case("UNIT") && destination.eq_ignore_ascii_case("PRICE"))
+        || (fragment.eq_ignore_ascii_case("LINE") && destination.eq_ignore_ascii_case("TOTAL"))
+}
+
+fn sufficiently_near_matching_column(positions: &[u32], left: usize, fragment: usize, right: usize) -> Option<usize> {
+    let span = positions[right].abs_diff(positions[left]);
+    let right_distance = positions[fragment].abs_diff(positions[right]);
+    (right_distance.saturating_mul(3) < span).then_some(right)
+}
+
+fn rebuild_table_without_header_fragments(
+    table: &mut [Vec<String>],
+    column_positions: &mut Vec<u32>,
+    targets: &[Option<usize>],
+) {
+    let column_count = targets.len();
+    let (prefixes, suffixes) = header_fragment_affixes(table, targets);
+    let kept_columns = targets.iter().filter(|target| target.is_none()).count();
+    for (row_index, row) in table.iter_mut().enumerate() {
+        let mut rebuilt = Vec::with_capacity(kept_columns);
+        for column in 0..column_count {
+            if targets[column].is_some() {
+                continue;
+            }
+            if row_index == 0 {
+                rebuilt.push(rebuilt_header(&row[column], &prefixes[column], &suffixes[column]));
+            } else {
+                rebuilt.push(std::mem::take(&mut row[column]));
+            }
+        }
+        *row = rebuilt;
+    }
+    let mut position_index = 0usize;
+    column_positions.retain(|_| {
+        let keep_position = targets[position_index].is_none();
+        position_index += 1;
+        keep_position
+    });
+}
+
+fn header_fragment_affixes(table: &[Vec<String>], targets: &[Option<usize>]) -> (Vec<String>, Vec<String>) {
+    let column_count = targets.len();
+    let mut prefixes = vec![String::new(); column_count];
+    let mut suffixes = vec![String::new(); column_count];
+    for (column, target) in targets.iter().copied().enumerate() {
+        let Some(target) = target else {
+            continue;
+        };
+        let fragment = table[0][column].trim();
+        let destination = if target < column {
+            &mut suffixes[target]
+        } else {
+            &mut prefixes[target]
+        };
+        if !destination.is_empty() {
+            destination.push(' ');
+        }
+        destination.push_str(fragment);
+    }
+    (prefixes, suffixes)
+}
+
+fn rebuilt_header(original: &str, prefix: &str, suffix: &str) -> String {
+    let original = original.trim();
+    let capacity = prefix.len() + original.len() + suffix.len() + 2;
+    let mut header = String::with_capacity(capacity);
+    for part in [prefix, original, suffix] {
+        if part.is_empty() {
+            continue;
+        }
+        if !header.is_empty() {
+            header.push(' ');
+        }
+        header.push_str(part);
+    }
+    header
 }
 
 /// Fraction of a cell's median word height within which two words belong to the same visual line.
@@ -995,6 +1145,150 @@ mod tests {
         );
         assert_eq!(table[0], vec!["Name".to_string(), "Value".to_string()]);
         assert_eq!(table[1], vec!["Alice Smith".to_string(), "42".to_string()]);
+    }
+
+    #[test]
+    fn reconstruct_table_attaches_header_fragments_to_nearest_supported_column() {
+        let words = vec![
+            word("DESCRIPTION", 279, 100, 250, 40),
+            word("QTY", 1_699, 100, 90, 40),
+            word("UNIT", 2_096, 100, 105, 40),
+            word("PRICE", 2_219, 100, 135, 40),
+            word("LINE", 2_663, 100, 98, 40),
+            word("TOTAL", 2_778, 100, 143, 40),
+            word("Espresso Beans", 279, 200, 400, 40),
+            word("10", 1_740, 200, 48, 40),
+            word("$45.00", 2_206, 200, 150, 40),
+            word("$450.00", 2_744, 200, 175, 40),
+            word("Cups", 279, 300, 100, 40),
+            word("200", 1_709, 300, 75, 40),
+            word("$1.20", 2_233, 300, 125, 40),
+            word("$240.00", 2_744, 300, 175, 40),
+            word("Cleaning Tablets", 279, 400, 360, 40),
+            word("$18.50", 2_206, 400, 150, 40),
+            word("$92.50", 2_772, 400, 150, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["DESCRIPTION", "QTY", "UNIT PRICE", "LINE TOTAL"]);
+        assert_eq!(table[3], vec!["Cleaning Tablets", "", "$18.50", "$92.50"]);
+        assert_eq!(column_positions, vec![279, 1_709, 2_219, 2_744]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_fragment_far_from_matching_right_column() {
+        let words = vec![
+            word("DESCRIPTION", 100, 100, 250, 40),
+            word("QTY", 1_000, 100, 90, 40),
+            word("UNIT", 1_150, 100, 105, 40),
+            word("PRICE", 1_500, 100, 135, 40),
+            word("Item A", 100, 200, 160, 40),
+            word("10", 1_000, 200, 48, 40),
+            word("$45.00", 1_500, 200, 150, 40),
+            word("Item B", 100, 300, 160, 40),
+            word("20", 1_000, 300, 48, 40),
+            word("$50.00", 1_500, 300, 150, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["DESCRIPTION", "QTY", "UNIT", "PRICE"]);
+        assert_eq!(column_positions, vec![100, 1_000, 1_150, 1_500]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_far_standalone_header_column() {
+        let words = vec![
+            word("QTY", 0, 100, 80, 40),
+            word("UNIT", 400, 100, 120, 40),
+            word("PRICE", 1_000, 100, 100, 40),
+            word("1", 0, 200, 30, 40),
+            word("$10", 1_000, 200, 60, 40),
+            word("2", 0, 300, 30, 40),
+            word("$20", 1_000, 300, 60, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["QTY", "UNIT", "PRICE"]);
+        assert_eq!(column_positions, vec![0, 400, 1_000]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_centered_group_header_column() {
+        let words = vec![
+            word("QTY", 0, 100, 80, 40),
+            word("UNIT", 500, 100, 120, 40),
+            word("PRICE", 1_000, 100, 100, 40),
+            word("1", 0, 200, 30, 40),
+            word("$10", 1_000, 200, 60, 40),
+            word("2", 0, 300, 30, 40),
+            word("$20", 1_000, 300, 60, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["QTY", "UNIT", "PRICE"]);
+        assert_eq!(column_positions, vec![0, 500, 1_000]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_non_header_singleton_column() {
+        let words = vec![
+            word("QTY", 0, 100, 80, 40),
+            word("note", 700, 100, 80, 40),
+            word("UNIT", 850, 100, 80, 40),
+            word("PRICE", 1_000, 100, 100, 40),
+            word("1", 0, 200, 30, 40),
+            word("$10", 1_000, 200, 60, 40),
+            word("2", 0, 300, 30, 40),
+            word("$20", 1_000, 300, 60, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["QTY", "note", "UNIT PRICE"]);
+        assert_eq!(column_positions, vec![0, 700, 1_000]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_unrelated_uppercase_header_column() {
+        let words = vec![
+            word("QTY", 0, 100, 80, 40),
+            word("DISCOUNT", 700, 100, 120, 40),
+            word("UNIT", 850, 100, 80, 40),
+            word("PRICE", 1_000, 100, 100, 40),
+            word("1", 0, 200, 30, 40),
+            word("$10", 1_000, 200, 60, 40),
+            word("2", 0, 300, 30, 40),
+            word("$20", 1_000, 300, 60, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["QTY", "DISCOUNT", "UNIT PRICE"]);
+        assert_eq!(column_positions, vec![0, 700, 1_000]);
+    }
+
+    #[test]
+    fn reconstruct_table_keeps_every_supported_column() {
+        let words = vec![
+            word("A", 0, 100, 40, 40),
+            word("B", 500, 100, 40, 40),
+            word("C", 1_000, 100, 40, 40),
+            word("1", 0, 200, 30, 40),
+            word("2", 500, 200, 30, 40),
+            word("3", 1_000, 200, 30, 40),
+            word("4", 0, 300, 30, 40),
+            word("5", 500, 300, 30, 40),
+            word("6", 1_000, 300, 30, 40),
+        ];
+
+        let (table, column_positions) = reconstruct_table_with_columns(&words, 50, 0.5);
+
+        assert_eq!(table[0], vec!["A", "B", "C"]);
+        assert_eq!(column_positions, vec![0, 500, 1_000]);
     }
 
     /// A genuinely separate, closely-spaced column pair ("Wid"/"Zone" at
