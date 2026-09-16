@@ -17,7 +17,7 @@ pub use embedding::EmbeddingBackendRegistry;
 pub use extractor::DocumentExtractorRegistry;
 pub(crate) use extractor::RegisteredDocumentExtractor;
 pub use ocr::OcrBackendRegistry;
-pub(crate) use ocr::builtin_ocr_backend_names;
+pub(crate) use ocr::{builtin_ocr_backend_names, canonical_ocr_backend_name};
 pub use processor::PostProcessorRegistry;
 pub use renderer::RendererRegistry;
 pub use reranker::RerankerBackendRegistry;

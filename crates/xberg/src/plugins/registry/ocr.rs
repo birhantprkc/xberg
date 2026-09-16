@@ -7,6 +7,20 @@ use crate::plugins::OcrBackend;
 use ahash::AHashMap;
 use std::sync::Arc;
 
+/// Resolves a caller-supplied backend name to its registered spelling.
+///
+/// Public capability queries and internal dispatch must agree on what `"PaddleOCR"`
+/// means; two copies of this mapping would let them drift, so both go through here.
+/// Ungated on purpose — `OcrBackendRegistry::get` is gated behind the OCR features
+/// while the public `ocr_backend_supports_language` is not. ~keep
+pub(crate) fn canonical_ocr_backend_name(name: &str) -> String {
+    let normalized = name.to_ascii_lowercase();
+    match normalized.as_str() {
+        "paddleocr" => "paddle-ocr".to_string(),
+        _ => normalized,
+    }
+}
+
 pub(crate) fn builtin_ocr_backend_names() -> Vec<&'static str> {
     let mut names = vec![
         #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
@@ -282,12 +296,8 @@ impl OcrBackendRegistry {
             return Ok(Arc::clone(backend));
         }
 
-        let normalized = name.to_ascii_lowercase();
-        let canonical = match normalized.as_str() {
-            "paddleocr" => "paddle-ocr",
-            _ => normalized.as_str(),
-        };
-        self.backends.get(canonical).cloned().ok_or_else(|| {
+        let canonical = canonical_ocr_backend_name(name);
+        self.backends.get(canonical.as_str()).cloned().ok_or_else(|| {
             tracing::error!(
                 backend = name,
                 available = ?self.backends.keys().collect::<Vec<_>>(),

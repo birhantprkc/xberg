@@ -603,6 +603,147 @@ pub fn list_ocr_backends() -> crate::Result<Vec<String>> {
     Ok(registry.list())
 }
 
+/// A registered OCR backend's declared name and language capabilities.
+///
+/// Returned by [`list_ocr_backend_capabilities`]. See that function's documentation for the
+/// determinism guarantees and the important caveat about what an empty `supported_languages`
+/// means.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
+pub struct OcrBackendCapabilities {
+    /// The backend's registered name, as returned by [`list_ocr_backends`].
+    pub name: String,
+    /// The languages this backend declares support for, via
+    /// [`OcrBackend::supported_languages`].
+    ///
+    /// An empty list means the backend does not enumerate its languages — it is *not* a
+    /// statement that the backend supports no languages. [`OcrBackend::supported_languages`]
+    /// is a defaulted trait method that returns `vec![]`, and not every backend overrides it:
+    /// the VLM backend (`llm::vlm_ocr::VlmOcrBackend`) accepts every language via
+    /// `supports_language` while inheriting the empty default here. Use
+    /// [`ocr_backend_supports_language`] to decide whether one specific language is usable —
+    /// never infer "unsupported" from an empty list.
+    ///
+    /// The order of this list is preserved exactly as the backend reported it and is *not*
+    /// re-sorted. Tesseract's order comes from enumerating installed tessdata files; PaddleOCR's
+    /// comes from its own `SUPPORTED_LANGUAGES` constant. Re-sorting would disagree with the
+    /// precedence each backend's own `supports_language` implementation uses internally.
+    pub supported_languages: Vec<String>,
+}
+
+/// List every registered OCR backend's name alongside its declared supported languages.
+///
+/// This is the capability-enumeration counterpart to [`list_ocr_backends`]: where that function
+/// exposes only backend names, this exposes each backend's `supported_languages()` too, so a
+/// consumer (for example, a job-acceptance gate) does not need to hardcode a second list of
+/// backend languages.
+///
+/// # Determinism
+///
+/// The returned vector is sorted by `name`, regardless of registration order or the order
+/// reported by the underlying registry. `supported_languages` within each entry is **not**
+/// sorted — see [`OcrBackendCapabilities::supported_languages`] for why.
+///
+/// # Cost
+///
+/// Calling this is not free for every backend. In particular, `TesseractBackend`'s
+/// `supported_languages()` allocates a Tesseract API and initializes it (`init("", "eng")`) the
+/// first time it is called, to enumerate installed tessdata languages; subsequent calls are
+/// served from a cache.
+///
+/// # Errors
+///
+/// Returns an error only if the registry lock cannot be acquired in the current environment.
+///
+/// # Example
+///
+/// ```rust
+/// use xberg::plugins::list_ocr_backend_capabilities;
+///
+/// # tokio_test::block_on(async {
+/// for capability in list_ocr_backend_capabilities()? {
+///     println!("{}: {:?}", capability.name, capability.supported_languages);
+/// }
+/// # Ok::<(), xberg::XbergError>(())
+/// # });
+/// ```
+pub fn list_ocr_backend_capabilities() -> crate::Result<Vec<OcrBackendCapabilities>> {
+    use crate::plugins::registry::get_ocr_backend_registry;
+
+    let registry = get_ocr_backend_registry();
+    let registry = registry.read();
+
+    Ok(capabilities_from_snapshot(registry.registered_snapshot()))
+}
+
+/// Pure mapping from a registry snapshot to sorted capability records.
+///
+/// Split out from [`list_ocr_backend_capabilities`] so tests can exercise the mapping and the
+/// sort-by-name contract with local mock backends, without mutating the process-global OCR
+/// registry (which other test modules also read and write concurrently).
+fn capabilities_from_snapshot(registered: Vec<(String, Arc<dyn OcrBackend>)>) -> Vec<OcrBackendCapabilities> {
+    let mut capabilities: Vec<OcrBackendCapabilities> = registered
+        .into_iter()
+        .map(|(name, backend)| OcrBackendCapabilities {
+            name,
+            supported_languages: backend.supported_languages(),
+        })
+        .collect();
+    capabilities.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    capabilities
+}
+
+/// Check whether a specific registered OCR backend supports a language.
+///
+/// Delegates to the named backend's own [`OcrBackend::supports_language`], which is the correct
+/// per-language decision — do not infer support (or its absence) from whether
+/// [`list_ocr_backend_capabilities`] reports an empty `supported_languages` list for that
+/// backend, since an empty list can mean "does not enumerate" rather than "supports nothing"
+/// (see [`OcrBackendCapabilities::supported_languages`]).
+///
+/// # Arguments
+///
+/// * `backend` - Name of a registered OCR backend, as returned by [`list_ocr_backends`]. Lookup
+///   is case-insensitive and resolves the same `paddleocr` alias as backend dispatch.
+/// * `language` - Language code to check (e.g. `"eng"`, `"deu"`).
+///
+/// # Errors
+///
+/// Returns an error if no backend with that name (or alias) is registered.
+///
+/// # Example
+///
+/// ```rust
+/// use xberg::plugins::ocr_backend_supports_language;
+///
+/// # tokio_test::block_on(async {
+/// let supported = ocr_backend_supports_language("tesseract", "eng")?;
+/// # Ok::<(), xberg::XbergError>(())
+/// # });
+/// ```
+pub fn ocr_backend_supports_language(backend: &str, language: &str) -> crate::Result<bool> {
+    use crate::plugins::registry::get_ocr_backend_registry;
+
+    let registry = get_ocr_backend_registry();
+    let registry = registry.read();
+    let registered = registry.registered_snapshot();
+
+    let canonical = crate::plugins::registry::canonical_ocr_backend_name(backend);
+
+    registered
+        .iter()
+        .find(|(name, _)| name.as_str() == backend)
+        .or_else(|| registered.iter().find(|(name, _)| name.as_str() == canonical.as_str()))
+        .map(|(_, instance)| instance.supports_language(language))
+        .ok_or_else(|| crate::XbergError::Plugin {
+            message: format!(
+                "OCR backend '{backend}' not registered. Available backends: {:?}",
+                registered.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>()
+            ),
+            plugin_name: backend.to_string(),
+        })
+}
+
 /// Clear all OCR backends from the global registry.
 ///
 /// Removes all OCR backends and calls their `shutdown()` methods.
@@ -1034,5 +1175,165 @@ mod tests {
         };
         let result = backend.process_image(b"img", &config).await;
         assert!(result.is_ok(), "unknown backend_options keys must not cause errors");
+    }
+
+    struct NamedMockOcrBackend {
+        name: &'static str,
+        languages: Vec<String>,
+    }
+
+    impl Plugin for NamedMockOcrBackend {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+        fn initialize(&self) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl OcrBackend for NamedMockOcrBackend {
+        async fn process_image(&self, _image_bytes: &[u8], _config: &OcrConfig) -> Result<ExtractedDocument> {
+            Ok(ExtractedDocument::default())
+        }
+
+        fn supports_language(&self, lang: &str) -> bool {
+            self.languages.iter().any(|l| l == lang)
+        }
+
+        fn backend_type(&self) -> OcrBackendType {
+            OcrBackendType::Custom
+        }
+
+        fn supported_languages(&self) -> Vec<String> {
+            self.languages.clone()
+        }
+    }
+
+    /// A backend that deliberately does not override `supported_languages`, to exercise the
+    /// trait's defaulted empty-list behaviour (see `OcrBackendCapabilities::supported_languages`).
+    struct UndeclaredLanguagesBackend {
+        name: &'static str,
+    }
+
+    impl Plugin for UndeclaredLanguagesBackend {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn version(&self) -> String {
+            "1.0.0".to_string()
+        }
+        fn initialize(&self) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl OcrBackend for UndeclaredLanguagesBackend {
+        async fn process_image(&self, _image_bytes: &[u8], _config: &OcrConfig) -> Result<ExtractedDocument> {
+            Ok(ExtractedDocument::default())
+        }
+
+        fn supports_language(&self, _lang: &str) -> bool {
+            true
+        }
+
+        fn backend_type(&self) -> OcrBackendType {
+            OcrBackendType::Custom
+        }
+    }
+
+    #[test]
+    fn capabilities_report_each_backend_declared_languages() {
+        let alpha: Arc<dyn OcrBackend> = Arc::new(NamedMockOcrBackend {
+            name: "alpha-ocr",
+            languages: vec!["eng".to_string(), "deu".to_string()],
+        });
+        let beta: Arc<dyn OcrBackend> = Arc::new(NamedMockOcrBackend {
+            name: "beta-ocr",
+            languages: vec!["fra".to_string()],
+        });
+
+        let capabilities =
+            capabilities_from_snapshot(vec![("alpha-ocr".to_string(), alpha), ("beta-ocr".to_string(), beta)]);
+
+        assert_eq!(
+            capabilities,
+            vec![
+                OcrBackendCapabilities {
+                    name: "alpha-ocr".to_string(),
+                    supported_languages: vec!["eng".to_string(), "deu".to_string()],
+                },
+                OcrBackendCapabilities {
+                    name: "beta-ocr".to_string(),
+                    supported_languages: vec!["fra".to_string()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn capabilities_are_ordered_by_backend_name() {
+        let zed: Arc<dyn OcrBackend> = Arc::new(NamedMockOcrBackend {
+            name: "zed-ocr",
+            languages: vec!["eng".to_string()],
+        });
+        let alpha: Arc<dyn OcrBackend> = Arc::new(NamedMockOcrBackend {
+            name: "alpha-ocr",
+            languages: vec!["deu".to_string()],
+        });
+
+        // Fed reversed (zed before alpha), to fail if the helper's own sort is ever dropped
+        // and it started trusting caller/registry order instead.
+        let capabilities =
+            capabilities_from_snapshot(vec![("zed-ocr".to_string(), zed), ("alpha-ocr".to_string(), alpha)]);
+
+        let names: Vec<&str> = capabilities.iter().map(|capability| capability.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha-ocr", "zed-ocr"]);
+    }
+
+    #[test]
+    fn a_backend_that_does_not_declare_languages_reports_an_empty_list() {
+        let backend: Arc<dyn OcrBackend> = Arc::new(UndeclaredLanguagesBackend { name: "undeclared-ocr" });
+
+        let capabilities = capabilities_from_snapshot(vec![("undeclared-ocr".to_string(), backend)]);
+
+        assert_eq!(
+            capabilities[0].supported_languages,
+            Vec::<String>::new(),
+            "an empty supported_languages list means the backend does not enumerate its \
+             languages, not that it supports none"
+        );
+    }
+
+    #[test]
+    fn global_registry_capabilities_are_sorted_with_non_empty_names() {
+        // Read-only sanity check against the live global registry. Deliberately does not
+        // compare against a separate `list_ocr_backends()` call: the two take the registry
+        // read lock separately, and a concurrent test in another module (e.g.
+        // `doctor::config_lint`) registering or clearing backends between the two reads would
+        // make such a comparison flaky for reasons that have nothing to do with this function.
+        let capabilities = list_ocr_backend_capabilities().expect("registry lock must be acquirable");
+
+        let names: Vec<&str> = capabilities.iter().map(|capability| capability.name.as_str()).collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort_unstable();
+        assert_eq!(names, sorted_names, "capabilities must be sorted by backend name");
+
+        for capability in &capabilities {
+            assert!(
+                !capability.name.is_empty(),
+                "a registered backend must report a non-empty name"
+            );
+        }
     }
 }
