@@ -450,7 +450,7 @@ pub(crate) fn get_or_init_backend_blocking(model_name: Option<&str>) -> Result<A
     })
 }
 
-/// Return the process-wide cached GLiNER backend for the requested model.
+/// Return the process-wide cached GLiNER backend for the requested model. ~keep
 ///
 /// Model download and ONNX initialization run on Tokio's blocking pool. Concurrent
 /// callers requesting the same canonical model and runtime thread budget receive
@@ -462,6 +462,7 @@ pub(crate) fn get_or_init_backend_blocking(model_name: Option<&str>) -> Result<A
 ///
 /// Returns an error when the model name is invalid, its artifacts cannot be loaded,
 /// ONNX initialization fails, or the blocking initialization task cannot complete.
+#[cfg_attr(alef, alef(skip))]
 pub async fn get_or_init_backend(model_name: Option<&str>) -> Result<Arc<GlineBackend>> {
     let thread_budget = crate::core::config::concurrency::resolve_thread_budget(None);
     let key = backend_cache_key(model_name, thread_budget)?;
