@@ -1090,21 +1090,124 @@ pub async fn embed_texts_async<T: AsRef<str> + Send + 'static>(
         | crate::core::config::EmbeddingModelType::Custom { .. } => {}
     }
 
-    let _permit = EMBED_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|_| crate::XbergError::embedding("Embedding semaphore closed".to_string()))?;
-
     #[cfg(not(target_arch = "wasm32"))]
     {
         let config = Arc::new(config.clone());
-        tokio::task::spawn_blocking(move || embed_texts(&texts, &config))
-            .await
-            .map_err(|e| crate::XbergError::embedding(format!("Embedding task panicked: {e}")))?
+        embed_holding_permit(EMBED_SEMAPHORE.clone(), move || embed_texts(&texts, &config)).await
     }
     #[cfg(target_arch = "wasm32")]
     {
+        // No blocking pool on wasm32: the work runs inline, so a permit held by this future
+        // is released exactly when the work it bounds finishes. ~keep
+        let _permit = EMBED_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|_| crate::XbergError::embedding("Embedding semaphore closed".to_string()))?;
         embed_texts(&texts, config)
+    }
+}
+
+/// Runs `task` on the blocking pool while holding a permit from `semaphore`.
+///
+/// The permit is moved *into* the blocking closure rather than held by this future. A
+/// `spawn_blocking` task cannot be cancelled -- dropping its `JoinHandle` detaches it and the
+/// closure still runs to completion -- so a permit owned by the awaiting future is released the
+/// moment a caller times out or drops, while the model load and ONNX inference it was bounding
+/// continue. Repeated abandoned calls then exceed the configured concurrency and keep several
+/// models resident. Same defect as GH#1641, which fixed the reranker; this is the embedding
+/// half. Taking the semaphore as a parameter also gives the tests a locally-owned semaphore,
+/// since the global one's permit count is 1 on a small host. ~keep
+#[cfg(all(
+    feature = "tokio-runtime",
+    any(feature = "embeddings", feature = "static-embeddings"),
+    not(target_arch = "wasm32")
+))]
+async fn embed_holding_permit<F>(semaphore: Arc<tokio::sync::Semaphore>, task: F) -> crate::Result<Vec<Vec<f32>>>
+where
+    F: FnOnce() -> crate::Result<Vec<Vec<f32>>> + Send + 'static,
+{
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| crate::XbergError::embedding("Embedding semaphore closed".to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|e| crate::XbergError::embedding(format!("Embedding task panicked: {e}")))?
+}
+
+#[cfg(all(
+    test,
+    feature = "tokio-runtime",
+    any(feature = "embeddings", feature = "static-embeddings"),
+    not(target_arch = "wasm32")
+))]
+mod permit_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Barrier;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn permit_stays_with_the_blocking_task_when_the_waiter_is_cancelled() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let release = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let mut waiter = Box::pin(embed_holding_permit(Arc::clone(&semaphore), {
+            let release = Arc::clone(&release);
+            move || {
+                let _ = started_tx.send(());
+                release.wait();
+                Ok(Vec::new())
+            }
+        }));
+
+        let first = std::future::poll_fn(|cx| Poll::Ready(Future::poll(waiter.as_mut(), cx))).await;
+        assert!(
+            first.is_pending(),
+            "the blocking task must still be running after the first poll"
+        );
+        started_rx.await.expect("the blocking task must have started");
+
+        drop(waiter);
+
+        // Observe first, release the barrier second, assert last. Asserting before the
+        // `release.wait()` below parks the blocking-pool thread on the barrier forever when the
+        // assertion fails, so the test binary never exits and the whole job dies on a timeout --
+        // which CI reports as `cancelled`, not as this failure. ~keep
+        let permit_withheld = Arc::clone(&semaphore).try_acquire_owned().is_err();
+
+        release.wait();
+
+        assert!(
+            permit_withheld,
+            "a cancelled waiter must not return the permit while its blocking task is still running"
+        );
+        let regained = tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire()).await;
+        assert!(
+            regained.is_ok(),
+            "the permit must return once the blocking task finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_is_returned_after_a_completed_call() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let results = embed_holding_permit(Arc::clone(&semaphore), || Ok(Vec::new()))
+            .await
+            .expect("the task must succeed");
+
+        assert_eq!(results.len(), 0, "the stub task returns no embeddings");
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "a completed call must release its permit"
+        );
     }
 }
 
