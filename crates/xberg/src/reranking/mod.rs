@@ -802,6 +802,38 @@ pub fn rerank(
     }
 }
 
+/// Runs `task` on the blocking pool while holding a permit from `semaphore`.
+///
+/// The permit is moved *into* the blocking closure rather than held by this
+/// future. A `spawn_blocking` task cannot be cancelled — dropping its
+/// `JoinHandle` detaches it and the closure still runs to completion — so a
+/// permit owned by the awaiting future is released the moment a caller times
+/// out or drops, while the model load and inference it was bounding continue.
+/// Repeated abandoned calls then exceed the configured concurrency and keep
+/// several models resident (GH#1641). Taking the semaphore as a parameter also
+/// gives the tests a locally-owned semaphore, since the global one's permit
+/// count is 1 on a small host. ~keep
+#[cfg(all(feature = "reranker", feature = "tokio-runtime"))]
+async fn rerank_holding_permit<F>(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    task: F,
+) -> crate::Result<Vec<RerankedDocument>>
+where
+    F: FnOnce() -> crate::Result<Vec<RerankedDocument>> + Send + 'static,
+{
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| crate::XbergError::reranking("Reranker semaphore closed".to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|e| crate::XbergError::reranking(format!("Reranker task panicked: {e}")))?
+}
+
 /// Rerank documents asynchronously.
 ///
 /// Async counterpart to [`rerank`]. Offloads blocking ONNX inference to a
@@ -867,15 +899,69 @@ pub async fn rerank_async(
         | crate::core::config::RerankerModelType::Custom { .. } => {}
     }
 
-    let _permit = RERANK_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|_| crate::XbergError::reranking("Reranker semaphore closed".to_string()))?;
-
     let config = std::sync::Arc::new(config.clone());
-    tokio::task::spawn_blocking(move || rerank(query, documents, &config))
-        .await
-        .map_err(|e| crate::XbergError::reranking(format!("Reranker task panicked: {e}")))?
+    rerank_holding_permit(RERANK_SEMAPHORE.clone(), move || rerank(query, documents, &config)).await
+}
+
+#[cfg(all(test, feature = "reranker", feature = "tokio-runtime", not(target_arch = "wasm32")))]
+mod permit_tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::Barrier;
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn permit_stays_with_the_blocking_task_when_the_waiter_is_cancelled() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let release = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let mut waiter = Box::pin(rerank_holding_permit(Arc::clone(&semaphore), {
+            let release = Arc::clone(&release);
+            move || {
+                let _ = started_tx.send(());
+                release.wait();
+                Ok(Vec::new())
+            }
+        }));
+
+        let first = std::future::poll_fn(|cx| Poll::Ready(Future::poll(waiter.as_mut(), cx))).await;
+        assert!(
+            first.is_pending(),
+            "the blocking task must still be running after the first poll"
+        );
+        started_rx.await.expect("the blocking task must have started");
+
+        drop(waiter);
+
+        assert!(
+            Arc::clone(&semaphore).try_acquire_owned().is_err(),
+            "a cancelled waiter must not return the permit while its blocking task is still running"
+        );
+
+        release.wait();
+        let regained = tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire()).await;
+        assert!(
+            regained.is_ok(),
+            "the permit must return once the blocking task finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_is_returned_after_a_completed_call() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let results = rerank_holding_permit(Arc::clone(&semaphore), || Ok(Vec::new()))
+            .await
+            .expect("the task must succeed");
+
+        assert_eq!(results.len(), 0, "the stub task returns no documents");
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "a completed call must release its permit"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "reranker"))]
