@@ -321,8 +321,10 @@ jobs:
     # always(): a cancelled/failed sibling build leg (e.g. cli hitting the timeout) must NOT
     # skip the whole merge — the core/full digests that DID build still need their manifests
     # pushed (rc.36 #1299: one cancelled cli/amd64 leg suppressed the -core image entirely).
-    # A per-variant leg with no digests skips cleanly below, so this matrix stays green and
-    # publish-helm still runs. ~keep
+    # A per-variant leg with no digests skips cleanly below, so this matrix stays green.
+    # That is necessary but NOT sufficient for publish-helm to run — a downstream job with an
+    # implicit success() still sees the failed build-docker ancestor through this job. See the
+    # condition on publish-helm, which is what actually keeps the chart shipping. ~keep
     if: ${{ always() && needs.prepare.outputs.release_docker == 'true' && needs.prepare.outputs.dry_run != 'true' }}
     runs-on: ubuntu-latest
     permissions:
@@ -445,7 +447,15 @@ jobs:
     needs:
       - prepare
       - merge-docker
-    if: ${{ needs.prepare.outputs.release_docker == 'true' && needs.prepare.outputs.dry_run != 'true' }}
+    # !cancelled() rather than a bare outputs check: an `if` with no status function gets an
+    # implicit success(), which evaluates over the WHOLE needs graph, not just the direct
+    # needs. merge-docker's own always() lets it run and succeed, but it does not launder the
+    # failed build-docker ancestor for this job — so a cli build leg timing out skipped the
+    # chart on every release from v1.1.4 to v1.2.2 while the images themselves published fine.
+    # The chart references ghcr.io/xberg-io/xberg:<version> (core/full), never xberg-cli, so a
+    # cli failure is genuinely irrelevant here; what the chart does require is that the
+    # manifests published, which is what the merge-docker result check below asserts. ~keep
+    if: ${{ !cancelled() && needs.prepare.outputs.release_docker == 'true' && needs.prepare.outputs.dry_run != 'true' && needs.merge-docker.result == 'success' }}
     permissions:
       contents: read
       packages: write
@@ -455,3 +465,43 @@ jobs:
       version: ${{ needs.prepare.outputs.version }}
       dry_run: false
     secrets: inherit
+
+  # A skipped chart publish is invisible: the images push, the release looks green, and the
+  # chart silently stops shipping — which is exactly what happened from v1.1.4 to v1.2.2, five
+  # releases in a row. Assert the tag is actually resolvable so the next regression is loud.
+  # ~keep
+  verify-helm-published:
+    name: Verify Helm chart published
+    needs:
+      - prepare
+      - publish-helm
+    if: ${{ !cancelled() && needs.prepare.outputs.release_docker == 'true' && needs.prepare.outputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Assert the chart tag resolves
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          HELM_RESULT: ${{ needs.publish-helm.result }}
+          # Kept out of the run: body so the value is never part of a command line. ~keep
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${HELM_RESULT}" != "success" ]; then
+            echo "::error::publish-helm did not run to completion (result=${HELM_RESULT}). The Helm chart for ${VERSION} was not published."
+            exit 1
+          fi
+          token=$(curl -fsSL -u "${GITHUB_ACTOR}:${GHCR_TOKEN}" \
+            "https://ghcr.io/token?scope=repository:xberg-io/charts/xberg:pull&service=ghcr.io" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/xberg-io/charts/xberg/manifests/${VERSION}")
+          if [ "${code}" != "200" ]; then
+            echo "::error::Helm chart ghcr.io/xberg-io/charts/xberg:${VERSION} is not resolvable (HTTP ${code})."
+            exit 1
+          fi
+          echo "Helm chart ${VERSION} is published and resolvable."
