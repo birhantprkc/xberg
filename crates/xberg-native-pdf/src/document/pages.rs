@@ -174,6 +174,35 @@ impl PdfDocument {
         Ok(if n % 90 == 0 { n } else { 0 })
     }
 
+    /// Sibling of [`get_page_rotation`](Self::get_page_rotation) that keeps the
+    /// three cases the latter folds into `0` (absent, non-numeric, and a
+    /// numeric value that is not a multiple of 90) distinct. Same inheritance
+    /// resolution via [`get_page`](Self::get_page).
+    pub fn get_page_rotation_status(&self, page_index: usize) -> Result<PageRotation> {
+        let page = self.get_page(page_index)?;
+        let dict = page
+            .as_dict()
+            .ok_or_else(|| Error::InvalidPdf("Page is not a dictionary".to_string()))?;
+        let Some(r) = dict.get("Rotate") else {
+            return Ok(PageRotation::Absent);
+        };
+        let raw = match self.resolve_obj_ref(r) {
+            Object::Integer(v) => v as i32,
+            // ~keep A non-integral `/Rotate` (e.g. `90.5`) is out of spec. `get_page_rotation`
+            // truncates it because it folds everything invalid to 0 anyway; here truncating
+            // would report `Valid(90)` and re-introduce the exact conflation this type exists
+            // to remove, so only an integral Real is accepted.
+            Object::Real(v) if v.fract() == 0.0 => v as i32,
+            _ => return Ok(PageRotation::Malformed),
+        };
+        let n = ((raw % 360) + 360) % 360;
+        Ok(if n % 90 == 0 {
+            PageRotation::Valid(n)
+        } else {
+            PageRotation::Malformed
+        })
+    }
+
     /// Get page count using the standard /Count field
     pub(super) fn get_page_count_standard(&self) -> Result<usize> {
         let catalog = self.catalog()?;

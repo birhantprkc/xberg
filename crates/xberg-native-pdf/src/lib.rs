@@ -195,7 +195,7 @@ pub use annotation_types::{
 };
 pub use annotations::{Annotation, LinkAction, LinkDestination};
 pub use config::{DocumentType, ExtractionProfile};
-pub use document::{ExtractedImageRef, ImageFormat, PdfDocument, ReadingOrder};
+pub use document::{ExtractedImageRef, ImageFormat, PageRotation, PdfDocument, ReadingOrder};
 pub use error::{Error, Result};
 pub use extractors::images::{PdfFilter, PdfImageHandle};
 pub use layout::PageText;

@@ -1732,6 +1732,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<OcrBackendCapabilities> dco_decode_list_ocr_backend_capabilities(
+    dynamic raw,
+  );
+
+  @protected
   List<OcrElement> dco_decode_list_ocr_element(dynamic raw);
 
   @protected
@@ -1922,6 +1927,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   NodeContent dco_decode_node_content(dynamic raw);
+
+  @protected
+  OcrBackendCapabilities dco_decode_ocr_backend_capabilities(dynamic raw);
 
   @protected
   OcrBackendType dco_decode_ocr_backend_type(dynamic raw);
@@ -4698,6 +4706,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<OcrBackendCapabilities> sse_decode_list_ocr_backend_capabilities(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   List<OcrElement> sse_decode_list_ocr_element(SseDeserializer deserializer);
 
   @protected
@@ -4936,6 +4949,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   NodeContent sse_decode_node_content(SseDeserializer deserializer);
+
+  @protected
+  OcrBackendCapabilities sse_decode_ocr_backend_capabilities(
+    SseDeserializer deserializer,
+  );
 
   @protected
   OcrBackendType sse_decode_ocr_backend_type(SseDeserializer deserializer);
@@ -8603,6 +8621,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_ocr_backend_capabilities(
+    List<OcrBackendCapabilities> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_list_ocr_element(
     List<OcrElement> self,
     SseSerializer serializer,
@@ -8910,6 +8934,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_node_content(NodeContent self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_ocr_backend_capabilities(
+    OcrBackendCapabilities self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_ocr_backend_type(

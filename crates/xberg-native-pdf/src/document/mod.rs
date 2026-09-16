@@ -54,6 +54,17 @@ pub enum ReadingOrder {
     Structure,
 }
 
+/// Distinguishes the three cases `get_page_rotation` folds into `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageRotation {
+    /// No `/Rotate` entry. ISO 32000-1 §7.7.3.3 default of 0 applies.
+    Absent,
+    /// A spec-valid multiple of 90, normalised to 0, 90, 180 or 270.
+    Valid(i32),
+    /// A `/Rotate` entry that is present but not a spec-valid multiple of 90.
+    Malformed,
+}
+
 /// In-memory reader used by `open()` and `from_bytes()`. Wrapping in an enum
 /// is kept (rather than using `BufReader<Cursor<Vec<u8>>>` directly) so a
 /// future file-backed variant can be re-introduced without touching call

@@ -1770,6 +1770,7 @@ impl PdfExtractor {
             pdf_form_fields,
             mut pdf_extraction_warnings,
             pdf_page_labels,
+            pdf_page_coordinate_frames,
         ) = extract_all_from_native_document(
             native_document,
             config,
@@ -2733,6 +2734,35 @@ impl PdfExtractor {
             assign_hierarchy_to_pages(pages, &doc);
         }
 
+        // GH#1653 + GH#1654: one raw-MediaBox coordinate frame per page that ended up with
+        // hierarchy blocks, now that `assign_hierarchy_to_pages` above has populated
+        // `PageContent::hierarchy`. One shared record covers both issues: a consumer needs
+        // the MediaBox origin (which can be non-zero and negative) and the page rotation
+        // together to place a page's raw-space geometry. Rides in `additional` rather than a
+        // new public binding type, same as the `page_labels` key below (issue #66) and
+        // `ocr_page_coordinate_frames` above (GH#1645). ~keep
+        if let Some(ref pages) = final_pages {
+            let pages_with_hierarchy: std::collections::HashSet<u32> = pages
+                .iter()
+                .filter(|page| {
+                    page.hierarchy
+                        .as_ref()
+                        .is_some_and(|hierarchy| !hierarchy.blocks.is_empty())
+                })
+                .map(|page| page.page_number)
+                .collect();
+            let pdf_page_coordinate_frames: Vec<_> = pdf_page_coordinate_frames
+                .into_iter()
+                .filter(|frame| pages_with_hierarchy.contains(&frame.page_number))
+                .collect();
+            if !pdf_page_coordinate_frames.is_empty() {
+                doc.metadata.additional.insert(
+                    std::borrow::Cow::Borrowed("pdf_page_coordinate_frames"),
+                    serde_json::json!(pdf_page_coordinate_frames),
+                );
+            }
+        }
+
         doc.prebuilt_pages = final_pages;
 
         #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
@@ -3413,6 +3443,182 @@ mod tests {
         let mut bytes = Vec::new();
         document.save_to(&mut bytes).expect("mixed PDF fixture must serialize");
         bytes
+    }
+
+    /// A single page with a non-origin, negative-origin `MediaBox [10 -100 622 692]` (GH#1653)
+    /// and two font sizes -- a 24pt heading line and a 10pt body paragraph, both at known raw
+    /// user-space positions -- so hierarchy clustering assigns a heading level to the first and
+    /// leaves the second as body text. `rotate` optionally sets `/Rotate` on the page (GH#1654).
+    #[cfg(feature = "pdf")]
+    fn coordinate_frame_test_pdf(rotate: Option<i32>) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                Operation::new("Td", vec![82.into(), 500.into()]),
+                Operation::new("Tj", vec![Object::string_literal("Coordinate Frame Heading")]),
+                Operation::new("ET", vec![]),
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 10.into()]),
+                Operation::new("Td", vec![82.into(), 460.into()]),
+                Operation::new(
+                    "Tj",
+                    vec![Object::string_literal(
+                        "This is a body paragraph with enough ordinary words to cluster as body text below the heading.",
+                    )],
+                ),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            content.encode().expect("coordinate frame fixture content must encode"),
+        ));
+
+        let mut page_dict = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "MediaBox" => vec![10.into(), (-100).into(), 622.into(), 692.into()],
+        };
+        if let Some(rotate) = rotate {
+            page_dict.set("Rotate", rotate);
+        }
+        let page_id = document.add_object(page_dict);
+
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document
+            .save_to(&mut bytes)
+            .expect("coordinate frame fixture PDF must serialize");
+        bytes
+    }
+
+    #[cfg(feature = "pdf")]
+    fn coordinate_frame_extraction_config() -> ExtractionConfig {
+        use crate::core::config::{HierarchyConfig, PdfConfig};
+
+        ExtractionConfig {
+            pdf_options: Some(PdfConfig {
+                hierarchy: Some(HierarchyConfig {
+                    enabled: true,
+                    ..HierarchyConfig::default()
+                }),
+                ..PdfConfig::default()
+            }),
+            ..ExtractionConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pdf")]
+    async fn pdf_page_coordinate_frame_reports_raw_media_box_origin_and_unswapped_extent() {
+        let content = coordinate_frame_test_pdf(None);
+        let config = coordinate_frame_extraction_config();
+        let extractor = PdfExtractor::new();
+        let result = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("coordinate frame fixture must extract");
+
+        let frames = result
+            .metadata
+            .additional
+            .get("pdf_page_coordinate_frames")
+            .expect("pdf_page_coordinate_frames must be present when a page has hierarchy blocks")
+            .as_array()
+            .expect("pdf_page_coordinate_frames must be a JSON array");
+        assert_eq!(frames.len(), 1, "exactly one page has hierarchy blocks");
+
+        let frame = &frames[0];
+        assert_eq!(frame["page_number"], serde_json::json!(1));
+        assert_eq!(frame["origin_x"], serde_json::json!(10.0));
+        assert_eq!(frame["origin_y"], serde_json::json!(-100.0));
+        assert_eq!(frame["width"], serde_json::json!(612.0));
+        assert_eq!(frame["height"], serde_json::json!(792.0));
+        assert_eq!(frame["unit"], serde_json::json!("point"));
+        assert_eq!(frame["origin"], serde_json::json!("bottom_left"));
+        assert_eq!(frame["clockwise_rotation"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pdf")]
+    async fn pdf_page_coordinate_frame_reports_rotation_without_swapping_extent() {
+        let content = coordinate_frame_test_pdf(Some(90));
+        let config = coordinate_frame_extraction_config();
+        let extractor = PdfExtractor::new();
+        let result = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("rotated coordinate frame fixture must extract");
+
+        let frames = result
+            .metadata
+            .additional
+            .get("pdf_page_coordinate_frames")
+            .expect("pdf_page_coordinate_frames must be present when a page has hierarchy blocks")
+            .as_array()
+            .expect("pdf_page_coordinate_frames must be a JSON array");
+        assert_eq!(frames.len(), 1);
+
+        let frame = &frames[0];
+        assert_eq!(frame["clockwise_rotation"], serde_json::json!(90));
+        // Deliberately un-swapped: this describes raw PDF user space, not the displayed frame.
+        assert_eq!(frame["width"], serde_json::json!(612.0));
+        assert_eq!(frame["height"], serde_json::json!(792.0));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pdf")]
+    async fn pdf_page_coordinate_frame_omits_page_with_malformed_rotation() {
+        let content = coordinate_frame_test_pdf(Some(135));
+        let config = coordinate_frame_extraction_config();
+        let extractor = PdfExtractor::new();
+        let result = extractor
+            .extract_content(&content, "application/pdf", &config)
+            .await
+            .expect("malformed-rotation fixture must still extract successfully");
+
+        assert!(
+            !result.elements.is_empty(),
+            "extraction must otherwise be unaffected by the malformed /Rotate"
+        );
+
+        match result.metadata.additional.get("pdf_page_coordinate_frames") {
+            None => {}
+            Some(value) => {
+                let frames = value.as_array().expect("pdf_page_coordinate_frames must be an array");
+                assert!(
+                    frames.is_empty(),
+                    "page with malformed /Rotate must be omitted entirely, got {frames:?}"
+                );
+            }
+        }
     }
 
     #[test]

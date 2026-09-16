@@ -7985,3 +7985,197 @@ fn test_extract_paths_layer_none_for_plain_stroke() {
     assert_eq!(paths.len(), 1);
     assert_eq!(paths[0].layer, None);
 }
+
+/// Like [`build_minimal_pdf`] but with a caller-supplied `/MediaBox` array
+/// literal (e.g. `"10 -100 622 692"`), for GH#1653 extent-vs-corner tests. ~keep
+fn build_minimal_pdf_with_media_box(media_box: &str, content: &[u8]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Contents 4 0 R /Resources << >> >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+
+    let off4 = pdf.len();
+    pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 5\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    pdf.extend_from_slice(format!("{:010} 00000 n \n", off1).as_bytes());
+    pdf.extend_from_slice(format!("{:010} 00000 n \n", off2).as_bytes());
+    pdf.extend_from_slice(format!("{:010} 00000 n \n", off3).as_bytes());
+    pdf.extend_from_slice(format!("{:010} 00000 n \n", off4).as_bytes());
+    pdf.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes());
+
+    pdf
+}
+
+#[test]
+fn test_extract_page_text_dimensions_use_extent_not_corner_for_nonzero_origin() {
+    // GH#1653: `/MediaBox [10 -100 622 692]` describes a 612x792 page whose
+    // lower-left corner sits at (10, -100), not the origin. `page_width` /
+    // `page_height` must report the EXTENT (urx - llx, ury - lly) = 612x792,
+    // not the raw upper-right corner (622, 692). ~keep
+    let pdf = build_minimal_pdf_with_media_box("10 -100 622 692", b"");
+    let doc = PdfDocument::from_bytes(pdf).unwrap();
+    let page_text = doc.extract_page_text(0).unwrap();
+    assert!(
+        (page_text.page_width - 612.0).abs() < 0.1,
+        "expected extent width 612, got {}",
+        page_text.page_width
+    );
+    assert!(
+        (page_text.page_height - 792.0).abs() < 0.1,
+        "expected extent height 792, got {}",
+        page_text.page_height
+    );
+}
+
+#[test]
+fn test_extract_page_text_dimensions_unchanged_for_zero_origin() {
+    // Companion to the non-zero-origin test above: when llx == lly == 0 (the
+    // overwhelming majority of real PDFs), extent and corner coincide, so this
+    // must report the exact same values as before GH#1653's fix. ~keep
+    let pdf = build_minimal_pdf_with_media_box("0 0 612 792", b"");
+    let doc = PdfDocument::from_bytes(pdf).unwrap();
+    let page_text = doc.extract_page_text(0).unwrap();
+    assert!((page_text.page_width - 612.0).abs() < 0.1);
+    assert!((page_text.page_height - 792.0).abs() < 0.1);
+}
+
+/// Builds a single-page PDF whose `/Rotate` entry is the caller-supplied raw
+/// PDF token (`"90"`, `"-90"`, `"135"`, `"90.5"`, `"(bogus)"`, ...), placed on
+/// the page dict (`inherited = false`) or the parent `/Pages` node
+/// (`inherited = true`). Mirrors `xberg::pdf::render::build_pdf_with_rotate`'s
+/// fixture shape (out of scope to reuse directly - that file is owned by a
+/// concurrent change), built with this crate's own manual PDF writer instead
+/// of `lopdf`, which this crate does not depend on. ~keep
+fn build_pdf_with_rotate_token(rotate_token: Option<&str>, inherited: bool) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+
+    let page_rotate = if inherited {
+        String::new()
+    } else {
+        rotate_token.map_or(String::new(), |t| format!(" /Rotate {t}"))
+    };
+    let pages_rotate = if inherited {
+        rotate_token.map_or(String::new(), |t| format!(" /Rotate {t}"))
+    } else {
+        String::new()
+    };
+
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let off2 = pdf.len();
+    pdf.extend_from_slice(
+        format!("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1{pages_rotate} >>\nendobj\n").as_bytes(),
+    );
+
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        format!("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100]{page_rotate} >>\nendobj\n").as_bytes(),
+    );
+
+    let xref_off = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 4\n");
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for off in [off1, off2, off3] {
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", xref_off).as_bytes());
+
+    pdf
+}
+
+#[test]
+fn test_get_page_rotation_status_absent_is_absent() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(None, false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Absent);
+}
+
+#[test]
+fn test_get_page_rotation_status_zero_is_valid_zero() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("0"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(0));
+}
+
+#[test]
+fn test_get_page_rotation_status_90_is_valid_90() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("90"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(90));
+}
+
+#[test]
+fn test_get_page_rotation_status_180_is_valid_180() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("180"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(180));
+}
+
+#[test]
+fn test_get_page_rotation_status_270_is_valid_270() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("270"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(270));
+}
+
+#[test]
+fn test_get_page_rotation_status_negative_90_normalizes_to_270() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("-90"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(270));
+}
+
+#[test]
+fn test_get_page_rotation_status_135_is_malformed_not_folded_to_valid_zero() {
+    // GH#1654: `get_page_rotation` folds this to plain `0`, indistinguishable
+    // from a genuine `/Rotate 0` or an absent entry. The new accessor must
+    // distinguish it as Malformed instead. ~keep
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("135"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Malformed);
+}
+
+#[test]
+fn test_get_page_rotation_status_real_value_is_read() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("90.0"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(90));
+}
+
+#[test]
+fn test_get_page_rotation_status_non_integral_real_is_malformed() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("90.5"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Malformed);
+}
+
+#[test]
+fn test_get_page_rotation_status_non_numeric_is_malformed() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("(bogus)"), false)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Malformed);
+}
+
+#[test]
+fn test_get_page_rotation_status_inherited_from_pages_node() {
+    let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("90"), true)).unwrap();
+    assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Valid(90));
+}
+
+#[test]
+fn test_get_page_rotation_still_folds_absent_and_malformed_to_zero() {
+    // Pins get_page_rotation's existing fold-to-0 contract, which must not
+    // change: both absent and out-of-spec /Rotate values still read as 0
+    // through the original accessor. ~keep
+    let absent = PdfDocument::from_bytes(build_pdf_with_rotate_token(None, false)).unwrap();
+    assert_eq!(absent.get_page_rotation(0).unwrap(), 0);
+    let malformed = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("135"), false)).unwrap();
+    assert_eq!(malformed.get_page_rotation(0).unwrap(), 0);
+}

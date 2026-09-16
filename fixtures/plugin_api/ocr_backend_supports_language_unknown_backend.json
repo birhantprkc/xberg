@@ -1,0 +1,22 @@
+{
+	"id": "ocr_backend_supports_language_unknown_backend",
+	"category": "ocr_backend_management",
+	"description": "Checking language support on an unregistered OCR backend is an error",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "Check language support on an unregistered OCR backend",
+		"description": "Checking language support on an unregistered OCR backend returns an error, since there is no backend to delegate the check to",
+		"side_effects": "safe"
+	},
+	"tags": ["ocr", "plugin_management", "capabilities", "error"],
+	"call": "ocr_backend_supports_language",
+	"input": {
+		"backend": "nonexistent-backend-xyz",
+		"language": "eng"
+	},
+	"assertions": [
+		{
+			"type": "error"
+		}
+	]
+}

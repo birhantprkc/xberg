@@ -583,8 +583,12 @@ impl PdfDocument {
         Ok(crate::layout::PageText {
             spans,
             chars,
-            page_width: media_box.2,
-            page_height: media_box.3,
+            // GH#1653: MediaBox is (llx, lly, urx, ury); the page EXTENT is
+            // (urx - llx, ury - lly), not the raw upper-right corner. A
+            // non-zero-origin MediaBox (e.g. `[10 -100 622 692]`) previously
+            // reported 622x692 instead of the true 612x792. ~keep
+            page_width: media_box.2 - media_box.0,
+            page_height: media_box.3 - media_box.1,
         })
     }
 

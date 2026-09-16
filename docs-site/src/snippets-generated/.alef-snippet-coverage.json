@@ -63,6 +63,8 @@
     "c/plugin_api/embedding_backends_clear.md",
     "c/plugin_api/embedding_backends_list.md",
     "c/plugin_api/list_reranker_backends.md",
+    "c/plugin_api/ocr_backend_capabilities_list.md",
+    "c/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "c/plugin_api/ocr_backends_clear.md",
     "c/plugin_api/ocr_backends_list.md",
     "c/plugin_api/post_processors_clear.md",
@@ -156,6 +158,8 @@
     "csharp/plugin_api/embedding_backends_clear.md",
     "csharp/plugin_api/embedding_backends_list.md",
     "csharp/plugin_api/list_reranker_backends.md",
+    "csharp/plugin_api/ocr_backend_capabilities_list.md",
+    "csharp/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "csharp/plugin_api/ocr_backends_clear.md",
     "csharp/plugin_api/ocr_backends_list.md",
     "csharp/plugin_api/post_processors_clear.md",
@@ -249,6 +253,8 @@
     "dart/plugin_api/embedding_backends_clear.md",
     "dart/plugin_api/embedding_backends_list.md",
     "dart/plugin_api/list_reranker_backends.md",
+    "dart/plugin_api/ocr_backend_capabilities_list.md",
+    "dart/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "dart/plugin_api/ocr_backends_clear.md",
     "dart/plugin_api/ocr_backends_list.md",
     "dart/plugin_api/post_processors_clear.md",
@@ -342,6 +348,8 @@
     "elixir/plugin_api/embedding_backends_clear.md",
     "elixir/plugin_api/embedding_backends_list.md",
     "elixir/plugin_api/list_reranker_backends.md",
+    "elixir/plugin_api/ocr_backend_capabilities_list.md",
+    "elixir/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "elixir/plugin_api/ocr_backends_clear.md",
     "elixir/plugin_api/ocr_backends_list.md",
     "elixir/plugin_api/post_processors_clear.md",
@@ -435,6 +443,8 @@
     "go/plugin_api/embedding_backends_clear.md",
     "go/plugin_api/embedding_backends_list.md",
     "go/plugin_api/list_reranker_backends.md",
+    "go/plugin_api/ocr_backend_capabilities_list.md",
+    "go/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "go/plugin_api/ocr_backends_clear.md",
     "go/plugin_api/ocr_backends_list.md",
     "go/plugin_api/post_processors_clear.md",
@@ -528,6 +538,8 @@
     "java/plugin_api/embedding_backends_clear.md",
     "java/plugin_api/embedding_backends_list.md",
     "java/plugin_api/list_reranker_backends.md",
+    "java/plugin_api/ocr_backend_capabilities_list.md",
+    "java/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "java/plugin_api/ocr_backends_clear.md",
     "java/plugin_api/ocr_backends_list.md",
     "java/plugin_api/post_processors_clear.md",
@@ -621,6 +633,8 @@
     "kotlin-android/plugin_api/embedding_backends_clear.md",
     "kotlin-android/plugin_api/embedding_backends_list.md",
     "kotlin-android/plugin_api/list_reranker_backends.md",
+    "kotlin-android/plugin_api/ocr_backend_capabilities_list.md",
+    "kotlin-android/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "kotlin-android/plugin_api/ocr_backends_clear.md",
     "kotlin-android/plugin_api/ocr_backends_list.md",
     "kotlin-android/plugin_api/post_processors_clear.md",
@@ -714,6 +728,8 @@
     "php/plugin_api/embedding_backends_clear.md",
     "php/plugin_api/embedding_backends_list.md",
     "php/plugin_api/list_reranker_backends.md",
+    "php/plugin_api/ocr_backend_capabilities_list.md",
+    "php/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "php/plugin_api/ocr_backends_clear.md",
     "php/plugin_api/ocr_backends_list.md",
     "php/plugin_api/post_processors_clear.md",
@@ -807,6 +823,8 @@
     "python/plugin_api/embedding_backends_clear.md",
     "python/plugin_api/embedding_backends_list.md",
     "python/plugin_api/list_reranker_backends.md",
+    "python/plugin_api/ocr_backend_capabilities_list.md",
+    "python/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "python/plugin_api/ocr_backends_clear.md",
     "python/plugin_api/ocr_backends_list.md",
     "python/plugin_api/post_processors_clear.md",
@@ -900,6 +918,8 @@
     "ruby/plugin_api/embedding_backends_clear.md",
     "ruby/plugin_api/embedding_backends_list.md",
     "ruby/plugin_api/list_reranker_backends.md",
+    "ruby/plugin_api/ocr_backend_capabilities_list.md",
+    "ruby/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "ruby/plugin_api/ocr_backends_clear.md",
     "ruby/plugin_api/ocr_backends_list.md",
     "ruby/plugin_api/post_processors_clear.md",
@@ -993,6 +1013,8 @@
     "rust/plugin_api/embedding_backends_clear.md",
     "rust/plugin_api/embedding_backends_list.md",
     "rust/plugin_api/list_reranker_backends.md",
+    "rust/plugin_api/ocr_backend_capabilities_list.md",
+    "rust/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "rust/plugin_api/ocr_backends_clear.md",
     "rust/plugin_api/ocr_backends_list.md",
     "rust/plugin_api/ocr_backends_unregister.md",
@@ -1098,6 +1120,8 @@
     "swift/plugin_api/embedding_backends_clear.md",
     "swift/plugin_api/embedding_backends_list.md",
     "swift/plugin_api/list_reranker_backends.md",
+    "swift/plugin_api/ocr_backend_capabilities_list.md",
+    "swift/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "swift/plugin_api/ocr_backends_clear.md",
     "swift/plugin_api/ocr_backends_list.md",
     "swift/plugin_api/post_processors_clear.md",
@@ -1191,6 +1215,8 @@
     "typescript/plugin_api/embedding_backends_clear.md",
     "typescript/plugin_api/embedding_backends_list.md",
     "typescript/plugin_api/list_reranker_backends.md",
+    "typescript/plugin_api/ocr_backend_capabilities_list.md",
+    "typescript/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "typescript/plugin_api/ocr_backends_clear.md",
     "typescript/plugin_api/ocr_backends_list.md",
     "typescript/plugin_api/post_processors_clear.md",
@@ -1284,6 +1310,8 @@
     "wasm/plugin_api/embedding_backends_clear.md",
     "wasm/plugin_api/embedding_backends_list.md",
     "wasm/plugin_api/list_reranker_backends.md",
+    "wasm/plugin_api/ocr_backend_capabilities_list.md",
+    "wasm/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "wasm/plugin_api/ocr_backends_clear.md",
     "wasm/plugin_api/ocr_backends_list.md",
     "wasm/plugin_api/post_processors_clear.md",
@@ -1377,6 +1405,8 @@
     "zig/plugin_api/embedding_backends_clear.md",
     "zig/plugin_api/embedding_backends_list.md",
     "zig/plugin_api/list_reranker_backends.md",
+    "zig/plugin_api/ocr_backend_capabilities_list.md",
+    "zig/plugin_api/ocr_backend_supports_language_unknown_backend.md",
     "zig/plugin_api/ocr_backends_clear.md",
     "zig/plugin_api/ocr_backends_list.md",
     "zig/plugin_api/post_processors_clear.md",
@@ -2148,6 +2178,30 @@
         "language": "c"
       },
       "path": "c/plugin_api/list_reranker_backends.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "c"
+      },
+      "path": "c/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "c",
+      "target": "c",
+      "session": "c",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "c"
+      },
+      "path": "c/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "c",
       "target": "c",
       "session": "c",
@@ -3272,6 +3326,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "csharp"
+      },
+      "path": "csharp/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "csharp",
+      "target": "csharp",
+      "session": "csharp",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "csharp"
       },
@@ -4380,6 +4458,30 @@
         "language": "dart"
       },
       "path": "dart/plugin_api/list_reranker_backends.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "dart",
+      "target": "dart",
+      "session": "dart",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "dart"
+      },
+      "path": "dart/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "dart",
       "target": "dart",
       "session": "dart",
@@ -5504,6 +5606,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "elixir"
+      },
+      "path": "elixir/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "elixir",
+      "target": "elixir",
+      "session": "elixir",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "elixir"
       },
@@ -6612,6 +6738,30 @@
         "language": "go"
       },
       "path": "go/plugin_api/list_reranker_backends.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "go"
+      },
+      "path": "go/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "go",
+      "target": "go",
+      "session": "go",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "go"
+      },
+      "path": "go/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "go",
       "target": "go",
       "session": "go",
@@ -7736,6 +7886,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "java"
+      },
+      "path": "java/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "java"
+      },
+      "path": "java/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "java",
+      "target": "java",
+      "session": "java",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "java"
       },
@@ -8844,6 +9018,30 @@
         "language": "kotlin_android"
       },
       "path": "kotlin-android/plugin_api/list_reranker_backends.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "kotlin",
+      "target": "kotlin_android",
+      "session": "kotlin_android",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "kotlin_android"
+      },
+      "path": "kotlin-android/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "kotlin",
       "target": "kotlin_android",
       "session": "kotlin_android",
@@ -9968,6 +10166,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "php"
+      },
+      "path": "php/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "php"
+      },
+      "path": "php/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "php",
+      "target": "php",
+      "session": "php",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "php"
       },
@@ -11084,6 +11306,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "python"
+      },
+      "path": "python/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "python"
+      },
+      "path": "python/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "python",
+      "target": "python",
+      "session": "python",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "python"
       },
@@ -12192,6 +12438,30 @@
         "language": "ruby"
       },
       "path": "ruby/plugin_api/list_reranker_backends.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "ruby",
+      "target": "ruby",
+      "session": "ruby",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "ruby"
+      },
+      "path": "ruby/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "ruby",
       "target": "ruby",
       "session": "ruby",
@@ -13482,6 +13752,30 @@
         "language": "rust"
       },
       "path": "rust/plugin_api/list_reranker_backends.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "rust",
+      "target": "rust",
+      "session": "rust",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "rust"
+      },
+      "path": "rust/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "rust",
       "target": "rust",
       "session": "rust",
@@ -14798,6 +15092,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "swift"
+      },
+      "path": "swift/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "swift",
+      "target": "swift",
+      "session": "swift",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "swift"
       },
@@ -15906,6 +16224,30 @@
         "language": "node"
       },
       "path": "typescript/plugin_api/list_reranker_backends.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "typescript",
+      "target": "node",
+      "session": "node",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "node"
+      },
+      "path": "typescript/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "typescript",
       "target": "node",
       "session": "node",
@@ -17030,6 +17372,30 @@
     },
     {
       "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "wasm"
+      },
+      "path": "wasm/plugin_api/ocr_backend_supports_language_unknown_backend.md",
+      "language": "typescript",
+      "target": "wasm",
+      "session": "wasm",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
         "fixture_id": "ocr_backends_clear",
         "language": "wasm"
       },
@@ -18138,6 +18504,30 @@
         "language": "zig"
       },
       "path": "zig/plugin_api/list_reranker_backends.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_capabilities_list",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/ocr_backend_capabilities_list.md",
+      "language": "zig",
+      "target": "zig",
+      "session": "zig",
+      "requires": [],
+      "side_effect": "safe"
+    },
+    {
+      "key": {
+        "fixture_id": "ocr_backend_supports_language_unknown_backend",
+        "language": "zig"
+      },
+      "path": "zig/plugin_api/ocr_backend_supports_language_unknown_backend.md",
       "language": "zig",
       "target": "zig",
       "session": "zig",
@@ -21936,6 +22326,126 @@
     },
     {
       "fixture_id": "metadata_access",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
       "language": "zig"
     },
     {
@@ -27566,6 +28076,126 @@
     },
     {
       "fixture_id": "metadata_access",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_backend_capabilities_list",
+      "language": "zig"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "c"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "csharp"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "dart"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "elixir"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "go"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "java"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "kotlin_android"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "node"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "php"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "python"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "ruby"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "rust"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "swift"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
+      "language": "wasm"
+    },
+    {
+      "fixture_id": "ocr_backend_supports_language_unknown_backend",
       "language": "zig"
     },
     {

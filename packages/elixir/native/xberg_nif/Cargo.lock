@@ -1312,7 +1312,7 @@ dependencies = [
  "finl_unicode",
  "jetscii",
  "phf 0.13.1",
- "phf_codegen",
+ "phf_codegen 0.13.1",
  "rustc-hash",
  "smallvec",
  "typed-arena",
@@ -1471,9 +1471,9 @@ dependencies = [
 
 [[package]]
 name = "crawlberg"
-version = "1.6.4"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23af95dc59a3ffaa4746714dbc51e2f05490e692350ee824eef7ef4292332016"
+checksum = "06c10f3514c8ab7b980f5c65956c0c5a81daea9343876a3506a628bb11280f3b"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3013,9 +3013,9 @@ checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "html-to-markdown-rs"
-version = "3.13.0"
+version = "3.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d7a15d966d18c9e245708eb4aa10d2c395dd7a1eae5776d83b0f31a82fb2ecc"
+checksum = "250c27ba332993f6972a03b1b7243fe087a94c3401318015fe0dde5e8ea1ccef"
 dependencies = [
  "ahash",
  "astral-tl",
@@ -3036,12 +3036,13 @@ dependencies = [
 
 [[package]]
 name = "html5ever"
-version = "0.39.0"
+version = "0.40.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46a1761807faccc9a19e86944bbf40610014066306f96edcdedc2fb714bcb7b8"
+checksum = "456a1a377e608e555d22ddab27ac0114bc7a7b4199078108e34c2aeae6c9b130"
 dependencies = [
  "log",
  "markup5ever",
+ "memchr",
 ]
 
 [[package]]
@@ -4136,9 +4137,9 @@ dependencies = [
 
 [[package]]
 name = "markup5ever"
-version = "0.39.0"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7122d987ec5f704ee56f6e5b41a7d93722e9aae27ae07cafa4036c4d3f9757de"
+checksum = "0ab3dc68ac4a0f5719e560136778c1ee716e296030d75dbd4484e37e39e3a842"
 dependencies = [
  "log",
  "tendril",
@@ -5107,6 +5108,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf_codegen"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b585a510fb76fdebead6897982ef2a03a21d8e6cbcca904999742a4afc6ffe"
+dependencies = [
+ "phf_generator 0.14.0",
+ "phf_shared 0.14.0",
+]
+
+[[package]]
 name = "phf_generator"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6008,9 +6019,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.3.0"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b88db56b8ae316560e9e868b6b978ea940f27cb883323fc90e07435e44158f5c"
+checksum = "b23c62fe489ac1d401ab32688cfacac3737a8978dc3343e5361464c7724fd3cb"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6040,9 +6051,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.3.0"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "873b730df6f0a9b74b13eb514e0dca4c2db0d8b68b74af98a2e9bf3f9d436585"
+checksum = "cd740c45d66ceb87e5579082abc27bd771665e464e9660a17a048c721b2a6025"
 dependencies = [
  "darling 0.24.1",
  "proc-macro2",
@@ -6911,24 +6922,24 @@ dependencies = [
 
 [[package]]
 name = "string_cache"
-version = "0.9.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a18596f8c785a729f2819c0f6a7eae6ebeebdfffbfe4214ae6b087f690e31901"
+checksum = "ffa8a5dbe8b3f0bbe29d4c3225daafaeead63afdc1b65fc4c01a1384166038e6"
 dependencies = [
  "new_debug_unreachable",
  "parking_lot",
- "phf_shared 0.13.1",
+ "phf_shared 0.14.0",
  "precomputed-hash",
 ]
 
 [[package]]
 name = "string_cache_codegen"
-version = "0.6.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "585635e46db231059f76c5849798146164652513eb9e8ab2685939dd90f29b69"
+checksum = "928dcdf75e47626b3617a976ec205d9f057584c371c1f23b782129268d0e6edc"
 dependencies = [
- "phf_generator 0.13.1",
- "phf_shared 0.13.1",
+ "phf_generator 0.14.0",
+ "phf_shared 0.14.0",
  "proc-macro2",
  "quote",
 ]
@@ -8594,12 +8605,12 @@ dependencies = [
 
 [[package]]
 name = "web_atoms"
-version = "0.2.6"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba8b815c1b593dc0baf78dd0f4fc8fdb2de53198fb1163738093e9a311c33fb3"
+checksum = "7572660c8890448ba236b7376f27e389c6a7e1c70195622faced601f855c0ada"
 dependencies = [
- "phf 0.13.1",
- "phf_codegen",
+ "phf 0.14.0",
+ "phf_codegen 0.14.0",
  "string_cache",
  "string_cache_codegen",
 ]
@@ -9034,7 +9045,7 @@ dependencies = [
 
 [[package]]
 name = "xberg"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -9170,7 +9181,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-candle-ocr"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "base64 0.23.1",
  "candle-core",
@@ -9190,7 +9201,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-gliner"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -9204,7 +9215,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libheif"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "cfg-if",
  "enumn",
@@ -9215,7 +9226,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libwpd"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "cc",
  "flate2",
@@ -9228,7 +9239,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-native-pdf"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "aes 0.9.3",
  "base64 0.23.1",
@@ -9273,7 +9284,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-paddle-ocr"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "geo-clipper",
  "geo-types",
@@ -9288,7 +9299,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-tesseract"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "cc",
  "cmake",
@@ -9303,7 +9314,7 @@ dependencies = [
 
 [[package]]
 name = "xberg_nif"
-version = "1.2.2"
+version = "1.2.3"
 dependencies = [
  "alloc-no-stdlib 3.0.0",
  "alloc-stdlib 0.3.0",

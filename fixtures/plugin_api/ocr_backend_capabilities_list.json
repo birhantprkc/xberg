@@ -1,0 +1,18 @@
+{
+	"id": "ocr_backend_capabilities_list",
+	"category": "ocr_backend_management",
+	"description": "List all registered OCR backends with their declared language capabilities",
+	"docs": {
+		"topic": "plugin_api",
+		"title": "List OCR backend capabilities",
+		"description": "List all registered OCR backends with their declared language capabilities",
+		"side_effects": "safe"
+	},
+	"tags": ["ocr", "plugin_management", "list", "capabilities"],
+	"call": "list_ocr_backend_capabilities",
+	"assertions": [
+		{
+			"type": "not_error"
+		}
+	]
+}

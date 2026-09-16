@@ -169,6 +169,69 @@ impl OcrPageCoordinateFrame {
     }
 }
 
+/// One PDF page's raw MediaBox coordinate frame (GH#1653 + GH#1654).
+///
+/// GH#1653: `origin_x`/`origin_y` are the MediaBox `llx`/`lly`, which can be non-zero and
+/// negative -- a consumer that assumes `(0, 0)` mis-places every geometry field the page
+/// reports. GH#1654: `clockwise_rotation` is the page `/Rotate`. Both gaps are one record,
+/// not two, because a consumer needs the origin and the rotation together to place a page's
+/// geometry in display space.
+///
+/// `width`/`height` are the MediaBox *extent* (`urx - llx`, `ury - lly`) and are deliberately
+/// NOT swapped for a 90/270 rotation: this describes raw PDF user space, the space
+/// `HierarchicalBlock.bbox` and other segment geometry actually live in
+/// (`pdf::structure::types`), not the displayed/rotated frame. This is the opposite of
+/// `OcrPageCoordinateFrame` above, which reports the already-rotated processed raster. ~keep
+#[cfg(feature = "pdf")]
+#[cfg_attr(alef, alef(skip))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub(crate) struct PdfPageCoordinateFrame {
+    /// 1-based page this frame describes.
+    pub page_number: u32,
+    /// MediaBox `llx`.
+    pub origin_x: f32,
+    /// MediaBox `lly`.
+    pub origin_y: f32,
+    /// MediaBox extent: `urx - llx`. Not swapped for 90/270 rotation.
+    pub width: f32,
+    /// MediaBox extent: `ury - lly`. Not swapped for 90/270 rotation.
+    pub height: f32,
+    /// Always `"point"`.
+    pub unit: &'static str,
+    /// Always `"bottom_left"`.
+    pub origin: &'static str,
+    /// The page `/Rotate`, normalized to one of `{0, 90, 180, 270}`.
+    pub clockwise_rotation: i32,
+}
+
+#[cfg(feature = "pdf")]
+impl PdfPageCoordinateFrame {
+    /// Returns `None` for a MediaBox that does not yield a usable extent.
+    ///
+    /// A MediaBox is not guaranteed well-ordered -- the margin filter at this record's own
+    /// call site defensively takes `min`/`max` over the same y pair -- so an inverted or
+    /// degenerate box produces a zero or negative extent. Publishing that as an authoritative
+    /// frame is worse than publishing nothing, so the page is omitted instead, matching the
+    /// fail-closed convention `OcrPageCoordinateFrame` uses for invalid raster dimensions. ~keep
+    pub fn new(page_number: u32, llx: f32, lly: f32, urx: f32, ury: f32, clockwise_rotation: i32) -> Option<Self> {
+        let width = urx - llx;
+        let height = ury - lly;
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            page_number,
+            origin_x: llx,
+            origin_y: lly,
+            width,
+            height,
+            unit: "point",
+            origin: "bottom_left",
+            clockwise_rotation,
+        })
+    }
+}
+
 #[cfg_attr(alef, alef(skip))]
 /// The internal flat document representation.
 ///

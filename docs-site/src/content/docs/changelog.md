@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `text::ner::gline::get_or_init_backend` performs model initialization on Tokio's blocking pool,
   returns the same `Arc` for the same model and thread budget, and leaves failed initializations
   retryable.
+- **(pdf): every hierarchy page now advertises the coordinate frame its boxes live in.** Hierarchy
+  bounding boxes are emitted in raw PDF user space, but nothing named that space, so a consumer
+  could not tell whether a box needed translating by a non-zero MediaBox origin or rotating for a
+  page's `/Rotate`. `metadata.additional.pdf_page_coordinate_frames` now carries one record per
+  page that has hierarchy blocks — `page_number`, `origin_x`/`origin_y` (the MediaBox `llx`/`lly`,
+  which may be non-zero and negative), `width`/`height`, `unit: "point"`,
+  `origin: "bottom_left"`, and `clockwise_rotation` — ordered by page number. `width`/`height` are
+  the MediaBox extent and are deliberately **not** swapped for a 90/270 rotation, because they
+  describe raw user space rather than the displayed frame; this is the opposite convention to
+  `ocr_page_coordinate_frames`, which reports an already-rotated raster, so the two must not be
+  assumed to agree for the same page. A page is omitted entirely, rather than reported with a
+  default, when its `/Rotate` is present but not a valid multiple of 90 or its MediaBox yields no
+  usable extent. (GH#1653, GH#1654)
 
 ### Fixed
 
@@ -75,6 +88,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `helm install --version <current>` could not resolve. The chart for 1.2.2 has been published
   retroactively, and a release now fails loudly if its chart is missing rather than shipping without
   one.
+- **(node): a JavaScript plugin registered through the Node binding now actually runs.** Every
+  generated Node trait bridge -- `OcrBackend`, `PostProcessor`, `Validator`, `Renderer`,
+  `TokenizerBackend` and the rest -- was structurally unable to call back into JavaScript. It
+  invoked the JS callable directly from whatever Tokio worker thread the pipeline happened to be
+  on, with no N-API handle scope; it never awaited a returned promise, so an `async` method's
+  result was the string `"[object Promise]"`; and it coerced whatever came back to a string before
+  parsing it as JSON, which fails for a plain object as well. The published `.d.ts` had always
+  declared the working contract (`processImage(imageBytes: Uint8Array): Promise<ExtractedDocument>`),
+  so no plugin could have been written against the shipped behaviour. Bridges now hold a
+  `ThreadsafeFunction` created on the JS thread, await the reply through `call_async_catch` (a JS
+  throw surfaces as a plugin error instead of aborting the process), and decode the value without
+  the string round-trip. A handle reference that would otherwise be released off its owning JS
+  thread is leaked rather than freed, since freeing it there corrupts the V8 heap. (GH#1636)
+
+### Changed
+
+- **(pdf): a page whose MediaBox is not rooted at the origin no longer reports the wrong page
+  size.** The native engine's per-page text result took its width and height from the MediaBox
+  upper-right corner instead of its extent, so a page with MediaBox `[10 -100 622 692]` reported
+  622x692 rather than the true 612x792. That figure feeds hierarchy reading-order computation, so
+  a non-zero MediaBox origin could mis-order content, not merely mis-scale it. Pages rooted at
+  `(0, 0)` — the overwhelming majority — are unaffected, since the two expressions agree there.
+  (GH#1653)
+
+- **Upgraded the `crawlberg` dependency to 1.7.0** (from 1.6.4). xberg re-exports crawlberg's
+  crawl types -- `CrawlConfig`, `MapResult`, `SitemapUrl` -- so the pin is part of this crate's
+  public surface. 1.7.0 makes no Rust API changes; its breaking changes are confined to
+  crawlberg's own Java and Swift bindings, which xberg does not consume.
 
 ## [1.2.2] - 2026-09-15
 

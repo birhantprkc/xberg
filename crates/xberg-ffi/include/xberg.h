@@ -1638,6 +1638,14 @@ typedef struct XBERGNodeContent XBERGNodeContent;
  */
 typedef uint64_t XBERGOcrBackend;
 /**
+ * A registered OCR backend's declared name and language capabilities.
+ *
+ * Returned by `list_ocr_backend_capabilities`. See that function's
+ * documentation for the determinism guarantees and the important caveat about
+ * what an empty `supported_languages` means.
+ */
+typedef struct XBERGOcrBackendCapabilities XBERGOcrBackendCapabilities;
+/**
  * OCR backend types.
  */
 typedef struct XBERGOcrBackendType XBERGOcrBackendType;
@@ -17435,6 +17443,46 @@ XBERGAlefHandle xberg_ngram_range_default(void);
 #endif
 
 /**
+ * Create a `OcrBackendCapabilities` from a JSON string. Returns null on
+ * failure. # Safety JSON string must be valid UTF-8 and null-terminated.
+ * Returned handle must be freed with `xberg_ocr_backend_capabilities_free`.
+ */
+XBERGAlefHandle xberg_ocr_backend_capabilities_from_json(const char *json);
+
+/**
+ * Serialize a `OcrBackendCapabilities` to a JSON string. Returns null on
+ * failure. # Safety `handle` must be a valid, non-zero handle returned by a
+ * `xberg` function. The returned string must be freed with `xberg_free_string`.
+ */
+char *xberg_ocr_backend_capabilities_to_json(XBERGAlefHandle handle);
+
+/**
+ * Free a `OcrBackendCapabilities` handle.
+ * # Safety
+ * Handle must have been returned by this library, or be zero.
+ */
+void xberg_ocr_backend_capabilities_free(XBERGAlefHandle handle);
+
+/**
+ * Get the `name` field from a `OcrBackendCapabilities`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `xberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *xberg_ocr_backend_capabilities_name(XBERGAlefHandle handle);
+
+/**
+ * Get the `supported_languages` field from a `OcrBackendCapabilities`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `xberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *
+xberg_ocr_backend_capabilities_supported_languages(XBERGAlefHandle handle);
+
+/**
  * Create a `OcrConfidence` from a JSON string. Returns null on failure.
  * # Safety
  * JSON string must be valid UTF-8 and null-terminated.
@@ -29593,6 +29641,52 @@ char *xberg_list_embedding_backends(void);
 uintptr_t xberg_list_embedding_backends_len(void);
 
 /**
+ * List every registered OCR backend's name alongside its declared supported
+ * languages.
+ *
+ * This is the capability-enumeration counterpart to `list_ocr_backends`: where
+ * that function exposes only backend names, this exposes each backend's
+ * `supported_languages()` too, so a consumer (for example, a job-acceptance
+ * gate) does not need to hardcode a second list of backend languages.
+ *
+ * # Determinism
+ *
+ * The returned vector is sorted by `name`, regardless of registration order or
+ * the order reported by the underlying registry. `supported_languages` within
+ * each entry is **not** sorted â see
+ * `OcrBackendCapabilities.supported_languages` for why.
+ *
+ * # Cost
+ *
+ * Calling this is not free for every backend. In particular,
+ * `TesseractBackend`'s `supported_languages()` allocates a Tesseract API and
+ * initializes it (`init("", "eng")`) the first time it is called, to enumerate
+ * installed tessdata languages; subsequent calls are served from a cache.
+ * \note Returns an error only if the registry lock cannot be acquired in the
+ * current environment.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ * \code
+ * use xberg::plugins::list_ocr_backend_capabilities;
+ *
+ * for capability in list_ocr_backend_capabilities()? {
+ *     println!("{}: {:?}", capability.name, capability.supported_languages);
+ * }
+ * \endcode
+ */
+char *xberg_list_ocr_backend_capabilities(void);
+
+/**
+ * Return the byte length of the C string most recently returned by
+ * `xberg_list_ocr_backend_capabilities` on this thread. Returns 0 when the
+ * primary call returned null or failed before producing a string. Enables safe
+ * slice construction in Zig and Java FFM Panama without a NUL-scan.
+ * \note SAFETY: Pointer arguments are ignored and are present only to keep the
+ * companion ABI aligned with `xberg_list_ocr_backend_capabilities`.
+ */
+uintptr_t xberg_list_ocr_backend_capabilities_len(void);
+
+/**
  * List all registered OCR backends.
  *
  * Returns the names of all OCR backends currently registered in the global
@@ -29836,6 +29930,32 @@ uintptr_t xberg_max_sim_rank_len(XBERGAlefHandle _query, const char *_docs);
  */
 double xberg_max_sim_score(XBERGAlefHandle query, XBERGAlefHandle doc);
 #endif
+
+/**
+ * Check whether a specific registered OCR backend supports a language.
+ *
+ * Delegates to the named backend's own `OcrBackend.supports_language`, which is
+ * the correct
+ * per-language decision â do not infer support (or its absence) from
+ * whether `list_ocr_backend_capabilities` reports an empty
+ * `supported_languages` list for that backend, since an empty list can mean
+ * "does not enumerate" rather than "supports nothing" (see
+ * `OcrBackendCapabilities.supported_languages`).
+ * \param backend Name of a registered OCR backend, as returned by
+ * `list_ocr_backends`. Lookup is case-insensitive and resolves the same
+ * `paddleocr` alias as backend dispatch.
+ * \param language Language code to check (e.g. `"eng"`, `"deu"`).
+ * \note Returns an error if no backend with that name (or alias) is registered.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ * \code
+ * use xberg::plugins::ocr_backend_supports_language;
+ *
+ * let supported = ocr_backend_supports_language("tesseract", "eng")?;
+ * \endcode
+ */
+int32_t xberg_ocr_backend_supports_language(const char *backend,
+                                            const char *language);
 
 #if defined(XBERG_FEATURE_MARKDOWN_FOOTNOTES)
 /**

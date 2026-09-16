@@ -24,6 +24,7 @@ pub(crate) type PdfExtractionPhaseResult = (
     Vec<crate::types::PdfFormField>,
     Vec<crate::types::ProcessingWarning>,
     Option<Vec<String>>,
+    Vec<crate::types::internal::PdfPageCoordinateFrame>,
 );
 
 #[cfg(feature = "pdf")]
@@ -567,6 +568,12 @@ pub(crate) fn extract_all_from_native_document(
         return Err(crate::error::XbergError::Cancelled);
     }
 
+    // GH#1653 + GH#1654: one raw-MediaBox coordinate frame per page, computed alongside the
+    // margin-filtering media-box read below while the native document is still in scope. Not
+    // yet filtered to pages that actually end up with hierarchy blocks -- `mod.rs` does that
+    // once `assign_hierarchy_to_pages` has run, since that happens after this function
+    // returns and the `NativeDocument` this loop reads from is dropped. ~keep
+    let mut pdf_page_coordinate_frames: Vec<crate::types::internal::PdfPageCoordinateFrame> = Vec::new();
     let pre_rendered_doc = if needs_structured && !config.force_ocr {
         let k = hierarchy_cluster_count(config);
 
@@ -606,7 +613,7 @@ pub(crate) fn extract_all_from_native_document(
         };
 
         for (page_index, segments) in all_page_segments.iter_mut().enumerate() {
-            let (_, lower_y, _, upper_y) =
+            let (llx, lower_y, urx, upper_y) =
                 doc.doc
                     .get_page_media_box(page_index)
                     .map_err(|error| crate::error::XbergError::Parsing {
@@ -617,6 +624,34 @@ pub(crate) fn extract_all_from_native_document(
                         source: None,
                     })?;
             retain_segments_inside_page_margins(segments, lower_y.min(upper_y), lower_y.max(upper_y), margins);
+
+            // Fail closed by omission (GH#1654): a page whose `/Rotate` is present but
+            // malformed gets no record at all rather than a silently-degraded
+            // `clockwise_rotation: 0`, which would be indistinguishable from an honestly
+            // absent `/Rotate`. ~keep
+            match doc.doc.get_page_rotation_status(page_index) {
+                Ok(xberg_native_pdf::PageRotation::Absent) => {
+                    pdf_page_coordinate_frames.extend(crate::types::internal::PdfPageCoordinateFrame::new(
+                        (page_index + 1) as u32,
+                        llx,
+                        lower_y,
+                        urx,
+                        upper_y,
+                        0,
+                    ));
+                }
+                Ok(xberg_native_pdf::PageRotation::Valid(rotation)) => {
+                    pdf_page_coordinate_frames.extend(crate::types::internal::PdfPageCoordinateFrame::new(
+                        (page_index + 1) as u32,
+                        llx,
+                        lower_y,
+                        urx,
+                        upper_y,
+                        rotation,
+                    ));
+                }
+                Ok(xberg_native_pdf::PageRotation::Malformed) | Err(_) => {}
+            }
         }
 
         let total_segs: usize = all_page_segments.iter().map(|s| s.len()).sum();
@@ -732,6 +767,7 @@ pub(crate) fn extract_all_from_native_document(
         form_fields,
         extraction_warnings,
         page_labels,
+        pdf_page_coordinate_frames,
     ))
 }
 

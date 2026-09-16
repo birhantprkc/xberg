@@ -136,6 +136,9 @@ public func listDocumentExtractors() throws -> RustVec<RustString> {
 public func listEmbeddingBackends() throws -> RustVec<RustString> {
     try { let val = __swift_bridge__$list_embedding_backends(); if val.is_ok { return RustVec(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func listOcrBackendCapabilities() throws -> RustVec<OcrBackendCapabilities> {
+    try { let val = __swift_bridge__$list_ocr_backend_capabilities(); if val.is_ok { return RustVec(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
 public func listOcrBackends() throws -> RustVec<RustString> {
     try { let val = __swift_bridge__$list_ocr_backends(); if val.is_ok { return RustVec(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
@@ -156,6 +159,9 @@ public func listTokenizerBackends() throws -> RustVec<RustString> {
 }
 public func listValidators() throws -> RustVec<RustString> {
     try { let val = __swift_bridge__$list_validators(); if val.is_ok { return RustVec(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
+public func ocrBackendSupportsLanguage<GenericIntoRustString: IntoRustString>(_ backend: GenericIntoRustString, _ language: GenericIntoRustString) throws -> Bool {
+    try { let val = __swift_bridge__$ocr_backend_supports_language({ let rustString = backend.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = language.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); switch val.tag { case __swift_bridge__$ResultBoolAndString$ResultOk: return val.payload.ok case __swift_bridge__$ResultBoolAndString$ResultErr: throw RustString(ptr: val.payload.err) default: fatalError() } }()
 }
 public func maxSimRank(_ query: MultiVectorEmbedding, _ docs: RustVec<MultiVectorEmbedding>) -> RustVec<LateInteractionMatch> {
     RustVec(ptr: __swift_bridge__$max_sim_rank({query.isOwned = false; return query.ptr;}(), { let val = docs; val.isOwned = false; return val.ptr }()))
@@ -930,6 +936,9 @@ public func nerConfigFromJson<GenericIntoRustString: IntoRustString>(_ json: Gen
 }
 public func ngramRangeFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> NgramRange {
     try { let val = __swift_bridge__$ngram_range_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return NgramRange(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
+public func ocrBackendCapabilitiesFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> OcrBackendCapabilities {
+    try { let val = __swift_bridge__$ocr_backend_capabilities_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return OcrBackendCapabilities(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
 public func ocrConfidenceFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> OcrConfidence {
     try { let val = __swift_bridge__$ocr_confidence_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return OcrConfidence(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
@@ -1896,6 +1905,9 @@ public func __alef_phantom_vec_metadata() -> RustVec<Metadata> {
 }
 public func __alef_phantom_vec_ner_config() -> RustVec<NerConfig> {
     RustVec(ptr: __swift_bridge__$__alef_phantom_vec_ner_config())
+}
+public func __alef_phantom_vec_ocr_backend_capabilities() -> RustVec<OcrBackendCapabilities> {
+    RustVec(ptr: __swift_bridge__$__alef_phantom_vec_ocr_backend_capabilities())
 }
 public func __alef_phantom_vec_ocr_confidence() -> RustVec<OcrConfidence> {
     RustVec(ptr: __swift_bridge__$__alef_phantom_vec_ocr_confidence())
@@ -17470,6 +17482,90 @@ extension NgramRange: Vectorizable {
 
     public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
         __swift_bridge__$Vec_NgramRange$len(vecPtr)
+    }
+}
+
+
+public class OcrBackendCapabilities: OcrBackendCapabilitiesRefMut {
+    public var isOwned: Bool = true
+
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+
+    deinit {
+        if isOwned {
+            __swift_bridge__$OcrBackendCapabilities$_free(ptr)
+        }
+    }
+}
+public class OcrBackendCapabilitiesRefMut: OcrBackendCapabilitiesRef {
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+}
+public class OcrBackendCapabilitiesRef {
+    public var ptr: UnsafeMutableRawPointer
+
+    public init(ptr: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+    }
+}
+extension OcrBackendCapabilitiesRef {
+    public func name() -> RustString {
+        RustString(ptr: __swift_bridge__$OcrBackendCapabilities$name(ptr))
+    }
+
+    public func supportedLanguages() -> RustVec<RustString> {
+        RustVec(ptr: __swift_bridge__$OcrBackendCapabilities$supported_languages(ptr))
+    }
+}
+extension OcrBackendCapabilities: Vectorizable {
+    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
+        __swift_bridge__$Vec_OcrBackendCapabilities$new()
+    }
+
+    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
+        __swift_bridge__$Vec_OcrBackendCapabilities$drop(vecPtr)
+    }
+
+    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: OcrBackendCapabilities) {
+        __swift_bridge__$Vec_OcrBackendCapabilities$push(vecPtr, {value.isOwned = false; return value.ptr;}())
+    }
+
+    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
+        let pointer = __swift_bridge__$Vec_OcrBackendCapabilities$pop(vecPtr)
+        if pointer == nil {
+            return nil
+        } else {
+            return (OcrBackendCapabilities(ptr: pointer!) as! Self)
+        }
+    }
+
+    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<OcrBackendCapabilitiesRef> {
+        let pointer = __swift_bridge__$Vec_OcrBackendCapabilities$get(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return OcrBackendCapabilitiesRef(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<OcrBackendCapabilitiesRefMut> {
+        let pointer = __swift_bridge__$Vec_OcrBackendCapabilities$get_mut(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return OcrBackendCapabilitiesRefMut(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<OcrBackendCapabilitiesRef> {
+        UnsafePointer<OcrBackendCapabilitiesRef>(OpaquePointer(__swift_bridge__$Vec_OcrBackendCapabilities$as_ptr(vecPtr)))
+    }
+
+    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
+        __swift_bridge__$Vec_OcrBackendCapabilities$len(vecPtr)
     }
 }
 
