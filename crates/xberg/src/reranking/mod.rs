@@ -934,12 +934,18 @@ mod permit_tests {
 
         drop(waiter);
 
-        assert!(
-            Arc::clone(&semaphore).try_acquire_owned().is_err(),
-            "a cancelled waiter must not return the permit while its blocking task is still running"
-        );
+        // Observe first, release the barrier second, assert last. Asserting before the
+        // `release.wait()` below parks the blocking-pool thread on the barrier forever when the
+        // assertion fails, so the test binary never exits and the whole job dies on a timeout --
+        // which CI reports as `cancelled`, not as this failure. ~keep
+        let permit_withheld = Arc::clone(&semaphore).try_acquire_owned().is_err();
 
         release.wait();
+
+        assert!(
+            permit_withheld,
+            "a cancelled waiter must not return the permit while its blocking task is still running"
+        );
         let regained = tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire()).await;
         assert!(
             regained.is_ok(),
