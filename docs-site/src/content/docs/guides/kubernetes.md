@@ -10,7 +10,7 @@ Deploy the Xberg REST API server (`xberg serve`) on Kubernetes with the official
 The chart is published as an OCI artifact to GitHub Container Registry:
 
 ```bash title="Terminal"
-helm install xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.0.14
+helm install xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.2.2
 ```
 
 This runs the full image (`ghcr.io/xberg-io/xberg`) in API-server mode on port 8000, exposed through a ClusterIP `Service` on port 80.
@@ -23,7 +23,7 @@ Every published chart is signed with [cosign](https://docs.sigstore.dev/) using 
 
 ```bash title="Terminal"
 cosign verify \
-  ghcr.io/xberg-io/charts/xberg:1.0.14 \
+  ghcr.io/xberg-io/charts/xberg:1.2.2 \
   --certificate-identity-regexp '^https://github.com/xberg-io/xberg/.github/workflows/publish-helm.yaml@.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -74,7 +74,7 @@ autoscaling:
 
 ```bash title="Terminal"
 helm install xberg oci://ghcr.io/xberg-io/charts/xberg \
-  --version 1.0.14 \
+  --version 1.2.2 \
   -f values.yaml
 ```
 
@@ -89,7 +89,7 @@ A `ReadWriteOnce` volume can only attach to one node, so the chart defaults to `
 ## Upgrade and uninstall
 
 ```bash title="Terminal"
-helm upgrade xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.0.14 -f values.yaml
+helm upgrade xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.2.2 -f values.yaml
 helm uninstall xberg
 ```
 
