@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **(ocr): a standalone-image table's multi-word cell no longer bleeds a trailing word into the
+  next column, a right-aligned amount column split by digit-width drift is folded back together,
+  and a legitimately sparse but independently-headed column (or a sparse first data row) no
+  longer gets the whole table rejected.** Reconstructing a table from OCR word boxes decided each
+  word's column independently by nearest x-position, so a wide cell's own trailing word (e.g. a
+  long description's last word) could resolve to a neighboring column's anchor instead of its own
+  cell's. Column membership for a data row is now decided once per merged cell cluster and applied
+  to every word the cluster contains; a drift-split right-aligned numeric column (mutually
+  exclusive per row, no independent header of its own) is folded into one column; and a section
+  caption sharing a table region with its real header row is dropped. Separately, `pdf`'s shared
+  table post-processor no longer treats an independently-headed but infrequently-populated column
+  (e.g. a bank statement's `DEPOSIT`, populated on a minority of transaction rows) as noise, and no
+  longer folds a sparse first data row (one missing an optional numeric field) into a bogus
+  multi-row header merge with the row after it. (GH#1649)
+
 ## [1.2.3] - 2026-09-16
 
 ### Added
