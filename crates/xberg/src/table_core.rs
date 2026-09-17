@@ -306,38 +306,85 @@ fn group_words_into_cell_tokens<'a>(
     let mut groups: Vec<(HocrWord, Vec<&HocrWord>)> = Vec::with_capacity(words.len());
     for mut row_words in rows {
         row_words.sort_by_key(|w| w.left);
+        groups.extend(merge_row_into_cell_tokens(&row_words, merge_gap));
+    }
 
-        let mut current: Option<(HocrWord, Vec<&HocrWord>)> = None;
-        for word in row_words {
-            current = Some(match current.take() {
-                None => (word.clone(), vec![word]),
-                Some((mut token, mut members)) => {
-                    let gap = word.left as f64 - (token.left + token.width) as f64;
-                    let allowed_gap = if is_pure_punctuation(&word.text) || is_pure_punctuation(&token.text) {
-                        merge_gap * PUNCTUATION_GLUE_GAP_MULTIPLIER
-                    } else {
-                        merge_gap
-                    };
-                    if gap <= allowed_gap {
-                        let new_right = (word.left + word.width).max(token.left + token.width);
-                        let new_bottom = (word.top + word.height).max(token.top + token.height);
-                        token.top = token.top.min(word.top);
-                        token.width = new_right.saturating_sub(token.left);
-                        token.height = new_bottom.saturating_sub(token.top);
-                        token.text.push(' ');
-                        token.text.push_str(&word.text);
-                        members.push(word);
-                        (token, members)
-                    } else {
-                        groups.push((token, members));
-                        (word.clone(), vec![word])
-                    }
+    groups
+}
+
+/// Decide the maximum horizontal gap allowed for merging `word` into the token immediately
+/// preceding it, and whether `word` itself is glued in as a punctuation *connector* (so a
+/// following word may in turn glue to it at the widened gap).
+///
+/// The widened [`PUNCTUATION_GLUE_GAP_MULTIPLIER`] gap applies only when punctuation genuinely
+/// bridges two real words, never to an isolated punctuation cell sitting between two column
+/// gaps (xberg-io/xberg#1649 review follow-up):
+/// - `word` is pure punctuation: bridging requires `next_word` (the word after it, same row) to
+///   itself be within the widened gap of `word` -- i.e. the punctuation has a real neighbour on
+///   both sides. A lone `-` with nothing close on the far side keeps the normal gap.
+/// - `word` is an ordinary word merging into a token that ends in punctuation: only widened when
+///   that trailing punctuation was itself glued in as a connector (`previous_was_connector`),
+///   never for an isolated leading punctuation cell. ~keep
+fn allowed_merge_gap(
+    word: &HocrWord,
+    next_word: Option<&HocrWord>,
+    base_gap: f64,
+    previous_was_connector: bool,
+) -> (f64, bool) {
+    if is_pure_punctuation(&word.text) {
+        let bridges_forward = next_word.is_some_and(|next| {
+            let gap_to_next = next.left as f64 - (word.left + word.width) as f64;
+            gap_to_next <= base_gap * PUNCTUATION_GLUE_GAP_MULTIPLIER
+        });
+        return if bridges_forward {
+            (base_gap * PUNCTUATION_GLUE_GAP_MULTIPLIER, true)
+        } else {
+            (base_gap, false)
+        };
+    }
+
+    if previous_was_connector {
+        (base_gap * PUNCTUATION_GLUE_GAP_MULTIPLIER, false)
+    } else {
+        (base_gap, false)
+    }
+}
+
+/// Merge one row's words (already sorted left-to-right) into cell-token clusters, applying
+/// [`allowed_merge_gap`]'s punctuation-connector rule.
+fn merge_row_into_cell_tokens<'a>(row_words: &[&'a HocrWord], merge_gap: f64) -> Vec<(HocrWord, Vec<&'a HocrWord>)> {
+    let mut groups: Vec<(HocrWord, Vec<&HocrWord>)> = Vec::new();
+    let mut current: Option<(HocrWord, Vec<&HocrWord>)> = None;
+    let mut previous_was_connector = false;
+
+    for (index, &word) in row_words.iter().enumerate() {
+        let next_word = row_words.get(index + 1).copied();
+        current = Some(match current.take() {
+            None => (word.clone(), vec![word]),
+            Some((mut token, mut members)) => {
+                let gap = word.left as f64 - (token.left + token.width) as f64;
+                let (allowed_gap, is_connector) = allowed_merge_gap(word, next_word, merge_gap, previous_was_connector);
+                if gap <= allowed_gap {
+                    let new_right = (word.left + word.width).max(token.left + token.width);
+                    let new_bottom = (word.top + word.height).max(token.top + token.height);
+                    token.top = token.top.min(word.top);
+                    token.width = new_right.saturating_sub(token.left);
+                    token.height = new_bottom.saturating_sub(token.top);
+                    token.text.push(' ');
+                    token.text.push_str(&word.text);
+                    members.push(word);
+                    previous_was_connector = is_connector;
+                    (token, members)
+                } else {
+                    groups.push((token, members));
+                    previous_was_connector = false;
+                    (word.clone(), vec![word])
                 }
-            });
-        }
-        if let Some(group) = current {
-            groups.push(group);
-        }
+            }
+        });
+    }
+    if let Some(group) = current {
+        groups.push(group);
     }
 
     groups
@@ -1974,6 +2021,34 @@ mod tests {
             table[0],
             vec!["Jan 1 - Jan 31, 2026".to_string()],
             "the dash must glue the date range into a single cell, not split it"
+        );
+    }
+
+    /// Regression for the punctuation-glue-gap connector rule (xberg-io/xberg#1649 review
+    /// follow-up): a lone punctuation cell (e.g. a "-" placeholder for a zero amount) sitting
+    /// near a real column boundary must not steal the preceding word into its cell just because
+    /// it is punctuation. The widened gap must apply only when the punctuation genuinely
+    /// bridges two neighboring words on both sides.
+    #[test]
+    fn issue_1649_lone_punctuation_cell_keeps_its_own_column() {
+        let words = vec![
+            word("Debit", 0, 0, 50, 20),
+            // Gap from "Debit" (right edge 50) to "-" (left 63) is 13px -- just over the normal
+            // merge_gap (0.6 * 20 = 12) but under the punctuation-widened gap (24). Gap from "-"
+            // (right edge 73) to "Credit" (left 130) is 57px -- nowhere near even the widened
+            // gap, so "-" has no genuine neighbour to bridge and must not glue to "Debit"
+            // either. ~keep
+            word("-", 63, 0, 10, 20),
+            word("Credit", 130, 0, 60, 20),
+        ];
+
+        let table = reconstruct_table(&words, 20, 0.5);
+
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table[0],
+            vec!["Debit".to_string(), "-".to_string(), "Credit".to_string()],
+            "an isolated punctuation cell with no genuine neighbour must not glue to the preceding word"
         );
     }
 }
