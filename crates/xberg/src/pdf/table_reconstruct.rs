@@ -1125,12 +1125,19 @@ fn find_data_start(table: &[Vec<String>], layout_guided: bool) -> usize {
     // Scoped to `!layout_guided`: a layout-guided (ML-confirmed) table already has the more
     // deliberate `looks_like_multiline_numeric_header`/repeated-row-shape logic below to decide
     // whether a digit-bearing second row is a units-annotation header continuation or real data,
-    // and this early return must not preempt that. ~keep
+    // and this early return must not preempt that.
+    //
+    // Also gated on row 1 looking like data (holding at least one digit): a genuine two-row text
+    // header (e.g. "Region | Sales Amount | Growth Rate" over "Area Code | Dollars | Percent")
+    // also has a fully populated, digit-free first row, and without this guard the shortcut
+    // stops one row too early, folding the second header row into the data (xberg-io/xberg#1649
+    // review follow-up). ~keep
     if !layout_guided
         && let Some(first_row) = table.first()
         && !first_row.is_empty()
         && first_row.iter().all(|cell| !cell.trim().is_empty())
         && digit_cell_count(first_row) == 0
+        && table.get(1).is_some_and(|row| digit_cell_count(row) > 0)
     {
         return 1;
     }
@@ -4578,6 +4585,27 @@ mod tests {
             find_data_start(&table, false),
             2,
             "a first row with an empty cell must not trigger the fully-populated-header shortcut"
+        );
+    }
+
+    /// Regression for the fully-populated-header shortcut over-firing on a genuine two-row text
+    /// header (`!layout_guided`, e.g. Tesseract/PaddleOCR): row 0 is fully populated and
+    /// digit-free, but row 1 is a non-numeric header continuation (units/labels), not data. The
+    /// shortcut must not stop at row 1 in that case -- it must fall through to the digit-density
+    /// scan and land on the first genuinely numeric row.
+    #[test]
+    fn issue_1649_two_row_text_header_is_not_truncated_by_the_header_shortcut() {
+        let table: Vec<Vec<String>> = vec![
+            vec!["Region".into(), "Sales Amount".into(), "Growth Rate".into()],
+            vec!["Area Code".into(), "Dollars".into(), "Percent".into()],
+            vec!["R1".into(), "120".into(), "5".into()],
+            vec!["R2".into(), "98".into(), "3".into()],
+        ];
+
+        assert_eq!(
+            find_data_start(&table, false),
+            2,
+            "a non-numeric second header row must not be mistaken for data"
         );
     }
 }
