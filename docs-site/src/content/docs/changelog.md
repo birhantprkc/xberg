@@ -9,6 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.4] - 2026-09-18
+
+### Added
+
+- **(llm): `LlmConfig` exposes liter-llm's provider response-byte cap.** liter-llm's
+  `ClientConfigBuilder::max_response_bytes` bounds every HTTP response body read from a
+  provider, but xberg's `LlmConfig` never forwarded it, so downstream products had no way to
+  bound provider responses. `LlmConfig::max_response_bytes` mirrors it: it bounds response
+  bodies on every non-streaming call and the error body read on a failed request (a
+  successful streaming response keeps its own existing frame bounds), and defaults to `None`
+  (unbounded), matching liter-llm. `Some(0)` is rejected by `LlmConfig::validate` rather than
+  reaching liter-llm's own builder. (xberg-io/xberg-enterprise#1568, xberg-io/xberg-enterprise#1861)
+
+### Fixed
+
+- **(pdf): a page-sized background rectangle no longer seeds a whole-page table.** Many
+  Office-to-PDF producers draw a white rectangle over the entire page before anything else.
+  That rectangle passed the table-primitive filter (its `< 1000 pt` bound does not exclude an
+  A4 or Letter page) and, because clustering unions any two primitives whose boxes intersect,
+  pulled every rule on the page -- the real table's borders, the footer rule, a figure's
+  frame, strokes inside a drawing -- into one cluster with the page as its box. The cluster
+  fallback then built a table over the whole page: the heading above the real table became
+  its first row, torn at the table's own column rule, and the first words of the prose below
+  it became its last row, with those words missing from or doubled in the paragraphs that
+  followed. A rectangle covering at least 90 % of the page's MediaBox in both dimensions is now
+  treated as page furniture and dropped before clustering, so the real table's rules cluster
+  on their own and the page comes out as it does without the background. A full-page-width
+  rule (one dimension at page scale) is deliberately still a primitive. (GH#1656)
+- **(pdf): a single-column page of hanging-number headings is no longer read as two columns.**
+  Some producers (Distiller among them) emit the tab between a heading's number and its title
+  as a space-only span in a different font, and leave space-only spans for blank lines. The
+  dense-two-column repair counted those spans as column population and let a blank line's two
+  whitespace spans and a footer split across both margins vote for a gutter, so five headings'
+  tabs plus two lines of nothing met the six-line quorum and the page was emitted
+  column-major: `6`, `6.1`, `6.1.1` as bare numbers and their titles as separate unnumbered
+  headings. Whitespace-only spans no longer count toward the per-side density gate, the
+  gutter vote, the whitespace corridors or the row-pairing guard, and a per-line gap wider
+  than a quarter of the page width is no longer accepted as gutter evidence (a blank line's or
+  a footer's gap; every real gutter measured here is under 10 %). (GH#1655)
+- **(ocr): a configured `security_limits` now reaches the Tesseract image decode.** GH#1554
+  routed `ExtractionConfig::security_limits` onto `OcrConfig` before each OCR call, but the
+  Tesseract backend's `config_to_tesseract` had no field to carry it into and built a fresh
+  default `ExtractionConfig` for the processor, so every Tesseract decode -- standalone
+  images, embedded images, scanned pages and the targeted page fallback alike -- ran under
+  the 100 MiB default no matter what the caller set. A 600 DPI A4 scan was refused with an
+  error naming `104857600 bytes` while both configuration objects said 5 GiB. The internal
+  `TesseractConfig` now carries the limits (outside the cache key: they gate whether a decode
+  runs, never what it produces), the processor prefers them over its synthetic config, and
+  the standalone-image and PDF embedded-image routes inject the caller's limits like the
+  other routes already did. A limit set directly on `OcrConfig` is honoured when
+  `ExtractionConfig` carries none; `ExtractionConfig` still wins when both are set. (GH#1651)
+- **(go): `Register*` no longer leaks its `cgo.Handle` when the C vtable allocation fails.**
+  Every `Register*` wrapper in the Go binding created the handle before allocating the C
+  vtable, and the allocation-failure branch returned without deleting it, keeping the bridge
+  and the caller's implementation reachable for the life of the process. The branch is only
+  reachable when a small `malloc` fails, so this is a resource leak on an error path rather
+  than an exploitable defect; it is fixed in the generator (alef 0.91.6) and regenerated
+  here. Reported by @OvOhao (GHSA-q5pq-8g86-v9j9).
+- **a table's multi-word cell no longer bleeds a trailing word into the next column, a
+  right-aligned amount column split by digit-width drift is folded back together, and a
+  legitimately sparse but independently-headed column (or a sparse first data row) no longer gets
+  the whole table rejected.** Reconstructing a table from word boxes decided each word's column
+  independently by nearest x-position, so a wide cell's own trailing word (e.g. a long
+  description's last word) could resolve to a neighboring column's anchor instead of its own
+  cell's. Column membership for a data row is now decided once per merged cell cluster and applied
+  to every word the cluster contains; a drift-split right-aligned numeric column (mutually
+  exclusive per row, no independent header of its own) is folded into one column; and a section
+  caption sharing a table region with its real header row is dropped. This cell-clustering and
+  column-assignment logic lives in the shared `table_core` module, so it also affects native-PDF
+  word-position table reconstruction, not just OCR. Separately, `pdf`'s shared table post-processor
+  no longer treats an independently-headed but infrequently-populated column (e.g. a bank
+  statement's `DEPOSIT`, populated on a minority of transaction rows) as noise, and no longer folds
+  a sparse first data row (one missing an optional numeric field) into a bogus multi-row header
+  merge with the row after it -- and that header-shortcut no longer stops one row early on a
+  genuine two-row text header, which also fully populates a digit-free first row. The punctuation
+  cell-merge gap this widens for a lone dash/colon glyph is now conditioned on the punctuation
+  genuinely bridging two neighboring words on both sides, so an isolated punctuation cell near a
+  real column boundary (a `-` placeholder, a `:`) no longer fuses two columns' content into one
+  cell. (GH#1649)
+
 ## [1.2.3] - 2026-09-16
 
 ### Added
