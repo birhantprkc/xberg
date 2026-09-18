@@ -1317,7 +1317,7 @@ ndarray = { version = "0.17", optional = true }
 nom-exif = { workspace = true, optional = true }
 num_cpus = { workspace = true }
 once_cell = { workspace = true }
-opentelemetry = { version = "0.32", features = ["trace"], optional = true }
+opentelemetry = { version = "0.32", features = ["trace"], optional = true } # capped by tracing-opentelemetry: 0.33 (latest) still depends on opentelemetry 0.32, so raising these three splits the lock into two `opentelemetry` versions and the layer/tracer types stop matching. `cargo upgrade --incompatible` raises them and leaves this comment behind; re-pin until tracing-opentelemetry moves to 0.33. Verified 2026-09-18. ~keep
 # Bridges the OTel `SdkMeterProvider` to a `prometheus::Registry` for the opt-in `/metrics`
 # endpoint (#1391). 0.32.0 matches the `opentelemetry`/`opentelemetry_sdk` 0.32 pin exactly.
 opentelemetry-prometheus = { version = "0.32", optional = true }

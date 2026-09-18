@@ -77,7 +77,7 @@ alloc-no-stdlib = "=3.0.0"
 alloc-stdlib = "=0.3.0"
 async-trait = "0.1"
 brotli-decompressor = "=6.0.0"
-crawlberg = { default-features = false, version = "1.7.0" }
+crawlberg = { default-features = false, version = "1.7.1" }
 html-to-markdown-rs = { default-features = false, version = "3.14" }
 rustler = "0.38"
 serde = { version = "1", features = ["derive"] }

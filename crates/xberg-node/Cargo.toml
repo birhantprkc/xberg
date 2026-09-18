@@ -74,7 +74,7 @@ xml = ["xberg/xml"]
 
 [dependencies]
 async-trait = "0.1"
-crawlberg = { default-features = false, version = "1.7.0" }
+crawlberg = { default-features = false, version = "1.7.1" }
 html-to-markdown-rs = { default-features = false, version = "3.14" }
 napi = { version = "3", features = ["async", "serde-json"] }
 napi-derive = "3"

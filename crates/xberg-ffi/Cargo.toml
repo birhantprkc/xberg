@@ -106,7 +106,7 @@ candle-ocr = ["xberg/candle-ocr"]
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"
-crawlberg = { default-features = false, version = "1.7.0" }
+crawlberg = { default-features = false, version = "1.7.1" }
 html-to-markdown-rs = { default-features = false, version = "3.14" }
 serde = "1"
 serde_json = "1"
