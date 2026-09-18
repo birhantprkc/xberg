@@ -12817,9 +12817,11 @@ class OcrConfig {
   ///
   /// Not user-configurable via config files — injected at runtime from
   /// `ExtractionConfig::security_limits` before each `process_image` call, the same
-  /// pattern [`Self::acceleration`] uses. `ExtractionConfig::security_limits` is the
-  /// single source of truth: this field only ever holds a copy the caller placed here
-  /// immediately before dispatch, so the two cannot drift. A backend consulting a
+  /// pattern [`Self::acceleration`] uses. `ExtractionConfig::security_limits` remains the
+  /// source of truth and overwrites this field whenever it carries a value; a value set
+  /// here directly is honoured only when `ExtractionConfig` carries none, so the two
+  /// cannot drift while a directly-set limit is no longer silently discarded (GH#1651).
+  /// A backend consulting a
   /// `backend_options` override for this call may still let that override win, but in
   /// the absence of one this field is what backends should fall back to instead of
   /// `SecurityLimits::default()`. `None` means "use `SecurityLimits::default()`", never

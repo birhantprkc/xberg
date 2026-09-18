@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the standalone-image and PDF embedded-image routes inject the caller's limits like the
   other routes already did. A limit set directly on `OcrConfig` is honoured when
   `ExtractionConfig` carries none; `ExtractionConfig` still wins when both are set. (GH#1651)
+- **(go): `Register*` no longer leaks its `cgo.Handle` when the C vtable allocation fails.**
+  Every `Register*` wrapper in the Go binding created the handle before allocating the C
+  vtable, and the allocation-failure branch returned without deleting it, keeping the bridge
+  and the caller's implementation reachable for the life of the process. The branch is only
+  reachable when a small `malloc` fails, so this is a resource leak on an error path rather
+  than an exploitable defect; it is fixed in the generator (alef 0.91.6) and regenerated
+  here. Reported by @OvOhao (GHSA-q5pq-8g86-v9j9).
 - **a table's multi-word cell no longer bleeds a trailing word into the next column, a
   right-aligned amount column split by digit-width drift is folded back together, and a
   legitimately sparse but independently-headed column (or a sparse first data row) no longer gets
