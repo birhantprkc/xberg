@@ -1494,7 +1494,7 @@ dependencies = [
  "liter-llm",
  "memchr",
  "notify",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "opentelemetry-semantic-conventions",
  "quick-xml 0.42.0",
  "regex",
@@ -2831,7 +2831,7 @@ dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
  "once_cell",
- "read-fonts 0.43.3",
+ "read-fonts",
  "smallvec",
 ]
 
@@ -3965,7 +3965,7 @@ dependencies = [
  "gloo-timers",
  "jsonwebtoken",
  "memchr",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "pin-project-lite",
  "rand 0.10.2",
  "regex",
@@ -4856,20 +4856,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry"
-version = "0.33.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cdb0b1b267eb9db3331b434ed9ddab10d50e280a9adf9d13e5233e2002b61b5"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "pin-project-lite",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
 name = "opentelemetry-semantic-conventions"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4877,14 +4863,14 @@ checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
 
 [[package]]
 name = "opentelemetry_sdk"
-version = "0.33.0"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb39533d9d1c912123efd7d41d7e0c29d16917b60ce15b4c8d87cb1af7f67520"
+checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
 dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
- "opentelemetry 0.33.0",
+ "opentelemetry",
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.5",
@@ -5815,17 +5801,6 @@ name = "read-fonts"
 version = "0.43.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "005c8acf251756c478b0bf402885bfd88a1476020c4c7e6060edc1aa68da38ea"
-dependencies = [
- "bytemuck",
- "font-types",
- "once_cell",
-]
-
-[[package]]
-name = "read-fonts"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5a0cf4bb6cbce4c29756270d189a5e400ac05e91192161d83a0bcb6e68492e8"
 dependencies = [
  "bytemuck",
  "font-types",
@@ -6813,12 +6788,12 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skrifa"
-version = "0.47.0"
+version = "0.46.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "526e654b303ff4ad73a5a40b25de2b3ce3d039c5e3b6da5f89ae6e57004cb40f"
+checksum = "d4febebda507fb889c545a37a135517769d1391941013561292897961d1887d6"
 dependencies = [
  "bytemuck",
- "read-fonts 0.44.0",
+ "read-fonts",
 ]
 
 [[package]]
@@ -7964,7 +7939,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
 dependencies = [
  "js-sys",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "smallvec",
  "tracing",
  "tracing-core",
@@ -9060,7 +9035,7 @@ dependencies = [
 
 [[package]]
 name = "xberg"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -9125,7 +9100,7 @@ dependencies = [
  "nom-exif",
  "num_cpus",
  "once_cell",
- "opentelemetry 0.33.0",
+ "opentelemetry",
  "opentelemetry_sdk",
  "org",
  "ort",
@@ -9196,7 +9171,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-candle-ocr"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "base64 0.23.1",
  "candle-core",
@@ -9216,7 +9191,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-gliner"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -9230,7 +9205,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libheif"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "cfg-if",
  "enumn",
@@ -9241,7 +9216,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libwpd"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "cc",
  "flate2",
@@ -9254,7 +9229,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-native-pdf"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "aes 0.9.3",
  "base64 0.23.1",
@@ -9299,7 +9274,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-paddle-ocr"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "geo-clipper",
  "geo-types",
@@ -9314,7 +9289,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-tesseract"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "cc",
  "cmake",
@@ -9329,7 +9304,7 @@ dependencies = [
 
 [[package]]
 name = "xberg_nif"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "alloc-no-stdlib 3.0.0",
  "alloc-stdlib 0.3.0",

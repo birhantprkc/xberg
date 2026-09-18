@@ -9,8 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.5] - 2026-09-18
+
+1.2.4 was tagged but never reached a package registry: its generated binding files still
+named 1.2.3, so its publish run was cancelled. 1.2.5 is the first published release carrying
+the 1.2.4 changes below in addition to its own.
+
 ### Fixed
 
+- **(python): a config field holding a nested data-carrying enum is no longer dropped by
+  `from_json` / `to_json`.** The Python DTOs marked every field whose type transitively held
+  a data enum as `#[serde(skip)]` -- `CaptioningConfig.llm` and `ChunkingConfig`'s nested
+  options among them -- so a JSON payload round-tripped through such a config silently lost
+  those fields. Regenerated on alef 0.92.1, whose Python emitter no longer treats a
+  serializable enum wrapper as opaque. (alef#394)
 - **(ppt): a legacy `.ppt`'s embedded OLE objects are extracted.** A Word document or Excel
   sheet inserted as an object -- the way PowerPoint 97-2003 decks routinely carry a table --
   lives in the deck's `ExOleObjStg` records, which the extractor walked over as opaque bytes,

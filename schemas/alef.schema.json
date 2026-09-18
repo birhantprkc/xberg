@@ -5264,6 +5264,14 @@
           },
           "type": "array"
         },
+        "send_sync_types": {
+          "default": [],
+          "description": "Extracted opaque types whose Python objects may cross runtime threads.\nEmits a frozen pyclass; the generated wrapper must satisfy PyO3's Send + Sync bounds.\nOther opaque types remain unsendable. This does not enable free-threaded Python. ~keep",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "serde_rename_all": {
           "default": null,
           "description": "Override the serde rename_all strategy for JSON field names (e.g. \"camelCase\", \"snake_case\").\nWhen set, this takes priority over the IR type-level serde_rename_all.",
@@ -8249,7 +8257,7 @@
       "type": "object"
     }
   },
-  "$id": "https://github.com/xberg-io/alef/releases/download/v0.91.3/alef.schema.json",
+  "$id": "https://github.com/xberg-io/alef/releases/download/v0.92.1/alef.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "JSON Schema for the JSON representation of alef.toml.",
@@ -8369,6 +8377,6 @@
   ],
   "title": "Alef configuration",
   "type": "object",
-  "version": "0.91.3",
-  "x-alef-version": "0.91.3"
+  "version": "0.92.1",
+  "x-alef-version": "0.92.1"
 }
