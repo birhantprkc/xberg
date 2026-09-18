@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **(pdf): a ruled table drawn one bar per cell no longer loses all but its last two rows.**
+  Word draws cell borders as per-cell filled bars with a corner square at every crossing, so
+  every vertical rule terminates at every horizontal rule. The section-divider split, which
+  reads a full-width rule that no vertical rule runs through as the boundary between two
+  stacked form sections, therefore treated every internal rule of such a table as a divider,
+  cut the table into one-row pieces and discarded the pieces below the cell minimum -- a
+  12-row table came back as `11 | 290`, `12 | 300`. A rule that every vertical rule stops at
+  carries no section information when the same is true of every other rule on the table, so
+  a table whose internal rules all qualify is now left whole; a form whose sections' rules
+  stop at a minority of the rules still splits. (GH#1656)
+
 ## [1.2.4] - 2026-09-18
 
 ### Added

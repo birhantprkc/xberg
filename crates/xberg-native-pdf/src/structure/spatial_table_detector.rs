@@ -3484,6 +3484,7 @@ fn split_table_at_section_dividers(
         .collect();
 
     let mut divider_ys: Vec<f32> = Vec::new();
+    let mut internal_rule_ys: Vec<f32> = Vec::new();
     for edge in h_edges {
         let overlap_start = edge.start.max(table_left);
         let overlap_end = edge.end.min(table_right);
@@ -3495,6 +3496,7 @@ fn split_table_at_section_dividers(
         if y <= top + margin || y >= bottom - margin {
             continue;
         }
+        internal_rule_ys.push(y);
         let cross_margin = SNAP_TOL + 1.0;
         let crossings = relevant_v_edges
             .iter()
@@ -3513,6 +3515,18 @@ fn split_table_at_section_dividers(
 
     divider_ys.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
     divider_ys.dedup_by(|a, b| (*a - *b).abs() <= SNAP_TOL);
+    internal_rule_ys.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
+    internal_rule_ys.dedup_by(|a, b| (*a - *b).abs() <= SNAP_TOL);
+
+    // A V rule stopping at an H rule is section evidence only when the other rules on the
+    // table behave differently. Word draws cell borders as one bar per cell with a corner
+    // square at each crossing, so every V rule terminates at every H rule and every internal
+    // rule qualifies above; splitting there turns a ruled table into one-row fragments that
+    // fall under `min_table_cells` and vanish (GH#1656). With a single internal rule there is
+    // nothing to compare against, so that case keeps the split. ~keep
+    if internal_rule_ys.len() >= 2 && divider_ys.len() == internal_rule_ys.len() {
+        return vec![table];
+    }
 
     let row_bounds: Vec<Option<(f32, f32)>> = table
         .rows
@@ -5109,6 +5123,85 @@ mod tests {
             clusters_without_frame.len(),
             3,
             "table, footer rule, and figure border must stay separate once the frame is filtered"
+        );
+    }
+
+    /// GH#1656 (the reporter's "observed alongside"): the carrier's drawing style, Word's way
+    /// of drawing cell borders -- every rule cut at the crossings into per-cell 0.48pt filled
+    /// bars with 0.48pt corner squares between them. The reporter's page-28 coordinates:
+    /// 13 H rules at an 11.40pt pitch from y 472.46, V rules at x 45.12 / 151.50 / 321.60. ~keep
+    fn gh1656_segmented_rule_table() -> (Vec<TextSpan>, Vec<crate::elements::PathContent>) {
+        const BAR: f32 = 0.48;
+        const PITCH: f32 = 11.40;
+        const Y0: f32 = 472.46;
+        const ROWS: usize = 12;
+        let col_xs = [45.12_f32, 151.50, 321.60];
+        let mut paths = Vec::new();
+        for r in 0..=ROWS {
+            let y = Y0 + r as f32 * PITCH;
+            for pair in col_xs.windows(2) {
+                paths.push(make_rect_path(pair[0] + BAR, y, pair[1] - pair[0] - BAR, BAR));
+            }
+            for &x in &col_xs {
+                paths.push(make_rect_path(x, y, BAR, BAR));
+            }
+            if r < ROWS {
+                for &x in &col_xs {
+                    paths.push(make_rect_path(x, y + BAR, BAR, PITCH - BAR));
+                }
+            }
+        }
+        let mut spans = Vec::new();
+        for r in 0..ROWS {
+            let y = Y0 + (ROWS - 1 - r) as f32 * PITCH + 2.0;
+            spans.push(create_test_span(&format!("{}", r + 1), 50.0, y, 10.0, 8.0));
+            spans.push(create_test_span(&format!("{}", 130 + r * 15), 160.0, y, 20.0, 8.0));
+        }
+        (spans, paths)
+    }
+
+    /// GH#1656: with per-cell segmented rules, `build_grid_from_lines` found all 24 cells and
+    /// 12 row bands, yet the table came back as its last two rows. `split_table_at_section_dividers`
+    /// treated every internal H rule as a section divider, because every V segment terminates
+    /// at every rule in this drawing style, split the table into one-row pieces and dropped
+    /// the pieces below `min_table_cells`. A rule that *every* V rule stops at carries no
+    /// section information when the same is true of every other rule on the table. ~keep
+    #[test]
+    fn gh1656_per_cell_segmented_rules_keep_every_row_of_the_table() {
+        let (spans, paths) = gh1656_segmented_rule_table();
+        let table_paths: Vec<_> = paths.into_iter().filter(|p| p.is_table_primitive()).collect();
+        let config = TableDetectionConfig {
+            horizontal_strategy: TableStrategy::Lines,
+            vertical_strategy: TableStrategy::Lines,
+            ..Default::default()
+        };
+
+        let (groups, _, _) = build_grid_from_lines(&table_paths, &config);
+        assert_eq!(groups.len(), 1, "fixture assumption: one cell group");
+        assert_eq!(groups[0].0.len(), 24, "fixture assumption: the grid itself is complete");
+        assert_eq!(groups[0].2.len(), 13, "fixture assumption: 12 row bands");
+
+        let tables = detect_tables_with_lines(&spans, &table_paths, &config);
+        assert_eq!(tables.len(), 1, "one table, not one-row fragments: {tables:?}");
+        let table = &tables[0];
+        assert_eq!(table.col_count, 2);
+        assert_eq!(
+            table.rows.len(),
+            12,
+            "every row band must survive, got {:?}",
+            table
+                .rows
+                .iter()
+                .map(|r| r.cells.iter().map(|c| c.text.as_str()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table.rows[0].cells.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["1", "130"]
+        );
+        assert_eq!(
+            table.rows[11].cells.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            ["12", "295"]
         );
     }
 
