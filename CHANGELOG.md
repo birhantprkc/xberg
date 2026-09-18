@@ -19,9 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful streaming response keeps its own existing frame bounds), and defaults to `None`
   (unbounded), matching liter-llm. `Some(0)` is rejected by `LlmConfig::validate` rather than
   reaching liter-llm's own builder. (xberg-io/xberg-enterprise#1568, xberg-io/xberg-enterprise#1861)
-  
+
 ### Fixed
 
+- **(pdf): a page-sized background rectangle no longer seeds a whole-page table.** Many
+  Office-to-PDF producers draw a white rectangle over the entire page before anything else.
+  That rectangle passed the table-primitive filter (its `< 1000 pt` bound does not exclude an
+  A4 or Letter page) and, because clustering unions any two primitives whose boxes intersect,
+  pulled every rule on the page -- the real table's borders, the footer rule, a figure's
+  frame, strokes inside a drawing -- into one cluster with the page as its box. The cluster
+  fallback then built a table over the whole page: the heading above the real table became
+  its first row, torn at the table's own column rule, and the first words of the prose below
+  it became its last row, with those words missing from or doubled in the paragraphs that
+  followed. A rectangle covering at least 90 % of the page's MediaBox in both dimensions is now
+  treated as page furniture and dropped before clustering, so the real table's rules cluster
+  on their own and the page comes out as it does without the background. A full-page-width
+  rule (one dimension at page scale) is deliberately still a primitive. (GH#1656)
 - **a table's multi-word cell no longer bleeds a trailing word into the next column, a
   right-aligned amount column split by digit-width drift is folded back together, and a
   legitimately sparse but independently-headed column (or a sparse first data row) no longer gets

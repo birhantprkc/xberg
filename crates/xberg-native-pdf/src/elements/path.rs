@@ -317,8 +317,21 @@ impl PathContent {
     /// and list bullets don't qualify; it must be under 2 pt across, twice
     /// the heaviest common ruling weight (typical PDF rules are 0.5–1 pt)
     /// while safely below any filled cell; and a box must stay under
-    /// 1000 pt per side, which exceeds a US-Letter page (612×792), so only
-    /// full-page frames and margin decorations are excluded.
+    /// 1000 pt per side so absurdly large shapes (chart backgrounds, full
+    /// artboards) don't seed a cluster on their own.
+    ///
+    /// GH#1656: `1000 pt` does **not** exclude an ordinary page — A4
+    /// (595×842) and US-Letter (612×792) both pass this bound, so a
+    /// full-page background rectangle (common Office-to-PDF output) is
+    /// accepted here as a table primitive and can cluster with every
+    /// other primitive on the page. This function has no access to the
+    /// page's MediaBox (`PathContent` carries no page dimensions), so it
+    /// cannot make that call itself. Page-relative filtering of such
+    /// furniture happens one level up, in `PdfDocument::extract_tables_with_config`
+    /// and `PdfDocument::extract_page_tables` (`document/tables.rs`), which use
+    /// [`PathContent::is_page_frame_rectangle`](Self::is_page_frame_rectangle)
+    /// against the real MediaBox before primitives reach the clusterer in
+    /// `spatial_table_detector.rs`. ~keep
     pub fn is_table_primitive(&self) -> bool {
         let rendered = self.rendered_bbox();
 
@@ -344,6 +357,54 @@ impl PathContent {
         }
 
         false
+    }
+
+    /// True when this path is a rectangle covering at least this fraction of
+    /// the MediaBox in *both* dimensions. 0.9 leaves generous margin for a
+    /// page background that stops just short of the trim box while still
+    /// rejecting anything smaller than page furniture — a genuine table
+    /// spanning most of a page's text column is still well under 90% of the
+    /// full MediaBox once margins are accounted for. GH#1656. ~keep
+    pub const PAGE_FRAME_COVERAGE_THRESHOLD: f32 = 0.9;
+
+    /// True when this path is a rectangle spanning at least
+    /// [`PAGE_FRAME_COVERAGE_THRESHOLD`](Self::PAGE_FRAME_COVERAGE_THRESHOLD)
+    /// of `media_box` in both width and height — page furniture (a
+    /// full-bleed background fill, a decorative frame) rather than a table
+    /// primitive. GH#1656: `is_table_primitive`'s `< 1000 pt` bound admits
+    /// ordinary page-sized rectangles (A4, Letter), which then seed a
+    /// whole-page false-positive cluster; this predicate is how callers with
+    /// access to the page's MediaBox (`PathContent` itself carries none) can
+    /// exclude that furniture before it reaches the clusterer.
+    ///
+    /// `media_box` is `(llx, lly, urx, ury)` as returned by
+    /// `PdfDocument::get_page_media_box`. Requiring *both* dimensions to
+    /// clear the threshold is deliberate: a full-page-width footer rule
+    /// (wide, but a fraction of a point tall) must not be classified as page
+    /// furniture and dropped — it is a legitimate table/ruling primitive.
+    /// A degenerate `media_box` (zero or negative area, non-finite) can't
+    /// establish "most of the page", so this returns `false` — callers
+    /// should treat a failed MediaBox lookup as "leave every primitive
+    /// alone", not as license to filter on garbage. ~keep
+    pub fn is_page_frame_rectangle(&self, media_box: (f32, f32, f32, f32)) -> bool {
+        if !self.is_rectangle() {
+            return false;
+        }
+
+        let (llx, lly, urx, ury) = media_box;
+        let page_width = (urx - llx).abs();
+        let page_height = (ury - lly).abs();
+        if !page_width.is_finite() || !page_height.is_finite() || page_width <= 0.0 || page_height <= 0.0 {
+            return false;
+        }
+
+        let w = self.bbox.width.abs();
+        let h = self.bbox.height.abs();
+        if !w.is_finite() || !h.is_finite() {
+            return false;
+        }
+
+        w >= page_width * Self::PAGE_FRAME_COVERAGE_THRESHOLD && h >= page_height * Self::PAGE_FRAME_COVERAGE_THRESHOLD
     }
 
     /// Create a line path from (x1, y1) to (x2, y2).
@@ -771,6 +832,58 @@ mod tests {
         assert_eq!(path.bbox.y, 30.0);
         assert_eq!(path.bbox.width, 100.0);
         assert_eq!(path.bbox.height, 50.0);
+    }
+
+    #[test]
+    fn is_page_frame_rectangle_excludes_a4_and_letter_page_backgrounds() {
+        // GH#1656: a full-page background rect must be recognized as page
+        // furniture against both an A4 and a US-Letter MediaBox. ~keep
+        let a4_media_box = (0.0, 0.0, 595.28, 842.0);
+        let a4_frame = PathContent::rect(0.0, 0.0, 595.28, 842.0);
+        assert!(a4_frame.is_page_frame_rectangle(a4_media_box));
+
+        let letter_media_box = (0.0, 0.0, 612.0, 792.0);
+        let letter_frame = PathContent::rect(0.0, 0.0, 612.0, 792.0);
+        assert!(letter_frame.is_page_frame_rectangle(letter_media_box));
+    }
+
+    #[test]
+    fn is_page_frame_rectangle_admits_a_genuine_table_cell_sized_box() {
+        // A table cell box is nowhere near 90% of the page in either
+        // dimension and must not be treated as furniture. ~keep
+        let media_box = (0.0, 0.0, 595.28, 842.0);
+        let cell = PathContent::rect(45.36, 472.70, 138.24, 34.02);
+        assert!(!cell.is_page_frame_rectangle(media_box));
+    }
+
+    #[test]
+    fn is_page_frame_rectangle_rejects_degenerate_media_box() {
+        // A missing/zero/non-finite MediaBox must not be treated as
+        // license to filter — leave the primitive alone instead. ~keep
+        let page_sized = PathContent::rect(0.0, 0.0, 595.28, 842.0);
+        assert!(!page_sized.is_page_frame_rectangle((0.0, 0.0, 0.0, 0.0)));
+        assert!(!page_sized.is_page_frame_rectangle((0.0, 0.0, f32::NAN, 842.0)));
+        assert!(!page_sized.is_page_frame_rectangle((0.0, 0.0, f32::INFINITY, 842.0)));
+    }
+
+    #[test]
+    fn is_page_frame_rectangle_ignores_non_rectangle_paths() {
+        // A full-page-width line is not a rectangle at all and must never
+        // be classified as page-frame furniture, regardless of extent. ~keep
+        let media_box = (0.0, 0.0, 595.28, 842.0);
+        let full_width_line = PathContent::line(0.0, 48.30, 595.28, 48.30);
+        assert!(!full_width_line.is_page_frame_rectangle(media_box));
+    }
+
+    #[test]
+    fn footer_rule_full_page_width_stays_a_table_primitive() {
+        // Proves the page-frame filter does not over-filter: a thin
+        // horizontal rule spanning the full page width is real ruling, not
+        // furniture, because only ONE dimension (width) reaches page scale
+        // — is_page_frame_rectangle requires both. GH#1656. ~keep
+        let footer_rule = PathContent::line(0.0, 48.30, 595.28, 48.30);
+        assert!(footer_rule.is_table_primitive());
+        assert!(!footer_rule.is_page_frame_rectangle((0.0, 0.0, 595.28, 842.0)));
     }
 
     /// Ground-truth cubic Bézier evaluation, used to validate flattening.

@@ -5051,6 +5051,67 @@ mod tests {
         );
     }
 
+    /// GH#1656: a page-sized background rectangle unions every primitive on
+    /// the page into one cluster (`is_table_primitive`'s `<1000pt` bound
+    /// admits an A4/Letter page). Document-level callers
+    /// (`document/tables.rs`) now drop such rectangles via
+    /// `PathContent::is_page_frame_rectangle` before calling
+    /// `group_lines_into_clusters`. This documents both the pre-fix
+    /// behavior (frame present → 1 cluster) and the fixed behavior (frame
+    /// filtered → the table, the footer rule, and the figure border stay
+    /// in 3 separate clusters). ~keep
+    #[test]
+    fn test_gh1656_page_frame_unions_clusters_until_caller_filters_it() {
+        let media_box = (0.0, 0.0, 595.28, 842.0);
+        let page_frame = make_rect_path(0.0, 0.0, 595.28, 842.0);
+
+        // A small ruled 2-column table, matching the reporter's control
+        // page 2 bbox (x[45.36,321.84] y[472.70,609.50]). ~keep
+        let table_lines = vec![
+            make_v_line(45.36, 472.70, 136.80),
+            make_v_line(321.84, 472.70, 136.80),
+            make_h_line(45.36, 609.50, 276.48),
+            make_h_line(45.36, 472.70, 276.48),
+        ];
+        // A full-page-width footer rule, far below the table (y gap far
+        // beyond the 3pt cluster expansion) — legitimate ruling, not
+        // furniture. ~keep
+        let footer_rule = make_h_line(0.0, 48.30, 595.28);
+        // A figure border, far from both the table and the footer rule in
+        // both axes. ~keep
+        let figure_border = make_rect_path(400.0, 700.0, 100.0, 80.0);
+
+        let mut all = vec![page_frame];
+        all.extend(table_lines.clone());
+        all.push(footer_rule.clone());
+        all.push(figure_border.clone());
+
+        let config = TableDetectionConfig::default();
+        let clusters_with_frame = group_lines_into_clusters(&all, &config);
+        assert_eq!(
+            clusters_with_frame.len(),
+            1,
+            "page-sized background rect must union every primitive (documents today's defect)"
+        );
+
+        let filtered: Vec<_> = all
+            .into_iter()
+            .filter(|p| !p.is_page_frame_rectangle(media_box))
+            .collect();
+        assert_eq!(
+            filtered.len(),
+            6,
+            "the filter must remove exactly the page frame and nothing else"
+        );
+
+        let clusters_without_frame = group_lines_into_clusters(&filtered, &config);
+        assert_eq!(
+            clusters_without_frame.len(),
+            3,
+            "table, footer rule, and figure border must stay separate once the frame is filtered"
+        );
+    }
+
     fn create_test_span(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextSpan {
         TextSpan {
             provenance: None,

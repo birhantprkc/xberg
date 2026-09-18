@@ -485,10 +485,20 @@ impl PdfDocument {
         // This ensures that strings with spaces are split into separate columns
         // for the spatial detector. ~keep
         let spans = self.extract_table_word_spans(page_index)?;
+        // GH#1656: a page-sized background rectangle passes is_table_primitive
+        // (its <1000pt bound doesn't exclude A4/Letter) and then unions every
+        // other primitive on the page into one cluster. Drop it here, where the
+        // real MediaBox is available; a failed MediaBox lookup leaves every
+        // primitive alone rather than filtering on garbage. ~keep
+        let media_box = self.get_page_media_box(page_index).ok();
         let lines: Vec<_> = self
             .extract_paths(page_index)?
             .into_iter()
             .filter(|p| p.is_table_primitive())
+            .filter(|p| match media_box {
+                Some(mb) => !p.is_page_frame_rectangle(mb),
+                None => true,
+            })
             .collect();
 
         // Same prose-rejection filter `extract_page_tables` applies to the
@@ -651,9 +661,18 @@ impl PdfDocument {
         // extract_edges ignores anyway — passing them through the full
         // detection pipeline wastes O(n²) time. ~keep
         const LINE_TOL: f32 = 2.0;
+        // GH#1656: same page-frame furniture filter as extract_tables_with_config
+        // above — required here too, since this entry point builds its own
+        // `table_paths` and feeds them straight into detect_tables_with_lines
+        // without going through that method. ~keep
+        let media_box = self.get_page_media_box(page_index).ok();
         let table_paths: Vec<_> = paths
             .into_iter()
             .filter(|p| p.is_horizontal_line(LINE_TOL) || p.is_vertical_line(LINE_TOL) || p.is_rectangle())
+            .filter(|p| match media_box {
+                Some(mb) => !p.is_page_frame_rectangle(mb),
+                None => true,
+            })
             .collect();
 
         // A page with thousands of line/rect paths is a drawing or chart, not a
