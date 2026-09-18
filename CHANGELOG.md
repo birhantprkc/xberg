@@ -46,6 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gutter vote, the whitespace corridors or the row-pairing guard, and a per-line gap wider
   than a quarter of the page width is no longer accepted as gutter evidence (a blank line's or
   a footer's gap; every real gutter measured here is under 10 %). (GH#1655)
+- **(ocr): a configured `security_limits` now reaches the Tesseract image decode.** GH#1554
+  routed `ExtractionConfig::security_limits` onto `OcrConfig` before each OCR call, but the
+  Tesseract backend's `config_to_tesseract` had no field to carry it into and built a fresh
+  default `ExtractionConfig` for the processor, so every Tesseract decode -- standalone
+  images, embedded images, scanned pages and the targeted page fallback alike -- ran under
+  the 100 MiB default no matter what the caller set. A 600 DPI A4 scan was refused with an
+  error naming `104857600 bytes` while both configuration objects said 5 GiB. The internal
+  `TesseractConfig` now carries the limits (outside the cache key: they gate whether a decode
+  runs, never what it produces), the processor prefers them over its synthetic config, and
+  the standalone-image and PDF embedded-image routes inject the caller's limits like the
+  other routes already did. A limit set directly on `OcrConfig` is honoured when
+  `ExtractionConfig` carries none; `ExtractionConfig` still wins when both are set. (GH#1651)
 - **a table's multi-word cell no longer bleeds a trailing word into the next column, a
   right-aligned amount column split by digit-width drift is folded back together, and a
   legitimately sparse but independently-headed column (or a sparse first data row) no longer gets

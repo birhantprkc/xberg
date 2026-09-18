@@ -104,6 +104,10 @@ impl TesseractBackend {
         if config.auto_rotate {
             internal.auto_rotate = true;
         }
+        // GH#1651: without this the caller's limits die here -- `TesseractConfig` is the only
+        // channel from `OcrConfig` down to the decode, because `OcrBackend::process_image`
+        // receives no `ExtractionConfig`. ~keep
+        internal.security_limits = config.security_limits.clone();
         internal.tessdata_path = config.tessdata_path.clone();
         internal.source_dpi = Self::source_dpi_from_backend_options(config);
         if let Some(use_cache) = Self::use_cache_from_backend_options(config) {

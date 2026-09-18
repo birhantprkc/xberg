@@ -1473,14 +1473,26 @@ fn extract_elements_via_iterator(
 
 /// Resolve the `SecurityLimits` to apply when decoding an image for OCR.
 ///
-/// `None` means no `ExtractionConfig` reached this call (internal/test call sites), not
-/// that limits should be waived — this falls back to the same default a configured caller
-/// gets when they never set `security_limits` explicitly (GH#1554: `load_image_for_ocr`
-/// previously hardcoded this default unconditionally, ignoring a caller's own configured,
-/// possibly higher, limit). ~keep
-fn security_limits_for_ocr(extraction_config: Option<&ExtractionConfig>) -> SecurityLimits {
-    extraction_config
-        .and_then(|config| config.security_limits.clone())
+/// `TesseractConfig::security_limits` wins because it is the only channel that survives
+/// the `OcrBackend` trait boundary: a backend receives `&OcrConfig` and no
+/// `ExtractionConfig`, so on every real backend route the `extraction_config` argument is
+/// a synthetic value built here to carry `output_format` and nothing else (GH#1651). The
+/// `extraction_config` fallback is retained for the direct/in-process call sites that do
+/// pass a real one.
+///
+/// `None` on both means no configured limit reached this call, not that limits should be
+/// waived — this falls back to the same default a configured caller gets when they never
+/// set `security_limits` explicitly (GH#1554: `load_image_for_ocr` previously hardcoded
+/// this default unconditionally, ignoring a caller's own configured, possibly higher,
+/// limit). ~keep
+fn security_limits_for_ocr(
+    tesseract_config: &TesseractConfig,
+    extraction_config: Option<&ExtractionConfig>,
+) -> SecurityLimits {
+    tesseract_config
+        .security_limits
+        .clone()
+        .or_else(|| extraction_config.and_then(|config| config.security_limits.clone()))
         .unwrap_or_default()
 }
 
@@ -1519,7 +1531,7 @@ pub(super) fn perform_ocr(
         )
     });
 
-    let security_limits = security_limits_for_ocr(extraction_config);
+    let security_limits = security_limits_for_ocr(config, extraction_config);
     let rgb_image = {
         let img = crate::extraction::image::load_image_for_ocr(image_bytes, &security_limits)
             .map_err(|e| OcrError::ImageProcessingFailed(e.to_string()))?;
@@ -2597,7 +2609,7 @@ mod tests {
             ..Default::default()
         };
 
-        let resolved = security_limits_for_ocr(Some(&config));
+        let resolved = security_limits_for_ocr(&TesseractConfig::default(), Some(&config));
 
         assert_eq!(resolved.max_content_size, 200 * 1024 * 1024);
     }
@@ -2606,9 +2618,53 @@ mod tests {
     /// `SecurityLimits::default()`, not to an unbounded/disabled check.
     #[test]
     fn should_fall_back_to_default_security_limits_when_extraction_config_absent() {
-        let resolved = security_limits_for_ocr(None);
+        let resolved = security_limits_for_ocr(&TesseractConfig::default(), None);
 
         assert_eq!(resolved.max_content_size, SecurityLimits::default().max_content_size);
+    }
+
+    /// GH#1651. The two tests above only ever exercised this helper directly, which is why
+    /// they stayed green while every real backend route decoded under the default: a
+    /// backend gets `&OcrConfig` and no `ExtractionConfig`, so the only value that can
+    /// reach here from a caller is the one `config_to_tesseract` copies onto
+    /// `TesseractConfig`. That value must therefore win. ~keep
+    #[test]
+    fn should_prefer_the_tesseract_config_limits_over_the_extraction_config_limits() {
+        let tesseract_config = TesseractConfig {
+            security_limits: Some(SecurityLimits {
+                max_content_size: 300 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let extraction_config = ExtractionConfig {
+            security_limits: Some(SecurityLimits {
+                max_content_size: 200 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = security_limits_for_ocr(&tesseract_config, Some(&extraction_config));
+
+        assert_eq!(resolved.max_content_size, 300 * 1024 * 1024);
+    }
+
+    /// A backend route supplies a synthetic `ExtractionConfig` carrying only `output_format`,
+    /// so the caller's limits arrive solely on `TesseractConfig` and must still be honoured. ~keep
+    #[test]
+    fn should_use_the_tesseract_config_limits_when_no_extraction_config_is_present() {
+        let tesseract_config = TesseractConfig {
+            security_limits: Some(SecurityLimits {
+                max_content_size: 300 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resolved = security_limits_for_ocr(&tesseract_config, None);
+
+        assert_eq!(resolved.max_content_size, 300 * 1024 * 1024);
     }
 
     #[test]

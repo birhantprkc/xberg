@@ -182,3 +182,85 @@ async fn should_ocr_a_large_image_when_the_caller_raises_the_limit_above_the_def
         Err(error) => panic!("a raised limit must admit a {WIDTH}x{HEIGHT} image, but: {error}"),
     }
 }
+
+fn pdf_fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ocr")
+        .join(name)
+}
+
+/// Collects the refusal text from EVERY channel a PDF-route OCR rejection can surface on:
+/// the outer `Err`, `ExtractionResult::errors`, and -- the reporter's own case -- a
+/// `ProcessingWarning` on the document when a targeted page fallback fails. ~keep
+async fn extract_pdf_failure_text(name: &str, config: &ExtractionConfig) -> String {
+    let bytes = std::fs::read(pdf_fixture(name)).expect("fixture must exist");
+    match xberg::extract(
+        ExtractInput::from_bytes(bytes, "application/pdf", Some(name.to_string())),
+        config,
+    )
+    .await
+    {
+        Err(error) => error.to_string(),
+        Ok(result) => {
+            let mut messages: Vec<String> = result.errors.iter().map(|item| item.message.clone()).collect();
+            messages.extend(
+                result
+                    .results
+                    .iter()
+                    .flat_map(|doc| doc.processing_warnings.iter())
+                    .map(|warning| warning.message.to_string()),
+            );
+            assert!(
+                !messages.is_empty(),
+                "PDF extraction succeeded with no error or warning on any channel: the configured \
+                 limit never reached the OCR decode. content={:?}",
+                result.results.first().map(|doc| doc.content.clone())
+            );
+            messages.join(" | ")
+        }
+    }
+}
+
+/// The reporter's real case: a mixed native/scanned PDF whose scanned pages go through the
+/// targeted OCR fallback. The limit is set on `OcrConfig` ONLY, deliberately: every page
+/// render gate on this route reads `ExtractionConfig::security_limits`, so leaving that
+/// `None` keeps the render under the default and makes the Tesseract decode the only gate
+/// that can cite `5000`. Before the fix `config_to_tesseract` dropped the value and the
+/// page OCR'd successfully. ~keep
+#[tokio::test]
+async fn should_reject_the_targeted_pdf_fallback_decode_when_ocr_config_security_limits_are_configured() {
+    let config = ExtractionConfig {
+        ocr: Some(OcrConfig {
+            security_limits: Some(limits()),
+            ..ocr_config()
+        }),
+        ..Default::default()
+    };
+
+    let text = extract_pdf_failure_text("mixed_native_scanned.pdf", &config).await;
+
+    assert!(
+        text.contains(&DISCRIMINATING_MAX_CONTENT_SIZE.to_string()),
+        "the refusal must cite the OcrConfig limit, not a default: {text}"
+    );
+}
+
+/// Same channel on the image-only route (`pipeline.rs`'s full-document scanned-page path),
+/// which prepares its `OcrConfig` at a different site from the mixed route above. ~keep
+#[tokio::test]
+async fn should_reject_the_scanned_pdf_decode_when_ocr_config_security_limits_are_configured() {
+    let config = ExtractionConfig {
+        ocr: Some(OcrConfig {
+            security_limits: Some(limits()),
+            ..ocr_config()
+        }),
+        ..Default::default()
+    };
+
+    let text = extract_pdf_failure_text("scanned_hello.pdf", &config).await;
+
+    assert!(
+        text.contains(&DISCRIMINATING_MAX_CONTENT_SIZE.to_string()),
+        "the refusal must cite the OcrConfig limit, not a default: {text}"
+    );
+}

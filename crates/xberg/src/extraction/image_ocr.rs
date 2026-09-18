@@ -84,7 +84,11 @@ pub(crate) async fn process_images_with_ocr(
         let mut ocr_config_clone = ocr_config.clone();
         ocr_config_clone.output_format = Some(output_format.clone());
         ocr_config_clone.acceleration = acceleration.clone();
-        ocr_config_clone.security_limits = security_limits.clone();
+        // Conditional for the same reason as the standalone-image route (GH#1651): do not
+        // replace a directly-set `OcrConfig::security_limits` with `None`. ~keep
+        if let Some(limits) = security_limits.clone() {
+            ocr_config_clone.security_limits = Some(limits);
+        }
         pending.push_back((idx, image_data, ocr_config_clone));
     }
 

@@ -178,6 +178,22 @@ pub struct TesseractConfig {
     /// (or don't need) the true page number leave it at the default, `1`.
     #[serde(default = "default_page_number")]
     pub page_number: u32,
+
+    /// Security limits for the image decode this OCR call performs.
+    ///
+    /// Carried from `OcrConfig::security_limits`, which the caller's `ExtractionConfig`
+    /// populates before dispatch. Before GH#1651 this type had no such field, so
+    /// `config_to_tesseract` had nothing to copy into and every Tesseract decode ran under
+    /// `SecurityLimits::default()` on every route -- a caller who raised the limit to admit
+    /// a large scan was still refused at 100 MiB.
+    ///
+    /// `#[serde(skip)]` because it is injected at runtime, never read from a config file,
+    /// and deliberately absent from `hash_config` (`ocr::processor::config`): limits gate
+    /// whether a decode is attempted and never change the text Tesseract produces, so
+    /// folding them into the cache key would split cache entries that are identical in
+    /// content. `None` means `SecurityLimits::default()`, never "disable the check". ~keep
+    #[serde(skip)]
+    pub security_limits: Option<crate::extractors::security::SecurityLimits>,
 }
 
 /// Default for [`TesseractConfig::page_number`]: page 1, matching Tesseract's own
@@ -241,6 +257,7 @@ impl Default for TesseractConfig {
             tessdata_path: None,
             source_dpi: None,
             page_number: default_page_number(),
+            security_limits: None,
         }
     }
 }
@@ -307,6 +324,7 @@ impl From<&crate::types::TesseractConfig> for TesseractConfig {
             // to the default; direct callers of the internal `TesseractConfig`/`perform_ocr`
             // API can still set it explicitly.
             page_number: default_page_number(),
+            security_limits: None,
         }
     }
 }

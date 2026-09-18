@@ -1629,6 +1629,14 @@ impl ImageExtractor {
         apply_default_whole_image_tesseract_psm(&mut ocr_config_with_format);
         ocr_config_with_format.output_format = Some(config.output_format.clone());
         ocr_config_with_format.acceleration = config.acceleration.clone();
+        // GH#1651: the sibling injection the embedded-image route already does
+        // (`extraction::image_ocr`). Without it a standalone image's OCR decode never sees
+        // the caller's `ExtractionConfig::security_limits`. Assigned conditionally so an
+        // `OcrConfig::security_limits` the caller set directly is not silently replaced by
+        // `None`; `ExtractionConfig` still wins whenever it carries a value. ~keep
+        if let Some(security_limits) = config.security_limits.clone() {
+            ocr_config_with_format.security_limits = Some(security_limits);
+        }
         #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
         let include_words = should_use_layout_ocr(config);
         #[cfg(not(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm"))))]

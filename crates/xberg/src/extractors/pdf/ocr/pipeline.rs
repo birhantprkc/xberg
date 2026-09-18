@@ -1395,8 +1395,11 @@ pub(super) async fn extract_with_ocr_for_page(
     ocr_config_owned.acceleration = config.acceleration.clone();
     // GH#1554: mirrors `acceleration` above so the full-document scanned-page OCR route
     // inherits the caller's configured decode limits instead of always falling back to
-    // `SecurityLimits::default()`. ~keep
-    ocr_config_owned.security_limits = config.security_limits.clone();
+    // `SecurityLimits::default()`. Conditional (GH#1651) so a limit set directly on
+    // `OcrConfig` is not replaced by `None` when `ExtractionConfig` carries none. ~keep
+    if let Some(limits) = config.security_limits.clone() {
+        ocr_config_owned.security_limits = Some(limits);
+    }
     let total_pages = if let Some(imgs) = images {
         imgs.len()
     } else {

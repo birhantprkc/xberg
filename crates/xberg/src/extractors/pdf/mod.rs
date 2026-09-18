@@ -1808,6 +1808,12 @@ impl PdfExtractor {
             };
             let mut ocr_config_with_format = ocr_config.clone();
             ocr_config_with_format.output_format = Some(config.output_format.clone());
+            // GH#1651: this embedded-image route never carried the caller's decode limits,
+            // so every decode ran under `SecurityLimits::default()`. Conditional so a limit
+            // set directly on `OcrConfig` is not replaced by `None`. ~keep
+            if let Some(limits) = config.security_limits.clone() {
+                ocr_config_with_format.security_limits = Some(limits);
+            }
             for img in imgs.iter_mut() {
                 if config.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()) {
                     break;
