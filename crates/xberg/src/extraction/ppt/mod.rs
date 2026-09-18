@@ -5,6 +5,9 @@
 //!
 //! Supports PowerPoint 97, 2000, XP, and 2003 (.ppt) files.
 
+mod embedded;
+pub(crate) use embedded::extract_ppt_embedded_objects;
+
 use crate::error::{Result, XbergError};
 use crate::types::{ExtractedImage, ProcessingWarning};
 use bytes::Bytes;
@@ -12,7 +15,7 @@ use std::borrow::Cow;
 use std::io::Cursor;
 
 /// Warning source tag for `.ppt` extraction diagnostics (#171 convention).
-const PPT_WARNING_SOURCE: &str = "ppt";
+pub(super) const PPT_WARNING_SOURCE: &str = "ppt";
 
 /// Result of PPT text extraction.
 #[cfg_attr(alef, alef(skip))]
@@ -296,15 +299,15 @@ pub(crate) fn extract_ppt_text_with_options(
 }
 
 /// Read a little-endian `u32` at `offset`, or `None` if it does not fit in `data`.
-fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+pub(super) fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
     let bytes = data.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// The deck's live slides, resolved through the persist chain (#1614, #1639).
-struct LiveSlides {
+pub(super) struct LiveSlides {
     /// Live `Slide` container offsets, presentation order (#1614).
-    offsets: Vec<usize>,
+    pub(super) offsets: Vec<usize>,
     /// Absolute stream offset of the live `SlideListWithText` record header itself -- the
     /// only occurrence [`extract_texts_from_records`] may harvest outline text (titles
     /// included) from. An older save's list, or the master/notes lists sharing the same
@@ -313,6 +316,13 @@ struct LiveSlides {
     /// `SlidePersistAtom.slideId` for each live slide, aligned by index with `offsets` --
     /// what `NotesAtom.slideIdRef` names a notes page's slide by (#1640).
     slide_ids: Vec<u32>,
+    /// The merged persist directory (persist id -> stream offset, newest save wins), kept
+    /// so other persist-referenced records -- an embedded object's `ExOleObjStg`, named by
+    /// `ExOleObjAtom.persistIdRef` (GH#1660) -- resolve through the same chain. ~keep
+    pub(super) persist: ahash::AHashMap<u32, usize>,
+    /// Payload range `[start, end)` of the live `DocumentContainer` in the stream, so a
+    /// document-level list (`ExObjList`) is read from the current save, not an older one. ~keep
+    pub(super) document_payload: (usize, usize),
 }
 
 /// Resolve the live slide containers, in presentation order, as byte offsets into the
@@ -347,7 +357,7 @@ struct LiveSlides {
 /// slide list naming an id no directory resolves. The caller then keeps stream order, which
 /// is what this extractor did unconditionally before. A partial answer would be worse than
 /// the old behaviour: it would drop real slides. See GH#1614. ~keep
-fn live_slide_offsets(ppt_stream: &[u8], current_user_stream: &[u8]) -> Option<LiveSlides> {
+pub(super) fn live_slide_offsets(ppt_stream: &[u8], current_user_stream: &[u8]) -> Option<LiveSlides> {
     let first_edit = read_u32_le(current_user_stream, CURRENT_USER_OFFSET_TO_CURRENT_EDIT)? as usize;
 
     // persist id -> stream offset, newest save wins.
@@ -419,6 +429,8 @@ fn live_slide_offsets(ppt_stream: &[u8], current_user_stream: &[u8]) -> Option<L
         offsets,
         outline_record_offset,
         slide_ids,
+        persist,
+        document_payload: (document_content_start, document_content_end),
     })
 }
 
@@ -937,11 +949,11 @@ fn extract_texts_from_records(
 
 /// One record header from the PowerPoint/OfficeArt record tree, flattened out of its
 /// containers so callers can filter by type without re-walking.
-struct ArtRecord {
-    rec_instance: u16,
-    rec_type: u16,
-    content_start: usize,
-    content_end: usize,
+pub(super) struct ArtRecord {
+    pub(super) rec_instance: u16,
+    pub(super) rec_type: u16,
+    pub(super) content_start: usize,
+    pub(super) content_end: usize,
 }
 
 /// Collect every record header in `data[start..end]`, descending into containers.
@@ -950,7 +962,7 @@ struct ArtRecord {
 /// children are the records inside its own declared byte range. A `recLen` that would run
 /// past `end` stops the walk at that level rather than over-reading -- the stream is
 /// untrusted, and a truncated tail is the common shape of a salvageable corrupt deck.
-fn collect_art_records(data: &[u8], start: usize, end: usize, depth: usize, out: &mut Vec<ArtRecord>) {
+pub(super) fn collect_art_records(data: &[u8], start: usize, end: usize, depth: usize, out: &mut Vec<ArtRecord>) {
     if depth > MAX_OFFICE_ART_DEPTH {
         return;
     }
@@ -1263,7 +1275,7 @@ fn cp1252_to_char(b: u8) -> char {
 }
 
 /// Read a named stream from the CFB compound file.
-fn read_stream(comp: &mut cfb::CompoundFile<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>> {
+pub(super) fn read_stream(comp: &mut cfb::CompoundFile<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut stream = comp
         .open_stream(name)

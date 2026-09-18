@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **(ppt): a legacy `.ppt`'s embedded OLE objects are extracted.** A Word document or Excel
+  sheet inserted as an object -- the way PowerPoint 97-2003 decks routinely carry a table --
+  lives in the deck's `ExOleObjStg` records, which the extractor walked over as opaque bytes,
+  so the slide came out as its title and nothing else. The `.pptx` path already recursed into
+  `ppt/embeddings/`; the legacy path now does the same: each embedded object's storage is
+  resolved through the persist chain (so a superseded save's copy is never read),
+  decompressed when the record says so, identified by its root stream (`WordDocument`,
+  `Workbook`/`Book`, `PowerPoint Document`, or an OPC `Package`) and extracted into
+  `children` as `slide<N>/oleObject<id>.bin` with the slide whose shape displays it. The
+  decompressed size is bounded by `max_embedded_file_bytes` (falling back to
+  `max_archive_size`), the object count by `max_files_in_archive`, and `max_archive_depth = 0`
+  disables the recursion, as for `.pptx`. Metafile presentation pictures (EMF/WMF) are still
+  not emitted as images. (GH#1660)
 - **(pdf): a ruled table drawn one bar per cell no longer loses all but its last two rows.**
   Word draws cell borders as per-cell filled bars with a corner square at every crossing, so
   every vertical rule terminates at every horizontal rule. The section-divider split, which

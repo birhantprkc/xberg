@@ -85,6 +85,7 @@ excel = ["dep:calamine", "dep:roxmltree", "dep:zip", "dep:quick-xml", "tokio-run
 excel-wasm = ["dep:calamine", "dep:roxmltree", "dep:zip"]
 office = [
     "dep:cfb",
+    "dep:flate2",
     "dep:roxmltree",
     "dep:zip",
     "dep:quick-xml",
