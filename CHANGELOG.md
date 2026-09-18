@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as page furniture and dropped before clustering, so the real table's rules cluster
   on their own and the page comes out as it does without the background. A full-page-width
   rule (one dimension at page scale) is deliberately still a primitive. (GH#1656)
+- **(pdf): a single-column page of hanging-number headings is no longer read as two columns.**
+  Some producers (Distiller among them) emit the tab between a heading's number and its title
+  as a space-only span in a different font, and leave space-only spans for blank lines. The
+  dense-two-column repair counted those spans as column population and let a blank line's two
+  whitespace spans and a footer split across both margins vote for a gutter, so five headings'
+  tabs plus two lines of nothing met the six-line quorum and the page was emitted
+  column-major: `6`, `6.1`, `6.1.1` as bare numbers and their titles as separate unnumbered
+  headings. Whitespace-only spans no longer count toward the per-side density gate, the
+  gutter vote, the whitespace corridors or the row-pairing guard, and a per-line gap wider
+  than a quarter of the page width is no longer accepted as gutter evidence (a blank line's or
+  a footer's gap; every real gutter measured here is under 10 %). (GH#1655)
 - **a table's multi-word cell no longer bleeds a trailing word into the next column, a
   right-aligned amount column split by digit-width drift is folded back together, and a
   legitimately sparse but independently-headed column (or a sparse first data row) no longer gets
