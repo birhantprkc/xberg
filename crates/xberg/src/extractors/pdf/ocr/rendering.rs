@@ -563,6 +563,54 @@ pub(super) fn valid_page_indices(page_indices: &[usize], page_count: usize) -> V
         })
         .collect()
 }
+/// Render one page: the per-page body `render_selected_pages_from_document` runs, either in
+/// parallel across the thread pool or sequentially on `wasm32` (which has no OS threads for
+/// rayon's work-stealing pool to use).
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+fn render_one_selected_page(
+    doc: &xberg_native_pdf::PdfDocument,
+    page_rotations: &[u32],
+    idx: usize,
+    security_limits: &crate::extractors::security::SecurityLimits,
+    images_config: Option<&crate::core::config::ImageExtractionConfig>,
+) -> crate::Result<(usize, image::DynamicImage)> {
+    let (page_width_pt, page_height_pt) = crate::pdf::render::get_page_dimensions_pt(doc, idx);
+    let render_dpi =
+        crate::image::dpi::effective_pdf_render_dpi(images_config, f64::from(page_width_pt), f64::from(page_height_pt));
+    let rendered =
+        crate::pdf::render::render_page_with_safeguards(doc, idx, render_dpi.max(1) as u32).map_err(|e| {
+            crate::XbergError::Parsing {
+                message: format!("Failed to render PDF page {}: {}", idx + 1, e),
+                source: None,
+            }
+        })?;
+    let rotation = page_rotations.get(idx).copied().unwrap_or(0);
+    let (data, _, _) = crate::pdf::render::normalize_rendered_page_for_ocr_with_security_limits(
+        rendered.data,
+        rendered.width,
+        rendered.height,
+        rotation,
+        security_limits,
+    )?;
+    let img = crate::extraction::image_decode::decode_standard_image_with_security_limits(&data, security_limits)
+        .map_err(|e| crate::XbergError::Parsing {
+            message: format!("Failed to decode rendered page {}: {}", idx + 1, e),
+            source: None,
+        })?;
+    Ok((idx, img))
+}
+
+/// Render every page in `page_indices`, in parallel across the configured thread budget.
+///
+/// PDF page rasterization (the pixels-from-vectors work inside `render_page_with_safeguards`)
+/// is CPU-bound and, per page, independent of every other page: `xberg_native_pdf::PdfDocument`
+/// is documented `Send + Sync` for exactly this reason (its own doc comment: "warm cache hits
+/// stay fully parallel"). Rendering used to run in a plain sequential loop regardless of the
+/// thread budget, while the sibling PNG-encode step a few lines away in `pipeline.rs` already
+/// used `.par_iter()` -- so widening `concurrency.max_threads` only ever widened the OCR
+/// recognition and encode stages, leaving rasterization as a floor no thread count could lower
+/// (issue #1666). `.par_iter().map(...).collect()` preserves `page_indices`' order, matching
+/// the previous sequential loop's output order exactly.
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 pub(super) fn render_selected_pages_from_document(
     doc: &xberg_native_pdf::PdfDocument,
@@ -571,38 +619,24 @@ pub(super) fn render_selected_pages_from_document(
     security_limits: &crate::extractors::security::SecurityLimits,
     images_config: Option<&crate::core::config::ImageExtractionConfig>,
 ) -> crate::Result<Vec<(usize, image::DynamicImage)>> {
-    let mut images = Vec::with_capacity(page_indices.len());
-    for &idx in page_indices {
-        let (page_width_pt, page_height_pt) = crate::pdf::render::get_page_dimensions_pt(doc, idx);
-        let render_dpi = crate::image::dpi::effective_pdf_render_dpi(
-            images_config,
-            f64::from(page_width_pt),
-            f64::from(page_height_pt),
-        );
-        let rendered =
-            crate::pdf::render::render_page_with_safeguards(doc, idx, render_dpi.max(1) as u32).map_err(|e| {
-                crate::XbergError::Parsing {
-                    message: format!("Failed to render PDF page {}: {}", idx + 1, e),
-                    source: None,
-                }
-            })?;
-        let rotation = page_rotations.get(idx).copied().unwrap_or(0);
-        let (data, _, _) = crate::pdf::render::normalize_rendered_page_for_ocr_with_security_limits(
-            rendered.data,
-            rendered.width,
-            rendered.height,
-            rotation,
-            security_limits,
-        )?;
-        let img = crate::extraction::image_decode::decode_standard_image_with_security_limits(&data, security_limits)
-            .map_err(|e| crate::XbergError::Parsing {
-            message: format!("Failed to decode rendered page {}: {}", idx + 1, e),
-            source: None,
-        })?;
-        images.push((idx, img));
+    // rayon's work-stealing pool needs OS threads; wasm32 has none, so this falls back to a
+    // sequential iterator there, matching the same gate used for the PNG-encode parallel path
+    // in `pipeline.rs`. ~keep
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    {
+        use rayon::prelude::*;
+        page_indices
+            .par_iter()
+            .map(|&idx| render_one_selected_page(doc, page_rotations, idx, security_limits, images_config))
+            .collect()
     }
-
-    Ok(images)
+    #[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
+    {
+        page_indices
+            .iter()
+            .map(|&idx| render_one_selected_page(doc, page_rotations, idx, security_limits, images_config))
+            .collect()
+    }
 }
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 pub(super) fn share_rendered_page_images(
