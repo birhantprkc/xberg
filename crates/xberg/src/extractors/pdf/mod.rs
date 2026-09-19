@@ -6266,8 +6266,7 @@ mod tests {
         // > 64 non-whitespace chars (`OcrQualityThresholds::min_total_non_whitespace`'s
         // default): a shorter fixture never reaches the fabricated-ratio check at all,
         // which would make the mutation-testing control below pass for the wrong reason. ~keep
-        const NATIVE_TEXT: &str =
-            "genuinely mapped native text read from the ToUnicode character map identity range covering printable ascii glyphs correctly";
+        const NATIVE_TEXT: &str = "genuinely mapped native text read from the ToUnicode character map identity range covering printable ascii glyphs correctly";
 
         let config = ExtractionConfig {
             ocr: Some(OcrConfig {
