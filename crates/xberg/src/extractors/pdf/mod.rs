@@ -720,6 +720,34 @@ fn replace_tables_with_ocr_output(tables: &mut Vec<crate::types::Table>, mut ocr
     *tables = ocr_tables;
 }
 
+/// Merge OCR tables into the mixed path's table list, replacing only the tables of pages OCR
+/// itself produced a table for.
+///
+/// Unlike [`replace_tables_with_ocr_output`], which is right for full-document OCR (every page
+/// went through OCR, so there is no native page left to preserve), the mixed path sends only
+/// SOME pages to OCR. Before this, the mixed path called `replace_tables_with_ocr_output` too,
+/// which replaced the WHOLE document's table list with only the OCR pages' tables: on a long
+/// document where a handful of scanned pages produced even one OCR table, every native table on
+/// every page OCR never touched was silently dropped (GH#1670). A page whose OCR pass found no
+/// table keeps its native tables untouched, the same as `replace_tables_with_ocr_output` does
+/// when it finds none anywhere.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn merge_mixed_ocr_tables(
+    tables: &mut Vec<crate::types::Table>,
+    structured_pages: &ahash::AHashMap<u32, InternalDocument>,
+) {
+    let mut ocr_tables = accepted_mixed_ocr_tables(structured_pages);
+    if ocr_tables.is_empty() {
+        return;
+    }
+
+    ocr_tables.sort_by_key(|table| table.page_number);
+    let ocr_pages: std::collections::HashSet<u32> = ocr_tables.iter().map(|table| table.page_number).collect();
+    tables.retain(|table| !ocr_pages.contains(&table.page_number));
+    tables.extend(ocr_tables);
+    tables.sort_by_key(|table| table.page_number);
+}
+
 #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-pipeline")))]
 fn prepare_ocr_layout_inputs(
     images: Vec<image::RgbImage>,
@@ -2438,7 +2466,7 @@ impl PdfExtractor {
             && let Some(ref accepted_pages) = structured_ocr_pages
         {
             ocr_elements = accepted_mixed_ocr_elements(accepted_pages);
-            replace_tables_with_ocr_output(&mut tables, accepted_mixed_ocr_tables(accepted_pages));
+            merge_mixed_ocr_tables(&mut tables, accepted_pages);
             ocr_coordinate_frames = accepted_mixed_ocr_coordinate_frames(accepted_pages);
         }
         #[cfg(not(any(feature = "ocr", feature = "ocr-pipeline")))]
@@ -3816,6 +3844,68 @@ mod tests {
 
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].markdown, "native");
+    }
+
+    /// GH#1670: a mixed-path document where only page 2 goes to OCR must keep the native
+    /// tables of every other page. The bug replaced the whole document's table list with only
+    /// page 2's OCR table, dropping pages 1 and 3 entirely.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn mixed_ocr_tables_replace_only_the_pages_ocr_produced_a_table_for() {
+        let native_table = |page_number| crate::types::Table {
+            cells: Vec::new(),
+            markdown: format!("native-page-{page_number}"),
+            page_number,
+            bounding_box: None,
+            ..Default::default()
+        };
+        let mut tables = vec![native_table(1), native_table(2), native_table(3)];
+
+        let mut ocr_page = InternalDocument::new("pdf");
+        ocr_page.tables.push(crate::types::Table {
+            cells: Vec::new(),
+            markdown: "ocr-page-2".to_string(),
+            page_number: 2,
+            bounding_box: None,
+            ..Default::default()
+        });
+        let structured_pages = ahash::AHashMap::from([(2, ocr_page)]);
+
+        merge_mixed_ocr_tables(&mut tables, &structured_pages);
+
+        assert_eq!(
+            tables.len(),
+            3,
+            "pages 1 and 3 were never sent to OCR; their native tables must survive"
+        );
+        assert_eq!(tables[0].markdown, "native-page-1");
+        assert_eq!(
+            tables[1].markdown, "ocr-page-2",
+            "page 2 went to OCR; its native table is superseded"
+        );
+        assert_eq!(tables[2].markdown, "native-page-3");
+    }
+
+    /// A page that goes to OCR but whose OCR pass finds no table must keep its native table,
+    /// the same rule `replace_tables_with_ocr_output` applies when OCR finds nothing anywhere.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn a_page_ocr_ran_on_but_found_no_table_for_keeps_its_native_table() {
+        let mut tables = vec![crate::types::Table {
+            cells: Vec::new(),
+            markdown: "native-page-1".to_string(),
+            page_number: 1,
+            bounding_box: None,
+            ..Default::default()
+        }];
+
+        // Page 1 went to OCR (it is a key in structured_pages) but produced no table there.
+        let structured_pages = ahash::AHashMap::from([(1, InternalDocument::new("pdf"))]);
+
+        merge_mixed_ocr_tables(&mut tables, &structured_pages);
+
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].markdown, "native-page-1");
     }
 
     #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
