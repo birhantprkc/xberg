@@ -178,9 +178,20 @@ pub enum CandleDeepseekOcrDtype {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeepseekOcrBackendOptions {
-    /// Local DeepSeek-OCR model directory. The backend requires this option.
+    /// Local DeepSeek-OCR model directory. Takes precedence over `model_id` when present.
     #[serde(alias = "model-path", skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
+    /// Optional Hugging Face repository identifier. Defaults to the checksum-pinned
+    /// `deepseek-ai/DeepSeek-OCR`. Ignored when `model_path` is set.
+    #[serde(alias = "model-id", skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Optional immutable Hugging Face model revision. The default model is pinned
+    /// automatically; a custom `model_id` requires this to be set explicitly.
+    #[serde(alias = "hf-revision", alias = "revision", skip_serializing_if = "Option::is_none")]
+    pub hf_revision: Option<String>,
+    /// Optional Hugging Face cache root.
+    #[serde(alias = "cache-dir", skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
     /// Optional per-call device override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<CandleDevicePreference>,
@@ -391,6 +402,9 @@ mod tests {
 
         let deepseek = DeepseekOcrBackendOptions {
             model_path: Some("/models/deepseek".to_string()),
+            model_id: Some("example/deepseek-ocr".to_string()),
+            hf_revision: Some("deepseek-revision".to_string()),
+            cache_dir: Some("/cache/deepseek".to_string()),
             device: Some(CandleDevicePreference::Auto),
             version: Some(3),
             dtype: Some(CandleDeepseekOcrDtype::Bf16),
@@ -399,6 +413,9 @@ mod tests {
             serde_json::to_value(deepseek).unwrap(),
             serde_json::json!({
                 "model_path": "/models/deepseek",
+                "model_id": "example/deepseek-ocr",
+                "hf_revision": "deepseek-revision",
+                "cache_dir": "/cache/deepseek",
                 "device": "auto",
                 "version": 3,
                 "dtype": "bf16"

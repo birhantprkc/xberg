@@ -6,6 +6,9 @@
 //! requiring callers to pre-stage a local `model_path`, verifying every file against a
 //! checked-in sha256 manifest before use.
 //!
+//! DeepSeek-OCR is fetched directly from the original `deepseek-ai/DeepSeek-OCR` repository
+//! (no re-hosted mirror) at a pinned revision, with the same checksum-manifest trust model.
+//!
 //! Trust attaches to the manifest, not the host: a changed or tampered file fails
 //! the staging step instead of silently feeding wrong weights into inference. The
 //! shards are byte-identical to the original release, so the checked-in checksums are
@@ -125,6 +128,115 @@ const PADDLEOCR_VL_16_FILES: &[&str] = &[
     "model.safetensors",
 ];
 
+/// SHA-256 manifest pinning every file `DeepseekOCREngine::init` reads at the pinned
+/// revision, checked in as the single source of truth. Trust attaches to the manifest,
+/// not the host -- a changed or tampered upstream file fails staging instead of feeding
+/// wrong weights into inference.
+#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+pub(crate) const DEEPSEEK_OCR_SHA256_MANIFEST: &str = include_str!("deepseek-ocr.sha256");
+
+/// DeepSeek-OCR, fetched directly from the original `deepseek-ai/DeepSeek-OCR` repository
+/// (unlike PaddleOCR-VL 1.6 above, there is no re-hosted mirror): the upstream repo is the
+/// only source, so pinning the revision plus checksums is the whole trust boundary.
+#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+const DEEPSEEK_OCR: HfModel = HfModel {
+    repo: "deepseek-ai/DeepSeek-OCR",
+    revision: "9f30c71f441d010e5429c532364a86705536c53a",
+    manifest: DEEPSEEK_OCR_SHA256_MANIFEST,
+};
+
+/// Ensure DeepSeek-OCR weights are present locally and return the model directory.
+///
+/// `repo_id` is normally the backend's default `deepseek-ai/DeepSeek-OCR` -- in that case
+/// every manifest file is fetched from the pinned revision through `hf-hub` (warm cache hits
+/// skip the network) and verified against the checked-in sha256 manifest before use, so a
+/// tampered or corrupted download fails staging instead of silently feeding wrong weights
+/// into inference.
+///
+/// A caller-supplied `repo_id` (via `backend_options.model_id`) that does not match the
+/// pinned repository has no corresponding checksum manifest, so its `config.json`,
+/// `tokenizer.json`, and every shard named by its own `model.safetensors.index.json` are
+/// fetched via plain `hf-hub` without checksum verification -- the same trust level as
+/// pointing `model_path` at arbitrary local weights.
+#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+pub(crate) fn ensure_deepseek_ocr(
+    repo_id: &str,
+    revision: Option<&str>,
+    cache_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if repo_id == DEEPSEEK_OCR.repo {
+        return ensure_model(&DEEPSEEK_OCR, revision, cache_dir);
+    }
+
+    tracing::warn!(
+        repo = repo_id,
+        pinned_repo = DEEPSEEK_OCR.repo,
+        "DeepSeek-OCR model_id does not match the checksum-pinned repository; downloading \
+         without checksum verification"
+    );
+    let revision = revision.ok_or_else(|| {
+        format!(
+            "custom DeepSeek-OCR model '{repo_id}' requires an explicit immutable `hf_revision`; refusing to resolve a mutable default branch"
+        )
+    })?;
+    ensure_deepseek_ocr_unverified(repo_id, revision, cache_dir)
+}
+
+/// Fetch DeepSeek-OCR's config, tokenizer, and every shard named by its own
+/// `model.safetensors.index.json` from `repo_id` via `hf-hub` without checksum
+/// verification. Used only for a non-default `model_id` override where no checked-in
+/// manifest exists; the shard set is read from the index rather than assumed, so this
+/// keeps working if a future custom repo shards its weights differently than the pinned
+/// default.
+#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+fn ensure_deepseek_ocr_unverified(repo_id: &str, revision: &str, cache_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let mut dir: Option<PathBuf> = None;
+    for name in ["config.json", "tokenizer.json"] {
+        let path = crate::model_download::hf_resolve_file(repo_id, name, Some(revision), cache_dir, None)?;
+        if dir.is_none() {
+            dir = path.parent().map(Path::to_path_buf);
+        }
+    }
+
+    let index_path = crate::model_download::hf_resolve_file(
+        repo_id,
+        "model.safetensors.index.json",
+        Some(revision),
+        cache_dir,
+        None,
+    )?;
+    let index_str = std::fs::read_to_string(&index_path)
+        .map_err(|e| format!("Failed to read fetched safetensors index for {repo_id}: {e}"))?;
+    for shard in index_shard_files(&index_str)? {
+        crate::model_download::hf_resolve_file(repo_id, &shard, Some(revision), cache_dir, None)?;
+    }
+
+    dir.ok_or_else(|| format!("Fetched no files for {repo_id}"))
+}
+
+/// Parse a `model.safetensors.index.json` document's `weight_map` into the deduplicated,
+/// sorted set of shard filenames it names.
+#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+fn index_shard_files(index_json: &str) -> Result<Vec<String>, String> {
+    let index: serde_json::Value =
+        serde_json::from_str(index_json).map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "safetensors index has no weight_map object".to_string())?;
+
+    let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for value in weight_map.values() {
+        if let Some(name) = value.as_str() {
+            files.insert(name.to_string());
+        }
+    }
+    if files.is_empty() {
+        return Err("safetensors index weight_map names no files".to_string());
+    }
+    Ok(files.into_iter().collect())
+}
+
 fn ensure_model(model: &HfModel, revision: Option<&str>, cache_dir: Option<&Path>) -> Result<PathBuf, String> {
     let files = manifest_files(model.manifest)?;
     let revision = revision.unwrap_or(model.revision);
@@ -205,6 +317,87 @@ mod tests {
         let model = HfModel {
             repo: PADDLEOCR_VL_16.repo,
             revision: PADDLEOCR_VL_16.revision,
+            manifest,
+        };
+
+        let out = ensure_model(&model, None, None).expect("staging must succeed");
+        for (name, sha256) in &small {
+            let path = out.join(name);
+            assert!(path.exists(), "{name} should be staged in the snapshot dir");
+            verify_sha256(&path, sha256, name).expect("staged file must match manifest checksum");
+        }
+
+        ensure_model(&model, None, None).expect("warm cache must succeed");
+    }
+
+    #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+    #[test]
+    fn deepseek_ocr_manifest_covers_every_file_the_engine_reads() {
+        let files = manifest_files(DEEPSEEK_OCR.manifest).expect("bundled manifest must parse");
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        for required in [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors.index.json",
+            "model-00001-of-000001.safetensors",
+        ] {
+            assert!(names.contains(&required), "manifest missing {required}");
+        }
+    }
+
+    #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+    #[test]
+    fn deepseek_ocr_is_pinned_to_the_upstream_hf_repo() {
+        assert_eq!(DEEPSEEK_OCR.repo, "deepseek-ai/DeepSeek-OCR");
+        assert_eq!(DEEPSEEK_OCR.revision.len(), 40);
+        assert!(DEEPSEEK_OCR.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+    #[test]
+    fn index_shard_files_extracts_deduplicated_sorted_shard_names() {
+        let index =
+            r#"{"weight_map": {"a": "shard-2.safetensors", "b": "shard-1.safetensors", "c": "shard-2.safetensors"}}"#;
+        assert_eq!(
+            index_shard_files(index).unwrap(),
+            vec!["shard-1.safetensors".to_string(), "shard-2.safetensors".to_string()]
+        );
+    }
+
+    #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+    #[test]
+    fn index_shard_files_rejects_a_missing_weight_map() {
+        assert!(index_shard_files("{}").is_err());
+        assert!(index_shard_files(r#"{"weight_map": {}}"#).is_err());
+    }
+
+    /// End-to-end check of the real hf-hub → verify path against the pinned
+    /// `deepseek-ai/DeepSeek-OCR` revision, using only the small config/tokenizer/index files
+    /// (no ~6.7 GB safetensors shard). Ignored by default (network); run with `--ignored`.
+    #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "hits the HuggingFace Hub; run with --ignored"]
+    fn stages_deepseek_ocr_small_files_from_hf() {
+        let bundled = manifest_files(DEEPSEEK_OCR.manifest).unwrap();
+        let small: Vec<(String, String)> = bundled
+            .into_iter()
+            .filter(|(name, _)| !name.ends_with(".safetensors"))
+            .collect();
+        assert!(
+            !small.is_empty(),
+            "manifest should list small config/tokenizer/index files besides the weights"
+        );
+        let manifest: &'static str = Box::leak(
+            small
+                .iter()
+                .map(|(name, sha256)| format!("{sha256}  {name}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_boxed_str(),
+        );
+        let model = HfModel {
+            repo: DEEPSEEK_OCR.repo,
+            revision: DEEPSEEK_OCR.revision,
             manifest,
         };
 
