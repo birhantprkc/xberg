@@ -1060,8 +1060,22 @@ impl ExtractionConfig {
     /// regardless of whether the caller also requested image extraction.
     pub fn needs_image_data(&self) -> bool {
         self.images.as_ref().is_some_and(|i| i.extract_images)
+            || self.runs_ocr_on_embedded_images()
             || self.captioning.is_some()
             || self.qr_codes == Some(true)
+    }
+
+    /// Whether embedded images get OCR'd.
+    ///
+    /// This mirrors the condition the pipeline itself uses before it calls
+    /// `image_ocr::process_images_with_ocr` (`core/pipeline/mod.rs`), and it is
+    /// deliberately the same predicate rather than an equivalent one: when the
+    /// two drifted apart, a container extractor asked `needs_image_data` and was
+    /// told no, so it attached an image with an empty buffer, and the OCR path
+    /// then ran on those zero bytes and reported `Could not determine image
+    /// format` (GH#1662).
+    pub fn runs_ocr_on_embedded_images(&self) -> bool {
+        self.ocr.is_some() && self.images.as_ref().map(|i| i.run_ocr_on_images).unwrap_or(true)
     }
 
     /// Returns `true` when any image processing is needed during extraction.
@@ -1649,6 +1663,38 @@ mod tests {
             Some(600),
             "absent field must use default_extraction_timeout() -> Some(600)"
         );
+    }
+
+    /// Embedded-image OCR reads the image bytes, so a configuration that runs it
+    /// has to report that it needs them. A container extractor asks this question
+    /// to decide whether to read the image out of its archive; when the answer was
+    /// no, the image still reached the OCR path, with an empty buffer (GH#1662).
+    #[test]
+    fn a_config_that_ocrs_embedded_images_needs_the_image_data() {
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+        assert!(
+            config.needs_image_data(),
+            "OCR of embedded images consumes the bytes, so they must be read"
+        );
+    }
+
+    /// Turning embedded-image OCR off leaves the answer where it was, so a
+    /// text-only extraction still skips reading images out of the container.
+    #[test]
+    fn a_config_that_does_not_ocr_embedded_images_still_skips_the_data() {
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            images: Some(ImageExtractionConfig {
+                extract_images: false,
+                run_ocr_on_images: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!config.needs_image_data());
     }
 
     #[test]
