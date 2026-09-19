@@ -6263,6 +6263,10 @@ mod tests {
     <w:basedOn w:val="Normal"/>
     <w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>
   </w:style>
+  <w:style w:type="paragraph" w:styleId="ListBulletChild">
+    <w:name w:val="List Bullet Child"/>
+    <w:basedOn w:val="ListBullet"/>
+  </w:style>
 </w:styles>"#;
 
     fn list_styled_paragraph(text: &str) -> String {
@@ -6302,6 +6306,18 @@ mod tests {
         assert_eq!(doc.paragraphs[0].numbering_level, Some(0));
         let md = doc.to_markdown(true);
         assert_eq!(md, "- First\n- Second", "markdown: {md:?}");
+    }
+
+    /// The numbering reference is found through `basedOn`: `ListBulletChild` carries no
+    /// `w:numPr` of its own and inherits it from `ListBullet` (GH#1663).
+    #[test]
+    fn a_paragraph_inherits_list_numbering_from_a_style_two_levels_up() {
+        let body = r#"<w:p><w:pPr><w:pStyle w:val="ListBulletChild"/></w:pPr><w:r><w:t>Nested</w:t></w:r></w:p>"#;
+        let doc = parse_bytes(&docx_with_list_style(body, &[]));
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(doc.paragraphs[0].numbering_level, Some(0));
+        assert_eq!(doc.to_markdown(true), "- Nested");
     }
 
     #[test]
