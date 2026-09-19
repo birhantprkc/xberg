@@ -13,12 +13,10 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
-use ahash::AHashMap;
-use parking_lot::RwLock;
-
 use crate::Result;
 use crate::candle_ocr::config::{DeepseekOcrBackendOptions, parse_backend_options, validate_optional_non_empty};
 use crate::core::config::OcrConfig;
+use crate::engine_cache::EngineCache;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::types::ExtractedDocument;
 use xberg_candle_ocr::DType;
@@ -47,9 +45,8 @@ impl EnginePoolKey {
 /// Pooled engine value: shared reference with interior mutability for the engine.
 type PooledEngine = Arc<parking_lot::Mutex<DeepseekOCREngine>>;
 
-#[allow(clippy::type_complexity)]
-static ENGINE_POOL: LazyLock<RwLock<AHashMap<EnginePoolKey, PooledEngine>>> =
-    LazyLock::new(|| RwLock::new(AHashMap::new()));
+static ENGINE_POOL: LazyLock<EngineCache<EnginePoolKey, parking_lot::Mutex<DeepseekOCREngine>>> =
+    LazyLock::new(EngineCache::unbounded);
 
 fn get_or_init_engine(
     preference: DevicePreference,
@@ -59,38 +56,26 @@ fn get_or_init_engine(
 ) -> crate::Result<PooledEngine> {
     let key = EnginePoolKey::new(preference, dtype, model_path, version);
 
-    {
-        let pool = ENGINE_POOL.read();
-        if let Some(engine) = pool.get(&key) {
-            return Ok(Arc::clone(engine));
-        }
-    }
-
-    let device = key.preference.select().map_err(|e| crate::XbergError::Ocr {
-        message: format!("Failed to select compute device: {e}"),
-        source: Some(Box::new(e)),
-    })?;
-
-    tracing::info!(
-        preference = ?key.preference,
-        dtype = ?key.dtype,
-        model_path = %model_path,
-        "Initialising DeepSeek-OCR engine (cold start)"
-    );
-
-    let new_engine =
-        DeepseekOCREngine::init(model_path, device, key.dtype, version).map_err(|e| crate::XbergError::Ocr {
-            message: format!("DeepSeek-OCR engine initialisation failed: {e}"),
+    ENGINE_POOL.get_or_try_init(key, || {
+        let device = preference.select().map_err(|e| crate::XbergError::Ocr {
+            message: format!("Failed to select compute device: {e}"),
             source: Some(Box::new(e)),
         })?;
-    let new_engine = Arc::new(parking_lot::Mutex::new(new_engine));
 
-    let mut pool = ENGINE_POOL.write();
-    if let Some(existing) = pool.get(&key) {
-        return Ok(Arc::clone(existing));
-    }
-    pool.insert(key, Arc::clone(&new_engine));
-    Ok(new_engine)
+        tracing::info!(
+            preference = ?preference,
+            dtype = ?dtype,
+            model_path = %model_path,
+            "Initialising DeepSeek-OCR engine (cold start)"
+        );
+
+        let new_engine =
+            DeepseekOCREngine::init(model_path, device, dtype, version).map_err(|e| crate::XbergError::Ocr {
+                message: format!("DeepSeek-OCR engine initialisation failed: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        Ok(parking_lot::Mutex::new(new_engine))
+    })
 }
 
 /// DeepSeek-OCR backend using candle transformers.
@@ -274,6 +259,8 @@ impl OcrBackend for DeepseekOcrBackend {
 
 #[cfg(test)]
 mod tests {
+    use ahash::AHashMap;
+
     use super::*;
 
     #[test]

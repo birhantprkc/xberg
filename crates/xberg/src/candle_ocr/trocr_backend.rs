@@ -8,14 +8,12 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
-use ahash::AHashMap;
-use parking_lot::RwLock;
-
 use crate::Result;
 use crate::candle_ocr::config::{
     CandleTrocrVariant, TrocrBackendOptions, parse_backend_options, validate_optional_non_empty,
 };
 use crate::core::config::OcrConfig;
+use crate::engine_cache::EngineCache;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::types::ExtractedDocument;
 use xberg_candle_ocr::DevicePreference;
@@ -32,8 +30,8 @@ fn variant_discriminant(v: TrocrVariant) -> u8 {
     }
 }
 
-/// Type alias for the engine pool mapping.
-type EnginePoolMap = AHashMap<(u8, DevicePreference, PathBuf, String), Arc<TrocrEngine>>;
+/// Key for the engine cache: `(variant_discriminant, device_preference, cache_dir, revision)`.
+type EngineKey = (u8, DevicePreference, PathBuf, String);
 
 /// Tallest a single cropped text-line image is expected to be, in pixels.
 ///
@@ -81,17 +79,18 @@ fn reject_whole_page_input(image_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Process-wide engine pool keyed by `(variant_discriminant, device_preference)`.
+/// Process-wide engine cache keyed by `(variant_discriminant, device_preference, cache_dir, revision)`.
 ///
 /// `TrocrEngine` initialisation downloads and parses safetensors weights from HF Hub
-/// and is expensive (~400 MB per variant). The pool ensures each
-/// `(variant, device)` combination is loaded at most once per process.
-static ENGINE_POOL: LazyLock<RwLock<EnginePoolMap>> = LazyLock::new(|| RwLock::new(AHashMap::default()));
+/// and is expensive (~400 MB per variant). The cache ensures each
+/// `(variant, device, cache_dir, revision)` combination is loaded at most once per process.
+static ENGINE_POOL: LazyLock<EngineCache<EngineKey, TrocrEngine>> = LazyLock::new(EngineCache::unbounded);
 
 /// Return a cached engine for `(variant, preference)`, initialising one on first use.
 ///
-/// Uses a read → miss → write → double-check pattern so that two racing callers
-/// do not both pay the initialisation cost.
+/// Delegates to [`EngineCache::get_or_try_init`], which stays locked across the
+/// load, so a second caller for the same key waits for the first engine
+/// instead of building another.
 fn get_or_init_engine(
     variant: TrocrVariant,
     preference: DevicePreference,
@@ -105,33 +104,20 @@ fn get_or_init_engine(
         revision.clone(),
     );
 
-    {
-        let pool = ENGINE_POOL.read();
-        if let Some(engine) = pool.get(&key) {
-            return Ok(Arc::clone(engine));
-        }
-    }
-
-    let device = preference.select().map_err(|e| crate::XbergError::Ocr {
-        message: format!("Failed to select compute device: {e}"),
-        source: Some(Box::new(e)),
-    })?;
-
-    tracing::info!(variant = ?variant, preference = ?preference, "Initialising TrOCR engine (cold start)");
-    let new_engine = TrocrEngine::new_with_hf(variant, device, Some(&cache_dir), Some(&revision)).map_err(|e| {
-        crate::XbergError::Ocr {
-            message: format!("TrOCR engine initialisation failed: {e}"),
+    ENGINE_POOL.get_or_try_init(key, || {
+        let device = preference.select().map_err(|e| crate::XbergError::Ocr {
+            message: format!("Failed to select compute device: {e}"),
             source: Some(Box::new(e)),
-        }
-    })?;
-    let new_engine = Arc::new(new_engine);
+        })?;
 
-    let mut pool = ENGINE_POOL.write();
-    if let Some(existing) = pool.get(&key) {
-        return Ok(Arc::clone(existing));
-    }
-    pool.insert(key, Arc::clone(&new_engine));
-    Ok(new_engine)
+        tracing::info!(variant = ?variant, preference = ?preference, "Initialising TrOCR engine (cold start)");
+        TrocrEngine::new_with_hf(variant, device, Some(&cache_dir), Some(&revision)).map_err(|e| {
+            crate::XbergError::Ocr {
+                message: format!("TrOCR engine initialisation failed: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })
+    })
 }
 
 /// TrOCR backend using candle transformers.

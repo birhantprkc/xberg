@@ -2,6 +2,13 @@
 //! number of resident engines. Least recently used engines leave first.
 
 use std::hash::Hash;
+#[cfg(any(
+    feature = "embeddings",
+    feature = "static-embeddings",
+    feature = "reranker",
+    feature = "sparse-embeddings",
+    feature = "late-interaction"
+))]
 use std::num::NonZeroUsize;
 use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
 
@@ -44,6 +51,18 @@ impl<K: Hash + Eq + Clone, V> EngineCache<K, V> {
     }
 
     /// Remove every engine whose key matches `matches`. Returns the number removed.
+    ///
+    /// Only the callers that manage eviction (embeddings, static embeddings,
+    /// reranker, sparse embeddings, late interaction) use this; gated to match,
+    /// so a consumer that only calls [`Self::get_or_try_init`] (candle OCR)
+    /// does not carry it as dead code.
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     pub(crate) fn evict_where(&self, mut matches: impl FnMut(&K) -> bool) -> usize {
         let mut cache = self.write();
         let keys: Vec<K> = cache
@@ -58,6 +77,13 @@ impl<K: Hash + Eq + Clone, V> EngineCache<K, V> {
     }
 
     /// Remove every engine. Returns the number removed.
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     pub(crate) fn clear(&self) -> usize {
         let mut cache = self.write();
         let removed = cache.len();
@@ -69,6 +95,13 @@ impl<K: Hash + Eq + Clone, V> EngineCache<K, V> {
     ///
     /// Lowering the bound below the current count drops the least recently
     /// used engines at once.
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     pub(crate) fn set_limit(&self, max_resident: Option<NonZeroUsize>) {
         self.write().resize(max_resident.unwrap_or(NonZeroUsize::MAX));
     }
@@ -81,6 +114,13 @@ impl<K: Hash + Eq + Clone, V> EngineCache<K, V> {
 
     /// Whether an engine for `key` is resident. Does not change its recency.
     #[cfg(test)]
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     pub(crate) fn contains(&self, key: &K) -> bool {
         self.inner.read().unwrap_or_else(PoisonError::into_inner).contains(key)
     }
@@ -89,6 +129,13 @@ impl<K: Hash + Eq + Clone, V> EngineCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     use std::sync::Weak;
 
     fn cache() -> EngineCache<String, u32> {
@@ -122,6 +169,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     fn bound_of_n_with_n_plus_one_models_drops_the_least_recently_used() {
         let cache = cache();
         cache.set_limit(NonZeroUsize::new(2));
@@ -137,6 +191,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     fn lowering_the_limit_drops_engines_at_once() {
         let cache = cache();
         load(&cache, "a", 1);
@@ -152,6 +213,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     fn evict_where_removes_only_matching_keys_and_drops_the_engine() {
         let cache = cache();
         let held: Weak<u32> = Arc::downgrade(&load(&cache, "a", 1));
@@ -165,6 +233,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     fn a_caller_holding_a_handle_keeps_the_engine_alive_after_eviction() {
         let cache = cache();
         let handle = load(&cache, "a", 1);
@@ -176,6 +251,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        feature = "embeddings",
+        feature = "static-embeddings",
+        feature = "reranker",
+        feature = "sparse-embeddings",
+        feature = "late-interaction"
+    ))]
     fn clear_reports_the_count_and_empties_the_cache() {
         let cache = cache();
         load(&cache, "a", 1);
