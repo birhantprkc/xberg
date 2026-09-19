@@ -647,9 +647,10 @@ pub struct OcrBackendCapabilities {
 /// # Cost
 ///
 /// Calling this is not free for every backend. In particular, `TesseractBackend`'s
-/// `supported_languages()` allocates a Tesseract API and initializes it (`init("", "eng")`) the
-/// first time it is called, to enumerate installed tessdata languages; subsequent calls are
-/// served from a cache.
+/// `supported_languages()` allocates a Tesseract API and initializes it against the same
+/// tessdata directory a real OCR job resolves (`resolve_tessdata_path`), the first time it
+/// is called, to enumerate installed tessdata languages; subsequent calls are served from a
+/// cache.
 ///
 /// # Errors
 ///
