@@ -535,7 +535,10 @@ late-interaction-presets = []
 # WASM-incompatible). Builds on the shared crate::onnx helper (onnx-runtime).
 late-interaction = ["late-interaction-presets", "onnx-runtime", "dep:ndarray", "dep:lru", "tokio-runtime"]
 stopwords = []
-quality = ["dep:unicode-normalization", "dep:chardetng", "stopwords"]
+# heuristics: the OCR-confidence fold quality_processor's evidence-floor cap shares with
+# ConfidenceSignals::ocr_aggregate (issue #1694). heuristics itself has zero deps, so this
+# costs nothing on WASM/Android.
+quality = ["dep:unicode-normalization", "dep:chardetng", "stopwords", "heuristics"]
 
 # Cloud-upstreamed infrastructure (pure-Rust; see gap-closing plan). Generic overridable
 # defaults only — no domain knowledge. `heuristics` text-layer detection is gated separately
