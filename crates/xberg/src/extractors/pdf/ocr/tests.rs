@@ -3351,6 +3351,97 @@ Buffers:           50000 kB
         );
     }
 
+    /// A minimal N-page PDF (no content stream, just a MediaBox per page), built the
+    /// same way `crate::pdf::render::build_minimal_pdf_with_mediabox` builds a one-page
+    /// version: a hand-written Catalog/Pages/Page object graph with its own xref table.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    fn build_minimal_multi_page_pdf(page_count: usize) -> Vec<u8> {
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n");
+
+        offsets.push(buf.len());
+        let kids: String = (0..page_count).map(|i| format!("{} 0 R ", 3 + i)).collect();
+        buf.extend_from_slice(
+            format!(
+                "2 0 obj\n<</Type /Pages /Kids [{}] /Count {}>>\nendobj\n",
+                kids.trim_end(),
+                page_count
+            )
+            .as_bytes(),
+        );
+
+        for i in 0..page_count {
+            offsets.push(buf.len());
+            let obj_num = 3 + i;
+            buf.extend_from_slice(
+                format!(
+                    "{} 0 obj\n<</Type /Page /MediaBox [0 0 200 200] /Parent 2 0 R>>\nendobj\n",
+                    obj_num
+                )
+                .as_bytes(),
+            );
+        }
+
+        let xref_offset = buf.len();
+        let total_objs = 2 + page_count + 1;
+        buf.extend_from_slice(b"xref\n");
+        buf.extend_from_slice(format!("0 {}\n", total_objs).as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+        }
+        buf.extend_from_slice(format!("trailer\n<</Size {} /Root 1 0 R>>\n", total_objs).as_bytes());
+        buf.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_offset).as_bytes());
+        buf
+    }
+
+    /// #1690: `render_selected_pages_from_document` must actually dispatch page renders
+    /// across the thread pool, not merely be fast. A wall-clock threshold on a shared
+    /// build box is the flaky test this round already has one of (xberg-enterprise#2786);
+    /// this asserts the MECHANISM instead of its timing consequence, so it cannot flake
+    /// under load -- it either used more than one OS thread to render the batch or it
+    /// did not, independent of how long that took.
+    ///
+    /// The render calls run inside a thread pool this test builds itself (4 threads,
+    /// not the ambient global pool), so the assertion never depends on how many CPUs the
+    /// host reports. 20 pages against 4 pool threads leaves no reasonable path for rayon
+    /// to keep every page on the calling thread: `.par_iter()` on a slice is an
+    /// `IndexedParallelIterator`, whose recursive `join`-based splitting hands half the
+    /// remaining range to a stolen thread whenever one is idle, and this batch has far
+    /// more real per-page rendering work (rasterizing a full page) than the handful of
+    /// pages needed for a work-stealing pool to actually steal.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    #[serial_test::serial]
+    fn parallel_render_dispatches_across_more_than_one_thread() {
+        clear_render_call_thread_ids();
+
+        let page_count = 20;
+        let pdf = build_minimal_multi_page_pdf(page_count);
+        let page_indices: Vec<usize> = (0..page_count).collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("building a dedicated 4-thread pool must succeed");
+        let result = pool.install(|| render_selected_pages_for_ocr(&pdf, &page_indices));
+        assert!(result.is_ok(), "rendering the fixture must succeed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), page_count, "every requested page must come back");
+
+        let threads = RENDER_CALL_THREAD_IDS.get().unwrap().lock().unwrap();
+        assert!(
+            threads.len() > 1,
+            "expected page renders to be observed on more than one OS thread (mechanism proof \
+             that rendering dispatched in parallel), got {} distinct thread(s): {:?}",
+            threads.len(),
+            *threads
+        );
+    }
+
     #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
     #[test]
     fn full_pdf_ocr_reuses_open_document_across_bounded_batches() {
