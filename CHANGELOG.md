@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.2.6] - Unreleased
 
+### Added
+
+- **(config): `ExtractionConfig::runs_ocr_on_embedded_images` and `ExtractionConfig::wants_own_bytes_in_result` are exposed on every binding**, beside the existing `needs_image_data`. The first is the predicate the pipeline uses to decide whether a container's embedded images are OCR'd; the second is the pre-GH#1662 formula (`extract_images`, captioning or QR codes) that decides whether a standalone image's own bytes are echoed into `images`. (GH#1662)
+
 ### Fixed
 
 - **(pdf): the mixed native-and-OCR path no longer drops every native table on a page OCR never touched.** On a long document where only some pages needed OCR, the mixed path replaced the whole document's table list with just the OCR pages' tables whenever OCR found even one, silently dropping every native table on every other page. Only the tables of pages OCR itself produced a table for are now replaced; a page the mixed path never sent to OCR keeps its native tables. (GH#1670)
@@ -20,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **(ocr): a DOCX, PPT, PPTX or HTML embedded image is read before OCR runs on it.** The predicate that decides whether a container reads an image out of its archive did not count embedded-image OCR, so with OCR configured and `run_ocr_on_images` left on, the image was attached with an empty buffer and OCR reported "Could not determine image format" for zero bytes. A standalone image extraction's `images` output is unchanged. (GH#1662)
 - **(ocr): the mixed native-and-OCR route sizes its render batch against `security_limits.max_content_size`.** The batch was sized from the resolved thread budget alone, so a wide thread budget requested a batch whose estimated PNG-encode peak crossed the fixed content limit, and every page in the rejected batch was skipped rather than the extraction failing. The batch is now capped up front from one representative page's estimated encode cost at the effective render DPI; the real peak is still checked, and still rejected if genuinely too large, afterwards. (GH#1665)
 - **(ocr): the candle OCR backends no longer reject every rendered PDF page.** The PDF OCR route stamps `source_dpi` and `page_rotation_degrees` into the shared `backend_options` for every backend, and the candle backends (`candle-paddleocr-vl`, `candle-glm-ocr`, `candle-deepseek-ocr`) deserialise their options strictly, so every rendered page failed validation and came back empty. Exactly those two pipeline hint keys are stripped before the candle options are read; any other unknown key still fails validation. (GH#1672)
+- **(ruby): a tagged enum's payload readers return the stored value.** The generated `Data` readers called `super` on a class that has no such method, so reading a payload field on a tagged-enum value raised `NoMethodError`. Regenerated on alef 0.93.1, whose Magnus emitter reads the stored member. (alef 0.93.0)
 
 ## [1.2.5] - 2026-09-18
 
