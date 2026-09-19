@@ -15109,6 +15109,18 @@ class PdfMetadata {
   /// `None` when the document could not be inspected; empty when no page qualifies.
   final Int64List? scannedPages;
 
+  /// Pages whose text was dominated by fabricated character mappings (1-indexed):
+  /// `MappingProvenance::Fallback`, a font whose glyph-to-Unicode mapping resolved to
+  /// a value the extractor chose rather than read from the file (issue #1254). This is
+  /// a fact about how the text was derived, independent of `scanned_pages`'s raster-based
+  /// scan detection, and independent of whether the resulting text happens to look
+  /// structurally like prose (issue #1667: a broken mapping that lands on ordinary
+  /// letters and punctuation passes every character-shape check but is still fabricated).
+  ///
+  /// `None` when `OcrQualityThresholds::enable_provenance_ocr_routing` is `false` or the
+  /// document could not be inspected; empty when no page qualifies.
+  final Int64List? fabricatedTextPages;
+
   /// Pages the `auto` layout strategy skipped (1-indexed).
   ///
   /// `None` unless layout detection ran with `LayoutStrategy::Auto`; empty
@@ -15131,6 +15143,7 @@ class PdfMetadata {
     this.pageCount,
     this.scannedConfidence,
     this.scannedPages,
+    this.fabricatedTextPages,
     this.layoutGatedPages,
     this.layoutGateReasons,
   });
@@ -15145,6 +15158,7 @@ class PdfMetadata {
       pageCount.hashCode ^
       scannedConfidence.hashCode ^
       scannedPages.hashCode ^
+      fabricatedTextPages.hashCode ^
       layoutGatedPages.hashCode ^
       layoutGateReasons.hashCode;
 
@@ -15161,6 +15175,7 @@ class PdfMetadata {
           pageCount == other.pageCount &&
           scannedConfidence == other.scannedConfidence &&
           scannedPages == other.scannedPages &&
+          fabricatedTextPages == other.fabricatedTextPages &&
           layoutGatedPages == other.layoutGatedPages &&
           layoutGateReasons == other.layoutGateReasons;
 }

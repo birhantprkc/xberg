@@ -14164,6 +14164,7 @@ const _: fn() = || {
         let _: Option<i64> = PdfMetadata.page_count;
         let _: Option<f64> = PdfMetadata.scanned_confidence;
         let _: Option<Vec<i64>> = PdfMetadata.scanned_pages;
+        let _: Option<Vec<i64>> = PdfMetadata.fabricated_text_pages;
         let _: Option<Vec<i64>> = PdfMetadata.layout_gated_pages;
         let _: Option<Vec<String>> = PdfMetadata.layout_gate_reasons;
     }
@@ -23824,6 +23825,7 @@ impl SseDecode for crate::PdfMetadata {
         let mut var_pageCount = <Option<i64>>::sse_decode(deserializer);
         let mut var_scannedConfidence = <Option<f64>>::sse_decode(deserializer);
         let mut var_scannedPages = <Option<Vec<i64>>>::sse_decode(deserializer);
+        let mut var_fabricatedTextPages = <Option<Vec<i64>>>::sse_decode(deserializer);
         let mut var_layoutGatedPages = <Option<Vec<i64>>>::sse_decode(deserializer);
         let mut var_layoutGateReasons = <Option<Vec<String>>>::sse_decode(deserializer);
         return crate::PdfMetadata {
@@ -23835,6 +23837,7 @@ impl SseDecode for crate::PdfMetadata {
             page_count: var_pageCount,
             scanned_confidence: var_scannedConfidence,
             scanned_pages: var_scannedPages,
+            fabricated_text_pages: var_fabricatedTextPages,
             layout_gated_pages: var_layoutGatedPages,
             layout_gate_reasons: var_layoutGateReasons,
         };
@@ -31876,6 +31879,7 @@ impl flutter_rust_bridge::IntoDart for FrbWrapper<crate::PdfMetadata> {
             self.0.page_count.into_into_dart().into_dart(),
             self.0.scanned_confidence.into_into_dart().into_dart(),
             self.0.scanned_pages.into_into_dart().into_dart(),
+            self.0.fabricated_text_pages.into_into_dart().into_dart(),
             self.0.layout_gated_pages.into_into_dart().into_dart(),
             self.0.layout_gate_reasons.into_into_dart().into_dart(),
         ]
@@ -40548,6 +40552,7 @@ impl SseEncode for crate::PdfMetadata {
         <Option<i64>>::sse_encode(self.page_count, serializer);
         <Option<f64>>::sse_encode(self.scanned_confidence, serializer);
         <Option<Vec<i64>>>::sse_encode(self.scanned_pages, serializer);
+        <Option<Vec<i64>>>::sse_encode(self.fabricated_text_pages, serializer);
         <Option<Vec<i64>>>::sse_encode(self.layout_gated_pages, serializer);
         <Option<Vec<String>>>::sse_encode(self.layout_gate_reasons, serializer);
     }
