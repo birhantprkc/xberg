@@ -3,7 +3,9 @@
 //! Combines three signals into a single threshold-able score:
 //! - `text_coverage` — fraction of pages with usable text (caller supplies from
 //!   pdf-level analysis, or 1.0 for non-PDF text formats),
-//! - `ocr_aggregate` — mean of `ocr_elements[].confidence.recognition` when OCR ran,
+//! - `ocr_aggregate` — recognition confidence averaged over every OCR'd word, weighted by word
+//!   count; sourced from `ocr_elements` when OCR ran on embedded images, or from
+//!   `PageContent.ocr_confidence` for the page-level OCR route when `ocr_elements` is absent,
 //! - `schema_compliance` — outcome of JSON validation against the caller's schema.
 
 use serde::{Deserialize, Serialize};
@@ -44,7 +46,8 @@ impl SchemaCompliance {
 pub struct ConfidenceSignals {
     /// Fraction of pages with usable text in `[0, 1]`.
     pub text_coverage: f32,
-    /// Mean OCR per-element recognition confidence; `None` when OCR did not run.
+    /// OCR recognition confidence, averaged over every recognized word and weighted by word
+    /// count rather than by element or page count; `None` when OCR did not run.
     pub ocr_aggregate: Option<f32>,
     /// Schema-validation result of the merged output.
     pub schema_compliance: SchemaCompliance,
@@ -58,28 +61,74 @@ impl ConfidenceSignals {
     /// * `text_coverage` — Caller-supplied fraction of pages with usable text
     ///   (e.g. 1.0 for native text formats, value from PDF analysis for PDFs).
     ///
-    /// The `ocr_aggregate` is computed as the arithmetic mean of all
-    /// `ocr_elements[].confidence.recognition` values.  When `ocr_elements` is
-    /// `None` or empty the field is set to `None`.
+    /// The `ocr_aggregate` is the word-count-weighted mean recognition confidence, taken from
+    /// `ocr_elements` when present ([`Self::ocr_aggregate_from_elements`]) or, for the
+    /// page-level OCR route, from `PageContent.ocr_confidence`
+    /// ([`Self::ocr_aggregate_from_pages`]). Both use the same weighting, so the field carries
+    /// one statistic regardless of which route populated it. `None` when neither source has a
+    /// recognized word.
     pub fn from_extraction_result(
         result: &ExtractedDocument,
         schema_compliance: SchemaCompliance,
         text_coverage: f32,
     ) -> Self {
-        let ocr_aggregate = result.ocr_elements.as_deref().and_then(|elements| {
-            if elements.is_empty() {
-                return None;
-            }
-            let sum: f64 = elements.iter().map(|e| e.confidence.recognition).sum();
-            let mean = sum / elements.len() as f64;
-            Some(mean as f32)
-        });
+        let ocr_aggregate =
+            Self::ocr_aggregate_from_elements(result).or_else(|| Self::ocr_aggregate_from_pages(result));
 
         Self {
             text_coverage,
             ocr_aggregate,
             schema_compliance,
         }
+    }
+
+    /// Word-count-weighted mean OCR recognition confidence from `ocr_elements`, the field
+    /// `apply_public_element_policy` populates. Its only two call sites are both embedded-image
+    /// OCR (`extraction/image_ocr.rs`, `extractors/pdf/mod.rs`'s `ocr_inline_images` path), so
+    /// this alone is `None` for the page-level OCR route (issue #1677);
+    /// [`Self::ocr_aggregate_from_pages`] covers that route.
+    ///
+    /// Weighted by each element's own word count (`text.split_whitespace().count()`), not
+    /// counted flat per element. PaddleOCR's native elements are `Line`-level
+    /// (`OcrElementLevel::Line`), and the default `OcrElementConfig::min_level` passes lines
+    /// through unfiltered, so a flat per-element mean would silently change meaning whenever
+    /// line lengths vary. Weighting by word count keeps the statistic "mean confidence per
+    /// recognized word" regardless of the element granularity a backend reports, which is also
+    /// what [`Self::ocr_aggregate_from_pages`] computes.
+    fn ocr_aggregate_from_elements(result: &ExtractedDocument) -> Option<f32> {
+        let elements = result.ocr_elements.as_deref()?;
+        Self::word_count_weighted_mean(elements.iter().map(|element| {
+            let word_count = element.text.split_whitespace().count() as u64;
+            (element.confidence.recognition, word_count)
+        }))
+    }
+
+    /// Word-count-weighted mean OCR recognition confidence for the page-level OCR route (issue
+    /// #1677), which reports per-page confidence (`PageContent.ocr_confidence`) but never
+    /// populates `ocr_elements`. Uses the SAME weighting [`Self::ocr_aggregate_from_elements`]
+    /// does, so the two routes agree on what `ocr_aggregate` means regardless of which one
+    /// populated it. A page whose backend reports no calibrated legibility scale
+    /// (`score: None`) is skipped rather than treated as zero confidence.
+    fn ocr_aggregate_from_pages(result: &ExtractedDocument) -> Option<f32> {
+        let pages = result.pages.as_deref()?;
+        Self::word_count_weighted_mean(
+            pages
+                .iter()
+                .filter_map(|page| page.ocr_confidence.as_ref())
+                .filter_map(|confidence| confidence.score.map(|score| (score, u64::from(confidence.word_count)))),
+        )
+    }
+
+    /// Fold `(recognition_score, word_count)` pairs into their word-count-weighted mean.
+    /// Shared by [`Self::ocr_aggregate_from_elements`] and [`Self::ocr_aggregate_from_pages`] so
+    /// the two routes cannot drift onto different weightings: this is the one place either can
+    /// compute "mean confidence per recognized word". `None` when no pair carries a word.
+    fn word_count_weighted_mean(pairs: impl Iterator<Item = (f64, u64)>) -> Option<f32> {
+        let (weighted_sum, total_words) = pairs.fold((0.0_f64, 0_u64), |(sum, words), (score, word_count)| {
+            (sum + score * word_count as f64, words + word_count)
+        });
+
+        (total_words > 0).then(|| (weighted_sum / total_words as f64) as f32)
     }
 }
 
@@ -125,7 +174,8 @@ impl ConfidenceWeights {
 pub struct ExtractionConfidence {
     /// Fraction of pages with a usable text layer.
     pub text_coverage: f32,
-    /// Mean OCR per-element recognition confidence when OCR ran; `None` when it did not.
+    /// OCR recognition confidence, word-count-weighted across every recognized word, when OCR
+    /// ran; `None` when it did not.
     pub ocr_aggregate: Option<f32>,
     /// Whether the merged output validates against the preset schema.
     pub schema_compliance: SchemaCompliance,
@@ -166,8 +216,15 @@ mod tests {
     use crate::types::ocr_elements::{OcrBoundingGeometry, OcrConfidence, OcrElement};
 
     fn make_ocr_element(recognition: f64) -> OcrElement {
+        make_ocr_element_with_text(recognition, "word")
+    }
+
+    /// Builds an OCR element with a given recognized text, so its word count (used to weight
+    /// `ocr_aggregate_from_elements`) can be controlled directly, the way a PaddleOCR `Line`
+    /// element's word count varies with how many words are on that line.
+    fn make_ocr_element_with_text(recognition: f64, text: &str) -> OcrElement {
         OcrElement {
-            text: "word".to_string(),
+            text: text.to_string(),
             geometry: OcrBoundingGeometry::default(),
             confidence: OcrConfidence {
                 detection: None,
@@ -232,6 +289,33 @@ mod tests {
 
         let ocr_agg = signals.ocr_aggregate.expect("should have ocr_aggregate");
         assert!((ocr_agg as f64 - 0.95).abs() < 0.001, "expected ~0.95, got {}", ocr_agg);
+    }
+
+    // xberg#1677 finding 1: PaddleOCR's native elements are Line-level, and the default
+    // `OcrElementConfig::min_level` passes lines through unfiltered, so a flat mean over
+    // elements silently becomes "confidence per line" rather than "confidence per word"
+    // whenever line lengths vary. `ocr_aggregate_from_elements` must weight by each element's
+    // own word count, matching what `ocr_aggregate_from_pages` already does.
+    #[test]
+    fn from_extraction_result_weights_elements_by_word_count_not_flat_per_element() {
+        let result = ExtractedDocument {
+            ocr_elements: Some(vec![
+                make_ocr_element_with_text(0.9, "one"),
+                make_ocr_element_with_text(0.9, "two"),
+                make_ocr_element_with_text(0.1, "three words here"),
+            ]),
+            ..Default::default()
+        };
+
+        let signals = ConfidenceSignals::from_extraction_result(&result, SchemaCompliance::AllValid, 1.0);
+
+        // Word-count-weighted: (0.9*1 + 0.9*1 + 0.1*3) / 5 = 0.42. A flat per-element mean
+        // would give (0.9 + 0.9 + 0.1) / 3 = 0.6333, which is the bug this pins.
+        let ocr_agg = signals.ocr_aggregate.expect("should have ocr_aggregate");
+        assert!(
+            (ocr_agg - 0.42).abs() < 0.001,
+            "expected word-count-weighted 0.42, got {ocr_agg}"
+        );
     }
 
     #[test]
@@ -600,5 +684,152 @@ mod tests {
         let deserialized: ExtractionConfidence = serde_json::from_str(&json).unwrap();
         assert_eq!(original, deserialized);
         assert!(deserialized.ocr_aggregate.is_none());
+    }
+
+    // xberg#1677: the page-level OCR route never populates `ocr_elements` (only
+    // `apply_public_element_policy`'s two embedded-image call sites do), but it reports a
+    // per-page confidence. These pin the fallback and the claim that it agrees with the
+    // elements-based formula.
+    fn ocrd_page(page_number: u32, score: Option<f64>, word_count: u32) -> crate::types::PageContent {
+        crate::types::PageContent {
+            page_number,
+            content: String::new(),
+            tables: Vec::new(),
+            image_indices: Vec::new(),
+            image_preprocessing: None,
+            hierarchy: None,
+            is_blank: None,
+            layout_regions: None,
+            speaker_notes: None,
+            section_name: None,
+            sheet_name: None,
+            ocr_confidence: Some(crate::types::page::PageOcrConfidence {
+                score,
+                word_count,
+                backend: "tesseract".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn from_extraction_result_falls_back_to_page_confidence_when_no_elements() {
+        let result = ExtractedDocument {
+            ocr_elements: None,
+            pages: Some(vec![ocrd_page(1, Some(0.9), 100), ocrd_page(2, Some(0.5), 300)]),
+            ..Default::default()
+        };
+
+        let signals = ConfidenceSignals::from_extraction_result(&result, SchemaCompliance::AllValid, 1.0);
+
+        // (0.9*100 + 0.5*300) / 400 = 0.6, the same word-count-weighted mean issue #1669's
+        // quality_score fix used for this exact data shape.
+        let ocr_agg = signals
+            .ocr_aggregate
+            .expect("page-route fallback must populate ocr_aggregate");
+        assert!((ocr_agg - 0.6).abs() < 1e-6, "expected 0.6, got {ocr_agg}");
+    }
+
+    #[test]
+    fn from_extraction_result_agrees_with_the_elements_formula_word_for_word() {
+        // Three pages, each carrying exactly one word's worth of confidence, must produce
+        // the identical aggregate an `ocr_elements` list of the same three words would:
+        // both are "the mean over every recognized word".
+        let via_pages = ExtractedDocument {
+            ocr_elements: None,
+            pages: Some(vec![
+                ocrd_page(1, Some(0.7), 1),
+                ocrd_page(2, Some(0.8), 1),
+                ocrd_page(3, Some(0.9), 1),
+            ]),
+            ..Default::default()
+        };
+        let via_elements = ExtractedDocument {
+            ocr_elements: Some(vec![
+                make_ocr_element(0.7),
+                make_ocr_element(0.8),
+                make_ocr_element(0.9),
+            ]),
+            ..Default::default()
+        };
+
+        let pages_signals = ConfidenceSignals::from_extraction_result(&via_pages, SchemaCompliance::AllValid, 1.0);
+        let elements_signals =
+            ConfidenceSignals::from_extraction_result(&via_elements, SchemaCompliance::AllValid, 1.0);
+
+        assert_eq!(
+            pages_signals.ocr_aggregate, elements_signals.ocr_aggregate,
+            "the page-route fallback must agree with the embedded-image route's own formula"
+        );
+    }
+
+    #[test]
+    fn from_extraction_result_agrees_with_elements_formula_when_line_lengths_vary() {
+        // Same reproduction as the flat-vs-weighted element test above, but this time compared
+        // against the page route for the same underlying word-level confidences: two 1-word
+        // lines at 0.9 and one 3-word line at 0.1. Both routes must land on the same aggregate,
+        // 0.42, regardless of which one filled it.
+        let via_elements = ExtractedDocument {
+            ocr_elements: Some(vec![
+                make_ocr_element_with_text(0.9, "one"),
+                make_ocr_element_with_text(0.9, "two"),
+                make_ocr_element_with_text(0.1, "three words here"),
+            ]),
+            ..Default::default()
+        };
+        let via_pages = ExtractedDocument {
+            ocr_elements: None,
+            pages: Some(vec![
+                ocrd_page(1, Some(0.9), 1),
+                ocrd_page(2, Some(0.9), 1),
+                ocrd_page(3, Some(0.1), 3),
+            ]),
+            ..Default::default()
+        };
+
+        let elements_signals =
+            ConfidenceSignals::from_extraction_result(&via_elements, SchemaCompliance::AllValid, 1.0);
+        let pages_signals = ConfidenceSignals::from_extraction_result(&via_pages, SchemaCompliance::AllValid, 1.0);
+
+        assert_eq!(
+            elements_signals.ocr_aggregate, pages_signals.ocr_aggregate,
+            "the two routes must agree even when element/line word counts vary"
+        );
+    }
+
+    #[test]
+    fn from_extraction_result_prefers_elements_over_pages_when_both_present() {
+        let result = ExtractedDocument {
+            ocr_elements: Some(vec![
+                make_ocr_element(0.7),
+                make_ocr_element(0.8),
+                make_ocr_element(0.9),
+            ]),
+            pages: Some(vec![ocrd_page(1, Some(0.1), 500)]),
+            ..Default::default()
+        };
+
+        let signals = ConfidenceSignals::from_extraction_result(&result, SchemaCompliance::AllValid, 1.0);
+
+        let ocr_agg = signals.ocr_aggregate.expect("must have ocr_aggregate");
+        assert!(
+            (ocr_agg - 0.8).abs() < 0.001,
+            "elements must take priority over the page fallback, got {ocr_agg}"
+        );
+    }
+
+    #[test]
+    fn from_extraction_result_pages_with_no_score_do_not_count_as_zero_confidence() {
+        let result = ExtractedDocument {
+            ocr_elements: None,
+            pages: Some(vec![ocrd_page(1, None, 500)]),
+            ..Default::default()
+        };
+
+        let signals = ConfidenceSignals::from_extraction_result(&result, SchemaCompliance::AllValid, 1.0);
+
+        assert!(
+            signals.ocr_aggregate.is_none(),
+            "an uncalibrated backend's None score must not be treated as zero confidence"
+        );
     }
 }
