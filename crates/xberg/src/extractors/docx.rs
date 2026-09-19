@@ -2140,6 +2140,41 @@ mod tests {
             .unwrap()
     }
 
+    /// End-to-end proof, through the reporter's document-structure shape, that a
+    /// style-carried `w:numId` (no direct paragraph numbering) produces one list
+    /// with three items rather than three plain paragraphs (GH#1663).
+    #[tokio::test]
+    async fn style_carried_numbering_produces_a_list_in_the_document_structure() {
+        use crate::types::internal::ElementKind;
+        let styles_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="ListBullet">
+    <w:name w:val="List Bullet"/><w:basedOn w:val="Normal"/>
+    <w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>
+  </w:style>
+</w:styles>"#;
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+  <w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+  <w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>Two</w:t></w:r></w:p>
+  <w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>Three</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let data = build_test_docx_with_parts(document_xml, Some(styles_xml), None, None, None, None, None);
+        let internal_doc = extract_docx_internal_document(&data).await;
+        let kinds: Vec<&ElementKind> = internal_doc.elements.iter().map(|e| &e.kind).collect();
+        let list_starts = kinds
+            .iter()
+            .filter(|k| matches!(k, ElementKind::ListStart { .. }))
+            .count();
+        let list_items = kinds
+            .iter()
+            .filter(|k| matches!(k, ElementKind::ListItem { .. }))
+            .count();
+        let paragraphs = kinds.iter().filter(|k| matches!(k, ElementKind::Paragraph)).count();
+        assert_eq!((list_starts, list_items, paragraphs), (1, 3, 0), "elements: {kinds:?}");
+    }
+
     #[tokio::test]
     async fn test_sdt_table_of_contents_marks_its_entries() {
         let data = build_test_docx_with_parts(TOC_SDT_DOCUMENT_XML, None, None, None, None, None, None);

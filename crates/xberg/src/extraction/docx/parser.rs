@@ -6255,6 +6255,101 @@ mod tests {
         assert_eq!(doc.paragraphs[0].numbering_level, Some(2));
     }
 
+    const LIST_BULLET_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="ListBullet">
+    <w:name w:val="List Bullet"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>
+  </w:style>
+</w:styles>"#;
+
+    fn list_styled_paragraph(text: &str) -> String {
+        format!(r#"<w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#)
+    }
+
+    fn docx_with_list_style(body: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("word/document.xml", options).unwrap();
+        zip.write_all(wrap_body(body).as_bytes()).unwrap();
+        zip.start_file("word/styles.xml", options).unwrap();
+        zip.write_all(LIST_BULLET_STYLES_XML.as_bytes()).unwrap();
+        for (path, xml) in extra_parts {
+            zip.start_file(*path, options).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn parse_bytes(bytes: &[u8]) -> Document {
+        let mut budget = SecurityBudget::with_defaults();
+        parse_document(bytes, &mut budget, &default_limits()).expect("docx parses")
+    }
+
+    /// End-to-end proof that `apply_style_numbering` is wired into `DocxParser::parse`:
+    /// a real archive through `parse_document`, not the extracted helper called directly
+    /// against a hand-built `Document` (GH#1663).
+    #[test]
+    fn a_body_paragraph_inherits_list_numbering_from_its_style_through_parse_document() {
+        let body = format!("{}{}", list_styled_paragraph("First"), list_styled_paragraph("Second"));
+        let doc = parse_bytes(&docx_with_list_style(&body, &[]));
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(doc.paragraphs[0].numbering_level, Some(0));
+        let md = doc.to_markdown(true);
+        assert_eq!(md, "- First\n- Second", "markdown: {md:?}");
+    }
+
+    #[test]
+    fn a_table_cell_paragraph_inherits_list_numbering_from_its_style() {
+        let body = format!(
+            "<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>",
+            list_styled_paragraph("In a cell")
+        );
+        let doc = parse_bytes(&docx_with_list_style(&body, &[]));
+        let cell = &doc.tables[0].rows[0].cells[0];
+        assert_eq!(cell.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(cell.paragraphs[0].numbering_level, Some(0));
+    }
+
+    #[test]
+    fn a_header_paragraph_inherits_list_numbering_from_its_style() {
+        let header = format!(
+            r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{}</w:hdr>"#,
+            list_styled_paragraph("In a header")
+        );
+        let doc = parse_bytes(&docx_with_list_style("", &[("word/header1.xml", &header)]));
+        assert_eq!(doc.headers.len(), 1, "header part was picked up");
+        assert_eq!(doc.headers[0].paragraphs[0].numbering_id, Some(1));
+    }
+
+    #[test]
+    fn a_footnote_paragraph_inherits_list_numbering_from_its_style() {
+        // ids -1/0/1 are reserved separators; 2 is the first real footnote id.
+        let footnotes = format!(
+            r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="2">{}</w:footnote></w:footnotes>"#,
+            list_styled_paragraph("In a footnote")
+        );
+        let doc = parse_bytes(&docx_with_list_style("", &[("word/footnotes.xml", &footnotes)]));
+        assert_eq!(doc.footnotes.len(), 1);
+        assert_eq!(doc.footnotes[0].paragraphs[0].numbering_id, Some(1));
+    }
+
+    #[test]
+    fn a_comment_paragraph_inherits_list_numbering_from_its_style() {
+        let comments = format!(
+            r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0" w:author="A">{}</w:comment></w:comments>"#,
+            list_styled_paragraph("In a comment")
+        );
+        let doc = parse_bytes(&docx_with_list_style("", &[("word/comments.xml", &comments)]));
+        assert_eq!(doc.comments.len(), 1);
+        assert_eq!(doc.comments[0].paragraphs[0].numbering_id, Some(1));
+    }
+
     #[test]
     fn test_bullet_list_extraction() {
         let xml = wrap_body(
