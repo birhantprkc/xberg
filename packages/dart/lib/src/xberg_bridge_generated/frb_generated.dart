@@ -23120,8 +23120,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PdfMetadata dco_decode_pdf_metadata(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 10)
-      throw Exception('unexpected arr length: expect 10 but see ${arr.length}');
+    if (arr.length != 11)
+      throw Exception('unexpected arr length: expect 11 but see ${arr.length}');
     return PdfMetadata(
       pdfVersion: dco_decode_opt_String(arr[0]),
       producer: dco_decode_opt_String(arr[1]),
@@ -23131,8 +23131,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       pageCount: dco_decode_opt_box_autoadd_i_64(arr[5]),
       scannedConfidence: dco_decode_opt_box_autoadd_f_64(arr[6]),
       scannedPages: dco_decode_opt_list_prim_i_64_strict(arr[7]),
-      layoutGatedPages: dco_decode_opt_list_prim_i_64_strict(arr[8]),
-      layoutGateReasons: dco_decode_opt_list_String(arr[9]),
+      fabricatedTextPages: dco_decode_opt_list_prim_i_64_strict(arr[8]),
+      layoutGatedPages: dco_decode_opt_list_prim_i_64_strict(arr[9]),
+      layoutGateReasons: dco_decode_opt_list_String(arr[10]),
     );
   }
 
@@ -34024,6 +34025,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_pageCount = sse_decode_opt_box_autoadd_i_64(deserializer);
     var var_scannedConfidence = sse_decode_opt_box_autoadd_f_64(deserializer);
     var var_scannedPages = sse_decode_opt_list_prim_i_64_strict(deserializer);
+    var var_fabricatedTextPages = sse_decode_opt_list_prim_i_64_strict(
+      deserializer,
+    );
     var var_layoutGatedPages = sse_decode_opt_list_prim_i_64_strict(
       deserializer,
     );
@@ -34037,6 +34041,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       pageCount: var_pageCount,
       scannedConfidence: var_scannedConfidence,
       scannedPages: var_scannedPages,
+      fabricatedTextPages: var_fabricatedTextPages,
       layoutGatedPages: var_layoutGatedPages,
       layoutGateReasons: var_layoutGateReasons,
     );
@@ -44257,6 +44262,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_i_64(self.pageCount, serializer);
     sse_encode_opt_box_autoadd_f_64(self.scannedConfidence, serializer);
     sse_encode_opt_list_prim_i_64_strict(self.scannedPages, serializer);
+    sse_encode_opt_list_prim_i_64_strict(self.fabricatedTextPages, serializer);
     sse_encode_opt_list_prim_i_64_strict(self.layoutGatedPages, serializer);
     sse_encode_opt_list_String(self.layoutGateReasons, serializer);
   }
