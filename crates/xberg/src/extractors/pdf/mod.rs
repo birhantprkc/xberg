@@ -6705,6 +6705,77 @@ mod tests {
         );
     }
 
+    /// GH#1668 review follow-up: `test_include_document_structure_alone_triggers_the_structured_path`
+    /// only asserts `node_types`, never `content`, so it cannot catch a change that keeps the
+    /// structure tree correct while reverting the plain-text rendering the changelog also
+    /// promises. `mod.rs`'s `select_pdf_document` Mixed-branch merge already gates a similar
+    /// merge on `output_format != Plain` (see the comment there); a later change of that shape
+    /// applied to the native path would silently revert this fix without failing the existing
+    /// test. This test pins the plain-text side directly: with `include_document_structure` set,
+    /// `Plain` output must still come from the structured document, so each table row renders as
+    /// its own line (`render_table_plain` is `row.join(" ")` per row), and that output must differ
+    /// from the flag left off.
+    #[tokio::test]
+    #[cfg(feature = "pdf")]
+    async fn plain_output_with_document_structure_renders_each_table_row_on_its_own_line() {
+        use crate::core::config::OutputFormat;
+
+        let extractor = PdfExtractor::new();
+        let pdf_path = pdf_test_document("embedded_images_tables.pdf");
+        assert!(
+            pdf_path.exists(),
+            "missing test fixture: {pdf_path:?} — add embedded_images_tables.pdf to test_documents/pdf/"
+        );
+        let content = std::fs::read(&pdf_path).expect("failed to read embedded_images_tables.pdf");
+
+        let flat_config = crate::core::config::ExtractionConfig {
+            include_document_structure: false,
+            ..Default::default()
+        };
+        let flat_result = extractor
+            .extract_content(&content, "application/pdf", &flat_config)
+            .await
+            .expect("native extraction without include_document_structure should succeed");
+        let flat_result = crate::extraction::derive::derive_extraction_result(flat_result, true, OutputFormat::Plain);
+
+        let structured_config = crate::core::config::ExtractionConfig {
+            include_document_structure: true,
+            ..Default::default()
+        };
+        let structured_result = extractor
+            .extract_content(&content, "application/pdf", &structured_config)
+            .await
+            .expect("native extraction with include_document_structure should succeed");
+        let structured_result =
+            crate::extraction::derive::derive_extraction_result(structured_result, true, OutputFormat::Plain);
+
+        assert_eq!(
+            flat_result.tables.len(),
+            1,
+            "fixture must carry exactly one native table with include_document_structure off"
+        );
+        assert_eq!(
+            structured_result.tables.len(),
+            1,
+            "fixture must carry exactly one native table with include_document_structure on"
+        );
+
+        let table = &structured_result.tables[0];
+        for row in &table.cells {
+            let rendered_row = row.join(" ");
+            assert!(
+                structured_result.content.lines().any(|line| line == rendered_row),
+                "expected table row {rendered_row:?} to render as its own line in the structured Plain content; got {:?}",
+                structured_result.content
+            );
+        }
+
+        assert_ne!(
+            flat_result.content, structured_result.content,
+            "include_document_structure must change the rendered Plain content for a document with a native table"
+        );
+    }
+
     /// Regression for #1355: when `force_ocr` renders a page blank (as xberg_native_pdf does
     /// for a page whose only visible content is an image XObject it silently failed to
     /// decode) but the page actually carries image XObjects, OCR must be retried on the
