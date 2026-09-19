@@ -566,6 +566,33 @@ pub(super) fn valid_page_indices(page_indices: &[usize], page_count: usize) -> V
 /// Render one page: the per-page body `render_selected_pages_from_document` runs, either in
 /// parallel across the thread pool or sequentially on `wasm32` (which has no OS threads for
 /// rayon's work-stealing pool to use).
+///
+/// #1690: `RENDER_CALL_THREAD_IDS` below is test-only instrumentation (compiled under
+/// `#[cfg(test)]` alone, no feature gate, so it never reaches a release build) that lets
+/// a test observe which OS threads actually executed page renders -- the mechanism a
+/// regression here breaks -- rather than inferring parallelism from wall-clock duration,
+/// which flakes under shared-box load. See `parallel_render_dispatches_across_more_than_one_thread`
+/// in `ocr/tests.rs`.
+#[cfg(test)]
+pub(super) static RENDER_CALL_THREAD_IDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(super) fn clear_render_call_thread_ids() {
+    RENDER_CALL_THREAD_IDS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+        .clear();
+}
+#[cfg(test)]
+fn record_render_thread() {
+    RENDER_CALL_THREAD_IDS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(std::thread::current().id());
+}
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 fn render_one_selected_page(
     doc: &xberg_native_pdf::PdfDocument,
@@ -574,6 +601,8 @@ fn render_one_selected_page(
     security_limits: &crate::extractors::security::SecurityLimits,
     images_config: Option<&crate::core::config::ImageExtractionConfig>,
 ) -> crate::Result<(usize, image::DynamicImage)> {
+    #[cfg(test)]
+    record_render_thread();
     let (page_width_pt, page_height_pt) = crate::pdf::render::get_page_dimensions_pt(doc, idx);
     let render_dpi =
         crate::image::dpi::effective_pdf_render_dpi(images_config, f64::from(page_width_pt), f64::from(page_height_pt));
