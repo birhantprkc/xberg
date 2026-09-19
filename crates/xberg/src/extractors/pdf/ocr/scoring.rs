@@ -1118,7 +1118,7 @@ pub(crate) fn apply_fabricated_provenance_pages(
 
     if !has_boundaries {
         // No boundaries to split mixed OCR by, so the whole document is the only
-        // unit the caller can act on -- matches the empty-native-text precedent above.
+        // unit the caller can act on -- matches the empty-native-text precedent above. ~keep
         decision.whole_doc_failure = true;
         return;
     }
