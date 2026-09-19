@@ -4270,6 +4270,40 @@ mod tests {
         );
     }
 
+    /// REV-C6 regression for GH#1662: an OCR-only config (no `extract_images`, no
+    /// captioning, no QR codes) must still read the real embedded-image bytes out of the
+    /// container, not an empty buffer. Before the fix, `needs_image_data` did not count
+    /// embedded-image OCR, so the `else` arm attached `Bytes::new()` with a format guessed
+    /// from the file extension, and OCR then ran on zero bytes and reported "Could not
+    /// determine image format".
+    #[tokio::test]
+    async fn test_docx_ocr_only_config_reads_real_embedded_image_bytes() {
+        let payload = "PNGPAYLOAD".repeat(64);
+        let data = build_docx_with_media(&payload);
+
+        let config = ExtractionConfig {
+            ocr: Some(crate::core::config::OcrConfig::default()),
+            ..Default::default()
+        };
+
+        let extractor = DocxExtractor::new();
+        let internal_doc = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                &config,
+            )
+            .await
+            .expect("an ordinary media member must extract");
+
+        assert_eq!(internal_doc.images.len(), 1, "the single drawing must yield one image");
+        assert_eq!(
+            internal_doc.images[0].data.as_ref(),
+            payload.as_bytes(),
+            "an OCR-only config must still read the real embedded-image bytes, not an empty buffer"
+        );
+    }
+
     /// Two drawings separated by two explicit page breaks, both referencing the same media part.
     const PAGED_IMAGES_DOCUMENT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"

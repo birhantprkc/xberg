@@ -1079,6 +1079,34 @@ mod tests {
         );
     }
 
+    /// REV-C6 regression for GH#1662: an OCR-only config must read a real inline image's
+    /// bytes, the same container-level fix `docx.rs`, `ppt.rs` and `pptx.rs` share through
+    /// `needs_image_data`. HTML carried the identical latent defect: before the fix an
+    /// OCR-only config (no `extract_images`) skipped reading the inline image at all.
+    #[tokio::test]
+    async fn test_html_ocr_only_config_reads_real_inline_image_bytes() {
+        let png_b64 =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        let html = format!(r#"<html><body><img src="data:image/png;base64,{png_b64}" alt="a photo"></body></html>"#);
+
+        let config = ExtractionConfig {
+            ocr: Some(crate::core::config::OcrConfig::default()),
+            ..Default::default()
+        };
+
+        let extractor = HtmlExtractor::new();
+        let doc = extractor
+            .extract_content(html.as_bytes(), "text/html", &config)
+            .await
+            .expect("inline image extraction must succeed");
+
+        assert_eq!(doc.images.len(), 1, "the single inline image must be read");
+        assert!(
+            !doc.images[0].data.is_empty(),
+            "an OCR-only config must read the real inline image bytes, not skip them"
+        );
+    }
+
     /// Regression test: extracted inline image bytes must be reachable from a matching
     /// `ElementKind::Image` element, otherwise renderers silently drop the image (and any OCR
     /// content attached to it) since they look images up by walking elements, not `doc.images`
