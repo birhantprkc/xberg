@@ -195,6 +195,10 @@ pub struct DeepseekOCRVisionConfig {
     pub width: Width,
 }
 
+fn default_max_new_tokens() -> usize {
+    4096
+}
+
 /// Complete DeepSeek-OCR model configuration.
 ///
 /// Top-level configuration combining language (DeepSeek V2 or Qwen2),
@@ -205,6 +209,15 @@ pub struct DeepseekOCRVisionConfig {
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct DeepseekOCRConfig {
+    /// Upper bound on tokens generated for one page.
+    ///
+    /// ~keep: this was a bare `const` of 128 inside the decode loop, which truncated every
+    /// dense page at roughly 400 to 650 characters and read as a model quality defect
+    /// (GH#1674). The sibling full-page OCR backend allows 4096 and GLM-OCR 2048; a dense
+    /// page needs about 800. It is a config field so a caller can lower it, because this
+    /// model costs far more per token than its siblings.
+    #[serde(default = "default_max_new_tokens")]
+    pub max_new_tokens: usize,
     /// Language decoder configuration.
     pub language_config: DeepseekV2Config,
     /// Vision-to-language projection configuration.

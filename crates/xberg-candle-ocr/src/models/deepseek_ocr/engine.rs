@@ -312,17 +312,17 @@ impl DeepseekOCREngine {
             .forward_initial(&input_ids, 0, mm_data)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Initial forward: {}", e)))?;
 
-        const MAX_NEW_TOKENS: usize = 128;
+        let max_new_tokens = self.config.max_new_tokens;
         let stop_ids = self.model.stop_token_ids();
         let mut output_tokens = prompt_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
 
         tracing::debug!(
-            max_tokens = MAX_NEW_TOKENS,
+            max_tokens = max_new_tokens,
             num_stop_ids = stop_ids.len(),
             "DeepSeek-OCR: starting decoding loop"
         );
 
-        for step in 0..MAX_NEW_TOKENS {
+        for step in 0..max_new_tokens {
             let seq_len = logits
                 .dim(1)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Output seq len: {}", e)))?;
