@@ -8928,4 +8928,70 @@ Name: ___
             "processing warnings must also still be carried forward"
         );
     }
+
+    // xberg#1665: the render batch peak scales with the configured thread budget, with no
+    // notion of `security_limits.max_content_size`, so a wider thread budget silently trips
+    // the fixed byte ceiling that a narrower one stays under and every page in the rejected
+    // batch is skipped. These test `adapt_batch_size_to_content_limit` directly, against the
+    // issue's own numbers: an A4 page at the 150 dpi default.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn adapt_batch_size_to_content_limit_shrinks_a_large_thread_budget_for_a4_pages() {
+        // A4 in points, matching the issue's reproduction (595 x 842pt).
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let batch_size = adapt_batch_size_to_content_limit(32, 595.0, 842.0, None, &limits);
+
+        assert!(
+            batch_size < 32,
+            "a 32-thread budget must be shrunk once its estimated peak crosses max_content_size, got {batch_size}"
+        );
+        assert!(batch_size >= 1, "a shrunk batch must never reach zero pages");
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn adapt_batch_size_to_content_limit_leaves_a_small_batch_untouched() {
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        // 16 A4 pages at 150 dpi stay under the 512 MiB default per the issue's own numbers.
+        let batch_size = adapt_batch_size_to_content_limit(16, 595.0, 842.0, None, &limits);
+
+        assert_eq!(
+            batch_size, 16,
+            "a batch that already fits the content limit must not shrink"
+        );
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn adapt_batch_size_to_content_limit_never_shrinks_below_one_page() {
+        // A single page whose own estimated peak already exceeds the limit: the batch must
+        // still carry that one page, not disappear to zero (`validate_png_encode_batch_peak`
+        // is what actually rejects an oversized single page; batch sizing must never do it
+        // silently by rounding a legitimate one-page batch down to nothing).
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 1,
+            ..Default::default()
+        };
+
+        let batch_size = adapt_batch_size_to_content_limit(8, 595.0, 842.0, None, &limits);
+
+        assert_eq!(batch_size, 1);
+    }
+
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn estimate_png_encode_page_peak_bytes_matches_hand_computed_accounting() {
+        // 100x50 px: source = conversion = 100*50*3 = 15,000; output = 100*50*4 + 262,144 = 282,144.
+        let bytes = estimate_png_encode_page_peak_bytes(100, 50).expect("small dimensions must not overflow");
+
+        assert_eq!(bytes, 15_000 + 15_000 + 282_144);
+    }
 }
