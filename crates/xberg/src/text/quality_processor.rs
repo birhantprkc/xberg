@@ -122,8 +122,14 @@ fn should_use_metadata(metadata: &crate::types::Metadata) -> bool {
 
 /// Below this many recognized words across all OCR'd pages, the mean confidence is based on
 /// too little evidence to trust as a ceiling on the whole document's score (issue #1669).
-/// Matches the caution in `PageOcrConfidence::word_count`'s own doc comment: a high score
+/// It follows the caution in `PageOcrConfidence::word_count`'s own doc comment: a high score
 /// next to a small word count is not representative.
+///
+/// ~keep: this floor is calibrated for this cap alone and is deliberately independent. It is
+/// not derived from `OcrConfig::min_words_for_ocr_output_check`, whose serde default happens
+/// to be 20 today, because that field is an operator-tunable knob for an unrelated check on
+/// fragmented OCR output. Deriving this floor from it would let a deployer who tunes that
+/// check silently move the ceiling on every document's quality score.
 const MIN_OCR_WORDS_FOR_CONFIDENCE_FLOOR: u64 = 20;
 
 /// Word-count-weighted mean OCR recognition confidence across pages that report one.
