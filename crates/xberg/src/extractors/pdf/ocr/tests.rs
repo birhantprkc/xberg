@@ -7813,6 +7813,96 @@ Name: ___
         data.starts_with(&[0xFF, 0xD8])
     }
 
+    /// Two pages: page one is the already-verified single-page embedded-image fixture
+    /// (`single_xobject_fixture_bytes`), page two is a synthetic, deliberately tiny blank
+    /// page with no image XObjects. Built by renumbering both source documents' objects
+    /// into one, the same technique lopdf's own merge example uses, so each page keeps its
+    /// own valid object graph (content stream, resources, XObjects) under one Pages tree.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    fn two_page_pdf_one_page_has_embedded_image() -> Vec<u8> {
+        use lopdf::{Document, Object, Stream, dictionary};
+        use std::collections::BTreeMap;
+
+        let doc1 = Document::load_mem(&single_xobject_fixture_bytes()).expect("fixture PDF must parse");
+        let doc2 = {
+            let mut d = Document::with_version("1.5");
+            let pages_id = d.new_object_id();
+            let content_id = d.add_object(Stream::new(dictionary! {}, Vec::new()));
+            let page_id = d.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 20.into(), 20.into()],
+                "Resources" => dictionary! {},
+                "Contents" => content_id,
+            });
+            d.objects.insert(
+                pages_id,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages",
+                    "Kids" => vec![page_id.into()],
+                    "Count" => 1,
+                }),
+            );
+            let catalog_id = d.add_object(dictionary! {
+                "Type" => "Catalog",
+                "Pages" => pages_id,
+            });
+            d.trailer.set("Root", catalog_id);
+            d
+        };
+
+        let mut max_id = 1;
+        let mut documents_pages: BTreeMap<lopdf::ObjectId, Object> = BTreeMap::new();
+        let mut documents_objects: BTreeMap<lopdf::ObjectId, Object> = BTreeMap::new();
+        for mut doc in [doc1, doc2] {
+            doc.renumber_objects_with(max_id);
+            max_id = doc.max_id + 1;
+            for (_, object_id) in doc.get_pages() {
+                documents_pages.insert(object_id, doc.get_object(object_id).unwrap().to_owned());
+            }
+            documents_objects.extend(doc.objects);
+        }
+
+        let mut document = Document::with_version("1.5");
+        for (object_id, object) in documents_objects {
+            document.objects.insert(object_id, object);
+        }
+
+        let pages_id: lopdf::ObjectId = (max_id, 0);
+        max_id += 1;
+        let catalog_id: lopdf::ObjectId = (max_id, 0);
+
+        let mut kids = Vec::new();
+        for (object_id, object) in documents_pages {
+            if let Object::Dictionary(mut dict) = object {
+                dict.set("Parent", pages_id);
+                document.objects.insert(object_id, Object::Dictionary(dict));
+                kids.push(Object::Reference(object_id));
+            }
+        }
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids.clone(),
+                "Count" => kids.len() as i64,
+            }),
+        );
+        document.objects.insert(
+            catalog_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Catalog",
+                "Pages" => pages_id,
+            }),
+        );
+        document.trailer.set("Root", catalog_id);
+        document.max_id = max_id;
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("merged fixture PDF must serialize");
+        bytes
+    }
+
     /// #1444, dominant hole: a per-page backend failure propagated straight out of
     /// `extract_with_ocr` with `?`, aborting the whole document *before* the blank-page
     /// image-XObject fallback further down the same loop could ever run. That is exactly the
@@ -8018,6 +8108,127 @@ Name: ___
             error.contains("retry") && error.contains("no text"),
             "the error must name the embedded-image retry's own empty outcome, not just repeat \
              the first failure as though the retry were never attempted; got: {error}"
+        );
+    }
+
+    /// #1673, per-page warning branch (the wholesale branch above is
+    /// `should_report_retry_outcome_when_xobject_retry_runs_but_recovers_nothing`; this is
+    /// its sibling). A multi-page document where one page's embedded-image retry runs and
+    /// recovers nothing, while a *different* page succeeds, must still name the failed
+    /// page's own retry outcome in its warning -- and must NOT be treated as the wholesale
+    /// "every page failed" defect, because another page produced real text.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn should_report_retry_outcome_on_one_page_without_wholesale_failure_when_another_page_succeeds() {
+        use crate::core::config::OcrConfig;
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+
+        const BACKEND_NAME: &str = "one-empty-retry-one-success-test-backend";
+        // Page one's raster is a real (photographic) page; page two's raster comes from a
+        // synthetic 20x20-point canvas, so its encoded PNG is trivially smaller. That size
+        // gap, not call order -- the pipeline submits both pages' raster calls concurrently
+        // -- is what the mock backend keys on to tell the two pages' raster calls apart.
+        const SMALL_RASTER_MAX_BYTES: usize = 4096;
+        // Comfortably over the ink-probe's MAX_INK_PROBE_TEXT_CHARS (200 non-whitespace
+        // characters) so page two's success is never mistaken for a blank page needing its
+        // own XObject retry.
+        const PAGE_TWO_TEXT: &str = "This page recovered real text directly, so the document overall must not be treated as a wholesale OCR failure. ";
+
+        struct OneEmptyRetryOneSuccessBackend;
+
+        #[async_trait::async_trait]
+        impl OcrBackend for OneEmptyRetryOneSuccessBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, data: &[u8], _: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                if is_embedded_jpeg(data) {
+                    // Page one's embedded-image retry: runs, but recovers nothing (#1673).
+                    Ok(ExtractedDocument::default())
+                } else if data.len() < SMALL_RASTER_MAX_BYTES {
+                    // Page two's own raster: succeeds directly, so page two never needs
+                    // the retry at all.
+                    Ok(ExtractedDocument {
+                        content: PAGE_TWO_TEXT.repeat(3),
+                        ..Default::default()
+                    })
+                } else {
+                    // Page one's own (real-page-sized) raster.
+                    Err(crate::XbergError::Plugin {
+                        message: VLM_NO_CONTENT_ERROR.to_string(),
+                        plugin_name: "ocr".to_string(),
+                    })
+                }
+            }
+            fn supports_document_processing(&self) -> bool {
+                false
+            }
+        }
+
+        impl Plugin for OneEmptyRetryOneSuccessBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        crate::plugins::register_ocr_backend(Arc::new(OneEmptyRetryOneSuccessBackend)).unwrap();
+
+        let pdf_bytes = two_page_pdf_one_page_has_embedded_image();
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: BACKEND_NAME.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extract_with_ocr(
+            Some(&pdf_bytes),
+            None,
+            #[cfg(feature = "layout-detection")]
+            None,
+            &config,
+            None,
+        )
+        .await;
+
+        crate::plugins::unregister_ocr_backend(BACKEND_NAME).unwrap();
+
+        let (text, _, _, _, doc, _, _, _, _, _, _) = result
+            .expect("page two recovered real text, so the document must NOT be treated as a wholesale OCR failure");
+        assert!(
+            text.contains(PAGE_TWO_TEXT.trim()),
+            "the successful page's text must survive into the document; got: {text}"
+        );
+
+        let warnings = doc
+            .expect("a per-page failure warning needs an internal document")
+            .processing_warnings;
+        assert!(
+            warnings.iter().any(|w| w.message.contains("OCR of page 1 failed")
+                && w.message
+                    .contains("the retry on the page's embedded image XObjects also returned no text")),
+            "the per-page warning must name the retry's own empty outcome; got: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("OCR failed on all")),
+            "another page recovered text, so this must stay a per-page warning, not the \
+             wholesale failure message; got: {warnings:?}"
         );
     }
 
