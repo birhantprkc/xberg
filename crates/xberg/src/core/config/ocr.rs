@@ -500,6 +500,14 @@ pub struct OcrPipelineStage {
 #[allow(dead_code)]
 pub(crate) const SOURCE_DPI_BACKEND_OPTION: &str = "source_dpi";
 
+/// [`OcrConfig::backend_options`] key carrying a page's PDF `/Rotate` value, in degrees.
+///
+/// Stamped per page by the PDF OCR route alongside [`SOURCE_DPI_BACKEND_OPTION`] (see
+/// `crate::extractors::pdf::ocr::pipeline::ocr_config_with_page_rotation_hint`). Declared here
+/// for the same reason: so the producer and any consumer cannot drift apart on the key's spelling.
+#[allow(dead_code)]
+pub(crate) const PAGE_ROTATION_DEGREES_BACKEND_OPTION: &str = "page_rotation_degrees";
+
 fn default_priority() -> u32 {
     100
 }

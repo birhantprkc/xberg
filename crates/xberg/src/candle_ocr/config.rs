@@ -193,7 +193,20 @@ where
             "invalid {backend_name} backend_options: expected a JSON object"
         )));
     }
-    serde_json::from_value(value.clone())
+    // The PDF OCR route stamps `source_dpi` and `page_rotation_degrees` into every backend's
+    // shared `backend_options` object regardless of which backend will read it (xberg#1672,
+    // `extractors::pdf::ocr::pipeline::ocr_config_with_page_rotation_hint`), and
+    // `OcrConfig::backend_options`'s own contract says unknown keys are silently ignored. No
+    // candle backend option struct declares either field, so strip exactly those two known
+    // pipeline hint keys before the `deny_unknown_fields` deserialize below -- which keeps
+    // reporting a real typo in a candle-specific option (any other unknown key) as the
+    // validation error it is.
+    let mut value = value.clone();
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove(crate::core::config::ocr::SOURCE_DPI_BACKEND_OPTION);
+        obj.remove(crate::core::config::ocr::PAGE_ROTATION_DEGREES_BACKEND_OPTION);
+    }
+    serde_json::from_value(value)
         .map_err(|error| XbergError::validation(format!("invalid {backend_name} backend_options: {error}")))
 }
 
@@ -415,6 +428,40 @@ mod tests {
             .to_string();
         assert!(error.contains("unknown field `versoin`"));
         assert!(error.contains("candle-deepseek-ocr backend_options"));
+    }
+
+    /// xberg#1672: the PDF OCR page path stamps `source_dpi` and `page_rotation_degrees` into
+    /// the shared `backend_options` object for every backend
+    /// (`extractors::pdf::ocr::pipeline::ocr_config_with_page_rotation_hint`).
+    /// `OcrConfig::backend_options`'s own contract says unknown keys are silently ignored, and no
+    /// candle backend option struct declares either field, so both keys must be tolerated here
+    /// too -- not just any unknown key, which `should_reject_invalid_candle_backend_options_with_context`
+    /// above still rejects.
+    ///
+    /// Fails on unfixed code: `deny_unknown_fields` rejects `source_dpi` with `unknown field
+    /// source_dpi, expected one of ...` for every one of the four candle backends.
+    #[test]
+    fn should_ignore_pdf_pipeline_hint_keys_in_candle_backend_options() {
+        let hints = serde_json::json!({"source_dpi": 150.0, "page_rotation_degrees": 270});
+
+        let trocr: TrocrBackendOptions = parse_backend_options(Some(&hints), "candle-trocr").unwrap();
+        assert_eq!(trocr, TrocrBackendOptions::default());
+
+        let paddle: PaddleOcrVlBackendOptions = parse_backend_options(Some(&hints), "candle-paddleocr-vl").unwrap();
+        assert_eq!(paddle, PaddleOcrVlBackendOptions::default());
+
+        let glm: GlmOcrBackendOptions = parse_backend_options(Some(&hints), "candle-glm-ocr").unwrap();
+        assert_eq!(glm, GlmOcrBackendOptions::default());
+
+        let deepseek: DeepseekOcrBackendOptions = parse_backend_options(Some(&hints), "candle-deepseek-ocr").unwrap();
+        assert_eq!(deepseek, DeepseekOcrBackendOptions::default());
+
+        // A hint alongside a real option must still combine correctly, not disappear with the
+        // rest of the object.
+        let mixed = serde_json::json!({"source_dpi": 150.0, "task": "table"});
+        let paddle_mixed: PaddleOcrVlBackendOptions =
+            parse_backend_options(Some(&mixed), "candle-paddleocr-vl").unwrap();
+        assert_eq!(paddle_mixed.task, Some(PaddleOcrVlTaskKind::Table));
     }
 
     #[test]
