@@ -7921,6 +7921,106 @@ Name: ___
         );
     }
 
+    /// #1673: when the embedded-image retry runs and the backend returns successfully but
+    /// with empty content -- the shape every candle VLM backend takes when it silently
+    /// produces nothing (`tracing::warn!("... output is empty")` and returns `Ok`, not an
+    /// `Err`) -- the page's failure warning must name the retry's own empty outcome rather
+    /// than just repeating the first (page-raster) failure as though nothing else happened.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn should_report_retry_outcome_when_xobject_retry_runs_but_recovers_nothing() {
+        use crate::core::config::OcrConfig;
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+
+        const BACKEND_NAME: &str = "page-raster-error-then-empty-retry-test-backend";
+
+        struct FailOnPageRasterThenEmptyBackend;
+
+        #[async_trait::async_trait]
+        impl OcrBackend for FailOnPageRasterThenEmptyBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, data: &[u8], _: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                if is_embedded_jpeg(data) {
+                    // The retry runs and returns successfully, but with nothing recovered --
+                    // exactly what candle-glm-ocr does on this kind of input (#1673).
+                    Ok(ExtractedDocument::default())
+                } else {
+                    Err(crate::XbergError::Plugin {
+                        message: VLM_NO_CONTENT_ERROR.to_string(),
+                        plugin_name: "ocr".to_string(),
+                    })
+                }
+            }
+            fn supports_document_processing(&self) -> bool {
+                false
+            }
+        }
+
+        impl Plugin for FailOnPageRasterThenEmptyBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        crate::plugins::register_ocr_backend(Arc::new(FailOnPageRasterThenEmptyBackend)).unwrap();
+
+        let pdf_bytes = single_xobject_fixture_bytes();
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: BACKEND_NAME.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extract_with_ocr(
+            Some(&pdf_bytes),
+            None,
+            #[cfg(feature = "layout-detection")]
+            None,
+            &config,
+            None,
+        )
+        .await;
+
+        crate::plugins::unregister_ocr_backend(BACKEND_NAME).unwrap();
+
+        // The document's only page fails and its embedded-image retry also recovers
+        // nothing, so this is the wholesale "every page failed" path -- an aggregate error,
+        // per `should_error_when_every_page_fails_and_nothing_can_be_recovered`. The defect
+        // this test pins is what that error SAYS: before the fix it names only the first
+        // (page-raster) failure, exactly as if the retry had never been attempted.
+        let error = result
+            .expect_err("every page failed and nothing was recovered, so the document must error")
+            .to_string();
+        assert!(
+            error.contains(VLM_NO_CONTENT_ERROR),
+            "the first failure must still be named; got: {error}"
+        );
+        assert!(
+            error.contains("retry") && error.contains("no text"),
+            "the error must name the embedded-image retry's own empty outcome, not just repeat \
+             the first failure as though the retry were never attempted; got: {error}"
+        );
+    }
+
     /// #1444, holes 2 and 4 together. Two independent reasons the fallback could not fire
     /// for a layout-detected scanned page:
     ///

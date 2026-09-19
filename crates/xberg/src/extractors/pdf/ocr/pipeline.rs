@@ -1463,6 +1463,12 @@ pub(super) async fn extract_with_ocr_for_page(
     // recovered still returns an error.
     let mut page_backend_errors: Vec<(usize, String)> = Vec::new();
     let mut page_failure_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
+    // #1673: page numbers (1-based) whose embedded-image retry ran (attempted at least one
+    // image) but the backend returned successfully with empty content on every one of them --
+    // the shape every candle VLM backend takes when it silently produces nothing
+    // (`tracing::warn!("... output is empty")`, `Ok` rather than `Err`). Distinguishes, on the
+    // failure paths below, "the retry never ran" from "the retry ran and recovered nothing".
+    let mut pages_with_empty_xobject_retry: Vec<u32> = Vec::new();
 
     #[cfg(feature = "pdf")]
     let mut margin_filter_warnings: Vec<crate::types::ProcessingWarning> = Vec::new();
@@ -1868,6 +1874,9 @@ pub(super) async fn extract_with_ocr_for_page(
             #[cfg(feature = "pdf")]
             let default_security_limits = crate::extractors::security::SecurityLimits::default();
             let security_limits = config.security_limits.as_ref().unwrap_or(&default_security_limits);
+            // Set when the embedded-image retry ran (attempted at least one image) but the
+            // backend returned successfully with empty content on every one of them (#1673).
+            let mut xobject_retry_ran_empty = false;
             if page_needs_xobject_fallback(&ocr_result.content, encoded_batch[offset].1.as_slice(), security_limits) {
                 // The layout-detection route hands in pre-rendered `images`, which leaves
                 // `lazy_pdf_render_state` unopened; that used to disable this fallback
@@ -1900,6 +1909,8 @@ pub(super) async fn extract_with_ocr_for_page(
                     } = recovery;
                     if !text.is_empty() {
                         ocr_result.content = text;
+                    } else if attempted > 0 {
+                        xobject_retry_ran_empty = true;
                     }
                     accumulated_llm_usage.append(&mut llm_usage);
                     collected_tables.append(&mut tables);
@@ -1919,12 +1930,21 @@ pub(super) async fn extract_with_ocr_for_page(
             // that vanishes silently is the defect this replaces.
             if let Some(error) = batch_page_errors[offset].take() {
                 let recovered = !ocr_result.content.trim().is_empty();
+                if !recovered && xobject_retry_ran_empty {
+                    pages_with_empty_xobject_retry.push(document_page_number);
+                }
                 page_failure_warnings.push(crate::types::ProcessingWarning {
                     source: std::borrow::Cow::Borrowed("ocr"),
                     message: std::borrow::Cow::Owned(if recovered {
                         format!(
                             "OCR of page {} failed ({error}); its text was recovered from the page's \
                              embedded image XObjects instead.",
+                            document_page_number
+                        )
+                    } else if xobject_retry_ran_empty {
+                        format!(
+                            "OCR of page {} failed ({error}); the retry on the page's embedded image \
+                             XObjects also returned no text.",
                             document_page_number
                         )
                     } else {
@@ -2252,11 +2272,20 @@ pub(super) async fn extract_with_ocr_for_page(
         && page_texts.iter().all(|text| text.trim().is_empty())
     {
         let (_, first_error) = &page_backend_errors[0];
-        return Err(crate::XbergError::Plugin {
-            message: format!(
+        let message = if pages_with_empty_xobject_retry.is_empty() {
+            format!(
                 "OCR failed on all {total_pages} page(s) and no text could be recovered from the pages' \
                  embedded images; first failure: {first_error}"
-            ),
+            )
+        } else {
+            format!(
+                "OCR failed on all {total_pages} page(s); first failure: {first_error}. The embedded-image \
+                 retry ran on {} of these page(s) and also returned no text.",
+                pages_with_empty_xobject_retry.len()
+            )
+        };
+        return Err(crate::XbergError::Plugin {
+            message,
             plugin_name: "ocr".to_string(),
         });
     }
