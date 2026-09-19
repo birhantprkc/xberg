@@ -1053,12 +1053,54 @@ impl ExtractionConfig {
     /// For text-only extractions (no OCR, no image extraction), skipping image
     /// decompression can improve CPU utilization by 5-10% by avoiding wasteful
     /// image I/O and processing when results won't be used.
-    /// Returns `true` when image binary data should be extracted.
+    /// Returns `true` when a CONTAINER document (DOCX, PPT, PPTX, HTML, ...) needs
+    /// to read an embedded image's binary data out of its archive or source.
     ///
-    /// True when `config.images.extract_images` is set, captioning is configured, or QR-code
-    /// detection is enabled. Captioning and QR-code detection both require image bytes
-    /// regardless of whether the caller also requested image extraction.
+    /// True when `config.images.extract_images` is set, captioning is configured, QR-code
+    /// detection is enabled, or embedded images get OCR'd. All four consume the bytes:
+    /// captioning and QR-code detection regardless of whether the caller also requested
+    /// image extraction, and embedded-image OCR because the OCR path reads the same bytes
+    /// the container would otherwise skip (GH#1662): before the OCR disjunct existed, a
+    /// container asked this question, was told no, and attached an image with an empty
+    /// buffer, which OCR then ran on and reported `Could not determine image format`.
+    ///
+    /// This governs whether a CONTAINER reads bytes it does not otherwise have. A
+    /// standalone image extractor already holds the whole file's bytes regardless of this
+    /// answer, so it must not use this method to decide whether to put its OWN bytes in the
+    /// result's `images` array; that is [`wants_own_bytes_in_result`](Self::wants_own_bytes_in_result).
     pub fn needs_image_data(&self) -> bool {
+        self.images.as_ref().is_some_and(|i| i.extract_images)
+            || self.runs_ocr_on_embedded_images()
+            || self.captioning.is_some()
+            || self.qr_codes == Some(true)
+    }
+
+    /// Whether embedded images get OCR'd.
+    ///
+    /// This mirrors the condition the pipeline itself uses before it calls
+    /// `image_ocr::process_images_with_ocr` (`core/pipeline/mod.rs`), and it is
+    /// deliberately the same predicate rather than an equivalent one: when the
+    /// two drifted apart, a container extractor asked `needs_image_data` and was
+    /// told no, so it attached an image with an empty buffer, and the OCR path
+    /// then ran on those zero bytes and reported `Could not determine image
+    /// format` (GH#1662).
+    pub fn runs_ocr_on_embedded_images(&self) -> bool {
+        self.ocr.is_some() && self.images.as_ref().map(|i| i.run_ocr_on_images).unwrap_or(true)
+    }
+
+    /// Returns `true` when a standalone image extraction (the whole input document IS
+    /// the image, not a container's embedded picture) should attach its own already-read
+    /// bytes to the result's `images` array.
+    ///
+    /// Deliberately narrower than [`needs_image_data`](Self::needs_image_data): a standalone
+    /// image's content is read in full before this question is ever asked, whether or not OCR
+    /// runs, so OCR being configured is not by itself a reason to echo those bytes back in the
+    /// public output. Using `needs_image_data` here (as `needs_image_data`'s own OCR disjunct
+    /// briefly did) would silently start returning every OCR'd standalone image's raw bytes in
+    /// `images`, a public output contract change with nothing asking for it. Same three
+    /// conditions as before that disjunct existed: explicit image extraction, captioning, or
+    /// QR-code detection.
+    pub fn wants_own_bytes_in_result(&self) -> bool {
         self.images.as_ref().is_some_and(|i| i.extract_images)
             || self.captioning.is_some()
             || self.qr_codes == Some(true)
@@ -1649,6 +1691,38 @@ mod tests {
             Some(600),
             "absent field must use default_extraction_timeout() -> Some(600)"
         );
+    }
+
+    /// Embedded-image OCR reads the image bytes, so a configuration that runs it
+    /// has to report that it needs them. A container extractor asks this question
+    /// to decide whether to read the image out of its archive; when the answer was
+    /// no, the image still reached the OCR path, with an empty buffer (GH#1662).
+    #[test]
+    fn a_config_that_ocrs_embedded_images_needs_the_image_data() {
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+        assert!(
+            config.needs_image_data(),
+            "OCR of embedded images consumes the bytes, so they must be read"
+        );
+    }
+
+    /// Turning embedded-image OCR off leaves the answer where it was, so a
+    /// text-only extraction still skips reading images out of the container.
+    #[test]
+    fn a_config_that_does_not_ocr_embedded_images_still_skips_the_data() {
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            images: Some(ImageExtractionConfig {
+                extract_images: false,
+                run_ocr_on_images: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!config.needs_image_data());
     }
 
     #[test]

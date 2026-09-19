@@ -592,6 +592,65 @@ impl InternalDocumentExtractor for PptxExtractor {
 mod tests {
     use super::*;
 
+    /// REV-CB regression for GH#1687 (shares the GH#1662/GH#1686 fix): an OCR-only
+    /// `ExtractionConfig` (no `images.extract_images`, no captioning, no QR codes) must
+    /// still read a slide's embedded raster image bytes out of the PPTX archive, not
+    /// skip it. `needs_image_data` gained the OCR disjunct that makes this true (#1662);
+    /// PPTX shares that predicate with DOCX and HTML through
+    /// `PptxExtractor::extract_content`'s `config.needs_image_data()` call, but until now
+    /// nothing exercised that call site directly for PPTX. Before the fix, `extract_images`
+    /// stayed `false` for an OCR-only config, so the slide-image loop in
+    /// `extraction::pptx::extract_pptx_from_bytes_with_slide_contents` never ran at all and
+    /// `doc.images` stayed empty, silently, with no warning.
+    #[tokio::test]
+    async fn test_pptx_ocr_only_config_reads_real_embedded_image_bytes() {
+        use crate::core::config::ExtractionConfig;
+        use crate::plugins::InternalDocumentExtractor;
+
+        let payload = "PNGPAYLOAD".repeat(64);
+        let slide_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+       xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <p:cSld><p:spTree>
+        <p:pic>
+            <p:nvPicPr><p:cNvPr id="2" name="Picture 1"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+            <p:blipFill><a:blip r:embed="rId2"/></p:blipFill>
+            <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1000000" cy="1000000"/></a:xfrm></p:spPr>
+        </p:pic>
+    </p:spTree></p:cSld>
+</p:sld>"#;
+        let slide_rels_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>"#;
+
+        let pptx = crate::extraction::pptx::tests::build_single_slide_pptx(
+            slide_xml,
+            Some(slide_rels_xml),
+            &[("ppt/media/image1.png", payload.as_bytes())],
+        );
+
+        let config = ExtractionConfig {
+            ocr: Some(crate::core::config::OcrConfig::default()),
+            ..Default::default()
+        };
+
+        let extractor = PptxExtractor::new();
+        let mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        let internal_doc = extractor
+            .extract_content(&pptx, mime, &config)
+            .await
+            .expect("a pptx with one embedded image must extract");
+
+        assert_eq!(internal_doc.images.len(), 1, "the single picture must yield one image");
+        assert_eq!(
+            internal_doc.images[0].data.as_ref(),
+            payload.as_bytes(),
+            "an OCR-only config must still read the real embedded-image bytes, not skip the image entirely"
+        );
+    }
+
     /// A slide with math: the LaTeX must reach `ExtractedDocument.formulas`, not
     /// only the text. The deck holds display math in its own shape, inline math
     /// beside text, and a `$` amount that is not math at all.

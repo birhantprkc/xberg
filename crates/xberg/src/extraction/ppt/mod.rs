@@ -2379,6 +2379,52 @@ mod tests {
         );
     }
 
+    /// REV-CB regression for GH#1687 (shares the GH#1662/GH#1686 fix): an OCR-only
+    /// `ExtractionConfig` (no `images.extract_images`, no captioning, no QR codes) must
+    /// still read a `.ppt` OLE container's embedded image out of its `Pictures` stream,
+    /// not skip it. `needs_image_data` gained the OCR disjunct that makes this true
+    /// (#1662); PPT shares that predicate with DOCX, HTML and PPTX through
+    /// `PptExtractor::extract_content`'s `config.needs_image_data()` call (see
+    /// `extractors::ppt`), but until now nothing exercised that call site directly.
+    /// Before the fix, `extract_images` stayed `false` for an OCR-only config, so
+    /// `extract_ppt_text_with_options` never read `/Pictures` at all and
+    /// `InternalDocument::images` stayed empty, silently, with no warning -- the same
+    /// shape `should_return_no_images_when_extract_images_is_false` above proves at the
+    /// lower `extract_ppt_text_with_options(bool)` layer. This test lives here rather
+    /// than in `extractors::ppt`'s own test module because it reuses `build_test_ppt_ole`
+    /// and the blip/record builders already proven above, instead of a second hand-rolled
+    /// OLE/CFB writer for the same container shape.
+    #[tokio::test]
+    async fn should_read_real_embedded_image_bytes_for_ocr_only_config_at_extract_content() {
+        use crate::core::config::{ExtractionConfig, OcrConfig};
+        use crate::core::mime::LEGACY_POWERPOINT_MIME_TYPE;
+        use crate::extractors::ppt::PptExtractor;
+        use crate::plugins::InternalDocumentExtractor;
+
+        let ppt_stream = container(RT_SLIDE, &text_chars_atom("Slide One"));
+        let picture = b"\xFF\xD8\xFFsynthetic-jpeg-bytes";
+        let pictures_stream = blip_record_one_uid(0x46A, RT_BLIP_JPEG, picture);
+        let content = build_test_ppt_ole(&ppt_stream, Some(&pictures_stream));
+
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+
+        let extractor = PptExtractor::new();
+        let internal_doc = extractor
+            .extract_content(&content, LEGACY_POWERPOINT_MIME_TYPE, &config)
+            .await
+            .expect("synthetic OLE container must extract");
+
+        assert_eq!(internal_doc.images.len(), 1, "the single blip must yield one image");
+        assert_eq!(
+            internal_doc.images[0].data.as_ref(),
+            &picture[..],
+            "an OCR-only config must still read the real embedded-image bytes, not skip the Pictures stream"
+        );
+    }
+
     #[test]
     fn should_return_no_images_when_pictures_stream_is_absent() {
         let ppt_stream = container(RT_SLIDE, &text_chars_atom("Slide One"));
