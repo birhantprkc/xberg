@@ -406,20 +406,7 @@ fn parse_paragraph_properties(node: &roxmltree::Node) -> ParagraphProperties {
                 props.outline_level = get_w_val(&child).and_then(|v| v.parse::<u8>().ok());
             }
             "numPr" => {
-                for num_child in child.children() {
-                    if !num_child.is_element() {
-                        continue;
-                    }
-                    match num_child.tag_name().name() {
-                        "numId" => {
-                            props.numbering_id = get_w_val(&num_child).and_then(|v| v.parse::<i64>().ok());
-                        }
-                        "ilvl" => {
-                            props.numbering_level = get_w_val(&num_child).and_then(|v| v.parse::<i64>().ok());
-                        }
-                        _ => {}
-                    }
-                }
+                (props.numbering_id, props.numbering_level) = parse_numbering_properties(&child);
             }
             "keepNext" => {
                 props.keep_next = Some(parse_toggle_property(&child));
@@ -462,6 +449,25 @@ fn parse_paragraph_properties(node: &roxmltree::Node) -> ParagraphProperties {
     }
 
     props
+}
+
+/// Parse `<w:numPr>` (numbering id and indent level) from a paragraph property's children.
+fn parse_numbering_properties(node: &roxmltree::Node) -> (Option<i64>, Option<i64>) {
+    let mut numbering_id = None;
+    let mut numbering_level = None;
+
+    for child in node.children() {
+        if !child.is_element() {
+            continue;
+        }
+        match child.tag_name().name() {
+            "numId" => numbering_id = get_w_val(&child).and_then(|v| v.parse::<i64>().ok()),
+            "ilvl" => numbering_level = get_w_val(&child).and_then(|v| v.parse::<i64>().ok()),
+            _ => {}
+        }
+    }
+
+    (numbering_id, numbering_level)
 }
 
 impl StyleCatalog {
