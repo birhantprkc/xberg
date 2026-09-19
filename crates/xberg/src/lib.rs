@@ -123,7 +123,8 @@ pub mod late_interaction;
     feature = "static-embeddings",
     feature = "reranker",
     feature = "sparse-embeddings",
-    feature = "late-interaction"
+    feature = "late-interaction",
+    feature = "candle-ocr"
 ))]
 mod engine_cache;
 
