@@ -80,7 +80,7 @@ The remaining backends cover larger-model and hosted use cases:
 
 - **Candle GLM-OCR** — Excellent accuracy with VLM-level reasoning on 0.9B-param GLM model. Pure Rust, GPU-accelerated (Metal on macOS, CUDA on Linux). Region-aware layout dispatch. First download ~3 GB.
 - **Candle TrOCR** — Smaller model footprint (~250 MB) with solid accuracy across languages. Pure Rust, GPU-accelerated. Good balance of speed and quality.
-- **Candle DeepSeek-OCR** — Deep learning-based OCR combining SAM + CLIP + Qwen2 + DeepSeek MoE. Multilingual with strong CJK coverage. Pure Rust, GPU-accelerated. First download ~4 GB.
+- **Candle DeepSeek-OCR** — Deep learning-based OCR combining SAM + CLIP + Qwen2 + DeepSeek MoE. Multilingual with strong CJK coverage. Pure Rust, GPU-accelerated. First download 6.7 GB (BF16 weights).
 - **Candle PaddleOCR-VL** — SigLIP vision encoder + Ernie-4.5 text decoder. Lightweight multilingual model with CJK and Latin support. Pure Rust, GPU-accelerated. First download ~2.5 GB.
 - **VLM** — Best for handwritten text, poor scans, Arabic/Farsi, and complex layouts. Requires an API key and incurs per-token costs. See [LLM Integration](/guides/llm-integration/) for full details.
 
@@ -702,7 +702,7 @@ DeepSeek-OCR — combination of SAM + CLIP encoder fused with Qwen2 decoder and 
 <Tabs syncKey="lang">
 <TabItem label="Native bindings (Rust, Go, TypeScript, Node.js, Java, C#, Ruby, PHP, Elixir)">
 
-Ships in the published package by default on native desktop/server platforms — no feature flag or custom build needed. Set `ocr.backend = "candle-deepseek-ocr"` and the model downloads automatically on first use (~4 GB), cached at `~/.cache/huggingface/`. Not available on WebAssembly, Android, iOS, Dart, or Swift.
+Ships in the published package by default on native desktop/server platforms — no feature flag or custom build needed. Set `ocr.backend = "candle-deepseek-ocr"` and the weights download automatically on first use from a checksum-pinned revision of `deepseek-ai/DeepSeek-OCR` (6.7 GB, BF16) into the standard Hugging Face cache (`HF_HUB_CACHE` / `HUGGINGFACE_HUB_CACHE` / `HF_HOME`, or `~/.cache/huggingface/` by default) — no `backend_options.model_path` needed. Not available on WebAssembly, Android, iOS, Dart, or Swift.
 
 For a custom Rust crate build, the model is gated behind the `candle-deepseek-ocr` feature (or the `candle-vlm-ocr` umbrella feature):
 
@@ -711,11 +711,11 @@ For a custom Rust crate build, the model is gated behind the `candle-deepseek-oc
 xberg = { version = "1", features = ["candle-deepseek-ocr"] }
 ```
 
-**GPU support:**
+**GPU support:** dtype follows the compute device (`backend_options.dtype = "auto"` by default; a wrong dtype fails the load hard rather than silently falling back, so override it only when you know the target device's kernel coverage).
 
-- **Metal** (macOS) — Default, F32 dtype
-- **CUDA** (Linux/Windows with NVIDIA GPU) — Auto-detected
-- **CPU fallback** — Slowest, but always available
+- **CUDA** (Linux/Windows with NVIDIA GPU) — Auto-detected, BF16
+- **Metal** (macOS) — F16 (BF16 kernel coverage is incomplete on Metal)
+- **CPU fallback** — F32, slowest but always available
 
 </TabItem>
 </Tabs>
@@ -733,7 +733,7 @@ config = ExtractionConfig(
     ocr=OcrConfig(
         backend="candle-deepseek-ocr",
         language=["en"],
-        backend_options={"device": "auto", "model_path": "~/.cache/huggingface/"},
+        backend_options={"device": "auto"},
     ),
 )
 output = await extract(ExtractInput(kind="uri", uri="document.pdf"), config=config)
@@ -754,7 +754,7 @@ const output = await extract(
     ocr: {
       backend: 'candle-deepseek-ocr',
       language: ['en'],
-      backendOptions: { device: 'auto', model_path: '~/.cache/huggingface/' },
+      backendOptions: { device: 'auto' },
     },
   },
 );
@@ -774,7 +774,7 @@ let config = ExtractionConfig {
     ocr: Some(OcrConfig {
         backend: "candle-deepseek-ocr".into(),
         language: vec!["en".to_string()],
-        backend_options: Some(json!({"device": "auto", "model_path": "~/.cache/huggingface/"})),
+        backend_options: Some(json!({"device": "auto"})),
         ..Default::default()
     }),
     ..Default::default()
@@ -788,7 +788,7 @@ println!("{}", result.content);
 <TabItem label="CLI">
 
 ```bash title="Terminal"
-xberg extract document.pdf --force-ocr true --ocr-backend candle-deepseek-ocr --ocr-backend-options '{"device":"auto","model_path":"~/.cache/huggingface/"}'
+xberg extract document.pdf --force-ocr true --ocr-backend candle-deepseek-ocr --ocr-backend-options '{"device":"auto"}'
 ```
 
 </TabItem>
@@ -796,7 +796,7 @@ xberg extract document.pdf --force-ocr true --ocr-backend candle-deepseek-ocr --
 
 **Supported languages:** English, Chinese, Japanese, Korean, French, German, Spanish, Italian, Portuguese, Russian, Arabic, Hindi, Thai, Vietnamese, and others.
 
-**Model source:** Download from [Hugging Face Hub](https://huggingface.co/models?search=deepseek-ocr).
+**Model source:** [`deepseek-ai/DeepSeek-OCR`](https://huggingface.co/deepseek-ai/DeepSeek-OCR) on the Hugging Face Hub, auto-downloaded at a checksum-pinned revision. Pass `backend_options.model_id` to use a different repository (requires an explicit `hf_revision`) or `backend_options.model_path` to point at pre-staged local weights.
 
 ### Candle PaddleOCR-VL
 
