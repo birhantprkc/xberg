@@ -25,12 +25,12 @@
 //!
 //! ## Preprocessing note
 //!
-//! The Phase 5 `process_image` implementation uses placeholder zero-tensors for
-//! `image_crop` and `images_spatial_crop` (flagged in the Phase 5 commit).  The
-//! model still runs a forward pass via the zero-crop branch, producing output
-//! from the global-features-only path.  The degenerate-repeat guard catches the
-//! most common failure mode (nucleus-sampling collapse).  Phase 6 benchmark
-//! gating will measure whether the placeholder path degrades extraction quality.
+//! `process_image` feeds the 1024 px global view plus, for a page whose width or height
+//! exceeds 640 px, a set of 640 px local-crop tiles selected the same way the reference
+//! "Gundam" mode picks its tiling grid (`dynamic_preprocess`). A page that fits inside a
+//! single 640 px tile takes the global-view-only path instead. The repeat-guard in
+//! `xberg_candle_ocr::generation` catches a decode loop that starts repeating itself
+//! regardless of which preprocessing path ran.
 
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "deepseek-ocr")]
