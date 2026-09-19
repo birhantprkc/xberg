@@ -16,14 +16,14 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
-use ahash::AHashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use crate::Result;
 use crate::candle_ocr::config::{
     GlmOcrBackendOptions, GlmOcrLayoutMode, GlmOcrTaskKind, parse_backend_options, validate_optional_non_empty,
 };
 use crate::core::config::OcrConfig;
+use crate::engine_cache::EngineCache;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::types::ExtractedDocument;
 use xberg_candle_ocr::CandleOcrError;
@@ -66,24 +66,22 @@ impl Default for LayoutMode {
     }
 }
 
-/// Pool type alias for the GLM-OCR engine pool keyed by `(DevicePreference, DType)`.
-type EnginePool = RwLock<AHashMap<(DevicePreference, DType, PathBuf, String), Arc<GlmOcrEngine>>>;
+/// Key for the GLM-OCR engine cache: `(DevicePreference, DType, cache_dir, revision)`.
+type EngineKey = (DevicePreference, DType, PathBuf, String);
 
-/// Process-wide engine pool keyed by `(DevicePreference, DType)`.
+/// Process-wide engine cache keyed by `(DevicePreference, DType, cache_dir, revision)`.
 ///
 /// A single engine instance handles all tasks (OCR / Table / Formula / Chart /
-/// Caption) via `process_image_with_task`, so the pool key does not include the
+/// Caption) via `process_image_with_task`, so the key does not include the
 /// task. Two callers requesting the same device+dtype but different tasks will
 /// share one engine and avoid loading weights twice.
-static ENGINE_POOL: LazyLock<EnginePool> = LazyLock::new(|| RwLock::new(AHashMap::new()));
+static ENGINE_POOL: LazyLock<EngineCache<EngineKey, GlmOcrEngine>> = LazyLock::new(EngineCache::unbounded);
 
-/// Pool type alias for the layout model pool keyed by `(model_path, device_preference)`.
+/// Key for the layout model cache: `(model_path, device_preference)`.
 #[cfg(feature = "layout-detection")]
-type LayoutPool = RwLock<
-    AHashMap<(String, DevicePreference), Arc<Mutex<crate::layout::models::pp_doclayout_v3::PpDocLayoutV3Model>>>,
->;
+type LayoutKey = (String, DevicePreference);
 
-/// Process-wide layout model pool keyed by `(model_path, device_preference)`.
+/// Process-wide layout model cache keyed by `(model_path, device_preference)`.
 ///
 /// Caches loaded `PpDocLayoutV3Model` instances by their file path and device preference
 /// to avoid reloading the expensive ONNX model on each `process_paired` invocation.
@@ -93,47 +91,33 @@ type LayoutPool = RwLock<
 ///
 /// Only available when `layout-detection` is enabled.
 #[cfg(feature = "layout-detection")]
-static LAYOUT_POOL: LazyLock<LayoutPool> = LazyLock::new(|| RwLock::new(AHashMap::new()));
+static LAYOUT_POOL: LazyLock<
+    EngineCache<LayoutKey, Mutex<crate::layout::models::pp_doclayout_v3::PpDocLayoutV3Model>>,
+> = LazyLock::new(EngineCache::unbounded);
 
-/// Generic double-checked-lock pool: get or initialize a value from cache.
+/// Get or build a cached value, delegating to [`EngineCache::get_or_try_init`].
 ///
-/// Uses a read → miss → write → double-check pattern so two racing callers do
-/// not both pay the initialization cost. Returns an Arc to the cached value,
-/// with pointer equality guarantees: two callers with the same key will receive
-/// Arc instances with `Arc::ptr_eq(a, b) == true`.
-///
-/// # Parameters
-/// - `pool`: The RwLock-wrapped pool
-/// - `key`: The cache key
-/// - `init`: A closure that constructs the value on cache miss
+/// The cache stays locked for the whole call, so a second caller for the same
+/// key waits for the first load instead of building a duplicate engine. That
+/// lock covers the WHOLE cache, not only `key`, so it also serialises loads of
+/// different keys while either is in flight; that is coarser than a per-key
+/// single flight, and it is the convention `EngineCache` already uses for
+/// embeddings, reranking, late interaction and sparse embeddings.
 ///
 /// # Errors
-/// Propagates errors from the `init` closure.
+/// Propagates errors from the `init` closure. A failed `init` does not insert
+/// anything, so the next caller for the same key retries rather than reusing
+/// a poisoned entry.
 #[inline]
 fn pool_get_or_init<K, V, E>(
-    pool: &RwLock<AHashMap<K, Arc<V>>>,
+    cache: &EngineCache<K, V>,
     key: K,
     init: impl FnOnce() -> std::result::Result<V, E>,
 ) -> std::result::Result<Arc<V>, E>
 where
     K: std::hash::Hash + Eq + Clone,
-    V: Send + 'static,
 {
-    {
-        let pool_guard = pool.read();
-        if let Some(value) = pool_guard.get(&key) {
-            return Ok(Arc::clone(value));
-        }
-    }
-
-    let new_value = Arc::new(init()?);
-
-    let mut pool_guard = pool.write();
-    if let Some(existing) = pool_guard.get(&key) {
-        return Ok(Arc::clone(existing));
-    }
-    pool_guard.insert(key, Arc::clone(&new_value));
-    Ok(new_value)
+    cache.get_or_try_init(key, init)
 }
 
 /// Return a cached engine for `(preference, dtype)`, initialising one on first use.
@@ -148,28 +132,24 @@ fn get_or_init_engine(
 ) -> crate::Result<Arc<GlmOcrEngine>> {
     let key = (preference, dtype, cache_dir.clone(), revision.clone());
 
-    pool_get_or_init::<(DevicePreference, DType, PathBuf, String), GlmOcrEngine, crate::XbergError>(
-        &ENGINE_POOL,
-        key,
-        || {
-            let device = preference.select().map_err(|e| crate::XbergError::Ocr {
-                message: format!("Failed to select compute device: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+    pool_get_or_init(&ENGINE_POOL, key, || {
+        let device = preference.select().map_err(|e| crate::XbergError::Ocr {
+            message: format!("Failed to select compute device: {e}"),
+            source: Some(Box::new(e)),
+        })?;
 
-            tracing::info!(
-                preference = ?preference,
-                ?dtype,
-                "Initialising GLM-OCR engine (cold start)"
-            );
-            GlmOcrEngine::new_with_hf(GlmOcrTask::default(), device, dtype, Some(&cache_dir), Some(&revision)).map_err(
-                |e| crate::XbergError::Ocr {
-                    message: format!("GLM-OCR engine initialisation failed: {e}"),
-                    source: Some(Box::new(e)),
-                },
-            )
-        },
-    )
+        tracing::info!(
+            preference = ?preference,
+            ?dtype,
+            "Initialising GLM-OCR engine (cold start)"
+        );
+        GlmOcrEngine::new_with_hf(GlmOcrTask::default(), device, dtype, Some(&cache_dir), Some(&revision)).map_err(
+            |e| crate::XbergError::Ocr {
+                message: format!("GLM-OCR engine initialisation failed: {e}"),
+                source: Some(Box::new(e)),
+            },
+        )
+    })
 }
 
 /// Return a cached layout model for the given path and device, initialising one on first use.
@@ -196,23 +176,19 @@ fn get_or_init_layout_model(
 
     let key = (model_path_str.clone(), device);
 
-    pool_get_or_init::<(String, DevicePreference), Mutex<PpDocLayoutV3Model>, crate::XbergError>(
-        &LAYOUT_POOL,
-        key,
-        || {
-            tracing::info!(
-                path = model_path_str.as_str(),
-                ?device,
-                "Initialising PP-DocLayout-V3 model (cold start)"
-            );
-            PpDocLayoutV3Model::from_file(&model_path_str, None)
-                .map_err(|e| crate::XbergError::Ocr {
-                    message: format!("PP-DocLayout-V3 model initialisation failed: {e}"),
-                    source: Some(Box::new(e)),
-                })
-                .map(Mutex::new)
-        },
-    )
+    pool_get_or_init(&LAYOUT_POOL, key, || {
+        tracing::info!(
+            path = model_path_str.as_str(),
+            ?device,
+            "Initialising PP-DocLayout-V3 model (cold start)"
+        );
+        PpDocLayoutV3Model::from_file(&model_path_str, None)
+            .map_err(|e| crate::XbergError::Ocr {
+                message: format!("PP-DocLayout-V3 model initialisation failed: {e}"),
+                source: Some(Box::new(e)),
+            })
+            .map(Mutex::new)
+    })
 }
 
 /// Options parsed from backend-specific configuration.
@@ -1104,7 +1080,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let pool = RwLock::new(AHashMap::new());
+        let pool: EngineCache<&str, u32> = EngineCache::unbounded();
         let init_count = StdArc::new(AtomicUsize::new(0));
 
         let init_count_clone = StdArc::clone(&init_count);
@@ -1141,7 +1117,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
-        let pool = StdArc::new(RwLock::new(AHashMap::new()));
+        let pool: StdArc<EngineCache<&str, u32>> = StdArc::new(EngineCache::unbounded());
         let init_count = StdArc::new(AtomicUsize::new(0));
         let mut handles = vec![];
 
@@ -1170,7 +1146,25 @@ mod tests {
         }
 
         let final_count = init_count.load(Ordering::SeqCst);
-        assert!(final_count >= 1, "Initializer must run at least once");
+        assert_eq!(
+            final_count, 1,
+            "Initializer must run exactly once, not once per racing caller"
+        );
+    }
+
+    #[test]
+    fn test_pool_get_or_init_failed_load_does_not_poison() {
+        let pool: EngineCache<&str, u32> = EngineCache::unbounded();
+
+        let failed = pool_get_or_init(&pool, "key", || Err::<u32, String>("load failed".to_string()));
+        assert!(failed.is_err(), "a failing init must not be papered over");
+
+        let recovered = pool_get_or_init(&pool, "key", || Ok::<u32, String>(7));
+        assert_eq!(
+            *recovered.expect("a later caller retries after a failed load"),
+            7,
+            "the retry must build a fresh value rather than reuse a poisoned entry"
+        );
     }
 
     #[test]
