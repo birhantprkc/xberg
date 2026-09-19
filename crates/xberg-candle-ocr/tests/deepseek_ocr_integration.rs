@@ -61,11 +61,37 @@ fn longest_repeated_ngram_run(text: &str, n: usize) -> usize {
     max_run
 }
 
+/// Compute device selected via `XBERG_CANDLE_DEVICE` (`"cpu"` (default), `"metal"`, `"cuda"`).
+/// Mirrors `xberg_candle_ocr::DevicePreference::select`, but as a free function so this test
+/// crate does not need the candle-ocr backend layer.
+fn device_from_env() -> candle_core::Device {
+    match std::env::var("XBERG_CANDLE_DEVICE").as_deref() {
+        Ok("metal") => {
+            candle_core::Device::new_metal(0).expect("Metal device must be available when XBERG_CANDLE_DEVICE=metal")
+        }
+        Ok("cuda") => {
+            candle_core::Device::new_cuda(0).expect("CUDA device must be available when XBERG_CANDLE_DEVICE=cuda")
+        }
+        _ => candle_core::Device::Cpu,
+    }
+}
+
+/// Weight dtype selected via `XBERG_CANDLE_DTYPE` (`"f32"` (default), `"f16"`, `"bf16"`).
+fn dtype_from_env() -> candle_core::DType {
+    match std::env::var("XBERG_CANDLE_DTYPE").as_deref() {
+        Ok("f16") => candle_core::DType::F16,
+        Ok("bf16") => candle_core::DType::BF16,
+        _ => candle_core::DType::F32,
+    }
+}
+
 /// Network-gated smoke test: load real DeepSeek-OCR weights and run inference
 /// on a fixture image that contains recognizable text.
 ///
-/// Skips gracefully when `XBERG_DEEPSEEK_OCR_MODEL_PATH` is not set.
-/// Run with `--ignored` to exercise this test.
+/// Skips gracefully when `XBERG_DEEPSEEK_OCR_MODEL_PATH` is not set. Device and dtype default
+/// to CPU/F32 for broad portability; override with `XBERG_CANDLE_DEVICE`/`XBERG_CANDLE_DTYPE`
+/// (e.g. `XBERG_CANDLE_DEVICE=metal XBERG_CANDLE_DTYPE=f16` on Apple Silicon). Run with
+/// `--ignored` to exercise this test.
 #[test]
 #[ignore = "requires DeepSeek-OCR weights from HuggingFace; set XBERG_DEEPSEEK_OCR_MODEL_PATH and run with --ignored"]
 fn deepseek_ocr_extracts_text_from_sample_image() {
@@ -81,11 +107,14 @@ fn deepseek_ocr_extracts_text_from_sample_image() {
         }
     };
 
+    let device = device_from_env();
+    let dtype = dtype_from_env();
+
     let image_bytes = include_bytes!("../../../fixtures/images/test_hello_world.png");
 
-    eprintln!("Loading DeepSeek-OCR engine from: {model_path}");
+    eprintln!("Loading DeepSeek-OCR engine from: {model_path} (device={device:?}, dtype={dtype:?})");
 
-    let mut engine = DeepseekOCREngine::init(&model_path, candle_core::Device::Cpu, candle_core::DType::F32, 2)
+    let mut engine = DeepseekOCREngine::init(&model_path, device, dtype, 2)
         .expect("DeepseekOCREngine::init must succeed with a valid model path");
 
     eprintln!("Engine loaded. Running inference on fixture image …");
