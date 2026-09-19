@@ -166,11 +166,23 @@ impl TesseractBackend {
     ///
     /// Returns a vector of available language codes, or an error if querying fails.
     fn query_available_languages(&self) -> Result<Vec<String>> {
+        // An empty datapath here used to hand libtesseract its own compiled-in default,
+        // which appends an extra `tessdata` directory level that the real OCR job's
+        // resolver (`resolve_tessdata_path`) never adds. That mismatch made this probe
+        // fail and log a misleading "couldn't load any languages" error on a layout where
+        // every real job already succeeds. Resolving through the same function the job
+        // uses keeps the two in agreement. See GH#1671.
+        let tessdata_path = crate::ocr::processor::validation::resolve_tessdata_path(&["eng".to_string()], None)
+            .map_err(|e| crate::XbergError::Ocr {
+                message: format!("Failed to resolve tessdata path for language query: {}", e),
+                source: Some(Box::new(e)),
+            })?;
+
         let api = xberg_tesseract::TesseractAPI::new().map_err(|e| crate::XbergError::Ocr {
             message: format!("Failed to allocate Tesseract engine: {}", e),
             source: Some(Box::new(e)),
         })?;
-        api.init("", "eng").map_err(|e| crate::XbergError::Ocr {
+        api.init(&tessdata_path, "eng").map_err(|e| crate::XbergError::Ocr {
             message: format!("Failed to initialize Tesseract for language query: {}", e),
             source: Some(Box::new(e)),
         })?;
@@ -770,8 +782,126 @@ fn is_compact_cjk_char(character: char) -> bool {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    // Needs real, loadable eng.traineddata with no network fetch to distinguish a
+    // resolved-directory probe from a silent fallback; `bundle-tessdata-eng` is the
+    // only feature that gives this test that without hitting the network at run time.
+    // The fix itself (resolving the datapath the same way the real job does) does not
+    // need this feature; it is only how this test gets deterministic fixture bytes.
+    #[cfg(feature = "bundle-tessdata-eng")]
+    #[test]
+    #[serial]
+    fn query_available_languages_resolves_the_same_tessdata_directory_the_real_job_uses() {
+        let temp_dir = tempfile::tempdir().expect("must create a temp dir for the fixture");
+        let tessdata_dir = temp_dir.path().join("tessdata");
+        std::fs::create_dir_all(&tessdata_dir).expect("must create the fixture tessdata dir");
+
+        let eng_bytes = xberg_tesseract::bundled_eng_traineddata()
+            .expect("this build must carry bundled eng.traineddata for the test to be meaningful");
+        std::fs::write(tessdata_dir.join("eng.traineddata"), eng_bytes).expect("must write eng.traineddata");
+        // A file only a real directory scan of THIS fixture would report; the hardcoded
+        // fallback list can never contain it, so its presence proves the probe actually
+        // looked at the tessdata directory the real OCR job resolves.
+        std::fs::write(tessdata_dir.join("zzz_probe_marker.traineddata"), b"not-a-real-model")
+            .expect("must write the marker file");
+
+        let previous = std::env::var("XBERG_CACHE_DIR").ok();
+        unsafe { std::env::set_var("XBERG_CACHE_DIR", temp_dir.path()) };
+
+        let backend = TesseractBackend::new();
+        let languages = backend.supported_languages();
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XBERG_CACHE_DIR", value) },
+            None => unsafe { std::env::remove_var("XBERG_CACHE_DIR") },
+        }
+
+        assert!(
+            languages.iter().any(|lang| lang == "zzz_probe_marker"),
+            "the language-availability probe must scan the same tessdata directory the real \
+             OCR job resolves (XBERG_CACHE_DIR/tessdata here), not silently fall back to the \
+             hardcoded language list; got: {languages:?}"
+        );
+    }
+
+    /// Real `eng.traineddata` bytes without the `bundle-tessdata-eng` feature.
+    ///
+    /// `xberg-tesseract`'s build script downloads and caches real `eng.traineddata` into
+    /// its own `OUT_DIR` unconditionally (`crates/xberg-tesseract/build.rs`), regardless of
+    /// `bundle-tessdata-eng`; that feature only controls whether the bytes are ALSO embedded
+    /// into the binary via `include_bytes!`. Building `xberg` with `pdf`/`ocr` builds
+    /// `xberg-tesseract` first, so its `OUT_DIR` is a sibling of this crate's own `OUT_DIR`
+    /// under `target/<profile>/build/` by the time this test runs. Returns `None`, rather
+    /// than panicking, when that layout assumption does not hold, so the test can skip
+    /// cleanly instead of failing for an environment reason unrelated to the fix.
+    fn real_eng_traineddata_bytes_from_sibling_build_dir() -> Option<Vec<u8>> {
+        let this_out_dir = std::path::PathBuf::from(env!("OUT_DIR"));
+        let build_dir = this_out_dir.parent()?.parent()?;
+        let mut entries: Vec<_> = std::fs::read_dir(build_dir).ok()?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("xberg-tesseract-") {
+                continue;
+            }
+            let candidate = entry.path().join("out").join("eng.traineddata");
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    // The regression test above only runs under `bundle-tessdata-eng`, which is never
+    // enabled outside wasm32 builds (`crates/xberg-tesseract/Cargo.toml`), so it protects
+    // nothing in the feature set that actually ships (`pdf,ocr`, no bundle gate). This is
+    // the same assertion against the same realistic `XBERG_CACHE_DIR/tessdata` fixture, but
+    // sourcing real `eng.traineddata` bytes the way described above instead of through the
+    // bundled feature, so it runs and protects the shipping path. See GH#1671.
+    #[test]
+    #[serial]
+    fn query_available_languages_resolves_the_same_tessdata_directory_the_real_job_uses_under_pdf_ocr() {
+        let Some(eng_bytes) = real_eng_traineddata_bytes_from_sibling_build_dir() else {
+            eprintln!(
+                "skipping: no real eng.traineddata found in a sibling xberg-tesseract build \
+                 OUT_DIR; this environment did not build xberg-tesseract the way this test expects"
+            );
+            return;
+        };
+
+        let temp_dir = tempfile::tempdir().expect("must create a temp dir for the fixture");
+        let tessdata_dir = temp_dir.path().join("tessdata");
+        std::fs::create_dir_all(&tessdata_dir).expect("must create the fixture tessdata dir");
+
+        std::fs::write(tessdata_dir.join("eng.traineddata"), &eng_bytes).expect("must write eng.traineddata");
+        // A file only a real directory scan of THIS fixture would report; the hardcoded
+        // fallback list can never contain it, so its presence proves the probe actually
+        // looked at the tessdata directory the real OCR job resolves.
+        std::fs::write(tessdata_dir.join("zzz_probe_marker.traineddata"), b"not-a-real-model")
+            .expect("must write the marker file");
+
+        let previous = std::env::var("XBERG_CACHE_DIR").ok();
+        unsafe { std::env::set_var("XBERG_CACHE_DIR", temp_dir.path()) };
+
+        let backend = TesseractBackend::new();
+        let languages = backend.supported_languages();
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XBERG_CACHE_DIR", value) },
+            None => unsafe { std::env::remove_var("XBERG_CACHE_DIR") },
+        }
+
+        assert!(
+            languages.iter().any(|lang| lang == "zzz_probe_marker"),
+            "the language-availability probe must scan the same tessdata directory the real \
+             OCR job resolves (XBERG_CACHE_DIR/tessdata here), not silently fall back to the \
+             hardcoded language list; got: {languages:?}"
+        );
+    }
 
     #[test]
     fn vertical_cjk_spacing_removes_only_inter_character_horizontal_space() {

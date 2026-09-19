@@ -75,7 +75,7 @@ pub(super) fn validate_language_and_traineddata(language: &str, tessdata_path: &
 ///
 /// `Ok(String)` with the path to a valid tessdata directory containing all
 /// requested languages, or `Err(OcrError)` if resolution fails.
-pub(super) fn resolve_tessdata_path(languages: &[String], override_path: Option<&Path>) -> Result<String, OcrError> {
+pub(crate) fn resolve_tessdata_path(languages: &[String], override_path: Option<&Path>) -> Result<String, OcrError> {
     for dir in tessdata_search_dirs(override_path) {
         if all_languages_exist(&dir, languages)? {
             return Ok(dir);
