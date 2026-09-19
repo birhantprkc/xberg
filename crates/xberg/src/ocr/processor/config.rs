@@ -372,9 +372,11 @@ mod tests {
     /// read a real per-block font size and every heading/body paragraph collapses
     /// to the same fallback value.
     ///
-    /// Uses a real (non-mocked) `TesseractAPI`, matching the pattern in
-    /// `crate::ocr::tesseract_backend`'s own `query_available_languages` test:
-    /// `init("", "eng")` resolves tessdata the same way production code does.
+    /// Uses a real (non-mocked) `TesseractAPI`. `init("", "eng")` relies on Tesseract's
+    /// own compiled-in default tessdata location rather than the crate's resolver
+    /// (`resolve_tessdata_path`, which real jobs and `query_available_languages` both
+    /// use), so it gracefully skips instead of asserting when that default has no
+    /// "eng" data in this environment.
     ///
     /// Before the fix, `apply_tesseract_variables` never called
     /// `set_variable("hocr_font_info", ...)`, so this reads back Tesseract's own
