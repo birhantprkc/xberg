@@ -159,6 +159,21 @@ pub struct GlmOcrBackendOptions {
     pub cache_dir: Option<String>,
 }
 
+/// Floating-point precision accepted by `candle-deepseek-ocr` backend options.
+///
+/// `Auto` (the default) resolves per compute device: BF16 on CUDA, F16 on Metal, F32 on CPU.
+/// A dtype with no kernel on the selected device fails the load hard rather than silently
+/// falling back to another precision -- this is not a tuning knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CandleDeepseekOcrDtype {
+    #[default]
+    Auto,
+    F32,
+    F16,
+    Bf16,
+}
+
 /// Runtime options accepted by the `candle-deepseek-ocr` backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -172,6 +187,9 @@ pub struct DeepseekOcrBackendOptions {
     /// DeepSeek-OCR model generation, either 1 or 2. Defaults to 2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+    /// Optional weight precision override; see [`CandleDeepseekOcrDtype`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<CandleDeepseekOcrDtype>,
 }
 
 #[cfg(any(
@@ -375,15 +393,27 @@ mod tests {
             model_path: Some("/models/deepseek".to_string()),
             device: Some(CandleDevicePreference::Auto),
             version: Some(3),
+            dtype: Some(CandleDeepseekOcrDtype::Bf16),
         };
         assert_eq!(
             serde_json::to_value(deepseek).unwrap(),
             serde_json::json!({
                 "model_path": "/models/deepseek",
                 "device": "auto",
-                "version": 3
+                "version": 3,
+                "dtype": "bf16"
             })
         );
+    }
+
+    #[test]
+    fn should_default_deepseek_dtype_to_auto_when_absent() {
+        let options: DeepseekOcrBackendOptions = parse_backend_options(None, "candle-deepseek-ocr").unwrap();
+        assert_eq!(options.dtype, None);
+
+        let explicit = serde_json::json!({"dtype": "f16"});
+        let options: DeepseekOcrBackendOptions = parse_backend_options(Some(&explicit), "candle-deepseek-ocr").unwrap();
+        assert_eq!(options.dtype, Some(CandleDeepseekOcrDtype::F16));
     }
 
     #[test]

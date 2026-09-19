@@ -14,14 +14,42 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use crate::Result;
-use crate::candle_ocr::config::{DeepseekOcrBackendOptions, parse_backend_options, validate_optional_non_empty};
+use crate::candle_ocr::config::{
+    CandleDeepseekOcrDtype, DeepseekOcrBackendOptions, parse_backend_options, validate_optional_non_empty,
+};
 use crate::core::config::OcrConfig;
 use crate::engine_cache::EngineCache;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::types::ExtractedDocument;
 use xberg_candle_ocr::DType;
+use xberg_candle_ocr::Device;
 use xberg_candle_ocr::DevicePreference;
 use xberg_candle_ocr::models::DeepseekOCREngine;
+
+/// Pick the floating-point precision that matches the actual compute device.
+///
+/// A BF16 checkpoint loaded as F32 doubles the weight footprint for no accuracy benefit -- on
+/// an L4 (24 GB) this was the 16.5 GB reported in #1674 for a 3B-parameter model whose weights
+/// are 6.67 GB in their native BF16 form. Metal's BF16 kernel coverage is incomplete, so F16 is
+/// the safe default there instead; CPU inference stays F32 for broad portability.
+fn default_dtype_for(device: &Device) -> DType {
+    match device {
+        Device::Cuda(_) => DType::BF16,
+        Device::Metal(_) => DType::F16,
+        Device::Cpu => DType::F32,
+    }
+}
+
+/// Map a parsed `backend_options.dtype` request to a concrete [`DType`]. `Auto` defers to
+/// [`default_dtype_for`], so it returns `None` here.
+fn requested_dtype(value: Option<CandleDeepseekOcrDtype>) -> Option<DType> {
+    match value {
+        None | Some(CandleDeepseekOcrDtype::Auto) => None,
+        Some(CandleDeepseekOcrDtype::F32) => Some(DType::F32),
+        Some(CandleDeepseekOcrDtype::F16) => Some(DType::F16),
+        Some(CandleDeepseekOcrDtype::Bf16) => Some(DType::BF16),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct EnginePoolKey {
@@ -50,6 +78,7 @@ static ENGINE_POOL: LazyLock<EngineCache<EnginePoolKey, parking_lot::Mutex<Deeps
 
 fn get_or_init_engine(
     preference: DevicePreference,
+    device: Device,
     dtype: DType,
     model_path: &str,
     version: usize,
@@ -57,11 +86,6 @@ fn get_or_init_engine(
     let key = EnginePoolKey::new(preference, dtype, model_path, version);
 
     ENGINE_POOL.get_or_try_init(key, || {
-        let device = preference.select().map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to select compute device: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-
         tracing::info!(
             preference = ?preference,
             dtype = ?dtype,
@@ -85,34 +109,43 @@ fn get_or_init_engine(
 ///
 /// # Configuration
 ///
-/// DeepSeek-OCR accepts backend options for device, model path, and version:
+/// DeepSeek-OCR accepts backend options for device, model path, version, and dtype:
 /// ```json
 /// {
 ///   "device": "auto",
 ///   "model_path": "/path/to/deepseek-ocr-model",
-///   "version": 2
+///   "version": 2,
+///   "dtype": "auto"
 /// }
 /// ```
 ///
 /// - `device` (string): `"auto"` (default), `"cpu"`, `"cuda"`, `"metal"`
 /// - `model_path` (string): path to the local model directory (required)
 /// - `version` (integer): model version `1` or `2` (default: `2`)
+/// - `dtype` (string): `"auto"` (default, picks BF16 on CUDA / F16 on Metal / F32 on CPU),
+///   `"f32"`, `"f16"`, or `"bf16"`. A dtype with no kernel on the selected device fails the
+///   load hard rather than silently falling back -- this is not a tuning knob.
 #[cfg_attr(alef, alef(skip))]
 pub struct DeepseekOcrBackend {
-    dtype: DType,
+    dtype: Option<DType>,
 }
 
 impl DeepseekOcrBackend {
     /// Create a new DeepSeek-OCR backend.
     ///
-    /// The data type defaults to `F32`. Use [`DeepseekOcrBackend::with_dtype`] to override.
+    /// The data type is auto-selected per compute device (see [`default_dtype_for`]) unless
+    /// overridden by [`DeepseekOcrBackend::with_dtype`] or a `backend_options.dtype` request,
+    /// which takes precedence over both.
     pub fn new() -> Self {
-        Self { dtype: DType::F32 }
+        Self { dtype: None }
     }
 
-    /// Override the floating-point precision used by the candle engine.
+    /// Force a specific floating-point precision regardless of device.
+    ///
+    /// A per-call `backend_options.dtype` request still takes precedence over this
+    /// constructor-level override.
     pub fn with_dtype(mut self, dtype: DType) -> Self {
-        self.dtype = dtype;
+        self.dtype = Some(dtype);
         self
     }
 
@@ -121,8 +154,9 @@ impl DeepseekOcrBackend {
     /// Device selection is delegated to [`crate::candle_ocr::resolve_device_preference`]
     /// so the central `AccelerationConfig` is honoured.
     ///
-    /// Returns `(model_path, device_preference, version)`.
-    fn parse_options(config: &OcrConfig) -> Result<(Option<String>, DevicePreference, usize)> {
+    /// Returns `(model_path, device_preference, version, dtype_override)`. `dtype_override` is
+    /// `None` when `backend_options.dtype` is absent or `"auto"`.
+    fn parse_options(config: &OcrConfig) -> Result<(Option<String>, DevicePreference, usize, Option<DType>)> {
         let options: DeepseekOcrBackendOptions =
             parse_backend_options(config.backend_options.as_ref(), "candle-deepseek-ocr")?;
         validate_optional_non_empty(options.model_path.as_deref(), "candle-deepseek-ocr", "model_path")?;
@@ -133,7 +167,8 @@ impl DeepseekOcrBackend {
             )));
         }
         let device = super::resolve_device_preference(config, options.device);
-        Ok((options.model_path, device, version as usize))
+        let dtype_override = requested_dtype(options.dtype);
+        Ok((options.model_path, device, version as usize, dtype_override))
     }
 }
 
@@ -179,7 +214,7 @@ impl OcrBackend for DeepseekOcrBackend {
             });
         }
 
-        let (model_path, device, version) = Self::parse_options(config)?;
+        let (model_path, device_preference, version, dtype_override) = Self::parse_options(config)?;
 
         let model_path = model_path.ok_or_else(|| crate::XbergError::Validation {
             message: "DeepSeek-OCR requires `model_path` in backend_options".to_string(),
@@ -187,10 +222,17 @@ impl OcrBackend for DeepseekOcrBackend {
         })?;
 
         let image_bytes_owned = image_bytes.to_vec();
-        let dtype = self.dtype;
+        let constructor_dtype = self.dtype;
 
         let content = tokio::task::spawn_blocking(move || {
-            let engine = get_or_init_engine(device, dtype, &model_path, version)?;
+            let device = device_preference.select().map_err(|e| crate::XbergError::Ocr {
+                message: format!("Failed to select compute device: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            let dtype = dtype_override
+                .or(constructor_dtype)
+                .unwrap_or_else(|| default_dtype_for(&device));
+            let engine = get_or_init_engine(device_preference, device, dtype, &model_path, version)?;
             let mut engine_guard = engine.lock();
             let output = engine_guard
                 .process_image(&image_bytes_owned, None)
@@ -297,10 +339,11 @@ mod tests {
     #[test]
     fn test_parse_options_defaults() {
         let config = OcrConfig::default();
-        let (model_path, device, version) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        let (model_path, device, version, dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
         assert!(model_path.is_none());
         assert_eq!(device, DevicePreference::Auto);
         assert_eq!(version, 2);
+        assert_eq!(dtype, None);
     }
 
     #[test]
@@ -309,7 +352,7 @@ mod tests {
             backend_options: Some(serde_json::json!({"model_path": "/models/deepseek"})),
             ..Default::default()
         };
-        let (model_path, _device, _version) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        let (model_path, _device, _version, _dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
         assert_eq!(model_path.as_deref(), Some("/models/deepseek"));
     }
 
@@ -319,7 +362,7 @@ mod tests {
             backend_options: Some(serde_json::json!({"device": "cpu"})),
             ..Default::default()
         };
-        let (_model_path, device, _version) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        let (_model_path, device, _version, _dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
         assert_eq!(device, DevicePreference::Cpu);
     }
 
@@ -339,7 +382,7 @@ mod tests {
             backend_options: Some(serde_json::json!({"version": 1})),
             ..Default::default()
         };
-        let (_, _, version) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        let (_, _, version, _dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
         assert_eq!(version, 1);
     }
 
@@ -359,10 +402,45 @@ mod tests {
             backend_options: Some(serde_json::json!({})),
             ..Default::default()
         };
-        let (model_path, device, version) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        let (model_path, device, version, dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
         assert!(model_path.is_none());
         assert_eq!(device, DevicePreference::Auto);
         assert_eq!(version, 2);
+        assert_eq!(dtype, None);
+    }
+
+    #[test]
+    fn test_parse_options_explicit_dtype() {
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({"dtype": "bf16"})),
+            ..Default::default()
+        };
+        let (_, _, _, dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        assert_eq!(dtype, Some(DType::BF16));
+    }
+
+    #[test]
+    fn test_parse_options_auto_dtype_resolves_to_none() {
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({"dtype": "auto"})),
+            ..Default::default()
+        };
+        let (_, _, _, dtype) = DeepseekOcrBackend::parse_options(&config).unwrap();
+        assert_eq!(dtype, None);
+    }
+
+    #[test]
+    fn default_dtype_for_cpu_is_f32() {
+        assert_eq!(default_dtype_for(&Device::Cpu), DType::F32);
+    }
+
+    #[test]
+    fn requested_dtype_maps_each_explicit_variant() {
+        assert_eq!(requested_dtype(None), None);
+        assert_eq!(requested_dtype(Some(CandleDeepseekOcrDtype::Auto)), None);
+        assert_eq!(requested_dtype(Some(CandleDeepseekOcrDtype::F32)), Some(DType::F32));
+        assert_eq!(requested_dtype(Some(CandleDeepseekOcrDtype::F16)), Some(DType::F16));
+        assert_eq!(requested_dtype(Some(CandleDeepseekOcrDtype::Bf16)), Some(DType::BF16));
     }
 
     #[test]
