@@ -104,9 +104,10 @@ Future<List<String>> listOcrBackends() =>
 /// # Cost
 ///
 /// Calling this is not free for every backend. In particular, `TesseractBackend`'s
-/// `supported_languages()` allocates a Tesseract API and initializes it (`init("", "eng")`) the
-/// first time it is called, to enumerate installed tessdata languages; subsequent calls are
-/// served from a cache.
+/// `supported_languages()` allocates a Tesseract API and initializes it against the same
+/// tessdata directory a real OCR job resolves (`resolve_tessdata_path`), the first time it
+/// is called, to enumerate installed tessdata languages; subsequent calls are served from a
+/// cache.
 ///
 /// **Errors:**
 ///
@@ -7604,7 +7605,8 @@ class ExtractionConfidence {
   /// Fraction of pages with a usable text layer.
   final double textCoverage;
 
-  /// Mean OCR per-element recognition confidence when OCR ran; `None` when it did not.
+  /// OCR recognition confidence, word-count-weighted across every recognized word, when OCR
+  /// ran; `None` when it did not.
   final double? ocrAggregate;
 
   /// Whether the merged output validates against the preset schema.
