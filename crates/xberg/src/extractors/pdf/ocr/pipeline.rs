@@ -3612,7 +3612,7 @@ pub(super) fn ocr_config_with_page_rotation_hint(
     if let Some(obj) = opts.as_object_mut() {
         if page_rotation_degrees != 0 {
             obj.insert(
-                "page_rotation_degrees".to_string(),
+                crate::core::config::ocr::PAGE_ROTATION_DEGREES_BACKEND_OPTION.to_string(),
                 serde_json::Value::Number(page_rotation_degrees.into()),
             );
         }
