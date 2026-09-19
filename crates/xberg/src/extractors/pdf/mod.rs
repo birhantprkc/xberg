@@ -3569,17 +3569,23 @@ mod tests {
         bytes
     }
 
-    /// A single-page PDF whose only font is `Type0`/`Identity-H` with no `/ToUnicode` and no
-    /// `/CIDSystemInfo` on its descendant `CIDFontType2`, so xberg_native_pdf's §9.10.2 mapping
-    /// cascade has no route to Unicode and falls back to a CID-as-Unicode echo
-    /// (`MappingProvenance::Fallback`, issue #1254's signal, same font shape as that issue's own
-    /// reproducer). CIDs are chosen equal to the Unicode codepoints of `text` (big-endian, two
-    /// bytes each), so the echoed native text reads as ordinary ASCII -- structurally
-    /// indistinguishable from real prose by every character-class heuristic, which is the shape
-    /// of issue #1667's defect. No embedded font program: the mapping decision does not depend
-    /// on one.
+    /// A single-page PDF whose only font is `Type0`/`Identity-H` with no `/CIDSystemInfo`
+    /// ordering on its descendant `CIDFontType2`, and, when `with_tounicode` is `false`, no
+    /// `/ToUnicode` either -- so xberg_native_pdf's §9.10.2 mapping cascade has no route to
+    /// Unicode and falls back to a CID-as-Unicode echo (`MappingProvenance::Fallback`, issue
+    /// #1254's signal, same font shape as that issue's own reproducer). CIDs are chosen equal
+    /// to the Unicode codepoints of `text` (big-endian, two bytes each), so the echoed native
+    /// text reads as ordinary ASCII -- structurally indistinguishable from real prose by every
+    /// character-class heuristic, which is the shape of issue #1667's defect. No embedded font
+    /// program: the mapping decision does not depend on one.
+    ///
+    /// When `with_tounicode` is `true`, an identity `/ToUnicode` CMap over printable ASCII
+    /// (§9.10.3) is attached, which resolves `MappingProvenance::ToUnicode` -- a mapping tier
+    /// the font's own file data backs, not a fallback echo -- so the page must NOT be routed
+    /// to OCR under `Auto` (issue #1696's false-positive control: the fix must not treat every
+    /// Type0 font as suspect, only ones with no usable mapping tier at all).
     #[cfg(all(feature = "pdf", feature = "ocr"))]
-    fn identity_h_no_tounicode_pdf(text: &str) -> Vec<u8> {
+    fn identity_h_mapping_pdf(text: &str, with_tounicode: bool) -> Vec<u8> {
         use lopdf::content::{Content, Operation};
         use lopdf::{Document, Object, Stream, dictionary};
 
@@ -3612,14 +3618,41 @@ mod tests {
             "CIDToGIDMap" => "Identity",
             "DW" => 600,
         });
-        let font_id = document.add_object(dictionary! {
+
+        // Identity mapping over printable ASCII (0x20-0x7E), which is the range `text`'s
+        // codepoints are drawn from in every caller. Sequential `beginbfrange` form (ISO
+        // 32000-1:2008 §9.10.3): a single dst start value, code and dst increment together. ~keep
+        const TO_UNICODE_CMAP: &[u8] = b"/CIDInit /ProcSet findresource begin\n\
+            12 dict begin\n\
+            begincmap\n\
+            /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+            /CMapName /Adobe-Identity-UCS def\n\
+            1 begincodespacerange\n\
+            <0000> <FFFF>\n\
+            endcodespacerange\n\
+            1 beginbfrange\n\
+            <0020> <007E> <0020>\n\
+            endbfrange\n\
+            endcmap\n\
+            CMapName currentdict /CMap defineresource pop\n\
+            end\n\
+            end";
+        let to_unicode_id =
+            with_tounicode.then(|| document.add_object(Stream::new(dictionary! {}, TO_UNICODE_CMAP.to_vec())));
+
+        let mut font_dict = dictionary! {
             "Type" => "Font",
             "Subtype" => "Type0",
             "BaseFont" => "Synth+Fallback",
             "Encoding" => "Identity-H",
             "DescendantFonts" => vec![descendant_id.into()],
-            // Deliberately no /ToUnicode: severs every route to Unicode (issue #1254).
-        });
+            // Deliberately no /ToUnicode when `with_tounicode` is false: severs every route to
+            // Unicode (issue #1254).
+        };
+        if let Some(id) = to_unicode_id {
+            font_dict.set("ToUnicode", id);
+        }
+        let font_id = document.add_object(font_dict);
 
         let content = Content {
             operations: vec![
@@ -6184,7 +6217,7 @@ mod tests {
 
         let internal = PdfExtractor::new()
             .extract_content(
-                &identity_h_no_tounicode_pdf(FABRICATED_NATIVE_TEXT),
+                &identity_h_mapping_pdf(FABRICATED_NATIVE_TEXT, false),
                 "application/pdf",
                 &config,
             )
@@ -6211,6 +6244,79 @@ mod tests {
             derived.extraction_method,
             Some(ExtractionMethod::Ocr),
             "Auto strategy must record extraction_method: ocr for a fabricated-provenance page"
+        );
+    }
+
+    /// xberg#1696's false-positive control: a Type0/Identity-H font that DOES carry a
+    /// `/ToUnicode` CMap resolves `MappingProvenance::ToUnicode`, never `Fallback`, so
+    /// `apply_fabricated_provenance_pages` (issue #1667's fix) must not route it to OCR --
+    /// the fix targets fonts with no usable mapping tier at all, not every Type0 font.
+    /// Reported alongside #1667's own test since both extract the same fixture shape through
+    /// the real `run.rs`/`font_dict.rs` provenance path, differing only in `/ToUnicode`
+    /// presence.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_auto_strategy_keeps_native_text_when_page_carries_tounicode_map() {
+        use crate::core::config::{OcrConfig, PageConfig};
+
+        const OCR_TEXT: &str = "mock ocr text that must never appear in a clean extraction";
+        let _backend = register_mock_ocr_backend("pdf-1696-tounicode-false-positive", OCR_TEXT);
+
+        // > 64 non-whitespace chars (`OcrQualityThresholds::min_total_non_whitespace`'s
+        // default): a shorter fixture never reaches the fabricated-ratio check at all,
+        // which would make the mutation-testing control below pass for the wrong reason. ~keep
+        const NATIVE_TEXT: &str =
+            "genuinely mapped native text read from the ToUnicode character map identity range covering printable ascii glyphs correctly";
+
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: "pdf-1696-tounicode-false-positive".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let internal = PdfExtractor::new()
+            .extract_content(&identity_h_mapping_pdf(NATIVE_TEXT, true), "application/pdf", &config)
+            .await
+            .expect("ToUnicode-mapped PDF extraction should succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        assert!(
+            derived.content.contains(NATIVE_TEXT),
+            "genuinely mapped native text must survive to the final content: {:?}",
+            derived.content
+        );
+        assert!(
+            !derived.content.contains(OCR_TEXT),
+            "a page with a real ToUnicode mapping must not be routed to OCR: {:?}",
+            derived.content
+        );
+        assert_eq!(
+            derived.extraction_method,
+            Some(ExtractionMethod::Native),
+            "Auto strategy must keep extraction_method: native for a genuinely mapped page"
+        );
+
+        let fabricated_text_pages = derived.metadata.format.as_ref().and_then(|format| match format {
+            crate::types::FormatMetadata::Pdf(pdf) => pdf.fabricated_text_pages.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            fabricated_text_pages,
+            Some(Vec::new()),
+            "a page whose mapping resolves via ToUnicode must not be listed as fabricated"
         );
     }
 
