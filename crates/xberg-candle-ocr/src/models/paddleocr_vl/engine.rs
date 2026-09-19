@@ -360,6 +360,11 @@ impl PaddleOcrVlEngine {
                 break;
             }
 
+            if let Some(period) = crate::generation::stop_if_degenerate(&mut generated) {
+                tracing::warn!(period, step, "PaddleOCR-VL: degenerate repetition, stopping");
+                break;
+            }
+
             if step + 1 == max_new_tokens {
                 break;
             }

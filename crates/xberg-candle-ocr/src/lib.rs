@@ -27,6 +27,8 @@ pub mod device;
 #[cfg(any(feature = "trocr", feature = "glm-ocr"))]
 pub(crate) mod download_guard;
 pub mod error;
+#[cfg(any(test, feature = "paddleocr-vl", feature = "glm-ocr", feature = "deepseek-ocr"))]
+pub mod generation;
 pub mod models;
 pub(crate) mod vendor;
 

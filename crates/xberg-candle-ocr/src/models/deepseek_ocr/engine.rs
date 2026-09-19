@@ -352,6 +352,11 @@ impl DeepseekOCREngine {
                 break;
             }
 
+            if let Some(period) = crate::generation::stop_if_degenerate(&mut output_tokens) {
+                tracing::warn!(period, step, "DeepSeek-OCR: degenerate repetition, stopping");
+                break;
+            }
+
             let next_token_tensor = Tensor::new(&[next_token as i64], &self.device)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Next token tensor: {}", e)))?
                 .unsqueeze(0)
