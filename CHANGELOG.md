@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **(pdf): the mixed native-and-OCR path no longer drops every native table on a page OCR never touched.** On a long document where only some pages needed OCR, the mixed path replaced the whole document's table list with just the OCR pages' tables whenever OCR found even one, silently dropping every native table on every other page. Only the tables of pages OCR itself produced a table for are now replaced; a page the mixed path never sent to OCR keeps its native tables. (GH#1670)
+- **(ocr): a cold start no longer builds one candle OCR engine per waiting caller.** Each candle backend's engine pool looked for a cached engine, released the lock, built the engine, then stored it, so every request that arrived during the first build loaded its own copy of the model and a burst could exhaust the GPU memory. All four backends and the GLM-OCR layout pool now use the shared engine cache, which holds the write lock across the build: the first caller builds and the rest wait for that engine. A failed load stores nothing, so the next caller retries. (GH#1683)
 
 ## [1.2.5] - 2026-09-18
 
