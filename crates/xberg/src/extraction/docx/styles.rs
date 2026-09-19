@@ -104,6 +104,16 @@ pub struct ParagraphProperties {
     pub indent_hanging: Option<i32>,
     /// Outline level 0-8 for heading levels.
     pub outline_level: Option<u8>,
+    /// Numbering definition id (`w:numPr/w:numId`) the style applies.
+    ///
+    /// Word lets a list style carry the numbering reference instead of putting it
+    /// on each paragraph, which is what the built-in `List Bullet` and
+    /// `List Number` styles do.
+    pub numbering_id: Option<i64>,
+    /// Indentation level within that numbering definition (`w:numPr/w:ilvl`).
+    ///
+    /// Absent on most list styles. Word reads an absent level as 0.
+    pub numbering_level: Option<i64>,
     /// Keep with next paragraph on same page.
     pub keep_next: Option<bool>,
     /// Keep all lines of paragraph on same page.
@@ -395,6 +405,9 @@ fn parse_paragraph_properties(node: &roxmltree::Node) -> ParagraphProperties {
             "outlineLvl" => {
                 props.outline_level = get_w_val(&child).and_then(|v| v.parse::<u8>().ok());
             }
+            "numPr" => {
+                (props.numbering_id, props.numbering_level) = parse_numbering_properties(&child);
+            }
             "keepNext" => {
                 props.keep_next = Some(parse_toggle_property(&child));
             }
@@ -436,6 +449,25 @@ fn parse_paragraph_properties(node: &roxmltree::Node) -> ParagraphProperties {
     }
 
     props
+}
+
+/// Parse `<w:numPr>` (numbering id and indent level) from a paragraph property's children.
+fn parse_numbering_properties(node: &roxmltree::Node) -> (Option<i64>, Option<i64>) {
+    let mut numbering_id = None;
+    let mut numbering_level = None;
+
+    for child in node.children() {
+        if !child.is_element() {
+            continue;
+        }
+        match child.tag_name().name() {
+            "numId" => numbering_id = get_w_val(&child).and_then(|v| v.parse::<i64>().ok()),
+            "ilvl" => numbering_level = get_w_val(&child).and_then(|v| v.parse::<i64>().ok()),
+            _ => {}
+        }
+    }
+
+    (numbering_id, numbering_level)
 }
 
 impl StyleCatalog {
@@ -616,6 +648,12 @@ fn merge_paragraph_properties(base: &mut ParagraphProperties, overlay: &Paragrap
     }
     if overlay.outline_level.is_some() {
         base.outline_level = overlay.outline_level;
+    }
+    if overlay.numbering_id.is_some() {
+        base.numbering_id = overlay.numbering_id;
+    }
+    if overlay.numbering_level.is_some() {
+        base.numbering_level = overlay.numbering_level;
     }
     if overlay.keep_next.is_some() {
         base.keep_next = overlay.keep_next;
@@ -1490,5 +1528,35 @@ mod tests {
         assert_eq!(resolved.run_properties.caps, Some(true));
         assert_eq!(resolved.run_properties.italic, Some(true));
         assert_eq!(resolved.run_properties.shadow, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod numbering_style_tests {
+    use super::*;
+
+    /// `w:numPr` inside a style's `w:pPr` is the reference Word writes for its
+    /// built-in list styles, so the style parser has to keep it (GH#1663).
+    #[test]
+    fn a_style_keeps_the_numbering_reference_in_its_paragraph_properties() {
+        let xml = r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:numPr><w:numId w:val="3"/><w:ilvl w:val="2"/></w:numPr>
+        </w:pPr>"#;
+        let doc = roxmltree::Document::parse(xml).expect("pPr parses");
+        let props = parse_paragraph_properties(&doc.root_element());
+        assert_eq!(props.numbering_id, Some(3));
+        assert_eq!(props.numbering_level, Some(2));
+    }
+
+    /// The common shape: a numbering reference with no level on it.
+    #[test]
+    fn a_style_numbering_reference_without_a_level_leaves_the_level_unset() {
+        let xml = r#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:numPr><w:numId w:val="1"/></w:numPr>
+        </w:pPr>"#;
+        let doc = roxmltree::Document::parse(xml).expect("pPr parses");
+        let props = parse_paragraph_properties(&doc.root_element());
+        assert_eq!(props.numbering_id, Some(1));
+        assert_eq!(props.numbering_level, None);
     }
 }
