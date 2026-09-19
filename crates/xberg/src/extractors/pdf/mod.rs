@@ -3451,6 +3451,78 @@ mod tests {
         bytes
     }
 
+    /// A PDF of `page_count` pages, each a full-page image `XObject` with no text layer, the
+    /// same scanned-page shape `mixed_native_and_scanned_pdf` uses for its one scanned page,
+    /// repeated. Letter `MediaBox` on every page (612x792pt) so the render batch peak is
+    /// uniform and predictable at the default 150 dpi: about 20.3MB per page.
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    fn all_scanned_pages_pdf(page_count: u32) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+
+        let image_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 1,
+                "Height" => 1,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            vec![0],
+        ));
+
+        let mut page_ids = Vec::new();
+        for _ in 0..page_count {
+            let scanned_content = Content {
+                operations: vec![
+                    Operation::new("q", vec![]),
+                    Operation::new(
+                        "cm",
+                        vec![612.into(), 0.into(), 0.into(), 792.into(), 0.into(), 0.into()],
+                    ),
+                    Operation::new("Do", vec![Object::Name(b"Scan".to_vec())]),
+                    Operation::new("Q", vec![]),
+                ],
+            };
+            let content_id = document.add_object(Stream::new(
+                dictionary! {},
+                scanned_content.encode().expect("scanned page content must encode"),
+            ));
+            let page_id = document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Scan" => image_id } },
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            });
+            page_ids.push(page_id.into());
+        }
+
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_ids,
+                "Count" => i64::from(page_count),
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document
+            .save_to(&mut bytes)
+            .expect("all-scanned PDF fixture must serialize");
+        bytes
+    }
+
     /// A single page with a non-origin, negative-origin `MediaBox [10 -100 622 692]` (GH#1653)
     /// and two font sizes -- a 24pt heading line and a 10pt body paragraph, both at known raw
     /// user-space positions -- so hierarchy clustering assigns a heading level to the first and
@@ -4327,6 +4399,70 @@ mod tests {
             Some(CONFIDENCE_MOCK_MEAN_TEXT_CONF as f64 / CONFIDENCE_MOCK_SCALE_MAX),
             "a calibrated backend's raw confidence must be normalized by its own scale"
         );
+    }
+
+    /// xberg#1665: the render batch peak scales with the configured thread budget alone, with
+    /// no notion of `security_limits.max_content_size`. A 4-page batch of Letter (612x792pt)
+    /// pages at the default 150 dpi estimates to about 4 x 20.3MB = 81MB; with
+    /// `max_content_size` set to 50MiB (well above any one page, but below the whole batch),
+    /// the pre-fix code renders and validates the FULL 4-page batch and rejects it outright.
+    /// `force_ocr_pages` is the explicit-request route (`extract_mixed_ocr_native`), which
+    /// keeps a real validation failure a hard error rather than a silent native-text fallback
+    /// (see the `~keep` comment on its call site), so on the base tree this call returns `Err`.
+    /// After the fix the batch shrinks to 2 pages per sub-batch (2 x 20.3MB = 41MB, under the
+    /// limit), so every page still reaches OCR, just across two smaller batches, and the
+    /// thread budget stops being the reason OCR turns off.
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[tokio::test]
+    #[serial]
+    async fn large_thread_budget_does_not_turn_off_ocr_at_a_fixed_content_limit() {
+        use crate::core::config::{ConcurrencyConfig, OcrConfig, PageConfig};
+        use crate::extractors::security::SecurityLimits;
+
+        const OCR_TEXT: &str = "issue sixteen sixty five recovered scanned page text";
+        let _backend = register_mock_ocr_backend("pdf-1665-batch-peak-thread-budget", OCR_TEXT);
+
+        let config = ExtractionConfig {
+            concurrency: Some(ConcurrencyConfig { max_threads: Some(4) }),
+            force_ocr_pages: Some(vec![1, 2, 3, 4]),
+            security_limits: Some(SecurityLimits {
+                max_content_size: 50 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ocr: Some(OcrConfig {
+                backend: "pdf-1665-batch-peak-thread-budget".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let result = PdfExtractor::new()
+            .extract_content(&all_scanned_pages_pdf(4), "application/pdf", &config)
+            .await;
+
+        let internal = result.expect(
+            "a thread budget wider than the content limit must still complete: the batch must \
+             shrink, not reject every scanned page",
+        );
+        let pages = internal
+            .prebuilt_pages
+            .as_ref()
+            .expect("extract_pages must produce page contents");
+        assert_eq!(pages.len(), 4, "the fixture has four pages: {pages:?}");
+        for page in pages {
+            assert!(
+                page.content.contains(OCR_TEXT),
+                "page {} must carry OCR'd text, not an empty native fallback: {:?}",
+                page.page_number,
+                page.content
+            );
+        }
     }
 
     /// #1568 -- the mixed / scanned-pages route (`config.force_ocr_pages` ->

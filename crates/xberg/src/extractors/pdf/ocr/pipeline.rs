@@ -55,9 +55,10 @@ use super::document::{
 use super::rendering::EncodedPage;
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 use super::rendering::{
-    XObjectRecoveryOutcome, clone_rgb_for_png_encode, fallback_render_document, open_pdf_for_full_ocr,
-    open_pdf_for_page_ocr, page_dimensions_pt, page_needs_xobject_fallback, recover_page_text_from_image_xobjects,
-    render_full_pdf_ocr_batch, render_selected_pages_from_document, share_rendered_page_images, valid_page_indices,
+    OCR_PNG_ENCODE_BYTES_PER_PIXEL, OCR_PNG_ENCODE_FIXED_BYTES, XObjectRecoveryOutcome, clone_rgb_for_png_encode,
+    fallback_render_document, open_pdf_for_full_ocr, open_pdf_for_page_ocr, page_dimensions_pt,
+    page_needs_xobject_fallback, recover_page_text_from_image_xobjects, render_full_pdf_ocr_batch,
+    render_selected_pages_from_document, share_rendered_page_images, valid_page_indices,
     validate_png_encode_batch_peak, xobject_fallback_warning,
 };
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
@@ -245,7 +246,33 @@ pub(crate) async fn extract_mixed_ocr_native(
         ocr_config_resolved.security_limits = config.security_limits.clone();
     }
 
-    let batch_size = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
+    let configured_batch_size = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
+    // The thread budget alone has no notion of `max_content_size`: a wider budget requests
+    // a wider render batch, and `validate_png_encode_batch_peak` below rejects the WHOLE
+    // batch once its estimated peak crosses that fixed byte ceiling, silently skipping every
+    // page in it rather than the extraction failing (issue #1665). Cap the batch by the same
+    // ceiling before rendering, using the first candidate page as this batch's representative
+    // size -- real documents are near-uniform in page size, and a wrong estimate only shifts
+    // the boundary, because `validate_png_encode_batch_peak` still checks the real peak
+    // afterward regardless of this estimate. ~keep
+    let default_security_limits_for_batch_sizing = crate::extractors::security::SecurityLimits::default();
+    let security_limits_for_batch_sizing = config
+        .security_limits
+        .as_ref()
+        .unwrap_or(&default_security_limits_for_batch_sizing);
+    let batch_size = match page_indices.first() {
+        Some(&first_page_idx) => {
+            let (page_width_pt, page_height_pt) = page_dimensions_pt(&render_doc, first_page_idx);
+            adapt_batch_size_to_content_limit(
+                configured_batch_size,
+                f64::from(page_width_pt),
+                f64::from(page_height_pt),
+                config.images.as_ref(),
+                security_limits_for_batch_sizing,
+            )
+        }
+        None => configured_batch_size,
+    };
 
     let capture_rasters = config.images.as_ref().is_some_and(|c| c.include_page_rasters);
     let ocr_config_owned = ensure_elements_enabled(&ocr_config_resolved);
@@ -2474,6 +2501,83 @@ pub(crate) fn build_page_raster_image(
         data_base64: None,
     }
 }
+/// Shrink `configured` so the render batch's estimated PNG-encode-and-decode peak stays
+/// within `security_limits.max_content_size`, independent of the thread budget that
+/// produced `configured` (issue #1665).
+///
+/// This is a different ceiling from [`adapt_batch_size_to_memory`]'s: that one bounds the
+/// batch against the HOST's available RAM (a number `max_content_size` knows nothing
+/// about), so it does not shrink a batch that comfortably fits in a large machine's memory
+/// even when the SAME batch still trips the fixed, configured `max_content_size` byte
+/// limit that `validate_png_encode_batch_peak` checks after rendering. A wider thread
+/// budget requests a wider batch with no notion of that limit at all, so this must run
+/// regardless of how much memory is free.
+///
+/// `page_width_pt`/`page_height_pt` are the batch's representative page (its `MediaBox`),
+/// used with the same effective render DPI `render_selected_pages_from_document` computes
+/// to estimate that one page's PNG-encode cost via [`estimate_png_encode_page_peak_bytes`],
+/// matching [`validate_png_encode_batch_peak`]'s own per-page accounting so the estimate
+/// and the later real check agree for a page of that size. A wrong estimate (a document
+/// whose pages vary widely in size) only shifts the batch boundary: the real peak is still
+/// checked, and still rejected if it is genuinely too large, by `validate_png_encode_batch_peak`
+/// afterward.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(super) fn adapt_batch_size_to_content_limit(
+    configured: usize,
+    page_width_pt: f64,
+    page_height_pt: f64,
+    images_config: Option<&crate::core::config::ImageExtractionConfig>,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> usize {
+    const PDF_POINTS_PER_INCH: f64 = 72.0;
+
+    let render_dpi = crate::image::dpi::effective_pdf_render_dpi(images_config, page_width_pt, page_height_pt);
+    let width = ((page_width_pt / PDF_POINTS_PER_INCH) * f64::from(render_dpi))
+        .round()
+        .max(1.0) as u32;
+    let height = ((page_height_pt / PDF_POINTS_PER_INCH) * f64::from(render_dpi))
+        .round()
+        .max(1.0) as u32;
+
+    let Ok(per_page_bytes) = estimate_png_encode_page_peak_bytes(width, height) else {
+        return configured;
+    };
+    if per_page_bytes == 0 {
+        return configured;
+    }
+
+    let content_limited_batch = ((security_limits.max_content_size as u64) / per_page_bytes).max(1) as usize;
+
+    let result = configured.min(content_limited_batch);
+
+    tracing::debug!(
+        render_dpi,
+        width,
+        height,
+        per_page_bytes,
+        content_limited_batch,
+        configured,
+        result,
+        "OCR batch size adapted to max_content_size"
+    );
+
+    result
+}
+
+/// One page's estimated PNG-encode-and-decode byte cost, matching
+/// `validate_png_encode_batch_peak`'s own accounting for the parallel encode path: the
+/// source raster, the RGB conversion buffer, and the PNG output buffer, each counted once
+/// per page in that path.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(super) fn estimate_png_encode_page_peak_bytes(width: u32, height: u32) -> crate::Result<u64> {
+    let source = crate::extraction::image_decode::decoded_byte_count(width, height, 3)?;
+    let conversion = crate::extraction::image_decode::decoded_byte_count(width, height, 3)?;
+    let output = crate::extraction::image_decode::decoded_byte_count(width, height, OCR_PNG_ENCODE_BYTES_PER_PIXEL)?
+        .checked_add(OCR_PNG_ENCODE_FIXED_BYTES)
+        .ok_or_else(|| crate::extraction::image_decode::image_dimension_error(width, height, u64::MAX, u64::MAX))?;
+    Ok(source + conversion + output)
+}
+
 /// Adapt batch size to available system memory.
 ///
 /// Estimates per-page memory cost based on typical page dimensions at 300 DPI
