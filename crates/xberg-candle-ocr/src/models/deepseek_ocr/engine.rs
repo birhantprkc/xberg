@@ -37,13 +37,6 @@ const IMAGE_MEAN_STD: f32 = 0.5;
 /// the `<image>` placeholder is materialized as the image-token run built below, so
 /// only the trailing text lives here.
 const DEFAULT_OCR_PROMPT: &str = "\nFree OCR.";
-/// Maximum number of tokens the decode loop will generate for a single page.
-///
-// ~keep: was 128 (~380-650 chars, matching the 15-25% page coverage from #1674). 4096
-// matches PaddleOCR-VL's `max_length`; the reference DeepSeek-OCR implementation uses 8192.
-// The repeat-guard in `crate::generation` bounds a run that starts looping well before this
-// budget is exhausted, so raising the cap does not reintroduce the runaway-table failure mode.
-const DEFAULT_MAX_NEW_TOKENS: usize = 4096;
 
 /// DeepSeek-OCR inference engine.
 ///
@@ -358,16 +351,17 @@ impl DeepseekOCREngine {
             .forward_initial(&input_ids, 0, mm_data)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Initial forward: {}", e)))?;
 
+        let max_new_tokens = self.config.max_new_tokens;
         let stop_ids = self.model.stop_token_ids();
         let mut output_tokens = prompt_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
 
         tracing::debug!(
-            max_tokens = DEFAULT_MAX_NEW_TOKENS,
+            max_tokens = max_new_tokens,
             num_stop_ids = stop_ids.len(),
             "DeepSeek-OCR: starting decoding loop"
         );
 
-        for step in 0..DEFAULT_MAX_NEW_TOKENS {
+        for step in 0..max_new_tokens {
             let seq_len = logits
                 .dim(1)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Output seq len: {}", e)))?;
