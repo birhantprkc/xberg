@@ -144,8 +144,15 @@ image-encode = ["dep:image"]
 # Lightweight marker feature: shared OCR pipeline infrastructure (quality scoring,
 # page rendering, multi-backend pipeline) usable without the Tesseract binary.
 # Implied by `liter-llm` so VLM-only OCR works without enabling the full `ocr` feature.
-# Also implied by `ocr` and `ocr-wasm` (see those feature definitions).
-ocr-pipeline = ["dep:image", "image-encode", "dep:fast_image_resize"]
+# Also implied by `ocr` and `ocr-wasm` (see those feature definitions). Implies
+# `language-detection`: the language/dictionary-plausibility OCR-routing signal
+# (`extractors::pdf::ocr::plausibility`, issue #1696) is gated the same as the rest of this
+# module (`ocr`/`ocr-pipeline`) and would otherwise be a silent hole under the VLM-only,
+# Tesseract-free pipeline that enables only `ocr-pipeline`. whatlang (behind
+# `language-detection`) depends only on `hashbrown`, so this is wasm/Android-safe -- both
+# `wasm-target` and `android-target` already carry `language-detection` independently via
+# `no-ort-target`. ~keep
+ocr-pipeline = ["dep:image", "image-encode", "dep:fast_image_resize", "language-detection"]
 
 tree-sitter = ["dep:tree-sitter-language-pack"]
 tree-sitter-wasm = ["tree-sitter"]
