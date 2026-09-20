@@ -91,6 +91,10 @@ fn extract_pdf_specific_metadata(
         scanned_confidence,
         scanned_pages,
         fabricated_text_pages,
+        // Filled by the extractor after the language-plausibility pass runs, not here:
+        // unlike `fabricated_text_pages`, this signal needs decoded page text and
+        // boundaries, which metadata extraction does not have (issue #1696). ~keep
+        implausible_text_pages: None,
         // Filled by the extractor after the layout pass runs, not here:
         // metadata extraction never runs the layout gate itself. ~keep
         layout_gated_pages: None,
