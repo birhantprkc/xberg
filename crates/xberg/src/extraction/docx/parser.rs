@@ -1446,6 +1446,88 @@ fn push_format_revision(
     });
 }
 
+/// Copy numbering a paragraph inherits from its style onto the paragraph itself.
+///
+/// A paragraph is recognised as a list item through `Paragraph::numbering_id`, and
+/// two separate readers ask that question: the markdown rendering in this module,
+/// and the document-structure node builder in `extractors/docx.rs`. Resolving the
+/// inheritance once, here, is what keeps the two answers the same; resolving it at
+/// either reader would fix one and leave the other emitting plain paragraphs.
+///
+/// Word lets a style own the numbering reference rather than the paragraph, which
+/// is how the built-in `List Bullet` and `List Number` styles work, so a list
+/// authored with them carries no `w:numPr` in `document.xml` at all.
+fn apply_style_numbering(catalog: &super::styles::StyleCatalog, document: &mut Document) {
+    fn fill(catalog: &super::styles::StyleCatalog, paragraphs: &mut [Paragraph]) {
+        for para in paragraphs {
+            if para.numbering_id.is_some() {
+                continue;
+            }
+            let Some(style_id) = para.style.as_deref() else {
+                continue;
+            };
+            let Some((numbering_id, level)) = resolve_style_numbering(catalog, style_id) else {
+                continue;
+            };
+            para.numbering_id = Some(numbering_id);
+            para.numbering_level = Some(para.numbering_level.unwrap_or(level));
+        }
+    }
+
+    fn fill_tables(catalog: &super::styles::StyleCatalog, tables: &mut [Table]) {
+        for table in tables {
+            for row in &mut table.rows {
+                for cell in &mut row.cells {
+                    fill(catalog, &mut cell.paragraphs);
+                }
+            }
+        }
+    }
+
+    fill(catalog, &mut document.paragraphs);
+    fill_tables(catalog, &mut document.tables);
+    for header_footer in document.headers.iter_mut().chain(document.footers.iter_mut()) {
+        fill(catalog, &mut header_footer.paragraphs);
+        fill_tables(catalog, &mut header_footer.tables);
+    }
+    for note in document.footnotes.iter_mut().chain(document.endnotes.iter_mut()) {
+        fill(catalog, &mut note.paragraphs);
+    }
+    for comment in &mut document.comments {
+        fill(catalog, &mut comment.paragraphs);
+    }
+}
+
+/// Walk a style's `basedOn` chain for the first numbering reference it carries.
+///
+/// The level is defaulted to 0 when the style sets `w:numId` without `w:ilvl`, which
+/// is the common shape and is how Word reads it. That default is load-bearing:
+/// `Paragraph::to_markdown` needs both values before it treats a paragraph as a list
+/// item, so inheriting the id alone would change nothing.
+///
+/// The chain is bounded at 20 like `resolve_heading_level`, for the same cycles.
+fn resolve_style_numbering(catalog: &super::styles::StyleCatalog, style_id: &str) -> Option<(i64, i64)> {
+    let mut current_id = Some(style_id);
+    let mut visited = 0;
+    while let Some(id) = current_id {
+        if visited > 20 {
+            break;
+        }
+        visited += 1;
+        let style_def = catalog.styles.get(id)?;
+        if let Some(numbering_id) = style_def.paragraph_properties.numbering_id {
+            let level = style_def
+                .paragraph_properties
+                .numbering_level
+                .map(clamp_numbering_level)
+                .unwrap_or(0);
+            return Some((numbering_id, level));
+        }
+        current_id = style_def.based_on.as_deref();
+    }
+    None
+}
+
 /// Maximum indentation depth honoured for a `w:ilvl` (list nesting level).
 ///
 /// Word's own list-formatting UI caps nesting at 9 levels (`w:ilvl` 0-8); this is also
@@ -2230,6 +2312,10 @@ impl<R: Read + Seek> DocxParser<R> {
         }
 
         document.style_catalog = self.styles.take();
+        if let Some(catalog) = document.style_catalog.take() {
+            apply_style_numbering(&catalog, &mut document);
+            document.style_catalog = Some(catalog);
+        }
         document.theme = self.theme.take();
         document.image_relationships = self
             .relationships
@@ -6090,6 +6176,194 @@ mod tests {
         assert_eq!(table.rows[0].cells.len(), 2);
         let md = doc.to_markdown(true);
         assert!(md.contains("Has content"), "Markdown: {}", md);
+    }
+
+    /// A list authored with Word's built-in `List Bullet` style carries no
+    /// `w:numPr` in `document.xml`: the numbering reference lives on the style.
+    /// The paragraph still has to read as a list item (GH#1663).
+    #[test]
+    fn a_paragraph_inherits_the_numbering_its_style_carries() {
+        let mut catalog = super::super::styles::StyleCatalog::default();
+        catalog.styles.insert(
+            "ListBullet".to_string(),
+            super::super::styles::StyleDefinition {
+                id: "ListBullet".to_string(),
+                name: Some("List Bullet".to_string()),
+                style_type: super::super::styles::StyleType::Paragraph,
+                based_on: None,
+                next_style: None,
+                is_default: false,
+                paragraph_properties: super::super::styles::ParagraphProperties {
+                    numbering_id: Some(1),
+                    ..Default::default()
+                },
+                run_properties: Default::default(),
+            },
+        );
+        let mut doc = Document {
+            paragraphs: vec![Paragraph {
+                style: Some("ListBullet".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        apply_style_numbering(&catalog, &mut doc);
+
+        assert_eq!(doc.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(
+            doc.paragraphs[0].numbering_level,
+            Some(0),
+            "a style that sets w:numId without w:ilvl is level 0, and to_markdown needs both"
+        );
+    }
+
+    /// Numbering written on the paragraph itself outranks the style's, so a list
+    /// item that overrides its style keeps its own definition and level.
+    #[test]
+    fn paragraph_numbering_outranks_the_numbering_on_its_style() {
+        let mut catalog = super::super::styles::StyleCatalog::default();
+        catalog.styles.insert(
+            "ListBullet".to_string(),
+            super::super::styles::StyleDefinition {
+                id: "ListBullet".to_string(),
+                name: Some("List Bullet".to_string()),
+                style_type: super::super::styles::StyleType::Paragraph,
+                based_on: None,
+                next_style: None,
+                is_default: false,
+                paragraph_properties: super::super::styles::ParagraphProperties {
+                    numbering_id: Some(1),
+                    ..Default::default()
+                },
+                run_properties: Default::default(),
+            },
+        );
+        let mut doc = Document {
+            paragraphs: vec![Paragraph {
+                style: Some("ListBullet".to_string()),
+                numbering_id: Some(7),
+                numbering_level: Some(2),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        apply_style_numbering(&catalog, &mut doc);
+
+        assert_eq!(doc.paragraphs[0].numbering_id, Some(7));
+        assert_eq!(doc.paragraphs[0].numbering_level, Some(2));
+    }
+
+    const LIST_BULLET_STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="ListBullet">
+    <w:name w:val="List Bullet"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="ListBulletChild">
+    <w:name w:val="List Bullet Child"/>
+    <w:basedOn w:val="ListBullet"/>
+  </w:style>
+</w:styles>"#;
+
+    fn list_styled_paragraph(text: &str) -> String {
+        format!(r#"<w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#)
+    }
+
+    fn docx_with_list_style(body: &str, extra_parts: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("word/document.xml", options).unwrap();
+        zip.write_all(wrap_body(body).as_bytes()).unwrap();
+        zip.start_file("word/styles.xml", options).unwrap();
+        zip.write_all(LIST_BULLET_STYLES_XML.as_bytes()).unwrap();
+        for (path, xml) in extra_parts {
+            zip.start_file(*path, options).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn parse_bytes(bytes: &[u8]) -> Document {
+        let mut budget = SecurityBudget::with_defaults();
+        parse_document(bytes, &mut budget, &default_limits()).expect("docx parses")
+    }
+
+    /// End-to-end proof that `apply_style_numbering` is wired into `DocxParser::parse`:
+    /// a real archive through `parse_document`, not the extracted helper called directly
+    /// against a hand-built `Document` (GH#1663).
+    #[test]
+    fn a_body_paragraph_inherits_list_numbering_from_its_style_through_parse_document() {
+        let body = format!("{}{}", list_styled_paragraph("First"), list_styled_paragraph("Second"));
+        let doc = parse_bytes(&docx_with_list_style(&body, &[]));
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert_eq!(doc.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(doc.paragraphs[0].numbering_level, Some(0));
+        let md = doc.to_markdown(true);
+        assert_eq!(md, "- First\n- Second", "markdown: {md:?}");
+    }
+
+    /// The numbering reference is found through `basedOn`: `ListBulletChild` carries no
+    /// `w:numPr` of its own and inherits it from `ListBullet` (GH#1663).
+    #[test]
+    fn a_paragraph_inherits_list_numbering_from_a_style_two_levels_up() {
+        let body = r#"<w:p><w:pPr><w:pStyle w:val="ListBulletChild"/></w:pPr><w:r><w:t>Nested</w:t></w:r></w:p>"#;
+        let doc = parse_bytes(&docx_with_list_style(body, &[]));
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert_eq!(doc.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(doc.paragraphs[0].numbering_level, Some(0));
+        assert_eq!(doc.to_markdown(true), "- Nested");
+    }
+
+    #[test]
+    fn a_table_cell_paragraph_inherits_list_numbering_from_its_style() {
+        let body = format!(
+            "<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>",
+            list_styled_paragraph("In a cell")
+        );
+        let doc = parse_bytes(&docx_with_list_style(&body, &[]));
+        let cell = &doc.tables[0].rows[0].cells[0];
+        assert_eq!(cell.paragraphs[0].numbering_id, Some(1));
+        assert_eq!(cell.paragraphs[0].numbering_level, Some(0));
+    }
+
+    #[test]
+    fn a_header_paragraph_inherits_list_numbering_from_its_style() {
+        let header = format!(
+            r#"<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{}</w:hdr>"#,
+            list_styled_paragraph("In a header")
+        );
+        let doc = parse_bytes(&docx_with_list_style("", &[("word/header1.xml", &header)]));
+        assert_eq!(doc.headers.len(), 1, "header part was picked up");
+        assert_eq!(doc.headers[0].paragraphs[0].numbering_id, Some(1));
+    }
+
+    #[test]
+    fn a_footnote_paragraph_inherits_list_numbering_from_its_style() {
+        // ids -1/0/1 are reserved separators; 2 is the first real footnote id.
+        let footnotes = format!(
+            r#"<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:footnote w:id="2">{}</w:footnote></w:footnotes>"#,
+            list_styled_paragraph("In a footnote")
+        );
+        let doc = parse_bytes(&docx_with_list_style("", &[("word/footnotes.xml", &footnotes)]));
+        assert_eq!(doc.footnotes.len(), 1);
+        assert_eq!(doc.footnotes[0].paragraphs[0].numbering_id, Some(1));
+    }
+
+    #[test]
+    fn a_comment_paragraph_inherits_list_numbering_from_its_style() {
+        let comments = format!(
+            r#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:comment w:id="0" w:author="A">{}</w:comment></w:comments>"#,
+            list_styled_paragraph("In a comment")
+        );
+        let doc = parse_bytes(&docx_with_list_style("", &[("word/comments.xml", &comments)]));
+        assert_eq!(doc.comments.len(), 1);
+        assert_eq!(doc.comments[0].paragraphs[0].numbering_id, Some(1));
     }
 
     #[test]

@@ -20682,6 +20682,17 @@ char *xberg_pdf_metadata_scanned_pages(XBERGAlefHandle handle);
 
 #if defined(XBERG_FEATURE_PDF)
 /**
+ * Get the `fabricated_text_pages` field from a `PdfMetadata`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `xberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *xberg_pdf_metadata_fabricated_text_pages(XBERGAlefHandle handle);
+#endif
+
+#if defined(XBERG_FEATURE_PDF)
+/**
  * Get the `layout_gated_pages` field from a `PdfMetadata`.
  * A non-null returned pointer is owned by the caller.
  * It must be freed with `xberg_free_string`.

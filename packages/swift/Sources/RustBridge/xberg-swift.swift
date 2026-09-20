@@ -21043,6 +21043,10 @@ extension PdfMetadataRef {
         RustString(ptr: __swift_bridge__$PdfMetadata$scanned_pages(ptr))
     }
 
+    public func fabricatedTextPages() -> RustString {
+        RustString(ptr: __swift_bridge__$PdfMetadata$fabricated_text_pages(ptr))
+    }
+
     public func layoutGatedPages() -> RustString {
         RustString(ptr: __swift_bridge__$PdfMetadata$layout_gated_pages(ptr))
     }
