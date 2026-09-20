@@ -6,18 +6,26 @@
 //! periodic tail and lets the caller stop early instead of burning the rest of the token budget
 //! on invented output.
 
+/// Largest period, in tokens, considered a degenerate repeat.
+///
+// ~keep: #1674's actual failure is a repeated HTML table ROW, not a single repeated cell --
+// observed rows tokenise to roughly 15-60 tokens, so a period cap below ~20 (an earlier version
+// of this guard used 8) is invisible to exactly the failure this guard exists to catch. The
+// reference DeepSeek-OCR implementation bans repeated 20-grams via `no_repeat_ngram_size=20`
+// (a logit-level ban needing per-step top-k tracking, which this argmax-only guard avoids); 32
+// is chosen over the reference's bare 20 to also cover the long end of the observed row range
+// with one period's margin to spare.
+pub const REPEAT_GUARD_MAX_PERIOD: usize = 32;
+
 /// Number of trailing token ids examined for an exactly periodic run.
 ///
-// ~keep: a wide table row of identical cells tokenises with period 2-3, so 32 tokens (~11-16
-// identical cells) is well within legitimate output that real financial tables hit. 64 tokens
-// (~21+ repeats) is outside anything a real page produces and costs at most 64 wasted decode
-// steps to detect. The reference DeepSeek-OCR implementation instead bans repeated n-grams via
-// `no_repeat_ngram_size=20`, a logit-level ban that needs per-step top-k tracking; this
-// stop-on-detect guard works with pure argmax decoding and no extra per-step cost.
-pub const REPEAT_GUARD_WINDOW: usize = 64;
-
-/// Largest period, in tokens, considered a degenerate repeat.
-pub const REPEAT_GUARD_MAX_PERIOD: usize = 8;
+// ~keep: sized as 4x REPEAT_GUARD_MAX_PERIOD so a period at the cap (32) still has to repeat at
+// least 4 full times before the guard fires -- comfortably above the >=3-repeat bar this was
+// reviewed against, and short of that no legitimate multi-row table (2-3 identical short rows,
+// period ~6) is at risk of a false positive; see `should_not_flag_three_identical_short_table_rows`
+// below. Detection cost is O(window * max_period) = 128 * 32 = 4096 comparisons per decode step,
+// negligible next to one transformer forward pass.
+pub const REPEAT_GUARD_WINDOW: usize = REPEAT_GUARD_MAX_PERIOD * 4;
 
 /// Return `Some(period)` when the last `window` ids of `ids` are exactly periodic with some
 /// period in `1..=max_period`, i.e. `ids[i] == ids[i - period]` for every index in the window.
@@ -77,8 +85,21 @@ pub fn stop_if_degenerate(ids: &mut Vec<u32>) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Build `count` repeats of `unit`, long enough that the result is at least
+    /// `REPEAT_GUARD_WINDOW` tokens regardless of how the constants above are tuned.
+    fn repeated(unit: &[u32], count: usize) -> Vec<u32> {
+        let ids: Vec<u32> = unit.iter().copied().cycle().take(unit.len() * count).collect();
+        assert!(
+            ids.len() >= REPEAT_GUARD_WINDOW,
+            "test fixture must be at least REPEAT_GUARD_WINDOW long, got {} < {}",
+            ids.len(),
+            REPEAT_GUARD_WINDOW
+        );
+        ids
+    }
+
     #[test]
-    fn should_detect_period_one_run_of_sixty_four_identical_tokens() {
+    fn should_detect_period_one_run_of_window_identical_tokens() {
         let ids = vec![7u32; REPEAT_GUARD_WINDOW];
         assert_eq!(
             degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
@@ -89,7 +110,7 @@ mod tests {
     #[test]
     fn should_detect_period_three_run_and_truncate_to_prefix_plus_one_unit() {
         let unit = [1u32, 2, 3];
-        let mut ids: Vec<u32> = unit.iter().copied().cycle().take(3 * 22).collect();
+        let mut ids = repeated(&unit, REPEAT_GUARD_WINDOW / unit.len() + 2);
         assert_eq!(
             degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
             Some(3)
@@ -99,9 +120,43 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3]);
     }
 
+    /// #1674's actual failure mode: a repeated HTML table row (observed at roughly 15-60
+    /// tokens), here modelled as a 25-token unit -- squarely inside that range and inside
+    /// `REPEAT_GUARD_MAX_PERIOD` (32). Must be caught.
+    #[test]
+    fn should_detect_a_twenty_five_token_repeating_table_row() {
+        let unit: [u32; 25] = std::array::from_fn(|index| 100 + index as u32);
+        let mut ids = repeated(&unit, REPEAT_GUARD_WINDOW / unit.len() + 2);
+        assert_eq!(
+            degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
+            Some(25),
+            "a 25-token repeating unit is within REPEAT_GUARD_MAX_PERIOD and must be detected"
+        );
+
+        truncate_degenerate_tail(&mut ids, 25);
+        assert_eq!(ids, unit.to_vec());
+    }
+
+    /// The mirror image of the case above: three genuinely distinct, short, identical table
+    /// rows (period ~6) are exactly the kind of legitimate repetition a real financial or
+    /// layout table produces, and must not trip the guard just because it repeats a little.
+    #[test]
+    fn should_not_flag_three_identical_short_table_rows() {
+        let unit = [11u32, 12, 13, 14, 15, 16];
+        let ids: Vec<u32> = unit.iter().copied().cycle().take(unit.len() * 3).collect();
+        assert!(
+            ids.len() < REPEAT_GUARD_WINDOW,
+            "fixture must be short enough to stay under the window on its own merits"
+        );
+        assert_eq!(
+            degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
+            None
+        );
+    }
+
     #[test]
     fn should_not_flag_a_strictly_increasing_sequence() {
-        let ids: Vec<u32> = (0..64).collect();
+        let ids: Vec<u32> = (0..REPEAT_GUARD_WINDOW as u32).collect();
         assert_eq!(
             degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
             None
@@ -117,10 +172,13 @@ mod tests {
         );
     }
 
+    /// A period one step past the cap must stay invisible to the guard -- otherwise
+    /// `REPEAT_GUARD_MAX_PERIOD` is not actually bounding anything.
     #[test]
-    fn should_not_flag_a_period_nine_run_because_it_exceeds_max_period() {
-        let unit = [1u32, 2, 3, 4, 5, 6, 7, 8, 9];
-        let ids: Vec<u32> = unit.iter().copied().cycle().take(9 * 8).collect();
+    fn should_not_flag_a_run_one_period_past_the_max_period_cap() {
+        let period = REPEAT_GUARD_MAX_PERIOD + 1;
+        let unit: Vec<u32> = (1..=period as u32).collect();
+        let ids = repeated(&unit, REPEAT_GUARD_WINDOW / unit.len() + 2);
         assert_eq!(
             degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
             None
@@ -132,7 +190,12 @@ mod tests {
         let prefix: Vec<u32> = (1..=19).collect();
         let unit = [5u32, 6];
         let mut ids = prefix.clone();
-        ids.extend(unit.iter().copied().cycle().take(2 * 40));
+        ids.extend(
+            unit.iter()
+                .copied()
+                .cycle()
+                .take(unit.len() * (REPEAT_GUARD_WINDOW / unit.len() + 5)),
+        );
 
         assert_eq!(
             degenerate_tail_period(&ids, REPEAT_GUARD_WINDOW, REPEAT_GUARD_MAX_PERIOD),
@@ -149,7 +212,7 @@ mod tests {
     #[test]
     fn should_report_and_truncate_via_the_combined_helper() {
         let unit = [1u32, 2, 3];
-        let mut ids: Vec<u32> = unit.iter().copied().cycle().take(3 * 22).collect();
+        let mut ids = repeated(&unit, REPEAT_GUARD_WINDOW / unit.len() + 2);
         assert_eq!(stop_if_degenerate(&mut ids), Some(3));
         assert_eq!(ids, vec![1, 2, 3]);
     }
