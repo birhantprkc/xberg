@@ -275,9 +275,13 @@ Pure-Rust VLM OCR combining SAM, CLIP, Qwen2, and DeepSeek-V2 MoE architecture. 
 
 **Model & performance:**
 
-- Model size: ~3 GB+ on first download; cached at `~/.cache/huggingface/`
+- Model size: 6.7 GB (BF16 weights) on first download, auto-downloaded from a checksum-pinned
+  revision of `deepseek-ai/DeepSeek-OCR`; cached at `~/.cache/huggingface/` (or `HF_HUB_CACHE` /
+  `HUGGINGFACE_HUB_CACHE` / `HF_HOME`) — no `backend_options.model_path` required
 - Fine-grained layout detection, table region recognition, text extraction with confidence scores
-- CPU dtype: F32; CUDA dtype: F16
+- Pages wider or taller than 640 px are tiled into 640 px local-crop tiles (the reference "Gundam"
+  mode) in addition to the 1024 px global view, so small text keeps its resolution
+- Dtype auto-selects per device (override via `backend_options.dtype`): CPU F32, CUDA BF16, Metal F16
 
 Configure via `--ocr-backend candle-deepseek-ocr` or `ocr.backend = "candle-deepseek-ocr"` in config. Set device via `backend_options`: `{"device":"metal"}`, `{"device":"cuda"}`.
 

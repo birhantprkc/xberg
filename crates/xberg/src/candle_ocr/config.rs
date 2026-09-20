@@ -159,19 +159,48 @@ pub struct GlmOcrBackendOptions {
     pub cache_dir: Option<String>,
 }
 
+/// Floating-point precision accepted by `candle-deepseek-ocr` backend options.
+///
+/// `Auto` (the default) resolves per compute device: BF16 on CUDA, F16 on Metal, F32 on CPU.
+/// A dtype with no kernel on the selected device fails the load hard rather than silently
+/// falling back to another precision -- this is not a tuning knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CandleDeepseekOcrDtype {
+    #[default]
+    Auto,
+    F32,
+    F16,
+    Bf16,
+}
+
 /// Runtime options accepted by the `candle-deepseek-ocr` backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeepseekOcrBackendOptions {
-    /// Local DeepSeek-OCR model directory. The backend requires this option.
+    /// Local DeepSeek-OCR model directory. Takes precedence over `model_id` when present.
     #[serde(alias = "model-path", skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
+    /// Optional Hugging Face repository identifier. Defaults to the checksum-pinned
+    /// `deepseek-ai/DeepSeek-OCR`. Ignored when `model_path` is set.
+    #[serde(alias = "model-id", skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Optional immutable Hugging Face model revision. The default model is pinned
+    /// automatically; a custom `model_id` requires this to be set explicitly.
+    #[serde(alias = "hf-revision", alias = "revision", skip_serializing_if = "Option::is_none")]
+    pub hf_revision: Option<String>,
+    /// Optional Hugging Face cache root.
+    #[serde(alias = "cache-dir", skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
     /// Optional per-call device override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<CandleDevicePreference>,
     /// DeepSeek-OCR model generation, either 1 or 2. Defaults to 2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
+    /// Optional weight precision override; see [`CandleDeepseekOcrDtype`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<CandleDeepseekOcrDtype>,
 }
 
 #[cfg(any(
@@ -373,17 +402,35 @@ mod tests {
 
         let deepseek = DeepseekOcrBackendOptions {
             model_path: Some("/models/deepseek".to_string()),
+            model_id: Some("example/deepseek-ocr".to_string()),
+            hf_revision: Some("deepseek-revision".to_string()),
+            cache_dir: Some("/cache/deepseek".to_string()),
             device: Some(CandleDevicePreference::Auto),
             version: Some(3),
+            dtype: Some(CandleDeepseekOcrDtype::Bf16),
         };
         assert_eq!(
             serde_json::to_value(deepseek).unwrap(),
             serde_json::json!({
                 "model_path": "/models/deepseek",
+                "model_id": "example/deepseek-ocr",
+                "hf_revision": "deepseek-revision",
+                "cache_dir": "/cache/deepseek",
                 "device": "auto",
-                "version": 3
+                "version": 3,
+                "dtype": "bf16"
             })
         );
+    }
+
+    #[test]
+    fn should_default_deepseek_dtype_to_auto_when_absent() {
+        let options: DeepseekOcrBackendOptions = parse_backend_options(None, "candle-deepseek-ocr").unwrap();
+        assert_eq!(options.dtype, None);
+
+        let explicit = serde_json::json!({"dtype": "f16"});
+        let options: DeepseekOcrBackendOptions = parse_backend_options(Some(&explicit), "candle-deepseek-ocr").unwrap();
+        assert_eq!(options.dtype, Some(CandleDeepseekOcrDtype::F16));
     }
 
     #[test]

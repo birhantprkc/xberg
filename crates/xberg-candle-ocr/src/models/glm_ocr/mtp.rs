@@ -116,6 +116,15 @@ mod imp {
                 return Ok(output_ids);
             }
 
+            if let Some(period) = crate::generation::stop_if_degenerate(&mut output_ids) {
+                tracing::warn!(
+                    period,
+                    step = output_ids.len(),
+                    "GLM-OCR: degenerate repetition, stopping"
+                );
+                break;
+            }
+
             let token_tensor = Tensor::new(&[token_id as i64], &dev)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Token tensor: {}", e)))?
                 .unsqueeze(0)
@@ -188,6 +197,15 @@ mod imp {
 
             if eos_token_ids.contains(&token_id) {
                 return Ok(output_ids);
+            }
+
+            if let Some(period) = crate::generation::stop_if_degenerate(&mut output_ids) {
+                tracing::warn!(
+                    period,
+                    step = output_ids.len(),
+                    "GLM-OCR: degenerate repetition, stopping"
+                );
+                break;
             }
 
             let token_tensor = Tensor::new(&[token_id as i64], logits.device())

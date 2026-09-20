@@ -1,0 +1,16 @@
+# DeepSeek-OCR weight manifest — deepseek-ai/DeepSeek-OCR, pinned at revision
+# 9f30c71f441d010e5429c532364a86705536c53a. Single source of truth: the runtime
+# staging path (model_stager.rs, via include_str!) reads this file. Update the model
+# → edit here only.
+#
+# Covers exactly the files DeepseekOCREngine::init() reads: config.json,
+# tokenizer.json, model.safetensors.index.json, and every shard the index's
+# weight_map names. At this revision the index names a single shard,
+# model-00001-of-000001.safetensors (6,672,547,120 bytes) — its checksum is the
+# upstream LFS sha256, not a git blob oid. The shard list is enumerated from the
+# index; if a future revision reshards the weights, the index and this manifest's
+# shard entries must be updated together.
+ac358c28898de6a71e84e0cb959fcc97fcb9c674edae13cd24286c17b90032d8  config.json
+a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4  tokenizer.json
+b51d17cc7b282880006a162b06e3a5c4c0a566f3d3093f34a93450ca5a91bd74  model.safetensors.index.json
+1169e7cdc28ff2fb6186556acb2175db148ad26a62097df4c45a17e523180d3f  model-00001-of-000001.safetensors

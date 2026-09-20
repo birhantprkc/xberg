@@ -22,6 +22,15 @@ const DOWNSAMPLE_RATIO: u32 = 4;
 /// Image tokens per side for the global view:
 /// `ceil((base_size / patch_size) / downsample_ratio)` = `(1024 / 16) / 4` = 16.
 const NUM_QUERIES_BASE: usize = (BASE_SIZE / PATCH_SIZE / DOWNSAMPLE_RATIO) as usize;
+/// Local-crop tile side length, matching the reference "Gundam" mode.
+const CROP_TILE_SIZE: u32 = 640;
+/// Minimum number of local-crop tiles considered by the aspect-ratio search.
+const CROP_MIN_TILES: u32 = 2;
+/// Maximum number of local-crop tiles considered by the aspect-ratio search.
+const CROP_MAX_TILES: u32 = 9;
+/// Image tokens per side for a single local-crop tile:
+/// `ceil((crop_tile_size / patch_size) / downsample_ratio)` = `(640 / 16) / 4` = 10.
+const NUM_QUERIES_LOCAL: usize = (CROP_TILE_SIZE / PATCH_SIZE / DOWNSAMPLE_RATIO) as usize;
 /// Channel mean and std for normalization (reference BasicImageTransform uses 0.5).
 const IMAGE_MEAN_STD: f32 = 0.5;
 /// Default plain-OCR instruction. In the reference this is `"<image>\nFree OCR."`;
@@ -256,16 +265,46 @@ impl DeepseekOCREngine {
             .unsqueeze(0)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Global batch: {}", e)))?;
 
-        let image_crop = Tensor::zeros(
-            (0, channels, BASE_SIZE as usize, BASE_SIZE as usize),
-            self.dtype,
-            &self.device,
-        )
-        .map_err(|e| CandleOcrError::InferenceFailed(format!("Image crop tensor: {}", e)))?;
-        let images_spatial_crop = Tensor::new(&[[1u32, 1u32]], &self.device)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Spatial crop tensor: {}", e)))?;
+        let (image_crop, images_spatial_crop, num_image_tokens) = match crop_grid_for(img_width, img_height) {
+            Some(_) => {
+                let (tiles, (w_crop, h_crop)) = crate::vendor::aha::image::dynamic_preprocess(
+                    &img,
+                    CROP_MIN_TILES,
+                    CROP_MAX_TILES,
+                    CROP_TILE_SIZE,
+                    false,
+                )
+                .map_err(|e| CandleOcrError::InferenceFailed(format!("Local-crop tiling: {}", e)))?;
 
-        let num_image_tokens = NUM_QUERIES_BASE * (NUM_QUERIES_BASE + 1) + 1;
+                tracing::debug!(w_crop, h_crop, num_tiles = tiles.len(), "DeepSeek-OCR: local-crop grid");
+
+                let mut tile_tensors = Vec::with_capacity(tiles.len());
+                for tile in &tiles {
+                    let tile_tensor =
+                        crate::vendor::aha::image::img_transform(tile, &mean, &std, &self.device, self.dtype)
+                            .map_err(|e| CandleOcrError::InferenceFailed(format!("Crop transform: {}", e)))?;
+                    tile_tensors.push(tile_tensor);
+                }
+                let image_crop = Tensor::stack(&tile_tensors, 0)
+                    .map_err(|e| CandleOcrError::InferenceFailed(format!("Crop stack: {}", e)))?;
+                let images_spatial_crop = Tensor::new(&[[w_crop, h_crop]], &self.device)
+                    .map_err(|e| CandleOcrError::InferenceFailed(format!("Spatial crop tensor: {}", e)))?;
+
+                (image_crop, images_spatial_crop, image_token_count(w_crop, h_crop))
+            }
+            None => {
+                let image_crop = Tensor::zeros(
+                    (0, channels, BASE_SIZE as usize, BASE_SIZE as usize),
+                    self.dtype,
+                    &self.device,
+                )
+                .map_err(|e| CandleOcrError::InferenceFailed(format!("Image crop tensor: {}", e)))?;
+                let images_spatial_crop = Tensor::new(&[[1u32, 1u32]], &self.device)
+                    .map_err(|e| CandleOcrError::InferenceFailed(format!("Spatial crop tensor: {}", e)))?;
+
+                (image_crop, images_spatial_crop, image_token_count(0, 0))
+            }
+        };
         let prompt_text = prompt.unwrap_or(DEFAULT_OCR_PROMPT);
         let text_ids: Vec<u32> = self
             .tokenizer
@@ -312,17 +351,17 @@ impl DeepseekOCREngine {
             .forward_initial(&input_ids, 0, mm_data)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Initial forward: {}", e)))?;
 
-        const MAX_NEW_TOKENS: usize = 128;
+        let max_new_tokens = self.config.max_new_tokens;
         let stop_ids = self.model.stop_token_ids();
         let mut output_tokens = prompt_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
 
         tracing::debug!(
-            max_tokens = MAX_NEW_TOKENS,
+            max_tokens = max_new_tokens,
             num_stop_ids = stop_ids.len(),
             "DeepSeek-OCR: starting decoding loop"
         );
 
-        for step in 0..MAX_NEW_TOKENS {
+        for step in 0..max_new_tokens {
             let seq_len = logits
                 .dim(1)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Output seq len: {}", e)))?;
@@ -349,6 +388,11 @@ impl DeepseekOCREngine {
                     num_tokens = output_tokens.len(),
                     "DeepSeek-OCR: reached stop token"
                 );
+                break;
+            }
+
+            if let Some(period) = crate::generation::stop_if_degenerate(&mut output_tokens) {
+                tracing::warn!(period, step, "DeepSeek-OCR: degenerate repetition, stopping");
                 break;
             }
 
@@ -406,5 +450,57 @@ impl DeepseekOCREngine {
     #[must_use]
     pub fn version(&self) -> usize {
         self.version
+    }
+}
+
+/// Number of image tokens the model consumes for a page whose local-crop grid is
+/// `(w_crop, h_crop)`. `(0, 0)` is the global-view-only path (no local crops), matching the
+/// `image_crop.sum_all() == 0` branch `DeepseekOCRModel::forward` takes in that case.
+fn image_token_count(w_crop: u32, h_crop: u32) -> usize {
+    let global = NUM_QUERIES_BASE * (NUM_QUERIES_BASE + 1) + 1;
+    let local = (NUM_QUERIES_LOCAL * w_crop as usize + 1) * (NUM_QUERIES_LOCAL * h_crop as usize);
+    global + local
+}
+
+/// Local-crop grid `(width_tiles, height_tiles)` the reference "Gundam" mode selects for a
+/// `width x height` page, mirroring `dynamic_preprocess`'s aspect-ratio search. Returns `None`
+/// when both sides already fit the `CROP_TILE_SIZE` global view and tiling would add nothing.
+fn crop_grid_for(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width <= CROP_TILE_SIZE && height <= CROP_TILE_SIZE {
+        return None;
+    }
+    let aspect_ratio = f64::from(width) / f64::from(height);
+    let target_ratios = crate::vendor::aha::image::generate_target_ratios_sorted(CROP_MIN_TILES, CROP_MAX_TILES);
+    Some(crate::vendor::aha::image::find_closest_aspect_ratio(
+        aspect_ratio,
+        &target_ratios,
+        width,
+        height,
+        CROP_TILE_SIZE,
+    ))
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::{crop_grid_for, image_token_count};
+
+    #[test]
+    fn image_token_count_matches_global_only_path() {
+        assert_eq!(image_token_count(0, 0), 273);
+    }
+
+    #[test]
+    fn image_token_count_matches_letter_page_local_crops() {
+        assert_eq!(image_token_count(2, 3), 903);
+    }
+
+    #[test]
+    fn crop_grid_for_returns_none_for_a_small_image() {
+        assert_eq!(crop_grid_for(600, 600), None);
+    }
+
+    #[test]
+    fn crop_grid_for_selects_2x3_for_a_letter_page_at_150dpi() {
+        assert_eq!(crop_grid_for(1275, 1650), Some((2, 3)));
     }
 }

@@ -34,16 +34,19 @@ pub mod paddleocr_vl_backend;
 #[cfg(all(feature = "candle-glm-ocr", not(target_arch = "wasm32")))]
 pub mod glm_ocr_backend;
 
-#[cfg(feature = "candle-paddleocr-vl")]
+#[cfg(any(
+    feature = "candle-paddleocr-vl",
+    all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32"))
+))]
 pub(crate) mod model_stager;
 
 #[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
 pub mod deepseek_ocr_backend;
 
 pub use config::{
-    CandleDevicePreference, CandleModelId, CandleOcrConfig, CandleTrocrVariant, DeepseekOcrBackendOptions,
-    GlmOcrBackendOptions, GlmOcrLayoutMode, GlmOcrTaskKind, PaddleOcrVlBackendOptions, PaddleOcrVlTaskKind,
-    TrocrBackendOptions,
+    CandleDeepseekOcrDtype, CandleDevicePreference, CandleModelId, CandleOcrConfig, CandleTrocrVariant,
+    DeepseekOcrBackendOptions, GlmOcrBackendOptions, GlmOcrLayoutMode, GlmOcrTaskKind, PaddleOcrVlBackendOptions,
+    PaddleOcrVlTaskKind, TrocrBackendOptions,
 };
 
 #[cfg(feature = "candle-trocr")]
