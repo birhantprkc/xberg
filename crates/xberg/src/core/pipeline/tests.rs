@@ -2457,7 +2457,7 @@ mod document_counts {
             pages: None,
             ..Default::default()
         };
-        populate_document_counts(&mut result);
+        populate_document_counts(&mut result, 0);
         assert_eq!(result.counts.pages, 5, "pages must read metadata.total_count");
         assert_eq!(result.counts.tables, 2);
         assert_eq!(result.counts.images, 1);
@@ -2470,7 +2470,7 @@ mod document_counts {
             pages: Some(vec![page(1), page(2), page(3)]),
             ..Default::default()
         };
-        populate_document_counts(&mut result);
+        populate_document_counts(&mut result, 0);
         assert_eq!(result.counts.pages, 3);
         assert_eq!(result.counts.tables, 0);
         assert_eq!(result.counts.images, 0);
@@ -2482,7 +2482,7 @@ mod document_counts {
             content: "plain text".to_string(),
             ..Default::default()
         };
-        populate_document_counts(&mut result);
+        populate_document_counts(&mut result, 0);
         assert_eq!(result.counts.pages, 0);
         assert_eq!(result.counts.tables, 0);
         assert_eq!(result.counts.images, 0);
@@ -2498,7 +2498,7 @@ mod document_counts {
             pages: Some(vec![page(1), page(2)]),
             ..Default::default()
         };
-        populate_document_counts(&mut result);
+        populate_document_counts(&mut result, 0);
         assert_eq!(result.counts.pages, 2);
     }
 }
