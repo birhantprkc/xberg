@@ -13978,6 +13978,8 @@ const _: fn() = || {
         let _: f64 = OcrQualityThresholds.min_undecodable_ratio;
         let _: bool = OcrQualityThresholds.enable_provenance_ocr_routing;
         let _: f64 = OcrQualityThresholds.min_provenance_fallback_ratio;
+        let _: bool = OcrQualityThresholds.enable_plausibility_ocr_routing;
+        let _: f64 = OcrQualityThresholds.min_reliable_language_chunk_ratio;
     }
     {
         let OcrRotation = None::<crate::OcrRotation>.unwrap();
@@ -14198,6 +14200,7 @@ const _: fn() = || {
         let _: Option<f64> = PdfMetadata.scanned_confidence;
         let _: Option<Vec<i64>> = PdfMetadata.scanned_pages;
         let _: Option<Vec<i64>> = PdfMetadata.fabricated_text_pages;
+        let _: Option<Vec<i64>> = PdfMetadata.implausible_text_pages;
         let _: Option<Vec<i64>> = PdfMetadata.layout_gated_pages;
         let _: Option<Vec<String>> = PdfMetadata.layout_gate_reasons;
     }
@@ -21741,6 +21744,8 @@ impl SseDecode for crate::OcrQualityThresholds {
         let mut var_minUndecodableRatio = <f64>::sse_decode(deserializer);
         let mut var_enableProvenanceOcrRouting = <bool>::sse_decode(deserializer);
         let mut var_minProvenanceFallbackRatio = <f64>::sse_decode(deserializer);
+        let mut var_enablePlausibilityOcrRouting = <bool>::sse_decode(deserializer);
+        let mut var_minReliableLanguageChunkRatio = <f64>::sse_decode(deserializer);
         return crate::OcrQualityThresholds {
             min_total_non_whitespace: var_minTotalNonWhitespace,
             min_non_whitespace_per_page: var_minNonWhitespacePerPage,
@@ -21766,6 +21771,8 @@ impl SseDecode for crate::OcrQualityThresholds {
             min_undecodable_ratio: var_minUndecodableRatio,
             enable_provenance_ocr_routing: var_enableProvenanceOcrRouting,
             min_provenance_fallback_ratio: var_minProvenanceFallbackRatio,
+            enable_plausibility_ocr_routing: var_enablePlausibilityOcrRouting,
+            min_reliable_language_chunk_ratio: var_minReliableLanguageChunkRatio,
         };
     }
 }
@@ -23892,6 +23899,7 @@ impl SseDecode for crate::PdfMetadata {
         let mut var_scannedConfidence = <Option<f64>>::sse_decode(deserializer);
         let mut var_scannedPages = <Option<Vec<i64>>>::sse_decode(deserializer);
         let mut var_fabricatedTextPages = <Option<Vec<i64>>>::sse_decode(deserializer);
+        let mut var_implausibleTextPages = <Option<Vec<i64>>>::sse_decode(deserializer);
         let mut var_layoutGatedPages = <Option<Vec<i64>>>::sse_decode(deserializer);
         let mut var_layoutGateReasons = <Option<Vec<String>>>::sse_decode(deserializer);
         return crate::PdfMetadata {
@@ -23904,6 +23912,7 @@ impl SseDecode for crate::PdfMetadata {
             scanned_confidence: var_scannedConfidence,
             scanned_pages: var_scannedPages,
             fabricated_text_pages: var_fabricatedTextPages,
+            implausible_text_pages: var_implausibleTextPages,
             layout_gated_pages: var_layoutGatedPages,
             layout_gate_reasons: var_layoutGateReasons,
         };
@@ -31310,6 +31319,8 @@ impl flutter_rust_bridge::IntoDart for FrbWrapper<crate::OcrQualityThresholds> {
             self.0.min_undecodable_ratio.into_into_dart().into_dart(),
             self.0.enable_provenance_ocr_routing.into_into_dart().into_dart(),
             self.0.min_provenance_fallback_ratio.into_into_dart().into_dart(),
+            self.0.enable_plausibility_ocr_routing.into_into_dart().into_dart(),
+            self.0.min_reliable_language_chunk_ratio.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -31970,6 +31981,7 @@ impl flutter_rust_bridge::IntoDart for FrbWrapper<crate::PdfMetadata> {
             self.0.scanned_confidence.into_into_dart().into_dart(),
             self.0.scanned_pages.into_into_dart().into_dart(),
             self.0.fabricated_text_pages.into_into_dart().into_dart(),
+            self.0.implausible_text_pages.into_into_dart().into_dart(),
             self.0.layout_gated_pages.into_into_dart().into_dart(),
             self.0.layout_gate_reasons.into_into_dart().into_dart(),
         ]
@@ -38833,6 +38845,8 @@ impl SseEncode for crate::OcrQualityThresholds {
         <f64>::sse_encode(self.min_undecodable_ratio, serializer);
         <bool>::sse_encode(self.enable_provenance_ocr_routing, serializer);
         <f64>::sse_encode(self.min_provenance_fallback_ratio, serializer);
+        <bool>::sse_encode(self.enable_plausibility_ocr_routing, serializer);
+        <f64>::sse_encode(self.min_reliable_language_chunk_ratio, serializer);
     }
 }
 
@@ -40675,6 +40689,7 @@ impl SseEncode for crate::PdfMetadata {
         <Option<f64>>::sse_encode(self.scanned_confidence, serializer);
         <Option<Vec<i64>>>::sse_encode(self.scanned_pages, serializer);
         <Option<Vec<i64>>>::sse_encode(self.fabricated_text_pages, serializer);
+        <Option<Vec<i64>>>::sse_encode(self.implausible_text_pages, serializer);
         <Option<Vec<i64>>>::sse_encode(self.layout_gated_pages, serializer);
         <Option<Vec<String>>>::sse_encode(self.layout_gate_reasons, serializer);
     }

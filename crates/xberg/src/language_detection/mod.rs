@@ -19,7 +19,88 @@ pub use processor::LanguageDetector;
 const AGGREGATE_RELIABLE_THRESHOLD: f64 = 0.9;
 
 /// Number of characters per chunk when detecting multiple languages.
-const CHUNK_SIZE: usize = 200;
+///
+/// `pub(crate)` so the PDF OCR plausibility detector's prose-chunking (issue #1696, in
+/// `extractors::pdf::ocr::plausibility`) chunks on the same boundary this module's own
+/// multi-language detection uses, rather than picking an independent chunk size that would
+/// need its own calibration. ~keep
+pub(crate) const CHUNK_SIZE: usize = 200;
+
+/// Per-chunk language-detection reliability, aggregated over a caller-supplied set of text
+/// chunks (issue #1696's plausibility signal).
+///
+/// Distinct from [`LangAggregate`]: that type aggregates *per detected language* for the
+/// public multi-language API; this aggregates *across all chunks regardless of language* for
+/// a single plausibility verdict — a wrong-mapped page has no one "detected language" to
+/// aggregate toward, only a chunk-by-chunk reliability record. ~keep
+// ~keep: the only consumer is `extractors::pdf::ocr::plausibility`, whose module is gated on
+// `pdf` + (`ocr` | `ocr-pipeline`); under CI's `ocr,auto-rotate-tract` leg `language-detection`
+// is on but `pdf` is off, so an ungated seam is dead code and fails `-D warnings`.
+#[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChunkReliability {
+    /// Total chunks evaluated.
+    pub(crate) chunks: usize,
+    /// Chunks whatlang classified as reliable (`Info::is_reliable()`, a margin between the
+    /// best and second-best language guess — not the same axis as raw confidence).
+    pub(crate) reliable_chunks: usize,
+    /// Sum of whatlang's per-chunk confidence, `0.0` for a chunk whatlang could not classify
+    /// at all (`detect` returning `None`), so the mean below is never inflated by treating an
+    /// unclassifiable chunk as absent rather than as evidence of implausibility. ~keep
+    pub(crate) confidence_sum: f64,
+}
+
+#[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+impl ChunkReliability {
+    /// Fraction of chunks whatlang classified as reliable, in `[0.0, 1.0]`. `0.0` when no
+    /// chunks were evaluated.
+    pub(crate) fn reliable_ratio(&self) -> f64 {
+        if self.chunks == 0 {
+            0.0
+        } else {
+            self.reliable_chunks as f64 / self.chunks as f64
+        }
+    }
+
+    /// Mean whatlang confidence across every evaluated chunk, in `[0.0, 1.0]`. `0.0` when no
+    /// chunks were evaluated.
+    pub(crate) fn mean_confidence(&self) -> f64 {
+        if self.chunks == 0 {
+            0.0
+        } else {
+            self.confidence_sum / self.chunks as f64
+        }
+    }
+}
+
+/// Run whatlang over each of `chunks` and aggregate reliability/confidence.
+///
+/// The only site outside this module's own multi-language detection that touches whatlang
+/// directly — kept here so every whatlang call in the crate goes through one seam. A chunk
+/// whatlang cannot classify at all (`detect` returns `None`, e.g. no alphabetic content)
+/// counts as confidence `0.0` and not reliable, rather than being skipped: skipping it would
+/// undercount `chunks` and let a page of entirely unclassifiable text score an artificially
+/// high `reliable_ratio` off a near-empty denominator. ~keep
+#[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+pub(crate) fn chunk_reliability(chunks: &[&str]) -> ChunkReliability {
+    let mut reliable_chunks = 0usize;
+    let mut confidence_sum = 0.0f64;
+
+    for chunk in chunks {
+        if let Some(info) = detect(chunk) {
+            confidence_sum += info.confidence();
+            if info.is_reliable() {
+                reliable_chunks += 1;
+            }
+        }
+    }
+
+    ChunkReliability {
+        chunks: chunks.len(),
+        reliable_chunks,
+        confidence_sum,
+    }
+}
 
 /// Detect languages in text using whatlang.
 ///

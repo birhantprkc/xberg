@@ -1363,9 +1363,6 @@ public func browserWaitFromJson<GenericIntoRustString: IntoRustString>(_ json: G
 public func callModeFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> CallMode {
     try { let val = __swift_bridge__$call_mode_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return CallMode(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
-public func candleDeepseekOcrDtypeFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> CandleDeepseekOcrDtype {
-    try { let val = __swift_bridge__$candle_deepseek_ocr_dtype_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return CandleDeepseekOcrDtype(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
-}
 public func candleDevicePreferenceFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> CandleDevicePreference {
     try { let val = __swift_bridge__$candle_device_preference_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return CandleDevicePreference(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
@@ -2580,9 +2577,6 @@ public func __alef_phantom_vec_yake_params() -> RustVec<YakeParams> {
 }
 public func __alef_phantom_vec_boundary_reason() -> RustVec<BoundaryReason> {
     RustVec(ptr: __swift_bridge__$__alef_phantom_vec_boundary_reason())
-}
-public func __alef_phantom_vec_candle_deepseek_ocr_dtype() -> RustVec<CandleDeepseekOcrDtype> {
-    RustVec(ptr: __swift_bridge__$__alef_phantom_vec_candle_deepseek_ocr_dtype())
 }
 public func __alef_phantom_vec_candle_device_preference() -> RustVec<CandleDevicePreference> {
     RustVec(ptr: __swift_bridge__$__alef_phantom_vec_candle_device_preference())
@@ -6737,8 +6731,8 @@ public class DeepseekOcrBackendOptions: DeepseekOcrBackendOptionsRefMut {
     }
 }
 extension DeepseekOcrBackendOptions {
-    public convenience init<GenericIntoRustString: IntoRustString>(_ model_path: Optional<GenericIntoRustString>, _ model_id: Optional<GenericIntoRustString>, _ hf_revision: Optional<GenericIntoRustString>, _ cache_dir: Optional<GenericIntoRustString>, _ device: Optional<CandleDevicePreference>, _ version: Optional<UInt32>, _ dtype: Optional<CandleDeepseekOcrDtype>) {
-        self.init(ptr: __swift_bridge__$DeepseekOcrBackendOptions$new({ if let rustString = optionalStringIntoRustString(model_path) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let rustString = optionalStringIntoRustString(model_id) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let rustString = optionalStringIntoRustString(hf_revision) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let rustString = optionalStringIntoRustString(cache_dir) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let val = device { val.isOwned = false; return val.ptr } else { return nil } }(), version.intoFfiRepr(), { if let val = dtype { val.isOwned = false; return val.ptr } else { return nil } }()))
+    public convenience init<GenericIntoRustString: IntoRustString>(_ model_path: Optional<GenericIntoRustString>, _ device: Optional<CandleDevicePreference>, _ version: Optional<UInt32>) {
+        self.init(ptr: __swift_bridge__$DeepseekOcrBackendOptions$new({ if let rustString = optionalStringIntoRustString(model_path) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let val = device { val.isOwned = false; return val.ptr } else { return nil } }(), version.intoFfiRepr()))
     }
 }
 public class DeepseekOcrBackendOptionsRefMut: DeepseekOcrBackendOptionsRef {
@@ -6758,28 +6752,12 @@ extension DeepseekOcrBackendOptionsRef {
         { let val = __swift_bridge__$DeepseekOcrBackendOptions$model_path(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
-    public func modelId() -> Optional<RustString> {
-        { let val = __swift_bridge__$DeepseekOcrBackendOptions$model_id(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
-    }
-
-    public func hfRevision() -> Optional<RustString> {
-        { let val = __swift_bridge__$DeepseekOcrBackendOptions$hf_revision(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
-    }
-
-    public func cacheDir() -> Optional<RustString> {
-        { let val = __swift_bridge__$DeepseekOcrBackendOptions$cache_dir(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
-    }
-
     public func device() -> Optional<RustString> {
         { let val = __swift_bridge__$DeepseekOcrBackendOptions$device(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
     public func version() -> Optional<UInt32> {
         __swift_bridge__$DeepseekOcrBackendOptions$version(ptr).intoSwiftRepr()
-    }
-
-    public func dtype() -> Optional<RustString> {
-        { let val = __swift_bridge__$DeepseekOcrBackendOptions$dtype(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 }
 extension DeepseekOcrBackendOptions: Vectorizable {
@@ -18536,8 +18514,8 @@ public class OcrQualityThresholds: OcrQualityThresholdsRefMut {
     }
 }
 extension OcrQualityThresholds {
-    public convenience init(_ min_total_non_whitespace: UInt, _ min_non_whitespace_per_page: Double, _ min_meaningful_word_len: UInt, _ min_meaningful_words: UInt, _ min_alnum_ratio: Double, _ min_garbage_chars: UInt, _ max_fragmented_word_ratio: Double, _ critical_fragmented_word_ratio: Double, _ max_ocr_output_fragmented_word_ratio: Double, _ min_ocr_mean_confidence: Double, _ min_words_for_ocr_output_check: UInt, _ max_ocr_output_dict_invalid_word_ratio: Double, _ discard_suspected_ocr_noise: Bool, _ min_avg_word_length: Double, _ min_words_for_avg_length_check: UInt, _ min_consecutive_repeat_ratio: Double, _ min_words_for_repeat_check: UInt, _ substantive_min_chars: UInt, _ non_text_min_chars: UInt, _ alnum_ws_ratio_threshold: Double, _ pipeline_min_quality: Double, _ min_undecodable_ratio: Double, _ enable_provenance_ocr_routing: Bool, _ min_provenance_fallback_ratio: Double) {
-        self.init(ptr: __swift_bridge__$OcrQualityThresholds$new(min_total_non_whitespace, min_non_whitespace_per_page, min_meaningful_word_len, min_meaningful_words, min_alnum_ratio, min_garbage_chars, max_fragmented_word_ratio, critical_fragmented_word_ratio, max_ocr_output_fragmented_word_ratio, min_ocr_mean_confidence, min_words_for_ocr_output_check, max_ocr_output_dict_invalid_word_ratio, discard_suspected_ocr_noise, min_avg_word_length, min_words_for_avg_length_check, min_consecutive_repeat_ratio, min_words_for_repeat_check, substantive_min_chars, non_text_min_chars, alnum_ws_ratio_threshold, pipeline_min_quality, min_undecodable_ratio, enable_provenance_ocr_routing, min_provenance_fallback_ratio))
+    public convenience init(_ min_total_non_whitespace: UInt, _ min_non_whitespace_per_page: Double, _ min_meaningful_word_len: UInt, _ min_meaningful_words: UInt, _ min_alnum_ratio: Double, _ min_garbage_chars: UInt, _ max_fragmented_word_ratio: Double, _ critical_fragmented_word_ratio: Double, _ max_ocr_output_fragmented_word_ratio: Double, _ min_ocr_mean_confidence: Double, _ min_words_for_ocr_output_check: UInt, _ max_ocr_output_dict_invalid_word_ratio: Double, _ discard_suspected_ocr_noise: Bool, _ min_avg_word_length: Double, _ min_words_for_avg_length_check: UInt, _ min_consecutive_repeat_ratio: Double, _ min_words_for_repeat_check: UInt, _ substantive_min_chars: UInt, _ non_text_min_chars: UInt, _ alnum_ws_ratio_threshold: Double, _ pipeline_min_quality: Double, _ min_undecodable_ratio: Double, _ enable_provenance_ocr_routing: Bool, _ min_provenance_fallback_ratio: Double, _ enable_plausibility_ocr_routing: Bool, _ min_reliable_language_chunk_ratio: Double) {
+        self.init(ptr: __swift_bridge__$OcrQualityThresholds$new(min_total_non_whitespace, min_non_whitespace_per_page, min_meaningful_word_len, min_meaningful_words, min_alnum_ratio, min_garbage_chars, max_fragmented_word_ratio, critical_fragmented_word_ratio, max_ocr_output_fragmented_word_ratio, min_ocr_mean_confidence, min_words_for_ocr_output_check, max_ocr_output_dict_invalid_word_ratio, discard_suspected_ocr_noise, min_avg_word_length, min_words_for_avg_length_check, min_consecutive_repeat_ratio, min_words_for_repeat_check, substantive_min_chars, non_text_min_chars, alnum_ws_ratio_threshold, pipeline_min_quality, min_undecodable_ratio, enable_provenance_ocr_routing, min_provenance_fallback_ratio, enable_plausibility_ocr_routing, min_reliable_language_chunk_ratio))
     }
 }
 public class OcrQualityThresholdsRefMut: OcrQualityThresholdsRef {
@@ -18647,6 +18625,14 @@ extension OcrQualityThresholdsRef {
 
     public func minProvenanceFallbackRatio() -> Double {
         __swift_bridge__$OcrQualityThresholds$min_provenance_fallback_ratio(ptr)
+    }
+
+    public func enablePlausibilityOcrRouting() -> Bool {
+        __swift_bridge__$OcrQualityThresholds$enable_plausibility_ocr_routing(ptr)
+    }
+
+    public func minReliableLanguageChunkRatio() -> Double {
+        __swift_bridge__$OcrQualityThresholds$min_reliable_language_chunk_ratio(ptr)
     }
 }
 extension OcrQualityThresholds: Vectorizable {
@@ -21045,6 +21031,10 @@ extension PdfMetadataRef {
 
     public func fabricatedTextPages() -> RustString {
         RustString(ptr: __swift_bridge__$PdfMetadata$fabricated_text_pages(ptr))
+    }
+
+    public func implausibleTextPages() -> RustString {
+        RustString(ptr: __swift_bridge__$PdfMetadata$implausible_text_pages(ptr))
     }
 
     public func layoutGatedPages() -> RustString {
@@ -28235,86 +28225,6 @@ extension CallMode: Vectorizable {
 
     public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
         __swift_bridge__$Vec_CallMode$len(vecPtr)
-    }
-}
-
-
-public class CandleDeepseekOcrDtype: CandleDeepseekOcrDtypeRefMut {
-    public var isOwned: Bool = true
-
-    public override init(ptr: UnsafeMutableRawPointer) {
-        super.init(ptr: ptr)
-    }
-
-    deinit {
-        if isOwned {
-            __swift_bridge__$CandleDeepseekOcrDtype$_free(ptr)
-        }
-    }
-}
-public class CandleDeepseekOcrDtypeRefMut: CandleDeepseekOcrDtypeRef {
-    public override init(ptr: UnsafeMutableRawPointer) {
-        super.init(ptr: ptr)
-    }
-}
-public class CandleDeepseekOcrDtypeRef {
-    public var ptr: UnsafeMutableRawPointer
-
-    public init(ptr: UnsafeMutableRawPointer) {
-        self.ptr = ptr
-    }
-}
-extension CandleDeepseekOcrDtypeRef {
-    public func to_string() -> RustString {
-        RustString(ptr: __swift_bridge__$CandleDeepseekOcrDtype$to_string(ptr))
-    }
-}
-extension CandleDeepseekOcrDtype: Vectorizable {
-    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
-        __swift_bridge__$Vec_CandleDeepseekOcrDtype$new()
-    }
-
-    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
-        __swift_bridge__$Vec_CandleDeepseekOcrDtype$drop(vecPtr)
-    }
-
-    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: CandleDeepseekOcrDtype) {
-        __swift_bridge__$Vec_CandleDeepseekOcrDtype$push(vecPtr, {value.isOwned = false; return value.ptr;}())
-    }
-
-    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
-        let pointer = __swift_bridge__$Vec_CandleDeepseekOcrDtype$pop(vecPtr)
-        if pointer == nil {
-            return nil
-        } else {
-            return (CandleDeepseekOcrDtype(ptr: pointer!) as! Self)
-        }
-    }
-
-    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<CandleDeepseekOcrDtypeRef> {
-        let pointer = __swift_bridge__$Vec_CandleDeepseekOcrDtype$get(vecPtr, index)
-        if pointer == nil {
-            return nil
-        } else {
-            return CandleDeepseekOcrDtypeRef(ptr: pointer!)
-        }
-    }
-
-    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<CandleDeepseekOcrDtypeRefMut> {
-        let pointer = __swift_bridge__$Vec_CandleDeepseekOcrDtype$get_mut(vecPtr, index)
-        if pointer == nil {
-            return nil
-        } else {
-            return CandleDeepseekOcrDtypeRefMut(ptr: pointer!)
-        }
-    }
-
-    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<CandleDeepseekOcrDtypeRef> {
-        UnsafePointer<CandleDeepseekOcrDtypeRef>(OpaquePointer(__swift_bridge__$Vec_CandleDeepseekOcrDtype$as_ptr(vecPtr)))
-    }
-
-    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
-        __swift_bridge__$Vec_CandleDeepseekOcrDtype$len(vecPtr)
     }
 }
 

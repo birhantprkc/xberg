@@ -1143,6 +1143,7 @@ The native-text-to-OCR fallback decision (should a PDF page with an embedded tex
 | `min_ocr_mean_confidence`        | `75.0`  | Calibrated backend confidence below which OCR output is reported as suspected noise. |
 | `discard_suspected_ocr_noise`    | `false` | Discard non-empty OCR output when a recognition-noise signal fires. By default, Xberg retains the text and adds a processing warning. |
 | `min_undecodable_ratio`          | `0.5`   | Minimum fraction of non-whitespace characters that must be undecodable (PUA, replacement, or control garbage) before a page's text layer is treated as unreadable and routed to OCR. See [Automatic OCR for Undecodable Text Layers](#automatic-ocr-for-undecodable-text-layers). |
+| `min_reliable_language_chunk_ratio` | `0.10` | Minimum fraction of a page's prose chunks whatlang must classify as a reliable language before the page is trusted as legible. See [Automatic OCR for Language/Dictionary-Implausible Text](#automatic-ocr-for-languagedictionary-implausible-text). |
 
 Inspect `processing_warnings` for pages flagged by fragmented-word, calibrated-confidence, or configured
 dictionary-invalid-word signals. To preserve the pre-1.1 destructive behavior, set
@@ -1248,9 +1249,68 @@ min_undecodable_ratio = 0.3
 </TabItem>
 </Tabs>
 
-:::note[Known limitation]
-This only covers glyph indices that decode into the PUA/replacement/control range. The related case where a broken CID-to-Unicode mapping resolves onto *plausible* ASCII (so the text layer "looks" readable but is actually wrong) is not detected — detecting it requires new support in xberg's native PDF engine (`crates/xberg-native-pdf`), which is not implemented yet.
+:::note[Related case]
+This only covers glyph indices that decode into the PUA/replacement/control range. The related case where a mapping resolves onto *plausible* letters, but the wrong ones, is covered separately — see [Automatic OCR for Language/Dictionary-Implausible Text](#automatic-ocr-for-languagedictionary-implausible-text) below.
 :::
+
+### Automatic OCR for Language/Dictionary-Implausible Text
+
+A `/ToUnicode` CMap (or other mapping tier) can resolve every glyph to *a* character, but consistently the WRONG one — a ROT-shifted mapping is the clearest example. The decoded text is structurally indistinguishable from real prose: normal alphanumeric ratio, normal word lengths, no fragmentation, and no undecodable (PUA/replacement/control) characters, so neither the character-shape checks above nor the undecodable-text-layer check can see the problem. Xberg detects this by checking whether the decoded text reads as any real, detectable language at all (issue #1696).
+
+A page is treated as language/dictionary-implausible, and routed to OCR under `OcrStrategy.Auto`, when:
+
+- it has enough prose content to judge in the first place — pages that are mostly numeric tables, formulas, or code abstain rather than guess;
+- less than `min_reliable_language_chunk_ratio` (default `0.10`) of its prose chunks are classified as a reliable language; and
+- the mean detection confidence across those chunks is also low, so a genuinely legible page in a close language pair (e.g. Danish vs. Norwegian Bokmål) is not misclassified.
+
+A page the character-shape or undecodable-text-layer checks already route to OCR is not independently re-flagged by this signal. `PdfMetadata.implausible_text_pages` reports the 1-indexed pages this check flagged; it is `None` when `enable_plausibility_ocr_routing` is `false`.
+
+Tune the ratio via `OcrQualityThresholds.min_reliable_language_chunk_ratio` on `OcrConfig.quality_thresholds`, or disable the check with `enable_plausibility_ocr_routing`:
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python title="implausible_text_layer.py"
+from xberg import ExtractInput, ExtractionConfig, OcrConfig, OcrQualityThresholds, extract
+
+config = ExtractionConfig(
+    ocr=OcrConfig(
+        quality_thresholds=OcrQualityThresholds(min_reliable_language_chunk_ratio=0.2),
+    ),
+)
+output = await extract(ExtractInput(kind="uri", uri="wrong-mapping.pdf"), config=config)
+result = output.results[0]
+# Pages whose decoded text did not read as any real language were OCR'd.
+```
+
+</TabItem>
+<TabItem label="Rust">
+
+```rust title="implausible_text_layer.rs"
+use xberg::{ExtractionConfig, OcrConfig, OcrQualityThresholds};
+
+let config = ExtractionConfig {
+    ocr: Some(OcrConfig {
+        quality_thresholds: Some(OcrQualityThresholds {
+            min_reliable_language_chunk_ratio: 0.2,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }),
+    ..Default::default()
+};
+```
+
+</TabItem>
+<TabItem label="TOML">
+
+```toml title="xberg.toml"
+[ocr.quality_thresholds]
+min_reliable_language_chunk_ratio = 0.2
+```
+
+</TabItem>
+</Tabs>
 
 ### Multi-Backend Pipeline
 

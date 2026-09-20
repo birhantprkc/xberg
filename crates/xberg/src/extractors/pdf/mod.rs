@@ -661,6 +661,68 @@ fn inject_unrepresented_form_field_elements(doc: &mut InternalDocument, form_fie
     }
 }
 
+/// Compute language/dictionary-implausible pages (issue #1696), record them on
+/// `pdf_metadata.pdf_specific.implausible_text_pages`, and merge them into
+/// `pdf_metadata.pdf_specific.scanned_pages` so `OcrStrategy::ScannedPages` (via
+/// `scanned_pages_to_ocr`, which reads `scanned_pages`) picks the signal up for free --
+/// mirroring how `native::metadata::ocr_routing_pages` already merges `fabricated_text_pages`
+/// into the same field for the provenance signal.
+///
+/// Runs unconditionally (using the default `OcrQualityThresholds` when `config.ocr` is `None`)
+/// so `ScannedPages` and the metadata field both see the signal regardless of whether the
+/// caller configured OCR explicitly. When no explicit `ocr` config is present, `Auto` itself
+/// will not act on the signal (`apply_flagged_pages` still requires it below, per #1338's
+/// "explicit OCR config" rule) so a deduped warning is pushed instead, keeping the defect
+/// visible rather than silently discarded. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn record_implausible_text_pages(
+    config: &ExtractionConfig,
+    pdf_metadata: &mut crate::pdf::metadata::PdfExtractionMetadata,
+    native_text: &str,
+    boundaries: Option<&[crate::types::PageBoundary]>,
+    warnings: &mut Vec<crate::types::ProcessingWarning>,
+) {
+    let default_ocr_config = crate::core::config::OcrConfig::default();
+    let ocr_config = config.ocr.as_ref().unwrap_or(&default_ocr_config);
+    let thresholds = ocr_config.effective_thresholds();
+
+    let implausible_pages = ocr::implausible_text_pages(
+        native_text,
+        boundaries,
+        pdf_metadata.pdf_specific.page_count,
+        &thresholds,
+    );
+
+    pdf_metadata.pdf_specific.implausible_text_pages = thresholds
+        .enable_plausibility_ocr_routing
+        .then(|| implausible_pages.clone());
+
+    if implausible_pages.is_empty() {
+        return;
+    }
+
+    let mut merged = pdf_metadata.pdf_specific.scanned_pages.clone().unwrap_or_default();
+    merged.extend(implausible_pages.iter().copied());
+    merged.sort_unstable();
+    merged.dedup();
+    pdf_metadata.pdf_specific.scanned_pages = Some(merged);
+
+    if config.ocr.is_none() {
+        crate::core::diagnostics::push_warning_deduped(
+            warnings,
+            crate::types::ProcessingWarning {
+                source: std::borrow::Cow::Borrowed("ocr"),
+                message: std::borrow::Cow::Owned(format!(
+                    "Page(s) {implausible_pages:?} do not read as any real detectable language, \
+                     suggesting a wrong glyph-to-Unicode mapping (issue #1696); no explicit `ocr` \
+                     config was provided, so they were not automatically routed to OCR. Set `ocr` \
+                     to route these pages to OCR."
+                )),
+            },
+        );
+    }
+}
+
 /// Pages to OCR under `OcrStrategy::ScannedPages`, 1-indexed.
 ///
 /// The union of detected scans and pages failing the text-quality gate, so never
@@ -1895,6 +1957,15 @@ impl PdfExtractor {
         #[allow(unused_assignments)]
         let mut ocr_layout_gate_audit: OcrLayoutGateDecisions = (None, None);
 
+        #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+        record_implausible_text_pages(
+            config,
+            &mut pdf_metadata,
+            &native_text,
+            boundaries.as_deref(),
+            &mut ocr_fallback_warnings,
+        );
+
         #[cfg(all(
             feature = "pdf",
             feature = "layout-detection",
@@ -2107,14 +2178,32 @@ impl PdfExtractor {
             // was derived, not a shape guess, and `ScannedPages` already routes it via
             // `scanned_pages_to_ocr`; `Auto` must consult it too rather than silently
             // discarding it. ~keep
-            ocr::apply_fabricated_provenance_pages(
+            let has_boundaries = boundaries.as_deref().is_some_and(|b| !b.is_empty());
+            ocr::apply_flagged_pages(
                 &mut decision,
                 pdf_metadata
                     .pdf_specific
                     .fabricated_text_pages
                     .as_deref()
                     .unwrap_or(&[]),
-                boundaries.as_deref().is_some_and(|b| !b.is_empty()),
+                has_boundaries,
+                pdf_metadata.pdf_specific.page_count,
+            );
+
+            // A `/ToUnicode` CMap that resolves every glyph to *a* character, but
+            // consistently the WRONG one, is file-backed exactly like a correct mapping --
+            // `fabricated_text_pages`' provenance check cannot see it either (issue #1696).
+            // `record_implausible_text_pages` already computed and merged this into
+            // `scanned_pages` above; `Auto` reads it here the same way it reads the
+            // provenance signal, so both share one union step. ~keep
+            ocr::apply_flagged_pages(
+                &mut decision,
+                pdf_metadata
+                    .pdf_specific
+                    .implausible_text_pages
+                    .as_deref()
+                    .unwrap_or(&[]),
+                has_boundaries,
                 pdf_metadata.pdf_specific.page_count,
             );
 
@@ -3696,6 +3785,456 @@ mod tests {
             .save_to(&mut bytes)
             .expect("fabricated-provenance fixture must serialize");
         bytes
+    }
+
+    /// A single-page PDF, modeled on [`identity_h_mapping_pdf`], whose `/ToUnicode` CMap
+    /// resolves every CID not to itself but to a ROT-`shift`ed letter (`a`-`z`/`A`-`Z` wrap
+    /// within their own case; every other character passes through unshifted). Unlike
+    /// [`identity_h_mapping_pdf`]'s `with_tounicode: false` case, this font DOES carry a
+    /// `/ToUnicode` CMap, so provenance resolves `MappingProvenance::ToUnicode` -- a real,
+    /// file-backed mapping tier -- not `Fallback`. Issue #1667's provenance signal must
+    /// therefore NOT fire on this fixture; only issue #1696's language-plausibility detector
+    /// can catch a `shift != 0` page, which is exactly the gap this builder exists to exercise.
+    ///
+    /// CIDs are chosen equal to the Unicode codepoints of `text`, mirroring
+    /// [`identity_h_mapping_pdf`], so `shift: 0` is a structurally identical no-op control that
+    /// must extract `text` verbatim.
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    fn shifted_to_unicode_pdf(text: &str, shift: u8) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Document, Object, Stream, dictionary};
+
+        fn rot(c: char, shift: u8) -> char {
+            let shift = shift % 26;
+            if c.is_ascii_lowercase() {
+                ((((c as u8 - b'a') + shift) % 26) + b'a') as char
+            } else if c.is_ascii_uppercase() {
+                ((((c as u8 - b'A') + shift) % 26) + b'A') as char
+            } else {
+                c
+            }
+        }
+
+        let cid_bytes: Vec<u8> = text.chars().flat_map(|c| (c as u32 as u16).to_be_bytes()).collect();
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+
+        let descriptor_id = document.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "Synth+Shifted",
+            "Flags" => 4,
+            "FontBBox" => vec![0.into(), (-200).into(), 1000.into(), 900.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 800,
+            "Descent" => (-200),
+            "CapHeight" => 700,
+            "StemV" => 80,
+        });
+        let descendant_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "Synth+Shifted",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0,
+            },
+            "FontDescriptor" => descriptor_id,
+            "CIDToGIDMap" => "Identity",
+            "DW" => 600,
+        });
+
+        // Per-character `bfchar` entries rather than a `bfrange`: a ROT shift is not a fixed
+        // offset once case wraps (`z` -> `a`, `Z` -> `A`), so each distinct source character
+        // needs its own explicit mapping entry.
+        let mut distinct: Vec<char> = text.chars().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut bfchar_body = String::new();
+        for c in &distinct {
+            let mapped = rot(*c, shift);
+            bfchar_body.push_str(&format!("<{:04X}> <{:04X}>\n", *c as u32, mapped as u32));
+        }
+        let to_unicode_cmap = format!(
+            "/CIDInit /ProcSet findresource begin\n\
+             12 dict begin\n\
+             begincmap\n\
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+             /CMapName /Adobe-Identity-UCS def\n\
+             1 begincodespacerange\n\
+             <0000> <FFFF>\n\
+             endcodespacerange\n\
+             {} beginbfchar\n\
+             {}\
+             endbfchar\n\
+             endcmap\n\
+             CMapName currentdict /CMap defineresource pop\n\
+             end\n\
+             end",
+            distinct.len(),
+            bfchar_body
+        );
+        let to_unicode_id = document.add_object(Stream::new(dictionary! {}, to_unicode_cmap.into_bytes()));
+
+        let font_dict = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Synth+Shifted",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![descendant_id.into()],
+            "ToUnicode" => to_unicode_id,
+        };
+        let font_id = document.add_object(font_dict);
+
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 18.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new("Tj", vec![Object::string_literal(cid_bytes)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            content.encode().expect("shifted-mapping fixture content must encode"),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        document
+            .save_to(&mut bytes)
+            .expect("shifted-mapping fixture must serialize");
+        bytes
+    }
+
+    /// Genuine English prose, single line, well over 600 characters -- three full
+    /// `language_detection::CHUNK_SIZE` chunks -- so `shifted_to_unicode_pdf`'s language-
+    /// plausibility detector has enough prose to render a verdict on (issue #1696). Public
+    /// domain (US Declaration of Independence, opening), pure ASCII letters/spaces so it
+    /// round-trips through a two-byte CID exactly.
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    const WRONG_MAPPING_PROSE: &str = "When in the course of human events it becomes necessary \
+        for one people to dissolve the political bands which have connected them with another \
+        and to assume among the powers of the earth the separate and equal station to which the \
+        laws of nature and of natures god entitle them a decent respect to the opinions of \
+        mankind requires that they should declare the causes which impel them to the separation \
+        we hold these truths to be self evident that all men are created equal that they are \
+        endowed by their creator with certain unalienable rights that among these are life \
+        liberty and the pursuit of happiness that to secure these rights governments are \
+        instituted among men deriving their just powers from the consent of the governed";
+
+    /// ROT-`shift` over ASCII letters only, mirroring `shifted_to_unicode_pdf`'s own mapping so
+    /// the assertions below can predict the extracted text without re-deriving it.
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    fn rot_ascii_letters(text: &str, shift: u8) -> String {
+        let shift = shift % 26;
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    ((((c as u8 - b'a') + shift) % 26) + b'a') as char
+                } else if c.is_ascii_uppercase() {
+                    ((((c as u8 - b'A') + shift) % 26) + b'A') as char
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// xberg#1696: a `/ToUnicode` CMap that resolves every glyph to a real, file-backed
+    /// character, but consistently the WRONG one (a ROT-3 shift), reads as ordinary,
+    /// structurally-clean prose to every character-shape heuristic -- including issue #1667's
+    /// provenance check, since the mapping tier really is `ToUnicode`, not `Fallback`. Only the
+    /// language/dictionary-plausibility signal can see that the decoded text is not English (or
+    /// any real language) at all.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_auto_strategy_routes_wrong_mapping_page_to_ocr() {
+        use crate::core::config::{OcrConfig, PageConfig};
+
+        const OCR_TEXT: &str = "issue sixteen ninety six wrong mapping ocr replacement text";
+        let _backend = register_mock_ocr_backend("pdf-1696-auto-wrong-mapping-routing", OCR_TEXT);
+        let shifted = rot_ascii_letters(WRONG_MAPPING_PROSE, 3);
+
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: "pdf-1696-auto-wrong-mapping-routing".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let internal = PdfExtractor::new()
+            .extract_content(
+                &shifted_to_unicode_pdf(WRONG_MAPPING_PROSE, 3),
+                "application/pdf",
+                &config,
+            )
+            .await
+            .expect("wrong-mapping PDF extraction should succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        assert!(
+            !derived.content.contains(&shifted),
+            "the wrong-mapped native text must not survive to the final content: {:?}",
+            derived.content
+        );
+        assert_eq!(
+            derived.content.matches(OCR_TEXT).count(),
+            1,
+            "Auto-routed OCR content must occur exactly once: {:?}",
+            derived.content
+        );
+        assert_eq!(
+            derived.extraction_method,
+            Some(ExtractionMethod::Ocr),
+            "Auto strategy must record extraction_method: ocr for a wrong-mapped page"
+        );
+
+        let implausible_text_pages = derived.metadata.format.as_ref().and_then(|format| match format {
+            crate::types::FormatMetadata::Pdf(pdf) => pdf.implausible_text_pages.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            implausible_text_pages,
+            Some(vec![1]),
+            "the wrong-mapped page must be listed in implausible_text_pages"
+        );
+    }
+
+    /// `shift: 0` control for the test above: a real `/ToUnicode` CMap whose mapping happens to
+    /// be the identity (equivalent to a correctly authored font) must never be routed to OCR --
+    /// the language-plausibility signal must not treat every `/ToUnicode`-bearing font as
+    /// suspect, only ones whose decoded text does not read as a real language.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_auto_strategy_keeps_native_text_for_identity_to_unicode() {
+        use crate::core::config::{OcrConfig, PageConfig};
+
+        const OCR_TEXT: &str = "mock ocr text that must never appear in a clean extraction";
+        let _backend = register_mock_ocr_backend("pdf-1696-identity-false-positive", OCR_TEXT);
+
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: "pdf-1696-identity-false-positive".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let internal = PdfExtractor::new()
+            .extract_content(
+                &shifted_to_unicode_pdf(WRONG_MAPPING_PROSE, 0),
+                "application/pdf",
+                &config,
+            )
+            .await
+            .expect("identity-mapped PDF extraction should succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        assert!(
+            derived.content.contains(WRONG_MAPPING_PROSE),
+            "genuinely mapped native text must survive to the final content: {:?}",
+            derived.content
+        );
+        assert!(
+            !derived.content.contains(OCR_TEXT),
+            "a page whose ToUnicode mapping happens to be identity must not be routed to OCR: {:?}",
+            derived.content
+        );
+        assert_eq!(
+            derived.extraction_method,
+            Some(ExtractionMethod::Native),
+            "Auto strategy must keep extraction_method: native for a genuinely legible page"
+        );
+
+        let implausible_text_pages = derived.metadata.format.as_ref().and_then(|format| match format {
+            crate::types::FormatMetadata::Pdf(pdf) => pdf.implausible_text_pages.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            implausible_text_pages,
+            Some(Vec::new()),
+            "a page that reads as real English must not be listed as implausible"
+        );
+    }
+
+    /// xberg#1338's "explicit OCR config" rule stays intact for the plausibility signal too: a
+    /// wrong-mapped page must not be silently, automatically OCR'd when the caller never
+    /// configured `ocr`. The defect must instead be surfaced as a warning, and the page's
+    /// native (implausible) text is what the caller gets back.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_wrong_mapping_page_without_ocr_config_warns_and_keeps_native() {
+        use crate::core::config::PageConfig;
+
+        let shifted = rot_ascii_letters(WRONG_MAPPING_PROSE, 3);
+
+        let config = ExtractionConfig {
+            ocr: None,
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let internal = PdfExtractor::new()
+            .extract_content(
+                &shifted_to_unicode_pdf(WRONG_MAPPING_PROSE, 3),
+                "application/pdf",
+                &config,
+            )
+            .await
+            .expect("wrong-mapping PDF extraction without an ocr config should still succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        assert!(
+            derived.content.contains(&shifted),
+            "without an explicit ocr config the wrong-mapped native text must be kept: {:?}",
+            derived.content
+        );
+        assert_eq!(
+            derived.extraction_method,
+            Some(ExtractionMethod::Native),
+            "Auto strategy must not silently OCR a page with no explicit ocr config"
+        );
+
+        let warnings = &derived.processing_warnings;
+        assert!(
+            warnings.iter().any(|warning| warning.message.contains("1696")),
+            "the defect must be surfaced as a warning naming issue #1696 when no ocr config is \
+             present: {warnings:?}"
+        );
+
+        let implausible_text_pages = derived.metadata.format.as_ref().and_then(|format| match format {
+            crate::types::FormatMetadata::Pdf(pdf) => pdf.implausible_text_pages.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            implausible_text_pages,
+            Some(vec![1]),
+            "the metadata must still record the implausible page even though it was not OCR'd"
+        );
+    }
+
+    /// The opt-in `OcrStrategy::ScannedPages` strategy reads `scanned_pages`, which
+    /// `record_implausible_text_pages` merges the language-plausibility signal into --
+    /// `scanned_pages_to_ocr` must therefore pick up a wrong-mapped page without needing its
+    /// own separate consultation of `implausible_text_pages`.
+    #[tokio::test]
+    #[cfg(all(feature = "pdf", feature = "ocr"))]
+    #[serial]
+    async fn test_scanned_pages_strategy_ocrs_implausible_pages() {
+        use crate::core::config::{OcrConfig, OcrStrategy, PageConfig};
+
+        // Long enough that its alnum count clears `MIN_OCR_NATIVE_ALNUM_RETENTION_RATIO`
+        // against `WRONG_MAPPING_PROSE`'s ~600 native alnum characters: that unrelated guard
+        // (`ocr::document`, #1678-era) rejects an OCR replacement that "recovers" less than
+        // half of a page the character-shape gate still calls structurally healthy -- which a
+        // wrong-but-ordinary-looking ROT-3 mapping does, despite being unreadable. A short mock
+        // string would be rejected by that guard before this test ever exercises the routing
+        // decision it is meant to check. ~keep
+        const OCR_TEXT: &str = "scanned pages strategy ocr replacement text for issue one thousand \
+            six hundred ninety six demonstrating that the language plausibility signal correctly \
+            routed this wrong mapped page through the mixed native and ocr merge path under the \
+            configured scanned pages strategy and confirming the ocr backend actually produced \
+            this replacement content for the page under test with plenty of additional \
+            alphanumeric characters to clear the native alnum retention guard";
+        let _backend = register_mock_ocr_backend("pdf-1696-scanned-pages-strategy", OCR_TEXT);
+
+        let config = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: Some(OcrConfig {
+                backend: "pdf-1696-scanned-pages-strategy".to_string(),
+                language: vec!["eng".to_string()],
+                ..Default::default()
+            }),
+            pages: Some(PageConfig {
+                extract_pages: true,
+                ..Default::default()
+            }),
+            use_cache: false,
+            ..Default::default()
+        };
+
+        let internal = PdfExtractor::new()
+            .extract_content(
+                &shifted_to_unicode_pdf(WRONG_MAPPING_PROSE, 3),
+                "application/pdf",
+                &config,
+            )
+            .await
+            .expect("wrong-mapping PDF extraction under ScannedPages should succeed");
+        let derived = crate::extraction::derive::derive_extraction_result(
+            internal,
+            false,
+            crate::core::config::OutputFormat::Plain,
+        );
+
+        assert_eq!(
+            derived.content.matches(OCR_TEXT).count(),
+            1,
+            "ScannedPages must route the implausible page to OCR via the merged scanned_pages \
+             field: {:?}",
+            derived.content
+        );
+        // The `ScannedPages` strategy always routes through the mixed OCR/native merge path
+        // (`extract_mixed_ocr_native`), which reports `Mixed` whenever any page was replaced --
+        // never `Ocr`, which is reserved for the whole-document `force_ocr`/`Auto` fallback
+        // path. See `test_scanned_page_strategy_automatically_routes_only_the_scan_to_ocr` for
+        // the same assertion on an unrelated fixture. ~keep
+        assert_eq!(derived.extraction_method, Some(ExtractionMethod::Mixed));
     }
 
     /// A single page with a non-origin, negative-origin `MediaBox [10 -100 622 692]` (GH#1653)
@@ -6249,7 +6788,7 @@ mod tests {
 
     /// xberg#1696's false-positive control: a Type0/Identity-H font that DOES carry a
     /// `/ToUnicode` CMap resolves `MappingProvenance::ToUnicode`, never `Fallback`, so
-    /// `apply_fabricated_provenance_pages` (issue #1667's fix) must not route it to OCR --
+    /// `apply_flagged_pages` (issue #1667's fix) must not route it to OCR --
     /// the fix targets fonts with no usable mapping tier at all, not every Type0 font.
     /// Reported alongside #1667's own test since both extract the same fixture shape through
     /// the real `run.rs`/`font_dict.rs` provenance path, differing only in `/ToUnicode`

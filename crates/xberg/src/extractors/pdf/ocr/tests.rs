@@ -1097,14 +1097,14 @@ mod tests {
         assert!(decision.failing_pages.is_empty());
     }
 
-    // xberg#1667: `apply_fabricated_provenance_pages` is the union step that lets the
+    // xberg#1667: `apply_flagged_pages` is the union step that lets the
     // default `Auto` OCR strategy see the same fabricated-mapping signal `ScannedPages`
     // already reads from `PdfMetadata.scanned_pages` (issue #1254). These tests exercise it
     // directly, without a character-statistic decision in play, so a text-shape regression in
     // `NativeTextStats` cannot mask a routing regression here.
     #[cfg(feature = "ocr")]
     #[test]
-    fn apply_fabricated_provenance_pages_is_a_no_op_when_the_list_is_empty() {
+    fn apply_flagged_pages_is_a_no_op_when_the_list_is_empty() {
         let mut decision = evaluate_native_text_for_ocr(
             "Clean prose with plenty of ordinary alphanumeric words on this single page.",
             Some(1),
@@ -1113,7 +1113,7 @@ mod tests {
         let before_fallback = decision.fallback;
         let before_whole_doc = decision.whole_doc_failure;
 
-        apply_fabricated_provenance_pages(&mut decision, &[], true, Some(1));
+        apply_flagged_pages(&mut decision, &[], true, Some(1));
 
         assert_eq!(decision.fallback, before_fallback);
         assert_eq!(decision.whole_doc_failure, before_whole_doc);
@@ -1125,7 +1125,7 @@ mod tests {
     /// forced to OCR once a page is known to carry a fabricated mapping.
     #[cfg(feature = "ocr")]
     #[test]
-    fn apply_fabricated_provenance_pages_forces_fallback_on_structurally_clean_text() {
+    fn apply_flagged_pages_forces_fallback_on_structurally_clean_text() {
         let clean_text = "synthetic fabricated text used only to confirm that automatic \
                            routing reaches the configured ocr backend correctly";
         let mut decision = evaluate_native_text_for_ocr(clean_text, Some(1), &t());
@@ -1135,7 +1135,7 @@ mod tests {
             decision.stats
         );
 
-        apply_fabricated_provenance_pages(&mut decision, &[1], true, Some(1));
+        apply_flagged_pages(&mut decision, &[1], true, Some(1));
 
         assert!(
             decision.fallback,
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[cfg(feature = "ocr")]
     #[test]
-    fn apply_fabricated_provenance_pages_unions_with_existing_character_class_failures() {
+    fn apply_flagged_pages_unions_with_existing_character_class_failures() {
         let mut decision = OcrFallbackDecision {
             stats: NativeTextStats::default(),
             avg_non_whitespace: 0.0,
@@ -1160,7 +1160,7 @@ mod tests {
             whole_doc_failure: false,
         };
 
-        apply_fabricated_provenance_pages(&mut decision, &[1, 2], true, Some(3));
+        apply_flagged_pages(&mut decision, &[1, 2], true, Some(3));
 
         assert_eq!(
             decision.failing_pages,
@@ -1173,12 +1173,74 @@ mod tests {
         );
     }
 
+    /// Regression coverage folded in from #1678 code review: a page index at or beyond
+    /// `page_count` must be dropped, not accepted into `failing_pages` and not treated as
+    /// evidence toward `whole_doc_failure`. `page_count` here is `Some(2)`, and page `5` is a
+    /// caller bug (out-of-range), not a real page 5 on this 2-page document.
     #[cfg(feature = "ocr")]
     #[test]
-    fn apply_fabricated_provenance_pages_without_boundaries_forces_whole_document() {
+    fn apply_flagged_pages_drops_a_page_index_at_or_beyond_page_count() {
+        let mut decision = OcrFallbackDecision {
+            stats: NativeTextStats::default(),
+            avg_non_whitespace: 0.0,
+            avg_alnum: 0.0,
+            fallback: false,
+            failing_pages: Vec::new(),
+            whole_doc_failure: false,
+        };
+
+        apply_flagged_pages(&mut decision, &[5], true, Some(2));
+
+        assert!(
+            decision.failing_pages.is_empty(),
+            "an out-of-range page index must not pad failing_pages: {:?}",
+            decision.failing_pages
+        );
+        assert!(
+            !decision.fallback,
+            "a wholly out-of-range flagged-page list must not force fallback"
+        );
+        assert!(
+            !decision.whole_doc_failure,
+            "an out-of-range page index must not be counted toward whole_doc_failure"
+        );
+    }
+
+    /// A mix of one in-range and one out-of-range index: the in-range page is kept and the
+    /// out-of-range one is silently dropped, not padded into the set used for the
+    /// `whole_doc_failure` comparison against `page_count`.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn apply_flagged_pages_keeps_in_range_pages_while_dropping_out_of_range_ones() {
+        let mut decision = OcrFallbackDecision {
+            stats: NativeTextStats::default(),
+            avg_non_whitespace: 0.0,
+            avg_alnum: 0.0,
+            fallback: false,
+            failing_pages: Vec::new(),
+            whole_doc_failure: false,
+        };
+
+        apply_flagged_pages(&mut decision, &[1, 5], true, Some(2));
+
+        assert_eq!(
+            decision.failing_pages,
+            vec![1],
+            "only the in-range page may survive into failing_pages"
+        );
+        assert!(decision.fallback);
+        assert!(
+            !decision.whole_doc_failure,
+            "1 of 2 real pages failing is not a whole-document failure, even though 2 indices were passed in"
+        );
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn apply_flagged_pages_without_boundaries_forces_whole_document() {
         let mut decision = evaluate_native_text_for_ocr("Clean prose that looks fine on its own.", Some(1), &t());
 
-        apply_fabricated_provenance_pages(&mut decision, &[1], false, None);
+        apply_flagged_pages(&mut decision, &[1], false, None);
 
         assert!(decision.fallback);
         assert!(

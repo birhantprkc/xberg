@@ -1087,44 +1087,61 @@ pub(crate) fn evaluate_per_page_ocr(
     document_decision.failing_pages = failing_pages;
     document_decision
 }
-/// Union provenance-fabricated pages (issue #1254's signal) into a per-page OCR decision.
+/// Union signal-flagged pages into a per-page OCR decision.
 ///
-/// `NativeTextStats`' character-class checks cannot see this failure mode even in
-/// principle: a font whose `/Encoding` or `/ToUnicode` legitimately, from the §9.10.2
-/// mapping cascade's perspective, resolves glyphs to the wrong-but-ordinary letters and
-/// punctuation produces text that is structurally indistinguishable from real prose —
-/// same alphanumeric ratio, same word-length distribution, same fragmentation (issue
-/// #1667). `fabricated_pages` (1-indexed) is a fact about how the text was *derived*
-/// (`MappingProvenance::Fallback`), not a guess about its shape, so it is unioned in
+/// `NativeTextStats`' character-class checks cannot see either signal-agnostic failure mode
+/// this function is used for: a font whose `/Encoding` or `/ToUnicode` legitimately, from the
+/// §9.10.2 mapping cascade's perspective, resolves glyphs to the wrong-but-ordinary letters and
+/// punctuation produces text that is structurally indistinguishable from real prose — same
+/// alphanumeric ratio, same word-length distribution, same fragmentation, whether the wrong
+/// mapping came from a fallback echo (`MappingProvenance::Fallback`, issue #1667) or from a
+/// `/ToUnicode` CMap that resolves to the wrong-but-real letters (issue #1696's
+/// language/dictionary-plausibility signal). `flagged_pages` (1-indexed) is a fact from a
+/// signal orthogonal to text shape, not a guess about its shape, so it is unioned in
 /// regardless of what the structural heuristics concluded.
 ///
-/// The tree already routed this signal, just only under the opt-in
+/// The tree already routed the provenance signal, just only under the opt-in
 /// `OcrStrategy::ScannedPages` (via `scanned_pages_to_ocr`, which already starts from
-/// `PdfMetadata.scanned_pages`); `OcrStrategy::Auto`, the default, never read it. This
-/// closes that gap for `Auto` without disturbing `ScannedPages`, whose own union already
-/// covers this list as a strict subset of the merged `scanned_pages` field.
+/// `PdfMetadata.scanned_pages`); `OcrStrategy::Auto`, the default, never read it. This closes
+/// that gap for `Auto` without disturbing `ScannedPages`, whose own union already covers this
+/// list as a strict subset of the merged `scanned_pages` field.
+///
+/// A page index at or beyond `total_pages` is silently dropped rather than accepted into
+/// `failing_pages`: `total_pages` is the authoritative page count, so an out-of-range index is
+/// caller data corruption, not evidence of a real page needing OCR, and padding the failing-page
+/// set with it would let a caller's off-by-one inflate `whole_doc_failure`'s "every page failed"
+/// comparison against a page count the bad index was never part of. ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
-pub(crate) fn apply_fabricated_provenance_pages(
+pub(crate) fn apply_flagged_pages(
     decision: &mut OcrFallbackDecision,
-    fabricated_pages: &[u32],
+    flagged_pages: &[u32],
     has_boundaries: bool,
     total_pages: Option<u32>,
 ) {
-    if fabricated_pages.is_empty() {
+    if flagged_pages.is_empty() {
+        return;
+    }
+
+    if !has_boundaries {
+        // No boundaries to split mixed OCR by, so the whole document is the only
+        // unit the caller can act on -- matches the empty-native-text precedent above. ~keep
+        decision.fallback = true;
+        decision.whole_doc_failure = true;
+        return;
+    }
+
+    let in_range_pages: Vec<u32> = match total_pages {
+        Some(total) => flagged_pages.iter().copied().filter(|page| *page <= total).collect(),
+        None => flagged_pages.to_vec(),
+    };
+    if in_range_pages.is_empty() {
         return;
     }
 
     decision.fallback = true;
 
-    if !has_boundaries {
-        // No boundaries to split mixed OCR by, so the whole document is the only
-        // unit the caller can act on -- matches the empty-native-text precedent above. ~keep
-        decision.whole_doc_failure = true;
-        return;
-    }
-
     let mut pages = decision.failing_pages.clone();
-    pages.extend_from_slice(fabricated_pages);
+    pages.extend_from_slice(&in_range_pages);
     pages.sort_unstable();
     pages.dedup();
 

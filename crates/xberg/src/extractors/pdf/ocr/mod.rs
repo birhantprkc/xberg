@@ -3,23 +3,26 @@
 //! Handles text quality evaluation, OCR fallback decision logic, and OCR processing.
 //!
 //! Split into topical submodules: [`scoring`] (native-text/OCR-output quality evaluation and
-//! the skip/fallback gate), [`rendering`] (PDF page rasterization and image-XObject recovery),
-//! [`document`] (bbox/geometry transforms and assembling OCR output into page documents,
-//! including merging OCR pages back into a natively-extracted document), and [`pipeline`]
-//! (the top-level mixed-OCR and per-page pipeline orchestrators). Items used across submodule
-//! boundaries are `pub(super)`; items already reachable from outside `ocr` keep their original
-//! visibility and are re-exported here so external call sites are unaffected by the split.
-//! Unit tests live in `tests.rs` and `recognition_noise_tests.rs`, not inline here.
+//! the skip/fallback gate), [`plausibility`] (language/dictionary-plausibility detection for
+//! wrong-mapped text layers, issue #1696), [`rendering`] (PDF page rasterization and
+//! image-XObject recovery), [`document`] (bbox/geometry transforms and assembling OCR output
+//! into page documents, including merging OCR pages back into a natively-extracted document),
+//! and [`pipeline`] (the top-level mixed-OCR and per-page pipeline orchestrators). Items used
+//! across submodule boundaries are `pub(super)`; items already reachable from outside `ocr`
+//! keep their original visibility and are re-exported here so external call sites are
+//! unaffected by the split. Unit tests live in `tests.rs`, `recognition_noise_tests.rs`, and
+//! `plausibility_tests.rs`, not inline here.
 
 mod document;
 mod pipeline;
+mod plausibility;
 mod rendering;
 mod scoring;
 
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
-pub(crate) use scoring::{
-    OcrGateOutcome, apply_fabricated_provenance_pages, evaluate_ocr_skip_gate, evaluate_per_page_ocr,
-};
+pub(crate) use plausibility::implausible_text_pages;
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(crate) use scoring::{OcrGateOutcome, apply_flagged_pages, evaluate_ocr_skip_gate, evaluate_per_page_ocr};
 
 // ~keep The standalone-image extractor builds the same `PageContent.ocr_confidence` summary
 // from its own single OCR run (#1568), so these three leave `ocr` rather than staying
@@ -54,6 +57,8 @@ pub(crate) use pipeline::extract_mixed_ocr_native;
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 pub(crate) use pipeline::{extract_with_ocr, run_ocr_pipeline};
 
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline")))]
+mod plausibility_tests;
 #[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline")))]
 mod recognition_noise_tests;
 #[cfg(all(test, feature = "ocr"))]
