@@ -1363,6 +1363,9 @@ public func browserWaitFromJson<GenericIntoRustString: IntoRustString>(_ json: G
 public func callModeFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> CallMode {
     try { let val = __swift_bridge__$call_mode_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return CallMode(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func candleDeepseekOcrDtypeFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> CandleDeepseekOcrDtype {
+    try { let val = __swift_bridge__$candle_deepseek_ocr_dtype_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return CandleDeepseekOcrDtype(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
 public func candleDevicePreferenceFromJson<GenericIntoRustString: IntoRustString>(_ json: GenericIntoRustString) throws -> CandleDevicePreference {
     try { let val = __swift_bridge__$candle_device_preference_from_json({ let rustString = json.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return CandleDevicePreference(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
@@ -2577,6 +2580,9 @@ public func __alef_phantom_vec_yake_params() -> RustVec<YakeParams> {
 }
 public func __alef_phantom_vec_boundary_reason() -> RustVec<BoundaryReason> {
     RustVec(ptr: __swift_bridge__$__alef_phantom_vec_boundary_reason())
+}
+public func __alef_phantom_vec_candle_deepseek_ocr_dtype() -> RustVec<CandleDeepseekOcrDtype> {
+    RustVec(ptr: __swift_bridge__$__alef_phantom_vec_candle_deepseek_ocr_dtype())
 }
 public func __alef_phantom_vec_candle_device_preference() -> RustVec<CandleDevicePreference> {
     RustVec(ptr: __swift_bridge__$__alef_phantom_vec_candle_device_preference())
@@ -6731,8 +6737,8 @@ public class DeepseekOcrBackendOptions: DeepseekOcrBackendOptionsRefMut {
     }
 }
 extension DeepseekOcrBackendOptions {
-    public convenience init<GenericIntoRustString: IntoRustString>(_ model_path: Optional<GenericIntoRustString>, _ device: Optional<CandleDevicePreference>, _ version: Optional<UInt32>) {
-        self.init(ptr: __swift_bridge__$DeepseekOcrBackendOptions$new({ if let rustString = optionalStringIntoRustString(model_path) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let val = device { val.isOwned = false; return val.ptr } else { return nil } }(), version.intoFfiRepr()))
+    public convenience init<GenericIntoRustString: IntoRustString>(_ model_path: Optional<GenericIntoRustString>, _ model_id: Optional<GenericIntoRustString>, _ hf_revision: Optional<GenericIntoRustString>, _ cache_dir: Optional<GenericIntoRustString>, _ device: Optional<CandleDevicePreference>, _ version: Optional<UInt32>, _ dtype: Optional<CandleDeepseekOcrDtype>) {
+        self.init(ptr: __swift_bridge__$DeepseekOcrBackendOptions$new({ if let rustString = optionalStringIntoRustString(model_path) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let rustString = optionalStringIntoRustString(model_id) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let rustString = optionalStringIntoRustString(hf_revision) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let rustString = optionalStringIntoRustString(cache_dir) { rustString.isOwned = false; return rustString.ptr } else { return nil } }(), { if let val = device { val.isOwned = false; return val.ptr } else { return nil } }(), version.intoFfiRepr(), { if let val = dtype { val.isOwned = false; return val.ptr } else { return nil } }()))
     }
 }
 public class DeepseekOcrBackendOptionsRefMut: DeepseekOcrBackendOptionsRef {
@@ -6752,12 +6758,28 @@ extension DeepseekOcrBackendOptionsRef {
         { let val = __swift_bridge__$DeepseekOcrBackendOptions$model_path(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
+    public func modelId() -> Optional<RustString> {
+        { let val = __swift_bridge__$DeepseekOcrBackendOptions$model_id(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
+    }
+
+    public func hfRevision() -> Optional<RustString> {
+        { let val = __swift_bridge__$DeepseekOcrBackendOptions$hf_revision(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
+    }
+
+    public func cacheDir() -> Optional<RustString> {
+        { let val = __swift_bridge__$DeepseekOcrBackendOptions$cache_dir(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
+    }
+
     public func device() -> Optional<RustString> {
         { let val = __swift_bridge__$DeepseekOcrBackendOptions$device(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 
     public func version() -> Optional<UInt32> {
         __swift_bridge__$DeepseekOcrBackendOptions$version(ptr).intoSwiftRepr()
+    }
+
+    public func dtype() -> Optional<RustString> {
+        { let val = __swift_bridge__$DeepseekOcrBackendOptions$dtype(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
 }
 extension DeepseekOcrBackendOptions: Vectorizable {
@@ -28209,6 +28231,86 @@ extension CallMode: Vectorizable {
 
     public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
         __swift_bridge__$Vec_CallMode$len(vecPtr)
+    }
+}
+
+
+public class CandleDeepseekOcrDtype: CandleDeepseekOcrDtypeRefMut {
+    public var isOwned: Bool = true
+
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+
+    deinit {
+        if isOwned {
+            __swift_bridge__$CandleDeepseekOcrDtype$_free(ptr)
+        }
+    }
+}
+public class CandleDeepseekOcrDtypeRefMut: CandleDeepseekOcrDtypeRef {
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+}
+public class CandleDeepseekOcrDtypeRef {
+    public var ptr: UnsafeMutableRawPointer
+
+    public init(ptr: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+    }
+}
+extension CandleDeepseekOcrDtypeRef {
+    public func to_string() -> RustString {
+        RustString(ptr: __swift_bridge__$CandleDeepseekOcrDtype$to_string(ptr))
+    }
+}
+extension CandleDeepseekOcrDtype: Vectorizable {
+    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
+        __swift_bridge__$Vec_CandleDeepseekOcrDtype$new()
+    }
+
+    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
+        __swift_bridge__$Vec_CandleDeepseekOcrDtype$drop(vecPtr)
+    }
+
+    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: CandleDeepseekOcrDtype) {
+        __swift_bridge__$Vec_CandleDeepseekOcrDtype$push(vecPtr, {value.isOwned = false; return value.ptr;}())
+    }
+
+    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
+        let pointer = __swift_bridge__$Vec_CandleDeepseekOcrDtype$pop(vecPtr)
+        if pointer == nil {
+            return nil
+        } else {
+            return (CandleDeepseekOcrDtype(ptr: pointer!) as! Self)
+        }
+    }
+
+    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<CandleDeepseekOcrDtypeRef> {
+        let pointer = __swift_bridge__$Vec_CandleDeepseekOcrDtype$get(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return CandleDeepseekOcrDtypeRef(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<CandleDeepseekOcrDtypeRefMut> {
+        let pointer = __swift_bridge__$Vec_CandleDeepseekOcrDtype$get_mut(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return CandleDeepseekOcrDtypeRefMut(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<CandleDeepseekOcrDtypeRef> {
+        UnsafePointer<CandleDeepseekOcrDtypeRef>(OpaquePointer(__swift_bridge__$Vec_CandleDeepseekOcrDtype$as_ptr(vecPtr)))
+    }
+
+    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
+        __swift_bridge__$Vec_CandleDeepseekOcrDtype$len(vecPtr)
     }
 }
 

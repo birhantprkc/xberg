@@ -641,6 +641,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BoundingBox dco_decode_box_autoadd_bounding_box(dynamic raw);
 
   @protected
+  CandleDeepseekOcrDtype dco_decode_box_autoadd_candle_deepseek_ocr_dtype(
+    dynamic raw,
+  );
+
+  @protected
   CandleDevicePreference dco_decode_box_autoadd_candle_device_preference(
     dynamic raw,
   );
@@ -1052,6 +1057,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CallMode dco_decode_call_mode(dynamic raw);
+
+  @protected
+  CandleDeepseekOcrDtype dco_decode_candle_deepseek_ocr_dtype(dynamic raw);
 
   @protected
   CandleDevicePreference dco_decode_candle_device_preference(dynamic raw);
@@ -2023,6 +2031,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BoundingBox? dco_decode_opt_box_autoadd_bounding_box(dynamic raw);
+
+  @protected
+  CandleDeepseekOcrDtype? dco_decode_opt_box_autoadd_candle_deepseek_ocr_dtype(
+    dynamic raw,
+  );
 
   @protected
   CandleDevicePreference? dco_decode_opt_box_autoadd_candle_device_preference(
@@ -3329,6 +3342,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   BoundingBox sse_decode_box_autoadd_bounding_box(SseDeserializer deserializer);
 
   @protected
+  CandleDeepseekOcrDtype sse_decode_box_autoadd_candle_deepseek_ocr_dtype(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   CandleDevicePreference sse_decode_box_autoadd_candle_device_preference(
     SseDeserializer deserializer,
   );
@@ -3880,6 +3898,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   CallMode sse_decode_call_mode(SseDeserializer deserializer);
+
+  @protected
+  CandleDeepseekOcrDtype sse_decode_candle_deepseek_ocr_dtype(
+    SseDeserializer deserializer,
+  );
 
   @protected
   CandleDevicePreference sse_decode_candle_device_preference(
@@ -5069,6 +5092,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BoundingBox? sse_decode_opt_box_autoadd_bounding_box(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CandleDeepseekOcrDtype? sse_decode_opt_box_autoadd_candle_deepseek_ocr_dtype(
     SseDeserializer deserializer,
   );
 
@@ -6824,6 +6852,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_candle_deepseek_ocr_dtype(
+    CandleDeepseekOcrDtype self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_candle_device_preference(
     CandleDevicePreference self,
     SseSerializer serializer,
@@ -7539,6 +7573,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_call_mode(CallMode self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_candle_deepseek_ocr_dtype(
+    CandleDeepseekOcrDtype self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_candle_device_preference(
@@ -9082,6 +9122,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_bounding_box(
     BoundingBox? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_candle_deepseek_ocr_dtype(
+    CandleDeepseekOcrDtype? self,
     SseSerializer serializer,
   );
 
