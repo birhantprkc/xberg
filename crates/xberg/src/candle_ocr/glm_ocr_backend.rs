@@ -685,6 +685,15 @@ async fn process_paired(
 
             let region_task = task_for_label(detection.class_name, enable_chart_understanding);
 
+            // ~keep: distinguishes region-overlap duplication (two detections OCR'd over the
+            // same area) from GH#1675's in-region repetition -- without per-region logging,
+            // the two look identical in the assembled output.
+            tracing::debug!(
+                class = ?detection.class_name,
+                bbox = ?bbox,
+                "GLM-OCR paired: processing region"
+            );
+
             let output = match engine.process_image_with_task(&crop_bytes, region_task) {
                 Ok(out) => out,
                 Err(CandleOcrError::UnsupportedConfig(ref msg)) => {

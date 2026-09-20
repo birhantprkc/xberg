@@ -19,6 +19,15 @@ pub struct MtpConfig {
     pub sample: bool,
     pub top_p: f32,
     pub temperature: f32,
+    /// Score scaling applied to previously generated tokens before sampling (`>1.0` suppresses
+    /// repetition, `<1.0` encourages it, `1.0` is a no-op).
+    ///
+    // ~keep: defaults to 1.0 because upstream's generation_config.json (zai-org/GLM-OCR, revision
+    // ca5d8b3e287e52589e37c28385d9655ee4372f9d) carries no `repetition_penalty` key at all -- just
+    // `do_sample: false` and two `eos_token_id`s. GH#1675: an earlier default of 1.1 here, combined
+    // with `apply_repetition_penalty` scaling PER OCCURRENCE over the whole decode history
+    // (`1.1^k` for a token seen k times), exponentially suppressed hex digits and `-` inside long
+    // identifiers (UUIDs) until argmax drifted onto a token that had never been penalised.
     pub repetition_penalty: f32,
 }
 
@@ -29,19 +38,35 @@ impl Default for MtpConfig {
             sample: false,
             top_p: 0.9,
             temperature: 0.1,
-            repetition_penalty: 1.1,
+            repetition_penalty: 1.0,
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
+    use std::collections::BTreeSet;
+
     use candle_core::{Device, Tensor};
 
     use super::super::decoder::Glm4Decoder;
     use super::MtpConfig;
     use crate::CandleOcrError;
     use crate::error::Result;
+
+    /// Trailing token history considered by the repetition penalty.
+    ///
+    // ~keep: bounding the window keeps a token from many steps ago (an earlier page's heading,
+    // a table row already closed out) from being penalised for the rest of decoding -- GH#1675's
+    // fix removes the per-occurrence exponential blowup, but an unbounded history would still
+    // eventually penalise every token in the vocabulary that has appeared even once.
+    pub(crate) const REPETITION_PENALTY_WINDOW: usize = 64;
+
+    /// Trailing slice of `ids`, at most [`REPETITION_PENALTY_WINDOW`] tokens.
+    fn repetition_penalty_window(ids: &[u32]) -> &[u32] {
+        let start = ids.len().saturating_sub(REPETITION_PENALTY_WINDOW);
+        &ids[start..]
+    }
 
     /// Build a `(3, 1, 1)` M-RoPE position tensor where all three axes share the
     /// same scalar value `pos`. Used for per-step autoregressive decoding once
@@ -86,8 +111,9 @@ mod imp {
                 .squeeze(0)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Squeeze batch: {}", e)))?;
 
+            let windowed_ids = repetition_penalty_window(&output_ids);
             let penalized_logits = if config.repetition_penalty != 1.0 && !output_ids.is_empty() {
-                apply_repetition_penalty(&last_logits, &output_ids, config.repetition_penalty)
+                apply_repetition_penalty(&last_logits, windowed_ids, config.repetition_penalty)
                     .map_err(|e| CandleOcrError::InferenceFailed(format!("Repetition penalty: {}", e)))?
             } else {
                 last_logits.clone()
@@ -179,8 +205,9 @@ mod imp {
                 .squeeze(0)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Squeeze batch: {}", e)))?;
 
+            let windowed_ids = repetition_penalty_window(&output_ids);
             let penalized_logits = if config.repetition_penalty != 1.0 && !output_ids.is_empty() {
-                apply_repetition_penalty(&last_logits, &output_ids, config.repetition_penalty)
+                apply_repetition_penalty(&last_logits, windowed_ids, config.repetition_penalty)
                     .map_err(|e| CandleOcrError::InferenceFailed(format!("Repetition penalty: {}", e)))?
             } else {
                 last_logits.clone()
@@ -227,26 +254,42 @@ mod imp {
         Ok(output_ids)
     }
 
-    /// Apply repetition penalty to logits: reduce scores for tokens already in output.
+    /// Apply repetition penalty to logits: reduce scores for tokens already in `recent_ids`.
     /// Penalty > 1 suppresses repetition; < 1 encourages it.
     ///
+    // ~keep: GH#1675 -- `recent_ids` is deduplicated (`BTreeSet`) so each token is penalised
+    // exactly ONCE regardless of how many times it occurs in the window. The earlier
+    // implementation scaled once per occurrence (`penalty.powi(k)` for a token seen k times),
+    // which drove hex digits and `-` inside a UUID toward zero probability after a handful of
+    // repeats and made argmax drift onto a token that had never been penalised. Runs entirely on
+    // `logits`'s device via `index_select` / `where_cond` / `scatter` -- no per-step `to_vec1`
+    // copy of the full vocabulary row to the host.
     pub(crate) fn apply_repetition_penalty(
         logits: &Tensor,
-        output_ids: &[u32],
+        recent_ids: &[u32],
         penalty: f32,
     ) -> candle_core::Result<Tensor> {
-        let mut logits_vec = logits.to_vec1::<f32>()?;
-        for &token_id in output_ids {
-            let idx = token_id as usize;
-            if idx < logits_vec.len() {
-                if logits_vec[idx] >= 0.0 {
-                    logits_vec[idx] /= penalty;
-                } else {
-                    logits_vec[idx] *= penalty;
-                }
-            }
+        let vocab_size = logits.dims()[0] as u32;
+        let unique_ids: Vec<u32> = recent_ids
+            .iter()
+            .copied()
+            .filter(|&id| id < vocab_size)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if unique_ids.is_empty() {
+            return Ok(logits.clone());
         }
-        Tensor::from_vec(logits_vec, logits.dims(), logits.device())
+
+        let device = logits.device();
+        let ids_len = unique_ids.len();
+        let ids_tensor = Tensor::from_vec(unique_ids, (ids_len,), device)?;
+        let selected = logits.index_select(&ids_tensor, 0)?;
+        let divided = selected.affine(1.0 / penalty as f64, 0.0)?;
+        let multiplied = selected.affine(penalty as f64, 0.0)?;
+        let is_non_negative = selected.ge(0f32)?;
+        let penalized_selected = is_non_negative.where_cond(&divided, &multiplied)?;
+        logits.scatter(&ids_tensor, &penalized_selected, 0)
     }
 
     /// Greedy decoding: return argmax of logits.
@@ -341,7 +384,7 @@ pub use imp::{generate, generate_mrope};
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod tests {
-    use super::imp::{apply_repetition_penalty, sample_nucleus};
+    use super::imp::{REPETITION_PENALTY_WINDOW, apply_repetition_penalty, sample_nucleus};
     use crate::error::Result;
     use candle_core::{Device, Tensor};
 
@@ -359,6 +402,91 @@ mod tests {
         assert!((result_vec[1] - (-0.3 * 1.1)).abs() < 0.01);
         assert!((result_vec[2] - 1.0).abs() < 0.01);
         assert!((result_vec[3] - (-0.8)).abs() < 0.01);
+    }
+
+    /// GH#1675: a token seen 3 times in the history must be penalised by a single factor of
+    /// `penalty`, not `penalty^3` -- the exponential-per-occurrence blowup that drove hex digits
+    /// in a UUID toward zero probability.
+    #[test]
+    fn repeated_token_is_penalised_once_not_per_occurrence() {
+        let device = Device::Cpu;
+        let logits_tensor = Tensor::from_vec(vec![0.5f32, 1.0], (2,), &device).unwrap();
+
+        let output_ids = vec![0u32, 0, 0];
+        let result = apply_repetition_penalty(&logits_tensor, &output_ids, 1.1).unwrap();
+        let result_vec = result.to_vec1::<f32>().unwrap();
+
+        assert!(
+            (result_vec[0] - 0.5 / 1.1).abs() < 1e-4,
+            "expected a single application of the penalty (0.5 / 1.1 = {}), got {}",
+            0.5 / 1.1,
+            result_vec[0]
+        );
+        let per_occurrence = 0.5 / 1.1f32.powi(3);
+        assert!(
+            (result_vec[0] - per_occurrence).abs() > 1e-3,
+            "must not scale per occurrence (1.1^3 = {})",
+            per_occurrence
+        );
+    }
+
+    /// A token that fell outside the trailing [`REPETITION_PENALTY_WINDOW`] must not be
+    /// penalised -- the window bounds how far back the penalty looks, so a token from many
+    /// steps ago cannot keep suppressing itself for the rest of decoding.
+    #[test]
+    fn tokens_outside_window_are_not_penalised() {
+        let device = Device::Cpu;
+        let logits_tensor = Tensor::from_vec(vec![0.5f32, 0.5], (2,), &device).unwrap();
+
+        // Token 0 occurs once, far enough back that a window of REPETITION_PENALTY_WINDOW
+        // tokens no longer contains it; token 1 fills the rest of the window.
+        let mut output_ids = vec![0u32];
+        output_ids.extend(std::iter::repeat_n(1u32, REPETITION_PENALTY_WINDOW));
+        let start = output_ids.len() - REPETITION_PENALTY_WINDOW;
+        let windowed = &output_ids[start..];
+        assert!(
+            !windowed.contains(&0),
+            "test fixture must push token 0 out of the window"
+        );
+
+        let result = apply_repetition_penalty(&logits_tensor, windowed, 1.1).unwrap();
+        let result_vec = result.to_vec1::<f32>().unwrap();
+
+        assert!(
+            (result_vec[0] - 0.5).abs() < 1e-6,
+            "token outside the window must be left unpenalised, got {}",
+            result_vec[0]
+        );
+        assert!(
+            (result_vec[1] - 0.5 / 1.1).abs() < 1e-4,
+            "token inside the window must still be penalised, got {}",
+            result_vec[1]
+        );
+    }
+
+    /// A penalty of 1.0 must be an exact identity -- the decode loops rely on this to skip
+    /// calling the penalty at all when `config.repetition_penalty == 1.0`.
+    #[test]
+    fn penalty_of_one_is_identity() {
+        let logits = vec![0.5f32, -0.3, 1.0, -0.8];
+        let device = Device::Cpu;
+        let logits_tensor = Tensor::from_vec(logits.clone(), (4,), &device).unwrap();
+
+        let output_ids = vec![0u32, 1, 1, 2];
+        let result = apply_repetition_penalty(&logits_tensor, &output_ids, 1.0).unwrap();
+        let result_vec = result.to_vec1::<f32>().unwrap();
+
+        assert_eq!(result_vec, logits);
+    }
+
+    /// GH#1675: upstream (`zai-org/GLM-OCR`, revision
+    /// ca5d8b3e287e52589e37c28385d9655ee4372f9d) `generation_config.json` carries no
+    /// `repetition_penalty` key -- fetched and confirmed to contain only `do_sample: false`
+    /// and `eos_token_id: [59246, 59253]`. Our default must match that absence (1.0 = no-op).
+    #[test]
+    fn default_config_matches_upstream_generation_config() {
+        let config = super::MtpConfig::default();
+        assert_eq!(config.repetition_penalty, 1.0);
     }
 
     #[test]
