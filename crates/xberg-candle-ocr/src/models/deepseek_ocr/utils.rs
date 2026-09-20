@@ -134,12 +134,19 @@ pub fn nonzero(t: &Tensor) -> Result<(Vec<usize>, Vec<usize>)> {
 
 /// Prepare causal attention mask.
 pub fn prepare_causal_attention_mask(bs: usize, seq_len: usize, _offset: usize, device: &Device) -> Result<Tensor> {
-    let mut mask = Tensor::ones((seq_len, seq_len), DType::U32, device)?;
+    // ~keep: the caller (`eager_attention_forward`) broadcast-adds this mask straight onto the
+    // raw attention logits before softmax, so it must already be additive (0 visible / -inf
+    // blocked). A 0/1 keep-mask cast to the logits' dtype and added would only ever nudge scores
+    // by 1.0 instead of hard-blocking future positions -- see GH#1701.
+    let mut data = vec![0f32; seq_len * seq_len];
     for i in 0..seq_len {
         for j in (i + 1)..seq_len {
-            mask = mask.slice_assign(&[(i..i + 1), (j..j + 1)], &Tensor::zeros((1, 1), DType::U32, device)?)?;
+            data[i * seq_len + j] = f32::NEG_INFINITY;
         }
     }
+    let mask = Tensor::from_vec(data, (seq_len, seq_len), device)?
+        .unsqueeze(0)?
+        .unsqueeze(0)?;
     Ok(mask.expand((bs, 1, seq_len, seq_len))?)
 }
 
@@ -225,6 +232,54 @@ mod tests {
     use candle_core::Device;
 
     use super::*;
+
+    /// The shape the SAM encoder hits on a 640 px local crop: a (1, 64, 127) rel-pos table
+    /// resized to 79 positions. The old implementation failed here with a candle shape
+    /// mismatch instead of interpolating (GH#1701).
+    #[test]
+    fn prepare_causal_attention_mask_hides_future_positions() {
+        let dev = Device::Cpu;
+        let mask = prepare_causal_attention_mask(1, 4, 0, &dev).expect("mask");
+        assert_eq!(mask.dims(), &[1, 1, 4, 4], "mask should be (batch, 1, seq, seq)");
+
+        let rows = mask
+            .reshape((4, 4))
+            .and_then(|t| t.to_vec2::<f32>())
+            .expect("read mask");
+        for (i, row) in rows.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                if j > i {
+                    assert!(value == f32::NEG_INFINITY, "future position ({i},{j}) should be masked");
+                } else {
+                    assert_eq!(value, 0.0, "visible position ({i},{j}) should be unmasked");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_causal_attention_mask_blocks_future_logits_after_broadcast_add() {
+        // Regression for GH#1701: the mask must be additive so that adding it to raw
+        // attention logits drives future positions to -inf before softmax, not just
+        // nudge visible positions by +1 relative to future ones.
+        let dev = Device::Cpu;
+        let mask = prepare_causal_attention_mask(1, 3, 0, &dev).expect("mask");
+        let logits = Tensor::new(&[[[[5.0f32, 5.0, 5.0], [5.0, 5.0, 5.0], [5.0, 5.0, 5.0]]]], &dev).expect("logits");
+        let combined = logits.broadcast_add(&mask).expect("add mask");
+        let row0 = combined
+            .reshape((3, 3))
+            .and_then(|t| t.to_vec2::<f32>())
+            .expect("read combined");
+        assert_eq!(row0[0][0], 5.0, "current position keeps its logit");
+        assert!(
+            row0[0][1].is_infinite() && row0[0][1].is_sign_negative(),
+            "future position must become -inf, not stay finite"
+        );
+        assert!(
+            row0[0][2].is_infinite() && row0[0][2].is_sign_negative(),
+            "future position must become -inf, not stay finite"
+        );
+    }
 
     #[test]
     fn index_select_2d_gathers_rows_into_grid() {
