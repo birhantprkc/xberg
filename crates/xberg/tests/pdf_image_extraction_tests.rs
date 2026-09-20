@@ -1394,6 +1394,10 @@ fn test_ocr_only_config_returns_no_images() {
         "ocr-only config (images: None) must not retain embedded image bytes; got {} image(s)",
         result.images.as_ref().map(|v| v.len()).unwrap_or(0)
     );
+    assert_eq!(
+        result.counts.images, 1,
+        "DocumentCounts::images is documented as always populated, so dropping the bytes must not zero it"
+    );
 
     if let Some(pages) = result.pages.as_ref() {
         for page in pages {
