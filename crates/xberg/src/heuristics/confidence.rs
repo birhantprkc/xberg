@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::extraction::ExtractedDocument;
+use crate::types::ocr_elements::OcrElement;
+use crate::types::page::PageContent;
 
 /// Schema-validation outcome surfaced as one of three buckets.
 ///
@@ -94,23 +96,43 @@ impl ConfidenceSignals {
     /// through unfiltered, so a flat per-element mean would silently change meaning whenever
     /// line lengths vary. Weighting by word count keeps the statistic "mean confidence per
     /// recognized word" regardless of the element granularity a backend reports, which is also
-    /// what [`Self::ocr_aggregate_from_pages`] computes.
+    /// what [`Self::ocr_aggregate_from_pages`] computes. Narrows [`Self::ocr_confidence_from_elements`]
+    /// to `f32`; callers that need the underlying word count use that fn directly.
     fn ocr_aggregate_from_elements(result: &ExtractedDocument) -> Option<f32> {
         let elements = result.ocr_elements.as_deref()?;
-        Self::word_count_weighted_mean(elements.iter().map(|element| {
-            let word_count = element.text.split_whitespace().count() as u64;
-            (element.confidence.recognition, word_count)
-        }))
+        Self::ocr_confidence_from_elements(elements).map(|(mean, _total_words)| mean as f32)
     }
 
     /// Word-count-weighted mean OCR recognition confidence for the page-level OCR route (issue
     /// #1677), which reports per-page confidence (`PageContent.ocr_confidence`) but never
     /// populates `ocr_elements`. Uses the SAME weighting [`Self::ocr_aggregate_from_elements`]
     /// does, so the two routes agree on what `ocr_aggregate` means regardless of which one
-    /// populated it. A page whose backend reports no calibrated legibility scale
-    /// (`score: None`) is skipped rather than treated as zero confidence.
+    /// populated it. Narrows [`Self::ocr_confidence_from_pages`] to `f32`; callers that need the
+    /// underlying word count use that fn directly.
     fn ocr_aggregate_from_pages(result: &ExtractedDocument) -> Option<f32> {
         let pages = result.pages.as_deref()?;
+        Self::ocr_confidence_from_pages(pages).map(|(mean, _total_words)| mean as f32)
+    }
+
+    /// Word-count-weighted mean OCR recognition confidence from a slice of `ocr_elements`, paired
+    /// with the total recognized word count the mean was computed over. `pub(crate)` so
+    /// `text::quality_processor` can apply its own evidence floor to the same fold instead of
+    /// recomputing it (issue #1694); [`Self::ocr_aggregate_from_elements`] is the `f32`,
+    /// floor-free wrapper `ocr_aggregate` itself uses. `None` when no element carries a word.
+    pub(crate) fn ocr_confidence_from_elements(elements: &[OcrElement]) -> Option<(f64, u64)> {
+        Self::word_count_weighted_mean(elements.iter().map(|element| {
+            let word_count = element.text.split_whitespace().count() as u64;
+            (element.confidence.recognition, word_count)
+        }))
+    }
+
+    /// Word-count-weighted mean OCR recognition confidence from a slice of `PageContent`, paired
+    /// with the total recognized word count the mean was computed over. `pub(crate)` for the same
+    /// reason as [`Self::ocr_confidence_from_elements`] (issue #1694); [`Self::ocr_aggregate_from_pages`]
+    /// is the `f32`, floor-free wrapper `ocr_aggregate` itself uses. A page whose backend reports
+    /// no calibrated legibility scale (`score: None`) is skipped rather than treated as zero
+    /// confidence. `None` when no page carries a word.
+    pub(crate) fn ocr_confidence_from_pages(pages: &[PageContent]) -> Option<(f64, u64)> {
         Self::word_count_weighted_mean(
             pages
                 .iter()
@@ -119,16 +141,24 @@ impl ConfidenceSignals {
         )
     }
 
-    /// Fold `(recognition_score, word_count)` pairs into their word-count-weighted mean.
-    /// Shared by [`Self::ocr_aggregate_from_elements`] and [`Self::ocr_aggregate_from_pages`] so
-    /// the two routes cannot drift onto different weightings: this is the one place either can
-    /// compute "mean confidence per recognized word". `None` when no pair carries a word.
-    fn word_count_weighted_mean(pairs: impl Iterator<Item = (f64, u64)>) -> Option<f32> {
+    /// Fold `(recognition_score, word_count)` pairs into their word-count-weighted mean, paired
+    /// with the total word count folded. Shared by [`Self::ocr_confidence_from_elements`] and
+    /// [`Self::ocr_confidence_from_pages`] so the two routes cannot drift onto different
+    /// weightings. `None` when no pair carries a word.
+    ///
+    /// ~keep: this is the one fold both `ocr_aggregate` and the quality-score cap build on, and
+    /// they read different amounts of trust into the same mean. `ocr_aggregate` reports
+    /// whenever any word was recognized; the quality-score cap applies its own, stricter
+    /// evidence floor on top of this fn's `total_words` before trusting the mean as a ceiling
+    /// (issue #1694). That is deliberate, not drift: `ocr_aggregate` is a diagnostic value read
+    /// on its own, while the cap silently lowers a score callers otherwise trust at face value
+    /// and needs more evidence before it will do that.
+    fn word_count_weighted_mean(pairs: impl Iterator<Item = (f64, u64)>) -> Option<(f64, u64)> {
         let (weighted_sum, total_words) = pairs.fold((0.0_f64, 0_u64), |(sum, words), (score, word_count)| {
             (sum + score * word_count as f64, words + word_count)
         });
 
-        (total_words > 0).then(|| (weighted_sum / total_words as f64) as f32)
+        (total_words > 0).then(|| (weighted_sum / total_words as f64, total_words))
     }
 }
 

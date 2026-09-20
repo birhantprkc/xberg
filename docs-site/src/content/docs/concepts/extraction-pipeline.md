@@ -189,8 +189,10 @@ These two steps run after validation.
 cleanliness/readability score between 0.0 and 1.0. The score penalizes OCR artifacts, embedded script/style noise, and
 navigation chrome; it rewards sentence and paragraph structure, multiple paragraphs, and punctuation, with an
 optional metadata bonus. It is not a completeness or recall score: clean text can score highly even when other content
-was omitted. The result is stored in `result.quality_score`; inspect `result.processing_warnings` separately for known
-degraded or partial extraction.
+was omitted. When OCR ran and recognized at least 20 words, the score is additionally capped at the recognition
+confidence OCR itself reported for that text, so a page OCR had little confidence in cannot score as clean purely
+because the characters happened to be well formed. The result is stored in `result.quality_score`; inspect
+`result.processing_warnings` separately for known degraded or partial extraction.
 
 **Chunking** is also optional. When you provide a `ChunkingConfig`, the extracted text is split into overlapping fragments with configurable maximum size and overlap. Each chunk records its start and end offset relative to the original text.
 
