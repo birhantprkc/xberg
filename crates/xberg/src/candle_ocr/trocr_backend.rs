@@ -266,10 +266,14 @@ impl OcrBackend for TrocrBackend {
         Ok(super::ocr_result::build_ocr_document(
             content,
             Vec::new(),
-            Cow::Borrowed("text/plain"),
             image_bytes,
             config,
-            "candle-trocr",
+            super::ocr_result::OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/plain"),
+                backend_name: "candle-trocr",
+                // TrOCR has no task selection; every call is plain-text OCR. ~keep
+                plain_text_task: true,
+            },
         ))
     }
 

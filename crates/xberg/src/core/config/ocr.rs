@@ -774,6 +774,9 @@ pub struct OcrConfig {
     /// deserializing from a config file, JSON body, or the REST/MCP API, a
     /// single string is also accepted, either as one code ("eng") or
     /// "+"-joined ("eng+deu").
+    ///
+    /// The four candle-based backends also use this list to decide which scripts are
+    /// plausible in their output, dropping a line written in an unconfigured script.
     #[serde(default = "default_eng", deserialize_with = "deserialize_languages")]
     pub language: Vec<String>,
 

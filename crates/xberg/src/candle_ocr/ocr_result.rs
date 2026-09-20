@@ -16,8 +16,10 @@
 //! inline for that reason.
 
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use regex::Regex;
 
 use crate::core::config::OcrConfig;
 use crate::types::{ExtractedDocument, FormatMetadata, Formula, Metadata, OcrMetadata, ProcessingWarning, Table};
@@ -35,16 +37,24 @@ use crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_WIDTH_METADATA_KEY as PROCESSE
 /// `"ocr-wasm"` / `paddle_ocr` / `liter-llm`. ~keep
 const DEFAULT_LANGUAGE: &str = "eng";
 
+/// Separator Tesseract uses between language codes in one string (`eng+deu`).
+const TESSERACT_LANGUAGE_SEPARATOR: char = '+';
+
 /// The languages the caller requested, with blanks dropped and the documented
 /// default applied when none remain. These candle backends do not perform
 /// independent language detection, so this reports the requested languages
 /// rather than a detected set — matching the Sceptre backend's `languages`
 /// field for the same reason.
+///
+/// A `+`-joined Tesseract list (`eng+deu`) is split the way `OcrConfig`'s
+/// deserializer splits it: the CLI `--ocr-language` override stores the raw flag value,
+/// so this is the only place that shape is normalised before the script allowlist reads it.
 fn effective_languages(config: &OcrConfig) -> Vec<String> {
     let langs: Vec<String> = config
         .language
         .iter()
-        .map(|lang| lang.trim())
+        .flat_map(|lang| lang.split(TESSERACT_LANGUAGE_SEPARATOR))
+        .map(str::trim)
         .filter(|lang| !lang.is_empty())
         .map(str::to_string)
         .collect();
@@ -55,6 +65,23 @@ fn effective_languages(config: &OcrConfig) -> Vec<String> {
     }
 }
 
+/// Call-site context for [`build_ocr_document`]: everything a backend knows before OCR
+/// runs, as opposed to `content`/`formulas` (what OCR produced). Grouped into one struct
+/// so the function stays under poly's parameter-count limit.
+pub(crate) struct OcrDocumentContext {
+    /// The document mime type the backend's OCR content is encoded as (e.g.
+    /// `"text/markdown"`, `"text/plain"`).
+    pub(crate) mime_type: Cow<'static, str>,
+    /// The same string each backend's `OcrBackend::name()` returns (e.g.
+    /// `"candle-trocr"`); used only to attribute warnings.
+    pub(crate) backend_name: &'static str,
+    /// Whether the caller asked this backend for plain-prose OCR rather than a
+    /// formula/table/chart task (GH#1676): a caller who explicitly requested LaTeX (a
+    /// formula task) expects LaTeX back, so [`filter_implausible_lines`]'s bare-LaTeX
+    /// rule only fires when this is `true`.
+    pub(crate) plain_text_task: bool,
+}
+
 /// Build the full `ExtractedDocument` a candle OCR backend should return.
 ///
 /// Populates `metadata` (`FormatMetadata::Ocr`, `ocr_used`, processed image
@@ -63,27 +90,36 @@ fn effective_languages(config: &OcrConfig) -> Vec<String> {
 /// requested; these backends do not perform independent language detection),
 /// and `processing_warnings` (see [`auto_rotate_unsupported_warning`]).
 ///
-/// `backend_name` is the same string each backend's `OcrBackend::name()`
-/// returns (e.g. `"candle-trocr"`) and is used only to attribute warnings.
-///
 /// This is the single call site all four candle backends route their
 /// `process_image` result through (issue #179's precedent for not pasting
 /// shared OCR-result plumbing a fifth time), which makes it the one place
 /// that needs to know about `auto_rotate` rather than four separate call
 /// sites that could drift the way the sceptre/paddle indent check did (#861).
+///
+/// The tables and detected languages below are derived from the content
+/// [`filter_implausible_lines`] filtered, not the raw model output, so a dropped line
+/// cannot surface as a stray table row or corrupt an otherwise-clean GFM table (GH#1676).
 pub(crate) fn build_ocr_document(
     content: String,
     formulas: Vec<Formula>,
-    mime_type: Cow<'static, str>,
     image_bytes: &[u8],
     config: &OcrConfig,
-    backend_name: &'static str,
+    context: OcrDocumentContext,
 ) -> ExtractedDocument {
+    let OcrDocumentContext {
+        mime_type,
+        backend_name,
+        plain_text_task,
+    } = context;
+    let (content, line_filter) = filter_implausible_lines(&content, config, plain_text_task);
     let tables = extract_gfm_tables(&content);
     let metadata = build_metadata(image_bytes, tables.len() as u32);
 
     let mut processing_warnings = Vec::new();
     if let Some(warning) = auto_rotate_unsupported_warning(config, backend_name) {
+        processing_warnings.push(warning);
+    }
+    if let Some(warning) = line_filter.into_warning(backend_name) {
         processing_warnings.push(warning);
     }
 
@@ -223,6 +259,241 @@ fn extract_gfm_tables(content: &str) -> Vec<Table> {
     tables
 }
 
+/// Minimum number of disallowed-script letters a line must contain before rule (a) in
+/// [`filter_implausible_lines`] considers dropping it (GH#1676).
+const IMPLAUSIBLE_SCRIPT_MIN_LETTERS: usize = 3;
+
+/// Minimum fraction of a line's script-classified letters that must fall in a disallowed
+/// script before rule (a) in [`filter_implausible_lines`] drops it (GH#1676).
+const IMPLAUSIBLE_SCRIPT_MIN_FRACTION: f64 = 0.5;
+
+/// Minimum number of `\command`-shaped tokens a line must contain, with no bare
+/// alphabetic word present, before rule (b) in [`filter_implausible_lines`] drops it on a
+/// plain-text OCR task (GH#1676).
+const LATEX_LINE_MIN_COMMANDS: usize = 2;
+
+/// A writing system a classified letter can belong to, for the script-plausibility check
+/// in [`filter_implausible_lines`] (GH#1676). Deliberately coarse-grained (code-point
+/// ranges, not a full script database) — enough to catch a CJK/Cyrillic/etc. run in an
+/// English-only document without pulling in a new crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Latin,
+    Cyrillic,
+    Greek,
+    Arabic,
+    Hebrew,
+    Devanagari,
+    Thai,
+    Han,
+    Kana,
+    Hangul,
+}
+
+/// Classify an already-known-alphabetic character into a [`Script`] by code-point range.
+///
+/// Returns `None` for a letter outside every range covered here (e.g. Armenian,
+/// Ethiopic): such letters are neither counted as evidence of a disallowed script nor as
+/// evidence of an allowed one, so they cannot influence rule (a) either way.
+fn classify_char(ch: char) -> Option<Script> {
+    match ch as u32 {
+        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F => Some(Script::Latin),
+        0x0370..=0x03FF => Some(Script::Greek),
+        0x0400..=0x04FF => Some(Script::Cyrillic),
+        0x0590..=0x05FF => Some(Script::Hebrew),
+        0x0600..=0x06FF | 0x0750..=0x077F => Some(Script::Arabic),
+        0x0900..=0x097F => Some(Script::Devanagari),
+        0x0E00..=0x0E7F => Some(Script::Thai),
+        0x3040..=0x30FF => Some(Script::Kana),
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => Some(Script::Han),
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7A3 => Some(Script::Hangul),
+        _ => None,
+    }
+}
+
+/// Map a configured OCR language code (ISO 639-1, ISO 639-3, or a Tesseract code) to the
+/// script(s) it is written in, for the script-plausibility allowlist in
+/// [`filter_implausible_lines`] (GH#1676).
+///
+/// Returns `None` for a code this table does not recognize, which the caller treats as
+/// "cannot judge script plausibility for this language list" and disables rule (a)
+/// entirely, rather than risk false positives against a language it cannot map.
+fn script_for_language(lang: &str) -> Option<&'static [Script]> {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "en" | "eng" | "de" | "deu" | "ger" | "fr" | "fra" | "fre" | "es" | "spa" | "it" | "ita" | "pt" | "por"
+        | "nl" | "nld" | "dut" | "pl" | "pol" | "sv" | "swe" | "tr" | "tur" | "vi" | "vie" | "id" | "ind" => {
+            Some(&[Script::Latin])
+        }
+        "ru" | "rus" | "uk" | "ukr" | "bg" | "bul" | "sr" | "srp" => Some(&[Script::Cyrillic]),
+        "el" | "ell" | "gre" => Some(&[Script::Greek]),
+        "ar" | "ara" | "fa" | "fas" | "per" | "ur" | "urd" => Some(&[Script::Arabic]),
+        "he" | "heb" | "yi" | "yid" => Some(&[Script::Hebrew]),
+        "hi" | "hin" | "mr" | "mar" | "ne" | "nep" => Some(&[Script::Devanagari]),
+        "th" | "tha" => Some(&[Script::Thai]),
+        "zh" | "zho" | "chi" | "chi_sim" | "chi_tra" => Some(&[Script::Han]),
+        "ja" | "jpn" => Some(&[Script::Han, Script::Kana]),
+        "ko" | "kor" => Some(&[Script::Hangul, Script::Han]),
+        _ => None,
+    }
+}
+
+/// Build the script allowlist for [`filter_implausible_lines`] from the configured OCR
+/// language list, or `None` when any configured language is unrecognized (which disables
+/// rule (a) entirely rather than risk false positives against a language it cannot map).
+///
+/// This deliberately reads [`effective_languages`] (the same resolution `detected_languages`
+/// already uses in [`build_ocr_document`]) rather than `config.tesseract_config.language`:
+/// none of the four candle backends consult `tesseract_config` for anything (it is a
+/// Tesseract-only field), so the language list that actually reached the model is the one
+/// `effective_languages` reports. Latin is always allowed regardless of the configured
+/// languages: Latin loanwords, product names, and numerals routinely appear even in
+/// non-Latin-script documents, and disallowing Latin would make rule (a) noisy rather than
+/// conservative.
+fn allowed_scripts(config: &OcrConfig) -> Option<Vec<Script>> {
+    let mut scripts = vec![Script::Latin];
+    for lang in effective_languages(config) {
+        let scripts_for_lang = script_for_language(&lang)?;
+        for script in scripts_for_lang {
+            if !scripts.contains(script) {
+                scripts.push(*script);
+            }
+        }
+    }
+    Some(scripts)
+}
+
+/// Count a line's script-classified letters, split into those in a disallowed script and
+/// the total classified (returns `(disallowed_count, classified_count)`).
+fn line_script_counts(line: &str, allowed: &[Script]) -> (usize, usize) {
+    let mut disallowed = 0usize;
+    let mut classified = 0usize;
+    for ch in line.chars().filter(|ch| ch.is_alphabetic()) {
+        if let Some(script) = classify_char(ch) {
+            classified += 1;
+            if !allowed.contains(&script) {
+                disallowed += 1;
+            }
+        }
+    }
+    (disallowed, classified)
+}
+
+/// Rule (a): a line is an implausible script when at least
+/// [`IMPLAUSIBLE_SCRIPT_MIN_LETTERS`] of its script-classified letters are in a script the
+/// configured OCR language list does not allow, and those disallowed letters make up at
+/// least [`IMPLAUSIBLE_SCRIPT_MIN_FRACTION`] of the line's classified letters.
+fn line_has_implausible_script(line: &str, allowed: &[Script]) -> bool {
+    let (disallowed, classified) = line_script_counts(line, allowed);
+    if classified == 0 || disallowed < IMPLAUSIBLE_SCRIPT_MIN_LETTERS {
+        return false;
+    }
+    (disallowed as f64 / classified as f64) >= IMPLAUSIBLE_SCRIPT_MIN_FRACTION
+}
+
+/// Matches a LaTeX-command-shaped token (`\` followed by one or more letters), e.g.
+/// `\alpha` or `\frac`. Used only by rule (b) in [`filter_implausible_lines`]. ~keep
+static LATEX_COMMAND_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\[A-Za-z]+").expect("static LaTeX command pattern is valid"));
+
+/// A token made only of alphabetic characters (a plain word, not a LaTeX command and not
+/// punctuation/digits) — evidence that a line is prose rather than bare markup.
+fn is_bare_alphabetic_word(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(char::is_alphabetic)
+}
+
+/// Rule (b): on a plain-text OCR task, a line with at least [`LATEX_LINE_MIN_COMMANDS`]
+/// LaTeX-command-shaped tokens and no bare alphabetic word anywhere in it reads as raw
+/// LaTeX markup rather than the prose the caller asked for.
+///
+/// The "no bare word" guard exists so a genuinely prose line that happens to mention a
+/// command name in passing is not dropped: it only fires when the *entire* line is
+/// markup, not merely contains some.
+fn line_is_bare_latex(line: &str) -> bool {
+    let command_count = LATEX_COMMAND_PATTERN.find_iter(line).count();
+    if command_count < LATEX_LINE_MIN_COMMANDS {
+        return false;
+    }
+    !line.split_whitespace().any(is_bare_alphabetic_word)
+}
+
+/// A line consisting only of a `$$` math-fence delimiter or a ``` code-fence delimiter.
+/// Lines between two such delimiters are exempt from rule (b): a genuine LaTeX block the
+/// model deliberately fenced off is not "bare" markup, it is the requested output.
+fn is_fence_boundary(trimmed_line: &str) -> bool {
+    trimmed_line == "$$" || trimmed_line.starts_with("```")
+}
+
+/// How many lines [`filter_implausible_lines`] dropped, by rule.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImplausibleLineFilter {
+    dropped_script_lines: usize,
+    dropped_latex_lines: usize,
+}
+
+impl ImplausibleLineFilter {
+    fn is_empty(&self) -> bool {
+        self.dropped_script_lines == 0 && self.dropped_latex_lines == 0
+    }
+
+    /// One combined warning naming both counts, or `None` when nothing was dropped.
+    fn into_warning(self, backend_name: &'static str) -> Option<ProcessingWarning> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(crate::core::diagnostics::warning(
+            backend_name,
+            format!(
+                "dropped {} line(s) with a script implausible for the configured OCR language(s) \
+                 and {} line(s) of bare LaTeX markup on a plain-text OCR task",
+                self.dropped_script_lines, self.dropped_latex_lines
+            ),
+        ))
+    }
+}
+
+/// Drop OCR output lines that read as noise rather than recognized text (GH#1676): a CJK
+/// run in an English-only document (rule (a), script implausibility) or bare LaTeX markup
+/// on a task that asked for plain prose (rule (b)). Conservative by design — both rules
+/// require multiple corroborating signals before dropping a line, and a `$$`/``` fenced
+/// block is exempt from rule (b) so a legitimately requested formula is never touched.
+///
+/// Returns the filtered content (lines rejoined with `\n`) and the drop counts.
+pub(crate) fn filter_implausible_lines(
+    content: &str,
+    config: &OcrConfig,
+    plain_text_task: bool,
+) -> (String, ImplausibleLineFilter) {
+    let allowed_scripts = allowed_scripts(config);
+    let mut outcome = ImplausibleLineFilter::default();
+    let mut in_fence = false;
+    let mut kept_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if is_fence_boundary(trimmed) {
+            in_fence = !in_fence;
+            kept_lines.push(line);
+            continue;
+        }
+
+        if let Some(allowed) = &allowed_scripts
+            && line_has_implausible_script(line, allowed)
+        {
+            outcome.dropped_script_lines += 1;
+            continue;
+        }
+
+        if plain_text_task && !in_fence && line_is_bare_latex(line) {
+            outcome.dropped_latex_lines += 1;
+            continue;
+        }
+
+        kept_lines.push(line);
+    }
+
+    (kept_lines.join("\n"), outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,10 +559,13 @@ mod tests {
         let doc = build_ocr_document(
             content.clone(),
             Vec::new(),
-            Cow::Borrowed("text/markdown"),
             png_1x1,
             &config,
-            "candle-trocr",
+            OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/markdown"),
+                backend_name: "candle-trocr",
+                plain_text_task: true,
+            },
         );
 
         assert_eq!(doc.content, content);
@@ -335,10 +609,13 @@ mod tests {
         let doc = build_ocr_document(
             "text".to_string(),
             Vec::new(),
-            Cow::Borrowed("text/plain"),
             &[],
             &config,
-            "candle-trocr",
+            OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/plain"),
+                backend_name: "candle-trocr",
+                plain_text_task: true,
+            },
         );
 
         assert_eq!(
@@ -369,10 +646,13 @@ mod tests {
         let doc = build_ocr_document(
             "text".to_string(),
             Vec::new(),
-            Cow::Borrowed("text/plain"),
             &[],
             &config,
-            "candle-glm-ocr",
+            OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/plain"),
+                backend_name: "candle-glm-ocr",
+                plain_text_task: true,
+            },
         );
 
         assert!(
@@ -380,5 +660,228 @@ mod tests {
             "auto_rotate: false must not produce a warning, got: {:?}",
             doc.processing_warnings
         );
+    }
+
+    /// GH#1676: a CJK run in an English-only document is implausible and is dropped, with
+    /// a warning naming the count.
+    #[test]
+    fn should_drop_cjk_line_under_english_only_language_config() {
+        let config = OcrConfig {
+            language: vec!["eng".to_string()],
+            ..Default::default()
+        };
+        let content = "Printed heading.\n这是一个测试\nMore printed prose.".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(
+            filtered, "Printed heading.\nMore printed prose.",
+            "expected the CJK line to be dropped, got: {filtered:?}"
+        );
+        assert_eq!(outcome.dropped_script_lines, 1);
+        assert_eq!(outcome.dropped_latex_lines, 0);
+        let warning = outcome
+            .into_warning("candle-paddleocr-vl")
+            .expect("a dropped line must produce a warning");
+        assert_eq!(warning.source, "candle-paddleocr-vl");
+        assert!(
+            warning.message.contains('1'),
+            "warning should name the dropped-line count, got: {}",
+            warning.message
+        );
+    }
+
+    /// GH#1676: the same CJK line is plausible once Japanese (which is written with Han
+    /// characters as well as kana) is in the configured language list.
+    #[test]
+    fn should_keep_cjk_line_when_japanese_is_configured() {
+        let config = OcrConfig {
+            language: vec!["eng".to_string(), "jpn".to_string()],
+            ..Default::default()
+        };
+        let content = "这是一个测试".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, content);
+        assert_eq!(outcome.dropped_script_lines, 0);
+    }
+
+    /// GH#1676: a `+`-joined Tesseract list (the CLI `--ocr-language` shape) is split before
+    /// the script allowlist is built, so `eng+deu` still drops a CJK line instead of being
+    /// treated as one unknown code that disables rule (a).
+    #[test]
+    fn should_split_plus_joined_language_list_before_building_the_allowlist() {
+        let config = OcrConfig {
+            language: vec!["eng+deu".to_string()],
+            ..Default::default()
+        };
+        let content = "这是一个测试".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, "");
+        assert_eq!(outcome.dropped_script_lines, 1);
+        assert_eq!(effective_languages(&config), vec!["eng".to_string(), "deu".to_string()]);
+    }
+
+    /// GH#1676: a Cyrillic run is implausible under an English-only config.
+    #[test]
+    fn should_drop_cyrillic_line_under_english_only_language_config() {
+        let config = OcrConfig {
+            language: vec!["eng".to_string()],
+            ..Default::default()
+        };
+        let content = "Привет мир".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, "");
+        assert_eq!(outcome.dropped_script_lines, 1);
+    }
+
+    /// GH#1676: the same Cyrillic run is plausible once Russian is configured.
+    #[test]
+    fn should_keep_cyrillic_line_when_russian_is_configured() {
+        let config = OcrConfig {
+            language: vec!["rus".to_string()],
+            ..Default::default()
+        };
+        let content = "Привет мир".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, content);
+        assert_eq!(outcome.dropped_script_lines, 0);
+    }
+
+    /// GH#1676: an unrecognized language code disables rule (a) entirely rather than
+    /// risk a false positive against a language the classifier cannot map.
+    #[test]
+    fn should_keep_implausible_script_line_when_language_code_is_unrecognized() {
+        let config = OcrConfig {
+            language: vec!["xx-unrecognized".to_string()],
+            ..Default::default()
+        };
+        let content = "这是一个测试".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, content, "rule (a) must be disabled for an unmapped language");
+        assert_eq!(outcome.dropped_script_lines, 0);
+    }
+
+    /// GH#1676: German umlauts are Latin-script and must never be flagged, regardless of
+    /// the configured language.
+    #[test]
+    fn should_keep_line_with_umlauts() {
+        let config = OcrConfig {
+            language: vec!["eng".to_string()],
+            ..Default::default()
+        };
+        let content = "Über die Brücke gehen wir jetzt äöüß".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, content);
+        assert_eq!(outcome.dropped_script_lines, 0);
+    }
+
+    /// GH#1676: bare LaTeX markup on a plain-text OCR task reads as noise, not
+    /// recognized prose, and is dropped.
+    #[test]
+    fn should_drop_bare_latex_line_on_plain_text_task() {
+        let config = OcrConfig::default();
+        let content = "\\alpha \\beta \\gamma".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, "");
+        assert_eq!(outcome.dropped_latex_lines, 1);
+    }
+
+    /// GH#1676: the same LaTeX line is expected, not noise, on a formula task.
+    #[test]
+    fn should_keep_bare_latex_line_on_formula_task() {
+        let config = OcrConfig::default();
+        let content = "\\alpha \\beta \\gamma".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, false);
+
+        assert_eq!(filtered, content);
+        assert_eq!(outcome.dropped_latex_lines, 0);
+    }
+
+    /// GH#1676: a `$$`-fenced math block is a deliberately requested formula, not noise,
+    /// even on a plain-text task.
+    #[test]
+    fn should_keep_latex_line_inside_dollar_fence_on_plain_text_task() {
+        let config = OcrConfig::default();
+        let content = "$$\n\\alpha \\beta \\gamma\n$$".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, content);
+        assert_eq!(outcome.dropped_latex_lines, 0);
+    }
+
+    /// GH#1676: a currency amount has no backslash commands at all and must never be
+    /// treated as LaTeX markup.
+    #[test]
+    fn should_keep_currency_amount_line() {
+        let config = OcrConfig::default();
+        let content = "Total due: $100.00".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, content);
+        assert_eq!(outcome.dropped_latex_lines, 0);
+    }
+
+    /// GH#1676: `build_ocr_document` parses tables from the *filtered* content, so a
+    /// script-implausible pseudo-table above a real one cannot inflate the table count or
+    /// corrupt the real table's header.
+    #[test]
+    fn should_count_tables_from_filtered_content_not_raw_content() {
+        let raw_content = "这是|一个测试\n----|----\n乱码|数据\n\nSome real prose.\n\n\
+            | Name | Age |\n|------|-----|\n| Alice | 30 |"
+            .to_string();
+
+        // Control: without filtering, pulldown-cmark parses the CJK block as its own
+        // (implausible) table in addition to the real one.
+        let raw_tables = extract_gfm_tables(&raw_content);
+        assert_eq!(
+            raw_tables.len(),
+            2,
+            "fixture must contain two GFM tables before filtering, got: {raw_tables:?}"
+        );
+
+        let config = OcrConfig {
+            language: vec!["eng".to_string()],
+            ..Default::default()
+        };
+        let doc = build_ocr_document(
+            raw_content,
+            Vec::new(),
+            &[],
+            &config,
+            OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/markdown"),
+                backend_name: "candle-paddleocr-vl",
+                plain_text_task: true,
+            },
+        );
+
+        assert_eq!(doc.tables.len(), 1, "expected only the real table to survive filtering");
+        assert_eq!(
+            doc.tables[0].cells[0],
+            vec!["Name".to_string(), "Age".to_string()],
+            "the real table's header must be intact, got: {:?}",
+            doc.tables[0].cells
+        );
+        let Some(FormatMetadata::Ocr(ocr_metadata)) = &doc.metadata.format else {
+            panic!("expected FormatMetadata::Ocr; got: {:?}", doc.metadata.format);
+        };
+        assert_eq!(ocr_metadata.table_count, 1);
     }
 }

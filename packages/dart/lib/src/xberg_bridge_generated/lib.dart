@@ -12760,6 +12760,9 @@ class OcrConfig {
   /// deserializing from a config file, JSON body, or the REST/MCP API, a
   /// single string is also accepted, either as one code ("eng") or
   /// "+"-joined ("eng+deu").
+  ///
+  /// The four candle-based backends also use this list to decide which scripts are
+  /// plausible in their output, dropping a line written in an unconfigured script.
   final List<String> language;
 
   /// Tesseract-specific configuration (optional)

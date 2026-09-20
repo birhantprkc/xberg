@@ -262,6 +262,10 @@ impl OcrBackend for PaddleOcrVlBackend {
     /// engine initialisation, or inference fails.
     async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument> {
         let options = self.parse_options(config)?;
+        // A non-OCR task (table/formula/chart) is expected to emit markup, so the
+        // bare-LaTeX rule in `filter_implausible_lines` must not apply to it (GH#1676).
+        // ~keep
+        let plain_text_task = options.task == PaddleOcrVlTask::Ocr;
 
         if image_bytes.is_empty() {
             return Err(crate::XbergError::Validation {
@@ -307,10 +311,13 @@ impl OcrBackend for PaddleOcrVlBackend {
         Ok(super::ocr_result::build_ocr_document(
             content,
             Vec::new(),
-            Cow::Borrowed("text/markdown"),
             image_bytes,
             config,
-            "candle-paddleocr-vl",
+            super::ocr_result::OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/markdown"),
+                backend_name: "candle-paddleocr-vl",
+                plain_text_task,
+            },
         ))
     }
 

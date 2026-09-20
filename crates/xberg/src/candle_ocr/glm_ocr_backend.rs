@@ -496,13 +496,22 @@ impl OcrBackend for GlmOcrBackend {
             }
         };
 
+        // A `Paired` layout mixes per-region tasks (table/formula/chart regions
+        // legitimately emit markup alongside OCR'd text regions), so the bare-LaTeX rule
+        // in `filter_implausible_lines` is disabled for it; only a `WholePage` call with
+        // the default OCR task is a plain-text task (GH#1676). ~keep
+        let plain_text_task = matches!(opts.layout_mode, LayoutMode::WholePage) && opts.task == GlmOcrTask::Ocr;
+
         let mut document = super::ocr_result::build_ocr_document(
             content,
             formulas,
-            Cow::Borrowed("text/markdown"),
             image_bytes,
             config,
-            "candle-glm-ocr",
+            super::ocr_result::OcrDocumentContext {
+                mime_type: Cow::Borrowed("text/markdown"),
+                backend_name: "candle-glm-ocr",
+                plain_text_task,
+            },
         );
         #[cfg(feature = "layout-detection")]
         merge_table_bounding_boxes(&mut document.tables, &table_bboxes);
@@ -1298,10 +1307,13 @@ mod tests {
         let mut doc = super::super::ocr_result::build_ocr_document(
             content,
             Vec::new(),
-            std::borrow::Cow::Borrowed("text/markdown"),
             &[],
             &config,
-            "candle-glm-ocr",
+            super::super::ocr_result::OcrDocumentContext {
+                mime_type: std::borrow::Cow::Borrowed("text/markdown"),
+                backend_name: "candle-glm-ocr",
+                plain_text_task: true,
+            },
         );
         merge_table_bounding_boxes(&mut doc.tables, &table_bboxes);
 

@@ -57,6 +57,8 @@ Eight OCR backends — pick based on platform, accuracy needs, and language cove
 The Candle backends (GLM-OCR, TrOCR, DeepSeek-OCR, PaddleOCR-VL) ship compiled in by default in the published packages for Python, Node, Go, Java, C#, Ruby, PHP, Elixir, Kotlin (JVM), Zig, and the CLI/Docker image on Linux, macOS, and Windows — no custom build or feature flag required. Model weights download automatically from Hugging Face on first use and are cached at `~/.cache/huggingface/`. They are **not** available on WebAssembly, Android, iOS, Dart, or Swift.
 :::
 
+All four Candle backends drop an output line that reads as noise rather than recognized text: a line written mostly in a script your configured `ocr.language` list does not cover (for example, a CJK run on an English-only document), or a plain-text OCR line that is mostly bare LaTeX markup with no ordinary word in it. A `$$`/``` fenced block, and a line produced by an explicit table/formula/chart task, are never touched. A dropped line adds a `ProcessingWarning` naming how many lines were removed.
+
 |                  | **Tesseract**        | **PaddleOCR**                       | **Sceptre**                 | **Candle GLM-OCR** | **Candle TrOCR** | **Candle DeepSeek-OCR** | **Candle PaddleOCR-VL** | **VLM**                  |
 | ---------------- | -------------------- | ----------------------------------- | --------------------------- | ------------------ | ---------------- | ----------------------- | ----------------------- | ------------------------ |
 | **Speed**        | Fast                 | Model-dependent                     | Fast on CPU                 | Moderate           | Moderate         | Moderate                | Moderate                | Slow (API latency)       |
