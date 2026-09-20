@@ -37,16 +37,24 @@ use crate::ocr_metadata_keys::OCR_PROCESSED_IMAGE_WIDTH_METADATA_KEY as PROCESSE
 /// `"ocr-wasm"` / `paddle_ocr` / `liter-llm`. ~keep
 const DEFAULT_LANGUAGE: &str = "eng";
 
+/// Separator Tesseract uses between language codes in one string (`eng+deu`).
+const TESSERACT_LANGUAGE_SEPARATOR: char = '+';
+
 /// The languages the caller requested, with blanks dropped and the documented
 /// default applied when none remain. These candle backends do not perform
 /// independent language detection, so this reports the requested languages
 /// rather than a detected set — matching the Sceptre backend's `languages`
 /// field for the same reason.
+///
+/// A `+`-joined Tesseract list (`eng+deu`) is split the way `OcrConfig`'s
+/// deserializer splits it: the CLI `--ocr-language` override stores the raw flag value,
+/// so this is the only place that shape is normalised before the script allowlist reads it.
 fn effective_languages(config: &OcrConfig) -> Vec<String> {
     let langs: Vec<String> = config
         .language
         .iter()
-        .map(|lang| lang.trim())
+        .flat_map(|lang| lang.split(TESSERACT_LANGUAGE_SEPARATOR))
+        .map(str::trim)
         .filter(|lang| !lang.is_empty())
         .map(str::to_string)
         .collect();
@@ -697,6 +705,24 @@ mod tests {
 
         assert_eq!(filtered, content);
         assert_eq!(outcome.dropped_script_lines, 0);
+    }
+
+    /// GH#1676: a `+`-joined Tesseract list (the CLI `--ocr-language` shape) is split before
+    /// the script allowlist is built, so `eng+deu` still drops a CJK line instead of being
+    /// treated as one unknown code that disables rule (a).
+    #[test]
+    fn should_split_plus_joined_language_list_before_building_the_allowlist() {
+        let config = OcrConfig {
+            language: vec!["eng+deu".to_string()],
+            ..Default::default()
+        };
+        let content = "这是一个测试".to_string();
+
+        let (filtered, outcome) = filter_implausible_lines(&content, &config, true);
+
+        assert_eq!(filtered, "");
+        assert_eq!(outcome.dropped_script_lines, 1);
+        assert_eq!(effective_languages(&config), vec!["eng".to_string(), "deu".to_string()]);
     }
 
     /// GH#1676: a Cyrillic run is implausible under an English-only config.
