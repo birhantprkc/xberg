@@ -63,7 +63,7 @@ mod imp {
     pub(crate) const REPETITION_PENALTY_WINDOW: usize = 64;
 
     /// Trailing slice of `ids`, at most [`REPETITION_PENALTY_WINDOW`] tokens.
-    fn repetition_penalty_window(ids: &[u32]) -> &[u32] {
+    pub(crate) fn repetition_penalty_window(ids: &[u32]) -> &[u32] {
         let start = ids.len().saturating_sub(REPETITION_PENALTY_WINDOW);
         &ids[start..]
     }
@@ -384,7 +384,7 @@ pub use imp::{generate, generate_mrope};
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod tests {
-    use super::imp::{REPETITION_PENALTY_WINDOW, apply_repetition_penalty, sample_nucleus};
+    use super::imp::{REPETITION_PENALTY_WINDOW, apply_repetition_penalty, repetition_penalty_window, sample_nucleus};
     use crate::error::Result;
     use candle_core::{Device, Tensor};
 
@@ -433,6 +433,23 @@ mod tests {
     /// A token that fell outside the trailing [`REPETITION_PENALTY_WINDOW`] must not be
     /// penalised -- the window bounds how far back the penalty looks, so a token from many
     /// steps ago cannot keep suppressing itself for the rest of decoding.
+    #[test]
+    fn window_keeps_only_the_trailing_tokens() {
+        let short: Vec<u32> = (0..10).collect();
+        assert_eq!(repetition_penalty_window(&short), &short[..]);
+
+        let long: Vec<u32> = (0..(REPETITION_PENALTY_WINDOW as u32 + 5)).collect();
+        let window = repetition_penalty_window(&long);
+        assert_eq!(window.len(), REPETITION_PENALTY_WINDOW);
+        assert_eq!(window[0], 5);
+        assert_eq!(
+            window[REPETITION_PENALTY_WINDOW - 1],
+            REPETITION_PENALTY_WINDOW as u32 + 4
+        );
+
+        assert_eq!(repetition_penalty_window(&[]), &[] as &[u32]);
+    }
+
     #[test]
     fn tokens_outside_window_are_not_penalised() {
         let device = Device::Cpu;
