@@ -249,6 +249,23 @@ pub struct OcrQualityThresholds {
     /// is `true`.
     #[serde(default = "default_min_provenance_fallback_ratio")]
     pub min_provenance_fallback_ratio: f64,
+
+    /// Whether to route a page to OCR when its decoded text does not read as any real,
+    /// detectable language (issue #1696). Unlike `enable_provenance_ocr_routing`, this
+    /// catches a `/ToUnicode` CMap that resolves every glyph to *a* character, but
+    /// consistently the WRONG one (e.g. a ROT-shifted mapping) -- text that is structurally
+    /// indistinguishable from real prose to every character-shape check, including the
+    /// provenance signal, because the mapping tier really is file-backed. Defaults to `true`.
+    #[serde(default = "default_enable_plausibility_ocr_routing")]
+    pub enable_plausibility_ocr_routing: bool,
+
+    /// Minimum fraction of a page's language-detection chunks that whatlang classifies as
+    /// reliable (`Info::is_reliable()`) before the page is trusted as legible (issue #1696).
+    /// Below this AND below the mean-confidence guard together, the page's text layer is
+    /// treated as implausible and routed to OCR. Only used when
+    /// `enable_plausibility_ocr_routing` is `true`.
+    #[serde(default = "default_min_reliable_language_chunk_ratio")]
+    pub min_reliable_language_chunk_ratio: f64,
 }
 
 const DISABLED_DICTIONARY_INVALID_WORD_RATIO: f64 = 1.01;
@@ -268,6 +285,10 @@ impl OcrQualityThresholds {
             ("pipeline_min_quality", self.pipeline_min_quality),
             ("min_undecodable_ratio", self.min_undecodable_ratio),
             ("min_provenance_fallback_ratio", self.min_provenance_fallback_ratio),
+            (
+                "min_reliable_language_chunk_ratio",
+                self.min_reliable_language_chunk_ratio,
+            ),
         ];
         for (field, value) in unit_ratios {
             validate_quality_value(path, field, value, 0.0, 1.0)?;
@@ -341,6 +362,8 @@ impl Default for OcrQualityThresholds {
             min_undecodable_ratio: default_min_undecodable_ratio(),
             enable_provenance_ocr_routing: default_enable_provenance_ocr_routing(),
             min_provenance_fallback_ratio: default_min_provenance_fallback_ratio(),
+            enable_plausibility_ocr_routing: default_enable_plausibility_ocr_routing(),
+            min_reliable_language_chunk_ratio: default_min_reliable_language_chunk_ratio(),
         }
     }
 }
@@ -422,6 +445,20 @@ fn default_enable_provenance_ocr_routing() -> bool {
 /// are treated as having a fabricated text layer (issue #1254).
 fn default_min_provenance_fallback_ratio() -> f64 {
     0.5
+}
+/// Language/dictionary-plausibility OCR routing is on by default: false positives are rare
+/// because the check abstains (`NotEvaluated`) on any page without enough prose to judge, and
+/// requires both a low reliable-chunk ratio AND a low mean confidence to flag one (issue
+/// #1696).
+fn default_enable_plausibility_ocr_routing() -> bool {
+    true
+}
+/// Calibrated in `tools/benchmark-harness/scripts/plausibility_calibrate.py` against the
+/// `wrong_mapping` corpus (100% recall target) and the `native-clean`/table/formula cohorts
+/// (false-positive ceilings); see that script's own doc comment for the measured numbers
+/// (issue #1696).
+fn default_min_reliable_language_chunk_ratio() -> f64 {
+    0.10
 }
 
 /// A single backend stage in the OCR pipeline.
@@ -2273,6 +2310,29 @@ mod tests {
         let thresholds: OcrQualityThresholds = serde_json::from_str(json).unwrap();
         assert!(!thresholds.enable_provenance_ocr_routing);
         assert!((thresholds.min_provenance_fallback_ratio - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_plausibility_ocr_routing_defaults_enabled_with_tenth_ratio() {
+        let thresholds = OcrQualityThresholds::default();
+        assert!(thresholds.enable_plausibility_ocr_routing);
+        assert!((thresholds.min_reliable_language_chunk_ratio - 0.10).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_plausibility_ocr_routing_deserializes_overrides() {
+        let json = r#"{"enable_plausibility_ocr_routing": false, "min_reliable_language_chunk_ratio": 0.25}"#;
+        let thresholds: OcrQualityThresholds = serde_json::from_str(json).unwrap();
+        assert!(!thresholds.enable_plausibility_ocr_routing);
+        assert!((thresholds.min_reliable_language_chunk_ratio - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn should_reject_out_of_range_min_reliable_language_chunk_ratio() {
+        let json = r#"{"ocr": {"quality_thresholds": {"min_reliable_language_chunk_ratio": 1.5}}}"#;
+        let config: crate::ExtractionConfig = serde_json::from_str(json).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("min_reliable_language_chunk_ratio"));
     }
 
     #[test]

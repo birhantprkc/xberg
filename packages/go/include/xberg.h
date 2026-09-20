@@ -18447,6 +18447,22 @@ double xberg_ocr_quality_thresholds_min_provenance_fallback_ratio(
     XBERGAlefHandle handle);
 
 /**
+ * Get the `enable_plausibility_ocr_routing` field from a
+ * `OcrQualityThresholds`. # Safety Pointer must be a valid handle returned by
+ * this library.
+ */
+int32_t xberg_ocr_quality_thresholds_enable_plausibility_ocr_routing(
+    XBERGAlefHandle handle);
+
+/**
+ * Get the `min_reliable_language_chunk_ratio` field from a
+ * `OcrQualityThresholds`. # Safety Pointer must be a valid handle returned by
+ * this library.
+ */
+double xberg_ocr_quality_thresholds_min_reliable_language_chunk_ratio(
+    XBERGAlefHandle handle);
+
+/**
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */
@@ -20635,6 +20651,17 @@ char *xberg_pdf_metadata_scanned_pages(XBERGAlefHandle handle);
  * Pointer must be a valid handle returned by this library.
  */
 char *xberg_pdf_metadata_fabricated_text_pages(XBERGAlefHandle handle);
+#endif
+
+#if defined(XBERG_FEATURE_PDF)
+/**
+ * Get the `implausible_text_pages` field from a `PdfMetadata`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `xberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *xberg_pdf_metadata_implausible_text_pages(XBERGAlefHandle handle);
 #endif
 
 #if defined(XBERG_FEATURE_PDF)

@@ -21682,8 +21682,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   OcrQualityThresholds dco_decode_ocr_quality_thresholds(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 24)
-      throw Exception('unexpected arr length: expect 24 but see ${arr.length}');
+    if (arr.length != 26)
+      throw Exception('unexpected arr length: expect 26 but see ${arr.length}');
     return OcrQualityThresholds(
       minTotalNonWhitespace: dco_decode_i_64(arr[0]),
       minNonWhitespacePerPage: dco_decode_f_64(arr[1]),
@@ -21709,6 +21709,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       minUndecodableRatio: dco_decode_f_64(arr[21]),
       enableProvenanceOcrRouting: dco_decode_bool(arr[22]),
       minProvenanceFallbackRatio: dco_decode_f_64(arr[23]),
+      enablePlausibilityOcrRouting: dco_decode_bool(arr[24]),
+      minReliableLanguageChunkRatio: dco_decode_f_64(arr[25]),
     );
   }
 
@@ -23120,8 +23122,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PdfMetadata dco_decode_pdf_metadata(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 11)
-      throw Exception('unexpected arr length: expect 11 but see ${arr.length}');
+    if (arr.length != 12)
+      throw Exception('unexpected arr length: expect 12 but see ${arr.length}');
     return PdfMetadata(
       pdfVersion: dco_decode_opt_String(arr[0]),
       producer: dco_decode_opt_String(arr[1]),
@@ -23132,8 +23134,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       scannedConfidence: dco_decode_opt_box_autoadd_f_64(arr[6]),
       scannedPages: dco_decode_opt_list_prim_i_64_strict(arr[7]),
       fabricatedTextPages: dco_decode_opt_list_prim_i_64_strict(arr[8]),
-      layoutGatedPages: dco_decode_opt_list_prim_i_64_strict(arr[9]),
-      layoutGateReasons: dco_decode_opt_list_String(arr[10]),
+      implausibleTextPages: dco_decode_opt_list_prim_i_64_strict(arr[9]),
+      layoutGatedPages: dco_decode_opt_list_prim_i_64_strict(arr[10]),
+      layoutGateReasons: dco_decode_opt_list_String(arr[11]),
     );
   }
 
@@ -31721,6 +31724,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_minUndecodableRatio = sse_decode_f_64(deserializer);
     var var_enableProvenanceOcrRouting = sse_decode_bool(deserializer);
     var var_minProvenanceFallbackRatio = sse_decode_f_64(deserializer);
+    var var_enablePlausibilityOcrRouting = sse_decode_bool(deserializer);
+    var var_minReliableLanguageChunkRatio = sse_decode_f_64(deserializer);
     return OcrQualityThresholds(
       minTotalNonWhitespace: var_minTotalNonWhitespace,
       minNonWhitespacePerPage: var_minNonWhitespacePerPage,
@@ -31746,6 +31751,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       minUndecodableRatio: var_minUndecodableRatio,
       enableProvenanceOcrRouting: var_enableProvenanceOcrRouting,
       minProvenanceFallbackRatio: var_minProvenanceFallbackRatio,
+      enablePlausibilityOcrRouting: var_enablePlausibilityOcrRouting,
+      minReliableLanguageChunkRatio: var_minReliableLanguageChunkRatio,
     );
   }
 
@@ -34028,6 +34035,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_fabricatedTextPages = sse_decode_opt_list_prim_i_64_strict(
       deserializer,
     );
+    var var_implausibleTextPages = sse_decode_opt_list_prim_i_64_strict(
+      deserializer,
+    );
     var var_layoutGatedPages = sse_decode_opt_list_prim_i_64_strict(
       deserializer,
     );
@@ -34042,6 +34052,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       scannedConfidence: var_scannedConfidence,
       scannedPages: var_scannedPages,
       fabricatedTextPages: var_fabricatedTextPages,
+      implausibleTextPages: var_implausibleTextPages,
       layoutGatedPages: var_layoutGatedPages,
       layoutGateReasons: var_layoutGateReasons,
     );
@@ -42126,6 +42137,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_f_64(self.minUndecodableRatio, serializer);
     sse_encode_bool(self.enableProvenanceOcrRouting, serializer);
     sse_encode_f_64(self.minProvenanceFallbackRatio, serializer);
+    sse_encode_bool(self.enablePlausibilityOcrRouting, serializer);
+    sse_encode_f_64(self.minReliableLanguageChunkRatio, serializer);
   }
 
   @protected
@@ -44263,6 +44276,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_f_64(self.scannedConfidence, serializer);
     sse_encode_opt_list_prim_i_64_strict(self.scannedPages, serializer);
     sse_encode_opt_list_prim_i_64_strict(self.fabricatedTextPages, serializer);
+    sse_encode_opt_list_prim_i_64_strict(self.implausibleTextPages, serializer);
     sse_encode_opt_list_prim_i_64_strict(self.layoutGatedPages, serializer);
     sse_encode_opt_list_String(self.layoutGateReasons, serializer);
   }

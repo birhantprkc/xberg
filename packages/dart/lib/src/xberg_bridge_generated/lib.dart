@@ -13430,6 +13430,21 @@ class OcrQualityThresholds {
   /// is `true`.
   final double minProvenanceFallbackRatio;
 
+  /// Whether to route a page to OCR when its decoded text does not read as any real,
+  /// detectable language (issue #1696). Unlike `enable_provenance_ocr_routing`, this
+  /// catches a `/ToUnicode` CMap that resolves every glyph to *a* character, but
+  /// consistently the WRONG one (e.g. a ROT-shifted mapping) -- text that is structurally
+  /// indistinguishable from real prose to every character-shape check, including the
+  /// provenance signal, because the mapping tier really is file-backed. Defaults to `true`.
+  final bool enablePlausibilityOcrRouting;
+
+  /// Minimum fraction of a page's language-detection chunks that whatlang classifies as
+  /// reliable (`Info::is_reliable()`) before the page is trusted as legible (issue #1696).
+  /// Below this AND below the mean-confidence guard together, the page's text layer is
+  /// treated as implausible and routed to OCR. Only used when
+  /// `enable_plausibility_ocr_routing` is `true`.
+  final double minReliableLanguageChunkRatio;
+
   const OcrQualityThresholds({
     required this.minTotalNonWhitespace,
     required this.minNonWhitespacePerPage,
@@ -13455,6 +13470,8 @@ class OcrQualityThresholds {
     required this.minUndecodableRatio,
     required this.enableProvenanceOcrRouting,
     required this.minProvenanceFallbackRatio,
+    required this.enablePlausibilityOcrRouting,
+    required this.minReliableLanguageChunkRatio,
   });
 
   @override
@@ -13482,7 +13499,9 @@ class OcrQualityThresholds {
       pipelineMinQuality.hashCode ^
       minUndecodableRatio.hashCode ^
       enableProvenanceOcrRouting.hashCode ^
-      minProvenanceFallbackRatio.hashCode;
+      minProvenanceFallbackRatio.hashCode ^
+      enablePlausibilityOcrRouting.hashCode ^
+      minReliableLanguageChunkRatio.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -13514,7 +13533,9 @@ class OcrQualityThresholds {
           pipelineMinQuality == other.pipelineMinQuality &&
           minUndecodableRatio == other.minUndecodableRatio &&
           enableProvenanceOcrRouting == other.enableProvenanceOcrRouting &&
-          minProvenanceFallbackRatio == other.minProvenanceFallbackRatio;
+          minProvenanceFallbackRatio == other.minProvenanceFallbackRatio &&
+          enablePlausibilityOcrRouting == other.enablePlausibilityOcrRouting &&
+          minReliableLanguageChunkRatio == other.minReliableLanguageChunkRatio;
 }
 
 /// Rotation information for an OCR element.
@@ -15117,9 +15138,21 @@ class PdfMetadata {
   /// structurally like prose (issue #1667: a broken mapping that lands on ordinary
   /// letters and punctuation passes every character-shape check but is still fabricated).
   ///
-  /// `None` when `OcrQualityThresholds::enable_provenance_ocr_routing` is `false` or the
-  /// document could not be inspected; empty when no page qualifies.
+  /// `None` when `OcrQualityThresholds::enable_provenance_ocr_routing` is `false`; empty
+  /// when no page qualifies.
   final Int64List? fabricatedTextPages;
+
+  /// Pages whose native text layer reads as no real detectable language (1-indexed): a
+  /// `/ToUnicode` CMap (or other mapping tier) that resolves every glyph to *a* character,
+  /// consistently the WRONG one (e.g. a ROT-shifted mapping), so the page is structurally
+  /// indistinguishable from real prose to `fabricated_text_pages`'s provenance check and to
+  /// every character-shape heuristic (issue #1696; issue #1667's `quality_score: 1.0` with
+  /// no warning on such a page is the same underlying gap). This is a content-plausibility
+  /// fact, independent of `fabricated_text_pages` and of `scanned_pages`.
+  ///
+  /// `None` when `OcrQualityThresholds::enable_plausibility_ocr_routing` is `false`; empty
+  /// when no page qualifies.
+  final Int64List? implausibleTextPages;
 
   /// Pages the `auto` layout strategy skipped (1-indexed).
   ///
@@ -15144,6 +15177,7 @@ class PdfMetadata {
     this.scannedConfidence,
     this.scannedPages,
     this.fabricatedTextPages,
+    this.implausibleTextPages,
     this.layoutGatedPages,
     this.layoutGateReasons,
   });
@@ -15159,6 +15193,7 @@ class PdfMetadata {
       scannedConfidence.hashCode ^
       scannedPages.hashCode ^
       fabricatedTextPages.hashCode ^
+      implausibleTextPages.hashCode ^
       layoutGatedPages.hashCode ^
       layoutGateReasons.hashCode;
 
@@ -15176,6 +15211,7 @@ class PdfMetadata {
           scannedConfidence == other.scannedConfidence &&
           scannedPages == other.scannedPages &&
           fabricatedTextPages == other.fabricatedTextPages &&
+          implausibleTextPages == other.implausibleTextPages &&
           layoutGatedPages == other.layoutGatedPages &&
           layoutGateReasons == other.layoutGateReasons;
 }
