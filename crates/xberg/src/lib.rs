@@ -124,7 +124,10 @@ pub mod late_interaction;
     feature = "reranker",
     feature = "sparse-embeddings",
     feature = "late-interaction",
-    feature = "candle-ocr"
+    feature = "candle-trocr",
+    feature = "candle-paddleocr-vl",
+    feature = "candle-glm-ocr",
+    feature = "candle-deepseek-ocr"
 ))]
 mod engine_cache;
 

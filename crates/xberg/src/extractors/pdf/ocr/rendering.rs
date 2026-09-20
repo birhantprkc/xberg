@@ -568,16 +568,17 @@ pub(super) fn valid_page_indices(page_indices: &[usize], page_count: usize) -> V
 /// rayon's work-stealing pool to use).
 ///
 /// #1690: `RENDER_CALL_THREAD_IDS` below is test-only instrumentation (compiled under
-/// `#[cfg(test)]` alone, no feature gate, so it never reaches a release build) that lets
+/// `cfg(test)` plus the gates of its only users, so it never reaches a release build and is
+/// never dead under a feature leg that lacks those users) that lets
 /// a test observe which OS threads actually executed page renders -- the mechanism a
 /// regression here breaks -- rather than inferring parallelism from wall-clock duration,
 /// which flakes under shared-box load. See `parallel_render_dispatches_across_more_than_one_thread`
 /// in `ocr/tests.rs`.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 pub(super) static RENDER_CALL_THREAD_IDS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
 > = std::sync::OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, feature = "ocr", feature = "pdf"))]
 pub(super) fn clear_render_call_thread_ids() {
     RENDER_CALL_THREAD_IDS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
@@ -585,7 +586,7 @@ pub(super) fn clear_render_call_thread_ids() {
         .unwrap()
         .clear();
 }
-#[cfg(test)]
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 fn record_render_thread() {
     RENDER_CALL_THREAD_IDS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
