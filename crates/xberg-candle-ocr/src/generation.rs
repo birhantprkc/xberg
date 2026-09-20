@@ -154,6 +154,28 @@ mod tests {
         );
     }
 
+    /// Documents where the false-positive boundary sits: once identical short rows fill the
+    /// whole window (`REPEAT_GUARD_WINDOW / period` copies, 22 rows of period 6 here) the guard
+    /// cannot tell a legitimate run from a hallucinated one and collapses it to a single row.
+    /// A page with that many byte-identical rows is accepted as the cost of catching #1674.
+    #[test]
+    fn should_collapse_identical_short_rows_once_they_fill_the_window() {
+        let unit = [11u32, 12, 13, 14, 15, 16];
+        let rows_filling_window = REPEAT_GUARD_WINDOW.div_ceil(unit.len());
+        let mut ids = repeated(&unit, rows_filling_window);
+        assert_eq!(
+            degenerate_tail_period(
+                &ids[..ids.len() - unit.len()],
+                REPEAT_GUARD_WINDOW,
+                REPEAT_GUARD_MAX_PERIOD
+            ),
+            None,
+            "one row short of the window must still be accepted"
+        );
+        assert_eq!(stop_if_degenerate(&mut ids), Some(unit.len()));
+        assert_eq!(ids, unit.to_vec());
+    }
+
     #[test]
     fn should_not_flag_a_strictly_increasing_sequence() {
         let ids: Vec<u32> = (0..REPEAT_GUARD_WINDOW as u32).collect();
