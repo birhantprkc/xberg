@@ -236,6 +236,26 @@ fn build_letter_prose_pdf(lines: &[String]) -> Vec<u8> {
     pdf
 }
 
+/// Greedy word wrap of `text` into lines of at most `max_chars` characters.
+#[cfg(all(feature = "candle-deepseek-ocr", feature = "pdf", not(target_arch = "wasm32")))]
+fn wrap_words(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > max_chars {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 /// Width and height from a PNG's IHDR chunk (bytes 16..24: signature(8) + length(4) + "IHDR"(4)).
 #[cfg(all(feature = "candle-deepseek-ocr", feature = "pdf", not(target_arch = "wasm32")))]
 fn png_dimensions(png_bytes: &[u8]) -> (u32, u32) {
@@ -284,13 +304,41 @@ async fn candle_deepseek_ocr_reads_a_full_letter_page_of_prose() {
     use xberg::plugins::OcrBackend as _;
     use xberg::render_pdf_page_to_png;
 
-    const PARAGRAPH: &str = "The quick brown fox jumps over the lazy dog near the riverbank \
-        every single morning before the sun has fully risen above the eastern hills, and the \
-        old town clock strikes seven while the bakery on the corner opens its doors to the \
-        first customers of the day, filling the crisp autumn air with the warm scent of fresh \
-        bread and roasted coffee beans as delivery trucks rumble slowly down the cobblestone \
-        street past the small bookshop that has stood on this corner for nearly a century.";
-    let lines: Vec<String> = std::iter::repeat_n(PARAGRAPH, 4).map(str::to_string).collect();
+    const PARAGRAPHS: [&str; 6] = [
+        "The quick brown fox jumps over the lazy dog near the riverbank every single morning before \
+         the sun has fully risen above the eastern hills, and the old town clock strikes seven while \
+         the bakery on the corner opens its doors to the first customers of the day, filling the \
+         crisp autumn air with the warm scent of fresh bread and roasted coffee beans.",
+        "Delivery trucks rumble slowly down the cobblestone street past the small bookshop that has \
+         stood on this corner for nearly a century, its window display changing with the seasons but \
+         its hand-painted sign never once repainted, a fact the owner mentions to anyone who lingers \
+         long enough at the counter to hear the story told from the beginning.",
+        "By nine the market square fills with vendors unfolding canvas awnings over crates of pears, \
+         late tomatoes and bundled herbs, while a violinist near the fountain tunes against the noise \
+         of the tram bell and the schoolchildren cutting through on their way to the river path that \
+         curves north toward the mill and the footbridge beyond it.",
+        "In the afternoon the light shifts to the west side of the street and the cafe tables move \
+         with it, chairs scraping across the flagstones as regulars trade seats for shade, and the \
+         last of the morning bread is marked down and sold in paper bags to students who eat it on \
+         the steps of the library before the reading room opens again at four.",
+        "Evening brings the ferry horn from the lower harbour and the slow return of the fishing \
+         boats, their decks stacked with grey crates that the dock crew passes hand to hand into \
+         the cold store, while gulls settle on the breakwater and the harbourmaster logs each \
+         arrival in a ledger he still keeps in pencil despite the terminal on his desk.",
+        "After dark the square empties except for the couple who run the late kiosk, selling \
+         newspapers, matches and the last sandwiches of the day to the night shift heading for \
+         the station, and the town settles into the quiet hum of the streetlamps until the bakery \
+         ovens are lit again a little before five and the whole cycle begins once more.",
+    ];
+    // ~keep: 11 pt Helvetica averages ~5.5 pt per character, so a 468 pt text column holds
+    // about 85 characters; longer lines run off the page unrendered and the model correctly
+    // reads only their visible heads (447 chars for four 484-char lines), which is exactly the
+    // fixture defect this wrapping exists to prevent.
+    const MAX_LINE_CHARS: usize = 80;
+    let lines: Vec<String> = PARAGRAPHS
+        .iter()
+        .flat_map(|paragraph| wrap_words(paragraph, MAX_LINE_CHARS))
+        .collect();
     let source_chars: usize = lines.iter().map(|l| l.len()).sum();
     assert!(
         source_chars > 1900,

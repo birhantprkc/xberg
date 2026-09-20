@@ -6,28 +6,33 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 
 use crate::error::{CandleOcrError, Result};
 
-/// Linear 1D interpolation for tensors.
+/// Linear 1D interpolation along the last axis of a `(batch, channels, length)` tensor, with
+/// PyTorch's `align_corners=False` (half-pixel) sample placement — the mode the reference
+/// SAM `get_rel_pos` uses when it resizes the relative-position table to the tile size.
 pub fn interpolate_linear_1d(input: &Tensor, target_size: usize, _align_corner: Option<bool>) -> Result<Tensor> {
     let src_size = input.dim(2)?;
     if src_size == target_size {
         return Ok(input.clone());
     }
-    let ratio = (src_size - 1) as f32 / (target_size - 1).max(1) as f32;
-    let mut output = Vec::new();
+    let scale = src_size as f64 / target_size as f64;
+    let mut output = Vec::with_capacity(target_size);
     for i in 0..target_size {
-        let src_i = i as f32 * ratio;
-        let src_i_floor = src_i.floor() as usize;
+        let src_i = ((i as f64 + HALF_PIXEL) * scale - HALF_PIXEL).max(0.0);
+        let src_i_floor = (src_i.floor() as usize).min(src_size - 1);
         let src_i_ceil = (src_i_floor + 1).min(src_size - 1);
-        let weight = src_i - src_i_floor as f32;
-        let val_floor = input.i((.., .., src_i_floor))?;
-        let val_ceil = input.i((.., .., src_i_ceil))?;
-        let val = val_floor
-            .mul(&Tensor::new(&[1.0 - weight], input.device())?)?
-            .add(&val_ceil.mul(&Tensor::new(&[weight], input.device())?)?)?;
-        output.push(val);
+        let weight = src_i - src_i_floor as f64;
+        // ~keep: `affine` scales every channel by the scalar; a `mul` against a `[1]` tensor is
+        // not a broadcast in candle and fails with "shape mismatch in mul, lhs: [1, 64], rhs: [1]"
+        // the first time a 640 px local crop resizes the 1024 px rel-pos table (GH#1701, #1702).
+        let val_floor = input.i((.., .., src_i_floor))?.affine(1.0 - weight, 0.0)?;
+        let val_ceil = input.i((.., .., src_i_ceil))?.affine(weight, 0.0)?;
+        output.push(val_floor.add(&val_ceil)?.unsqueeze(2)?);
     }
     Tensor::cat(&output, 2).map_err(|e| CandleOcrError::InferenceFailed(format!("cat failed: {e}")))
 }
+
+/// Half-pixel offset of PyTorch's `align_corners=False` sample placement.
+const HALF_PIXEL: f64 = 0.5;
 
 /// Bicubic interpolation for spatial tensors.
 pub fn interpolate_bicubic(
@@ -236,6 +241,31 @@ mod tests {
     /// The shape the SAM encoder hits on a 640 px local crop: a (1, 64, 127) rel-pos table
     /// resized to 79 positions. The old implementation failed here with a candle shape
     /// mismatch instead of interpolating (GH#1701).
+    #[test]
+    fn interpolate_linear_1d_resizes_a_rel_pos_table_to_the_crop_length() {
+        let dev = Device::Cpu;
+        let input = Tensor::arange(0f32, 64.0 * 127.0, &dev)
+            .and_then(|t| t.reshape((1, 64, 127)))
+            .expect("input");
+
+        let resized = interpolate_linear_1d(&input, 79, None).expect("interpolate");
+
+        assert_eq!(resized.dims(), &[1, 64, 79]);
+    }
+
+    /// Values follow PyTorch `F.interpolate(mode="linear")` with `align_corners=False`:
+    /// `[0, 1, 2, 3]` upsampled to 8 samples is `[0, .25, .75, 1.25, 1.75, 2.25, 2.75, 3]`.
+    #[test]
+    fn interpolate_linear_1d_matches_half_pixel_linear_sampling() {
+        let dev = Device::Cpu;
+        let input = Tensor::new(&[[[0f32, 1.0, 2.0, 3.0]]], &dev).expect("input");
+
+        let resized = interpolate_linear_1d(&input, 8, None).expect("interpolate");
+
+        let values = resized.flatten_all().and_then(|t| t.to_vec1::<f32>()).expect("read");
+        assert_eq!(values, vec![0.0, 0.25, 0.75, 1.25, 1.75, 2.25, 2.75, 3.0]);
+    }
+
     #[test]
     fn prepare_causal_attention_mask_hides_future_positions() {
         let dev = Device::Cpu;
