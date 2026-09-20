@@ -91,6 +91,58 @@ fn should_skip_pdf_image_ocr(doc: &InternalDocument, image: &crate::types::Extra
     image_area / (page_width * page_height) >= FULL_PAGE_IMAGE_AREA_RATIO
 }
 
+/// Whether `ExtractedDocument.images` must survive past embedded-image OCR (GH#1703).
+///
+/// `needs_image_data`/`runs_ocr_on_embedded_images` (GH#1662) are the READ gate: they make a
+/// container read an embedded image's bytes so OCR has something to decode. This is the WRITE
+/// gate, asked once rendering (which folds `ExtractedImage.ocr_result.content` into `content`
+/// for every `ElementKind::Image`, `doc.rs`'s render_plain/render_markdown/etc.) has already
+/// consumed those bytes: it widens `wants_own_bytes_in_result` (extract_images/captioning/
+/// qr_codes) with the two other ways the same bytes end up wanted in the output rather than
+/// merely read for OCR input — `pdf_options.ocr_inline_images` (the OCR'd images ARE the
+/// requested result, see `test_ocr_inline_images_enters_decompression_path`) and
+/// `images.include_page_rasters` (per-page OCR renders live in this same `Vec`). Without this,
+/// every OCR'd container returned every embedded image's raw bytes regardless of `images`,
+/// because the GH#1662 read gate has no matching write-side gate of its own. ~keep
+fn should_retain_images_after_ocr(config: &ExtractionConfig) -> bool {
+    if config.wants_own_bytes_in_result() {
+        return true;
+    }
+    #[cfg(feature = "pdf")]
+    if config
+        .pdf_options
+        .as_ref()
+        .is_some_and(|options| options.ocr_inline_images)
+    {
+        return true;
+    }
+    config.images.as_ref().is_some_and(|images| images.include_page_rasters)
+}
+
+/// Drop `result.images` once OCR has consumed the bytes and rendering has folded any
+/// per-image OCR text into `content` (GH#1703), keeping `PageContent::image_indices`
+/// consistent with the now-empty `images` collection they index into. Returns how many
+/// images were dropped so `DocumentCounts::images` (documented as always populated, even
+/// when the collection itself is not returned) can still report them.
+///
+/// Must run AFTER `derive_extraction_result`, not before: that call is what renders
+/// `content` from `doc.elements` + `doc.images` in the first place (`render_plain`,
+/// `render_markdown`, …), reading `ExtractedImage.ocr_result` off each `ElementKind::Image`
+/// element as it goes. Clearing the bytes any earlier would silently drop that OCR text
+/// along with the raw image data instead of just the bytes GH#1703 is about. Chunk-level
+/// `image_indices` need no matching cleanup: `execute_chunking` only populates them from
+/// `result.images.is_some()`, so setting `images` to `None` here already keeps chunks
+/// consistent by construction. ~keep
+fn drop_ocr_only_images(result: &mut ExtractedDocument) -> usize {
+    let dropped = result.images.take().map_or(0, |images| images.len());
+    if let Some(ref mut pages) = result.pages {
+        for page in pages.iter_mut() {
+            page.image_indices.clear();
+        }
+    }
+    dropped
+}
+
 #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
 fn page_has_extracted_text(doc: &InternalDocument, page_number: Option<u32>) -> bool {
     let Some(page_number) = page_number else {
@@ -443,6 +495,16 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     result.internal_document = doc_for_elements;
     captioning_carry_over.apply(&mut result);
 
+    // GH#1662 reads embedded-image bytes so OCR has something to decode; rendering above
+    // (inside `derive_extraction_result`) has already folded any resulting OCR text into
+    // `content`. GH#1703: drop the bytes themselves now unless the caller actually wanted
+    // them (see `should_retain_images_after_ocr`). ~keep
+    let images_dropped_after_ocr = if should_retain_images_after_ocr(config) {
+        0
+    } else {
+        drop_ocr_only_images(&mut result)
+    };
+
     // #286: record the text the preserved element tree stands for, so the divergence check
     // below can tell whether post-processing has since made the tree a stale second copy of
     // the document text. See `discard_diverged_internal_document`.
@@ -570,7 +632,7 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     // ordering note on this function's doc comment (#213).
     execute_chunking(&mut result, config, chunker_heading_source.as_deref())?;
 
-    populate_document_counts(&mut result);
+    populate_document_counts(&mut result, images_dropped_after_ocr);
 
     #[cfg(feature = "heuristics")]
     {
@@ -693,6 +755,14 @@ pub fn run_pipeline_sync(mut doc: InternalDocument, config: &ExtractionConfig) -
     let include_structure = config.include_document_structure;
     let mut result =
         crate::extraction::derive::derive_extraction_result(doc, include_structure, config.output_format.clone());
+
+    // GH#1703: mirror `run_pipeline` -- rendering above has consumed the OCR text, so the bytes
+    // read only for embedded-image OCR (GH#1662) go unless the caller asked for images. ~keep
+    let images_dropped_after_ocr = if should_retain_images_after_ocr(config) {
+        0
+    } else {
+        drop_ocr_only_images(&mut result)
+    };
     result.internal_document = doc_for_elements;
 
     // #286: mirrors `run_pipeline` — see `discard_diverged_internal_document`.
@@ -733,7 +803,7 @@ pub fn run_pipeline_sync(mut doc: InternalDocument, config: &ExtractionConfig) -
     // ordering note on `run_pipeline`'s doc comment (#213).
     execute_chunking(&mut result, config, chunker_heading_source.as_deref())?;
 
-    populate_document_counts(&mut result);
+    populate_document_counts(&mut result, images_dropped_after_ocr);
 
     #[cfg(feature = "heuristics")]
     {
@@ -754,7 +824,7 @@ pub fn run_pipeline_sync(mut doc: InternalDocument, config: &ExtractionConfig) -
 /// extraction is disabled; it falls back to the materialized `pages` length and
 /// finally `0` for inputs that are not page-addressable (plain text, etc.).
 /// Table and image counts are the lengths of the already-populated collections.
-fn populate_document_counts(result: &mut ExtractedDocument) {
+fn populate_document_counts(result: &mut ExtractedDocument, images_dropped_after_ocr: usize) {
     let pages = result
         .metadata
         .pages
@@ -766,7 +836,7 @@ fn populate_document_counts(result: &mut ExtractedDocument) {
     result.counts = crate::types::DocumentCounts {
         pages,
         tables: result.tables.len(),
-        images: result.images.as_ref().map_or(0, Vec::len),
+        images: result.images.as_ref().map_or(images_dropped_after_ocr, Vec::len),
     };
 }
 

@@ -1308,3 +1308,200 @@ fn test_chunk_image_indices_empty_when_images_disabled() {
         }
     }
 }
+
+/// GH#1703: an OCR-only config (`ocr: Some(_)`, `images: None`) must not retain every
+/// embedded image's raw bytes just because GH#1662's read gate needed them to run OCR.
+/// `images` must come back empty and page `image_indices` must stay consistent (empty)
+/// with it, while the document's own extracted text still comes through in `content`.
+///
+/// `images: None` never routes embedded-image OCR text into `content` for PDF, with or
+/// without this fix -- `inject_placeholders` (the only way a PDF gets `ElementKind::Image`
+/// elements for `render_plain`/`render_markdown` to read `ocr_result` off) reads
+/// `config.images.as_ref().is_some_and(...)`, which is `false` when `images` itself is
+/// `None`. See `test_ocr_only_config_with_placeholders_preserves_ocr_text` below for the
+/// config shape where that text does surface, and where this fix must not swallow it. ~keep
+#[cfg(feature = "ocr")]
+#[test]
+fn test_ocr_only_config_returns_no_images() {
+    use async_trait::async_trait;
+    use xberg::core::config::{OcrConfig, PageConfig};
+    use xberg::plugins::{OcrBackend, OcrBackendType, Plugin, register_ocr_backend, unregister_ocr_backend};
+    use xberg::types::ExtractedDocument;
+
+    const SENTINEL_OCR_TEXT: &str = "GH1703_SENTINEL_OCR_TEXT";
+    const BACKEND_NAME: &str = "gh1703-fixed-text-ocr";
+
+    struct FixedTextOcrBackend;
+
+    #[async_trait]
+    impl OcrBackend for FixedTextOcrBackend {
+        fn backend_type(&self) -> OcrBackendType {
+            OcrBackendType::Custom
+        }
+        fn supports_language(&self, _: &str) -> bool {
+            true
+        }
+        async fn process_image(&self, _: &[u8], _config: &OcrConfig) -> xberg::Result<ExtractedDocument> {
+            let mut document = ExtractedDocument::default();
+            document.content = SENTINEL_OCR_TEXT.to_string();
+            Ok(document)
+        }
+    }
+
+    impl Plugin for FixedTextOcrBackend {
+        fn name(&self) -> &str {
+            BACKEND_NAME
+        }
+        fn version(&self) -> String {
+            "0.0.0".to_string()
+        }
+        fn initialize(&self) -> xberg::Result<()> {
+            Ok(())
+        }
+        fn shutdown(&self) -> xberg::Result<()> {
+            Ok(())
+        }
+    }
+
+    register_ocr_backend(std::sync::Arc::new(FixedTextOcrBackend)).unwrap();
+    struct BackendGuard(&'static str);
+    impl Drop for BackendGuard {
+        fn drop(&mut self) {
+            let _ = unregister_ocr_backend(self.0);
+        }
+    }
+    let _guard = BackendGuard(BACKEND_NAME);
+
+    let path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+    let config = ExtractionConfig {
+        ocr: Some(OcrConfig {
+            backend: BACKEND_NAME.to_string(),
+            ..Default::default()
+        }),
+        images: None,
+        pages: Some(PageConfig {
+            extract_pages: true,
+            ..Default::default()
+        }),
+        use_cache: false,
+        ..Default::default()
+    };
+
+    let result = extract_uri_document_blocking(&path, None, &config).expect("extraction must succeed");
+
+    assert!(
+        result.images.as_ref().map(|v| v.is_empty()).unwrap_or(true),
+        "ocr-only config (images: None) must not retain embedded image bytes; got {} image(s)",
+        result.images.as_ref().map(|v| v.len()).unwrap_or(0)
+    );
+    assert_eq!(
+        result.counts.images, 1,
+        "DocumentCounts::images is documented as always populated, so dropping the bytes must not zero it"
+    );
+
+    if let Some(pages) = result.pages.as_ref() {
+        for page in pages {
+            assert!(
+                page.image_indices.is_empty(),
+                "page {} image_indices must be empty once images are dropped, got {:?}",
+                page.page_number,
+                page.image_indices
+            );
+        }
+    }
+
+    assert!(
+        !result.content.trim().is_empty(),
+        "document content must still be extracted when images are dropped"
+    );
+}
+
+/// GH#1703, OCR-text-survives variant: `images: Some(extract_images: false)` leaves
+/// `inject_placeholders` at its default `true`, so the PDF extractor creates
+/// `ElementKind::Image` elements and `render_plain`/`render_markdown` read
+/// `ExtractedImage.ocr_result` off them while rendering `content`. This is the
+/// config shape the GH#1703 fix must not regress: `should_retain_images_after_ocr`
+/// says drop the bytes (extract_images is false), but `drop_ocr_only_images` must run
+/// AFTER `derive_extraction_result` has already rendered that OCR text into `content`,
+/// or this test goes red with the bytes AND the text both gone.
+#[cfg(feature = "ocr")]
+#[test]
+fn test_ocr_only_config_with_placeholders_preserves_ocr_text() {
+    use async_trait::async_trait;
+    use xberg::core::config::{ImageExtractionConfig, OcrConfig};
+    use xberg::plugins::{OcrBackend, OcrBackendType, Plugin, register_ocr_backend, unregister_ocr_backend};
+    use xberg::types::ExtractedDocument;
+
+    const SENTINEL_OCR_TEXT: &str = "GH1703_PLACEHOLDER_SENTINEL_OCR_TEXT";
+    const BACKEND_NAME: &str = "gh1703-placeholders-fixed-text-ocr";
+
+    struct FixedTextOcrBackend;
+
+    #[async_trait]
+    impl OcrBackend for FixedTextOcrBackend {
+        fn backend_type(&self) -> OcrBackendType {
+            OcrBackendType::Custom
+        }
+        fn supports_language(&self, _: &str) -> bool {
+            true
+        }
+        async fn process_image(&self, _: &[u8], _config: &OcrConfig) -> xberg::Result<ExtractedDocument> {
+            let mut document = ExtractedDocument::default();
+            document.content = SENTINEL_OCR_TEXT.to_string();
+            Ok(document)
+        }
+    }
+
+    impl Plugin for FixedTextOcrBackend {
+        fn name(&self) -> &str {
+            BACKEND_NAME
+        }
+        fn version(&self) -> String {
+            "0.0.0".to_string()
+        }
+        fn initialize(&self) -> xberg::Result<()> {
+            Ok(())
+        }
+        fn shutdown(&self) -> xberg::Result<()> {
+            Ok(())
+        }
+    }
+
+    register_ocr_backend(std::sync::Arc::new(FixedTextOcrBackend)).unwrap();
+    struct BackendGuard(&'static str);
+    impl Drop for BackendGuard {
+        fn drop(&mut self) {
+            let _ = unregister_ocr_backend(self.0);
+        }
+    }
+    let _guard = BackendGuard(BACKEND_NAME);
+
+    let path = test_documents_dir().join("pdf/embedded_images_tables.pdf");
+    let config = ExtractionConfig {
+        ocr: Some(OcrConfig {
+            backend: BACKEND_NAME.to_string(),
+            ..Default::default()
+        }),
+        images: Some(ImageExtractionConfig {
+            extract_images: false,
+            ..Default::default()
+        }),
+        use_cache: false,
+        ..Default::default()
+    };
+
+    let result = extract_uri_document_blocking(&path, None, &config).expect("extraction must succeed");
+
+    assert!(
+        result.images.as_ref().map(|v| v.is_empty()).unwrap_or(true),
+        "extract_images=false must not retain embedded image bytes even though OCR ran; \
+         got {} image(s)",
+        result.images.as_ref().map(|v| v.len()).unwrap_or(0)
+    );
+    assert!(
+        result.content.contains(SENTINEL_OCR_TEXT),
+        "embedded-image OCR text must still land in content even though the raw image \
+         bytes are dropped; got content:\n{}",
+        result.content
+    );
+}
