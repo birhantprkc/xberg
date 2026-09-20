@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn prepare_causal_attention_mask_blocks_future_logits_after_broadcast_add() {
-        // Regression for GH#1701: the mask must be additive so that adding it to raw
+        // ~keep Regression for GH#1701: the mask must be additive so that adding it to raw
         // attention logits drives future positions to -inf before softmax, not just
         // nudge visible positions by +1 relative to future ones.
         let dev = Device::Cpu;
