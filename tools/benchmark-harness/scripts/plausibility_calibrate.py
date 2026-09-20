@@ -191,8 +191,14 @@ def evaluate_wrong_mapping_recall(binary: Path, paths: list[Path], cache_dir: Pa
 
 
 def print_cohort_row(name: str, report: dict, ceiling: float) -> bool:
-    ok = report["fp_rate"] <= ceiling
-    status = "OK" if ok else "OVER CEILING"
+    # ~keep: a cohort that evaluated nothing has proven nothing -- an empty or unfetched fixture
+    # directory must read as a failure, not as a 0.00% false-positive rate.
+    if report["evaluated"] == 0:
+        status = "NO DOCUMENTS EVALUATED"
+        ok = False
+    else:
+        ok = report["fp_rate"] <= ceiling
+        status = "OK" if ok else "OVER CEILING"
     print(
         f"{name:<20} evaluated={report['evaluated']:>4} missing={report['missing']:>3} "
         f"flagged={len(report['flagged_ids']):>3} fp={report['fp_rate'] * 100:>5.2f}% "
