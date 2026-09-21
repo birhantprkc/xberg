@@ -6,7 +6,7 @@
 # for. 0.83.0 additionally fixes the php/napi/pyo3 mirror defaults, the elixir bytes
 # hop and the typescript/wasm mock-url builder that this repo's e2e legs were red on.
 # ~keep
-alef_version = "0.94.0"
+alef_version = "0.95.0"
 languages = [
   "python",
   "node",
@@ -5520,6 +5520,7 @@ CRAWLBERG_ALLOW_PRIVATE_NETWORK = "true"
 RUST_MIN_STACK = "16777216"
 
 [crates.e2e.format]
+dart = "cd {dir} && dart format ."
 python = "uv run --no-sync ruff check --fix {dir} && uv run --no-sync ruff format {dir}"
 go = "gofmt -w {dir}"
 rust = "(cd {dir} && cargo fmt --all)"
