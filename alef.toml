@@ -4332,10 +4332,6 @@ module = "Xberg"
 function = "ocr_backend_supports_language"
 module = "xberg"
 
-[crates.e2e.calls.ocr_backend_supports_language.overrides.kotlin_android]
-function = "supportsLanguage"
-class = "OcrBackendBridge"
-
 [crates.e2e.calls.ocr_backend_supports_language.overrides.c]
 # ~keep The C export returns the bool as i32 (1/0), not the char* every other simple-result
 # call returns, so the C e2e recipe cannot infer the binding type from result_is_simple alone.
