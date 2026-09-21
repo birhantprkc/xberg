@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **(ocr): `candle-deepseek-ocr` reads device tensors back in one transfer instead of one element at a time.** The mixture-of-experts gate copied its score matrix per expert, per row, per layer, per generated token, and the SAM relative-position lookup read its index inside a nested loop per attention layer, per crop. Both are now a single bulk read. Measured on an A100 at BF16: 62.71 s to 8.09 s per page (7.8x), output byte-identical, peak memory unchanged. A 22-page scanned document that previously exceeded the 600 s extraction ceiling now completes in 322 s. (GH#1711, GH#1714)
+
+### Fixed
+
+- **(ocr): `candle-glm-ocr` resolves its layout model once per process, not once per page.** Each page re-ran the Hugging Face path resolution and checksum verification of the 131 MB PP-DocLayout-V3 model; that is now cached by directory, the same shape the layout engine's sibling models use. Measured on 22 pages: 82.71 s to 6.24 s. A failed resolution is not cached, so the next caller retries. (GH#1718)
+- **(pdf): a document whose text-plausibility check could not judge any page now says so.** `implausible_text_pages: []` meant either that every page was checked and passed or that no page held enough prose to be checked at all (contracts, invoices, forms, agenda packets), and a caller could not tell the two apart. A document where no page could be judged now carries a processing warning naming how many pages were examined; the warning is suppressed when OCR was already forced. Extraction behaviour and OCR routing are unchanged. (GH#1709)
+
 ## [1.2.6] - 2026-09-20
 
 ### Added
