@@ -5304,7 +5304,7 @@ pub(crate) fn glyph_name_to_unicode(glyph_name: &str) -> Option<char> {
     if glyph_name.contains('_') {
         let parts: Vec<&str> = glyph_name.split('_').collect();
         if let Some(first) = parts.first()
-            && let Some(&ch) = super::adobe_glyph_list::ADOBE_GLYPH_LIST.get(*first)
+            && let Some(&ch) = super::adobe_glyph_list::ADOBE_GLYPH_LIST.get(first)
         {
             return Some(ch);
         }

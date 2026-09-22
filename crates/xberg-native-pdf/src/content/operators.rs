@@ -850,16 +850,11 @@ fn validate_text_object_operands(operator_name: &str, operands: &[Object]) -> cr
 
 // XObject operator - PDF Spec Section 8.8 ~keep
 fn validate_xobject_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
-    match operator_name {
-        "Do" => {
-            if operands.len() != 1 {
-                return Err(Error::InvalidPdf(format!(
-                    "Operator 'Do' requires 1 operand (name), got {}",
-                    operands.len()
-                )));
-            }
-        }
-        _ => {}
+    if operator_name == "Do" && operands.len() != 1 {
+        return Err(Error::InvalidPdf(format!(
+            "Operator 'Do' requires 1 operand (name), got {}",
+            operands.len()
+        )));
     }
     Ok(())
 }
