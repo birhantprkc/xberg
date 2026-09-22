@@ -566,8 +566,12 @@ mod tests {
             pixels.extend_from_slice(&[0x80; 3]);
             pixels.push(0x00);
         }
-        let result =
-            raw_pixels_to_png(width, height, &xberg_native_pdf::extractors::PixelFormat::Grayscale, &pixels);
+        let result = raw_pixels_to_png(
+            width,
+            height,
+            &xberg_native_pdf::extractors::PixelFormat::Grayscale,
+            &pixels,
+        );
         assert!(
             result.is_err(),
             "a row-padded grayscale buffer must return Err, not panic in the PNG encoder"
