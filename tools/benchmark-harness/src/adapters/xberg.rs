@@ -129,6 +129,45 @@ fn xberg_framework_name(
     }
 }
 
+/// Push the flags that force OCR through one named backend.
+fn push_forced_ocr_args(args: &mut Vec<String>, backend: &str) {
+    args.push("--ocr".to_string());
+    args.push("true".to_string());
+    args.push("--ocr-backend".to_string());
+    args.push(backend.to_string());
+    args.push("--force-ocr".to_string());
+    args.push("true".to_string());
+}
+
+/// Append the CLI flags that distinguish one pipeline from the baseline.
+fn push_pipeline_args(args: &mut Vec<String>, pipeline: XbergPipeline) {
+    match pipeline {
+        XbergPipeline::Baseline => {}
+        XbergPipeline::Layout => push_layout_args(args),
+        XbergPipeline::PaddleOcr | XbergPipeline::BaselinePaddle => push_forced_ocr_args(args, "paddle-ocr"),
+        XbergPipeline::LayoutPaddle => {
+            push_layout_args(args);
+            push_forced_ocr_args(args, "paddle-ocr");
+        }
+        XbergPipeline::SceptreOrt => push_sceptre_args(args, SCEPTRE_ORT_OPTIONS_JSON),
+        XbergPipeline::SceptreOrtLayout => {
+            push_layout_args(args);
+            push_sceptre_args(args, SCEPTRE_ORT_OPTIONS_JSON);
+        }
+        XbergPipeline::SceptreOrtAutoRotate => {
+            push_sceptre_args(args, SCEPTRE_ORT_OPTIONS_JSON);
+            args.extend(["--ocr-auto-rotate".to_string(), "true".to_string()]);
+        }
+        XbergPipeline::SceptreTract => push_sceptre_args(args, SCEPTRE_TRACT_OPTIONS_JSON),
+        XbergPipeline::CandleTrocr => push_forced_ocr_args(args, "candle-trocr"),
+        XbergPipeline::CandlePaddleocrVl | XbergPipeline::CandlePaddleocrVl15 => {
+            push_forced_ocr_args(args, "candle-paddleocr-vl");
+        }
+        XbergPipeline::CandleGlmOcr => push_forced_ocr_args(args, "candle-glm-ocr"),
+        XbergPipeline::CandleDeepseekOcr => push_forced_ocr_args(args, "candle-deepseek-ocr"),
+    }
+}
+
 /// Creates a Xberg adapter for the given pipeline and configuration.
 ///
 /// # Arguments
@@ -166,79 +205,7 @@ pub fn create_xberg_adapter(
     let tesseract_ocr_enabled = ocr_enabled && matches!(pipeline, XbergPipeline::Baseline | XbergPipeline::Layout);
     let mut args = benchmark_base_args(batch, content_format, tesseract_ocr_enabled);
 
-    match pipeline {
-        XbergPipeline::Baseline => {}
-        XbergPipeline::Layout => {
-            push_layout_args(&mut args);
-        }
-        XbergPipeline::PaddleOcr | XbergPipeline::BaselinePaddle => {
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("paddle-ocr".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-        XbergPipeline::LayoutPaddle => {
-            push_layout_args(&mut args);
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("paddle-ocr".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-        XbergPipeline::SceptreOrt => push_sceptre_args(&mut args, SCEPTRE_ORT_OPTIONS_JSON),
-        XbergPipeline::SceptreOrtLayout => {
-            push_layout_args(&mut args);
-            push_sceptre_args(&mut args, SCEPTRE_ORT_OPTIONS_JSON);
-        }
-        XbergPipeline::SceptreOrtAutoRotate => {
-            push_sceptre_args(&mut args, SCEPTRE_ORT_OPTIONS_JSON);
-            args.extend(["--ocr-auto-rotate".to_string(), "true".to_string()]);
-        }
-        XbergPipeline::SceptreTract => push_sceptre_args(&mut args, SCEPTRE_TRACT_OPTIONS_JSON),
-        XbergPipeline::CandleTrocr => {
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("candle-trocr".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-        XbergPipeline::CandlePaddleocrVl => {
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("candle-paddleocr-vl".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-        XbergPipeline::CandleGlmOcr => {
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("candle-glm-ocr".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-        XbergPipeline::CandleDeepseekOcr => {
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("candle-deepseek-ocr".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-        XbergPipeline::CandlePaddleocrVl15 => {
-            args.push("--ocr".to_string());
-            args.push("true".to_string());
-            args.push("--ocr-backend".to_string());
-            args.push("candle-paddleocr-vl".to_string());
-            args.push("--force-ocr".to_string());
-            args.push("true".to_string());
-        }
-    }
+    push_pipeline_args(&mut args, pipeline);
 
     args.push("--pdf-backend".to_string());
     args.push(pdf_backend.as_str().to_string());

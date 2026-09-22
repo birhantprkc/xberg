@@ -93,75 +93,77 @@ pub struct EmbedBenchmarkResults {
     pub parallel: Option<ParallelResult>,
 }
 
+/// Vocabulary the synthetic chunks are drawn from: common English function words plus
+/// domain terms, so chunk length and token distribution stay representative. ~keep
+const WORDS: &[&str] = &[
+    "the",
+    "quick",
+    "brown",
+    "fox",
+    "jumps",
+    "over",
+    "lazy",
+    "dog",
+    "in",
+    "a",
+    "field",
+    "of",
+    "green",
+    "grass",
+    "under",
+    "blue",
+    "sky",
+    "with",
+    "white",
+    "clouds",
+    "floating",
+    "gently",
+    "by",
+    "as",
+    "birds",
+    "sing",
+    "their",
+    "songs",
+    "and",
+    "children",
+    "play",
+    "happily",
+    "near",
+    "river",
+    "bank",
+    "where",
+    "water",
+    "flows",
+    "crystal",
+    "clear",
+    "through",
+    "ancient",
+    "stones",
+    "document",
+    "extraction",
+    "embedding",
+    "vector",
+    "semantic",
+    "search",
+    "retrieval",
+    "augmented",
+    "generation",
+    "neural",
+    "network",
+    "transformer",
+    "attention",
+    "mechanism",
+    "tokenizer",
+    "inference",
+    "batch",
+    "processing",
+];
+
 /// Generate synthetic text chunks for benchmarking.
 ///
 /// Each chunk contains `words_per_chunk` space-separated lorem-ipsum-style words
 /// to approximate realistic sentence length distributions.
 fn generate_test_chunks(count: usize, words_per_chunk: usize) -> Vec<Chunk> {
-    const WORDS: &[&str] = &[
-        "the",
-        "quick",
-        "brown",
-        "fox",
-        "jumps",
-        "over",
-        "lazy",
-        "dog",
-        "in",
-        "a",
-        "field",
-        "of",
-        "green",
-        "grass",
-        "under",
-        "blue",
-        "sky",
-        "with",
-        "white",
-        "clouds",
-        "floating",
-        "gently",
-        "by",
-        "as",
-        "birds",
-        "sing",
-        "their",
-        "songs",
-        "and",
-        "children",
-        "play",
-        "happily",
-        "near",
-        "river",
-        "bank",
-        "where",
-        "water",
-        "flows",
-        "crystal",
-        "clear",
-        "through",
-        "ancient",
-        "stones",
-        "document",
-        "extraction",
-        "embedding",
-        "vector",
-        "semantic",
-        "search",
-        "retrieval",
-        "augmented",
-        "generation",
-        "neural",
-        "network",
-        "transformer",
-        "attention",
-        "mechanism",
-        "tokenizer",
-        "inference",
-        "batch",
-        "processing",
-    ];
-
     (0..count)
         .map(|i| {
             let text: String = (0..words_per_chunk)
@@ -212,16 +214,25 @@ fn config_for_preset(preset: &EmbeddingPreset, batch_size: usize) -> EmbeddingCo
     }
 }
 
-/// Run the full embedding benchmark.
-///
-/// Prints a formatted table to stdout and returns structured results.
-pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
-    println!("\n=== Embedding Benchmark ===\n");
-    println!(
-        "Generating {} test chunks (~{} words each)...",
-        THROUGHPUT_CHUNK_COUNT, WORDS_PER_CHUNK
-    );
+/// Batch size used for the throughput pass and the parallel comparison, so both report the
+/// same per-call work as the middle of the sweep grid.
+const THROUGHPUT_BATCH_SIZE: usize = 32;
 
+/// One chunk at a time, so the warm-up measures model load rather than batching.
+const WARMUP_BATCH_SIZE: usize = 1;
+
+/// Rule widths under the sweep and summary table headers.
+const SWEEP_RULE_WIDTH: usize = 55;
+const SUMMARY_RULE_WIDTH: usize = 60;
+
+/// Shape of the parallel-inference comparison.
+const PARALLEL_BATCH_COUNT: usize = 8;
+const PARALLEL_CHUNKS_PER_BATCH: usize = 50;
+
+/// Warm each preset's model, then measure single-pass throughput over the synthetic corpus.
+///
+/// A preset whose model fails to load or embed is skipped rather than aborting the run.
+fn benchmark_presets() -> Vec<PresetResult> {
     let mut preset_results: Vec<PresetResult> = Vec::new();
 
     for preset in EMBEDDING_PRESETS.iter() {
@@ -230,8 +241,8 @@ pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
             preset.name, preset.dimensions, preset.description
         );
 
-        let mut warmup_chunks = generate_test_chunks(1, WORDS_PER_CHUNK);
-        let warmup_config = config_for_preset(preset, 1);
+        let mut warmup_chunks = generate_test_chunks(WARMUP_BATCH_SIZE, WORDS_PER_CHUNK);
+        let warmup_config = config_for_preset(preset, WARMUP_BATCH_SIZE);
 
         print!("  Warming up model...");
         let warm_start = Instant::now();
@@ -246,9 +257,12 @@ pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
         println!(" {:.0} ms", warm_ms);
 
         let mut chunks = generate_test_chunks(THROUGHPUT_CHUNK_COUNT, WORDS_PER_CHUNK);
-        let throughput_config = config_for_preset(preset, 32);
+        let throughput_config = config_for_preset(preset, THROUGHPUT_BATCH_SIZE);
 
-        print!("  Throughput ({} chunks, batch=32)...", THROUGHPUT_CHUNK_COUNT);
+        print!(
+            "  Throughput ({} chunks, batch={})...",
+            THROUGHPUT_CHUNK_COUNT, THROUGHPUT_BATCH_SIZE
+        );
         let t_start = Instant::now();
         match embed_chunks(&mut chunks, &throughput_config) {
             Ok(()) => {}
@@ -276,34 +290,22 @@ pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
         });
     }
 
-    println!(
-        "\n--- Batch size sweep (balanced preset, {} chunks) ---\n",
-        THROUGHPUT_CHUNK_COUNT
-    );
+    preset_results
+}
 
-    let balanced = match EMBEDDING_PRESETS.iter().find(|p| p.name == "balanced") {
-        Some(p) => p,
-        None => {
-            eprintln!("WARNING: 'balanced' preset not found; skipping batch sweep.");
-            return EmbedBenchmarkResults {
-                presets: preset_results,
-                batch_sweep: Vec::new(),
-                parallel: None,
-            };
-        }
-    };
-
+/// Sweep `BATCH_SIZES` against one preset and print the per-batch-size table.
+fn run_batch_sweep(preset: &EmbeddingPreset) -> Vec<BatchSweepResult> {
     let mut sweep_results: Vec<BatchSweepResult> = Vec::new();
 
     println!(
         "{:>12}  {:>12}  {:>14}  {:>12}",
         "batch_size", "total_ms", "chunks/sec", "ms/chunk"
     );
-    println!("{}", "-".repeat(55));
+    println!("{}", "-".repeat(SWEEP_RULE_WIDTH));
 
     for &batch_size in BATCH_SIZES {
         let mut chunks = generate_test_chunks(THROUGHPUT_CHUNK_COUNT, WORDS_PER_CHUNK);
-        let config = config_for_preset(balanced, batch_size);
+        let config = config_for_preset(preset, batch_size);
 
         let t_start = Instant::now();
         match embed_chunks(&mut chunks, &config) {
@@ -330,16 +332,18 @@ pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
         });
     }
 
+    sweep_results
+}
+
+/// Embed the same batches sequentially and then via rayon, and report the speedup.
+fn run_parallel_comparison(preset: &EmbeddingPreset) -> ParallelResult {
     println!("\n--- Parallel inference test (balanced preset) ---\n");
 
-    let parallel_batches: usize = 8;
-    let chunks_per_batch: usize = 50;
-
-    let mut batches: Vec<Vec<Chunk>> = (0..parallel_batches)
-        .map(|_| generate_test_chunks(chunks_per_batch, WORDS_PER_CHUNK))
+    let mut batches: Vec<Vec<Chunk>> = (0..PARALLEL_BATCH_COUNT)
+        .map(|_| generate_test_chunks(PARALLEL_CHUNKS_PER_BATCH, WORDS_PER_CHUNK))
         .collect();
 
-    let parallel_config = config_for_preset(balanced, 32);
+    let parallel_config = config_for_preset(preset, THROUGHPUT_BATCH_SIZE);
 
     let mut seq_batches = batches.clone();
     let seq_start = Instant::now();
@@ -354,44 +358,82 @@ pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
     });
     let par_ms = par_start.elapsed().as_secs_f64() * 1000.0;
 
-    let total_chunks = parallel_batches * chunks_per_batch;
+    let total_chunks = PARALLEL_BATCH_COUNT * PARALLEL_CHUNKS_PER_BATCH;
     let speedup = seq_ms / par_ms;
     let seq_chunks_per_sec = total_chunks as f64 / (seq_ms / 1000.0);
     let par_chunks_per_sec = total_chunks as f64 / (par_ms / 1000.0);
 
     println!(
         "{} batches x {} chunks = {} total chunks",
-        parallel_batches, chunks_per_batch, total_chunks
+        PARALLEL_BATCH_COUNT, PARALLEL_CHUNKS_PER_BATCH, total_chunks
     );
     println!("  Sequential: {:.0} ms ({:.1} chunks/sec)", seq_ms, seq_chunks_per_sec);
     println!("  Parallel:   {:.0} ms ({:.1} chunks/sec)", par_ms, par_chunks_per_sec);
     println!("  Speedup:    {:.2}x", speedup);
 
-    let parallel_result = Some(ParallelResult {
-        num_batches: parallel_batches,
-        chunks_per_batch,
+    ParallelResult {
+        num_batches: PARALLEL_BATCH_COUNT,
+        chunks_per_batch: PARALLEL_CHUNKS_PER_BATCH,
         total_chunks,
         sequential_ms: seq_ms,
         sequential_chunks_per_sec: seq_chunks_per_sec,
         parallel_ms: par_ms,
         parallel_chunks_per_sec: par_chunks_per_sec,
         speedup,
-    });
-
-    if !preset_results.is_empty() {
-        println!("\n=== Summary ===\n");
-        println!(
-            "{:<14}  {:>6}  {:>10}  {:>12}  {:>12}",
-            "preset", "dims", "warm_ms", "chunks/sec", "ms/chunk"
-        );
-        println!("{}", "-".repeat(60));
-        for r in &preset_results {
-            println!(
-                "{:<14}  {:>6}  {:>10.0}  {:>12.1}  {:>12.2}",
-                r.name, r.dimensions, r.warm_ms, r.chunks_per_sec, r.ms_per_chunk
-            );
-        }
     }
+}
+
+fn print_preset_summary(preset_results: &[PresetResult]) {
+    if preset_results.is_empty() {
+        return;
+    }
+    println!("\n=== Summary ===\n");
+    println!(
+        "{:<14}  {:>6}  {:>10}  {:>12}  {:>12}",
+        "preset", "dims", "warm_ms", "chunks/sec", "ms/chunk"
+    );
+    println!("{}", "-".repeat(SUMMARY_RULE_WIDTH));
+    for r in preset_results {
+        println!(
+            "{:<14}  {:>6}  {:>10.0}  {:>12.1}  {:>12.2}",
+            r.name, r.dimensions, r.warm_ms, r.chunks_per_sec, r.ms_per_chunk
+        );
+    }
+}
+
+/// Run the full embedding benchmark.
+///
+/// Prints a formatted table to stdout and returns structured results.
+pub fn run_embed_benchmark() -> EmbedBenchmarkResults {
+    println!("\n=== Embedding Benchmark ===\n");
+    println!(
+        "Generating {} test chunks (~{} words each)...",
+        THROUGHPUT_CHUNK_COUNT, WORDS_PER_CHUNK
+    );
+
+    let preset_results = benchmark_presets();
+
+    println!(
+        "\n--- Batch size sweep (balanced preset, {} chunks) ---\n",
+        THROUGHPUT_CHUNK_COUNT
+    );
+
+    let balanced = match EMBEDDING_PRESETS.iter().find(|p| p.name == "balanced") {
+        Some(p) => p,
+        None => {
+            eprintln!("WARNING: 'balanced' preset not found; skipping batch sweep.");
+            return EmbedBenchmarkResults {
+                presets: preset_results,
+                batch_sweep: Vec::new(),
+                parallel: None,
+            };
+        }
+    };
+
+    let sweep_results = run_batch_sweep(balanced);
+    let parallel_result = Some(run_parallel_comparison(balanced));
+
+    print_preset_summary(&preset_results);
 
     EmbedBenchmarkResults {
         presets: preset_results,
