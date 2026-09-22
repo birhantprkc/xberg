@@ -277,53 +277,8 @@ fn parse_records_into_paragraphs_and_tables(
                     para.outline_level = record.data[18];
                 }
             }
-            TAG_CHAR_SHAPE => {
-                if let Some(ref mut para) = current_paragraph {
-                    let mut reader = record.data_reader();
-                    while reader.remaining() >= 6 {
-                        let pos = reader.read_u32().unwrap_or(0);
-                        let shape_idx = reader.read_u16().unwrap_or(0);
-                        para.char_shape_runs.push((pos, shape_idx));
-                    }
-                }
-            }
-            TAG_EQEDIT => {
-                if let Some(script) = parse_eqedit_script(&record.data) {
-                    let latex = equation::to_latex(&script);
-                    let replacement = format!("${latex}$");
-
-                    match &mut current_paragraph {
-                        Some(para) => {
-                            // Common case: fill the placeholder the inline "eqed" control
-                            // reserved in this paragraph's own text. Computed before the
-                            // branch because a pattern guard cannot borrow mutably.
-                            para.equations.push(latex.clone());
-                            let filled = para
-                                .text
-                                .as_mut()
-                                .is_some_and(|text| fill_next_equation_placeholder(&mut text.content, &replacement));
-                            if !filled {
-                                let existing = para.text.take().map(|t| t.content).unwrap_or_default();
-                                warnings.push(format!(
-                                    "HWP equation in '{stream_name}' had no reserved inline slot; \
-                                     its LaTeX rendering was appended to the paragraph instead of placed inline"
-                                ));
-                                para.text = Some(super::model::ParaText {
-                                    content: format!("{existing}{replacement}"),
-                                });
-                            }
-                        }
-                        // Orphan EqEdit with no open paragraph to anchor to — start one
-                        // rather than dropping the equation (#99).
-                        None => {
-                            current_paragraph = Some(Paragraph {
-                                text: Some(super::model::ParaText { content: replacement }),
-                                ..Paragraph::default()
-                            });
-                        }
-                    }
-                }
-            }
+            TAG_CHAR_SHAPE => apply_char_shape_record(record, &mut current_paragraph),
+            TAG_EQEDIT => apply_eqedit_record(record, &mut current_paragraph, warnings, stream_name),
             TAG_TABLE => {
                 let table_level = record.level;
                 let table_end = find_block_end(records, idx, table_level);
@@ -344,6 +299,65 @@ fn parse_records_into_paragraphs_and_tables(
     }
 
     (paragraphs, tables)
+}
+
+/// Appends a `TAG_CHAR_SHAPE` record's `(position, shape_index)` runs onto the current paragraph,
+/// if one is open.
+fn apply_char_shape_record(record: &Record, current_paragraph: &mut Option<Paragraph>) {
+    if let Some(para) = current_paragraph {
+        let mut reader = record.data_reader();
+        while reader.remaining() >= 6 {
+            let pos = reader.read_u32().unwrap_or(0);
+            let shape_idx = reader.read_u16().unwrap_or(0);
+            para.char_shape_runs.push((pos, shape_idx));
+        }
+    }
+}
+
+/// Decodes a `TAG_EQEDIT` record's equation script and places its LaTeX rendering into the
+/// current paragraph, or starts a new orphan paragraph for it if none is open (#99).
+fn apply_eqedit_record(
+    record: &Record,
+    current_paragraph: &mut Option<Paragraph>,
+    warnings: &mut Vec<String>,
+    stream_name: &str,
+) {
+    let Some(script) = parse_eqedit_script(&record.data) else {
+        return;
+    };
+    let latex = equation::to_latex(&script);
+    let replacement = format!("${latex}$");
+
+    match current_paragraph {
+        Some(para) => {
+            // Common case: fill the placeholder the inline "eqed" control
+            // reserved in this paragraph's own text. Computed before the
+            // branch because a pattern guard cannot borrow mutably.
+            para.equations.push(latex.clone());
+            let filled = para
+                .text
+                .as_mut()
+                .is_some_and(|text| fill_next_equation_placeholder(&mut text.content, &replacement));
+            if !filled {
+                let existing = para.text.take().map(|t| t.content).unwrap_or_default();
+                warnings.push(format!(
+                    "HWP equation in '{stream_name}' had no reserved inline slot; \
+                     its LaTeX rendering was appended to the paragraph instead of placed inline"
+                ));
+                para.text = Some(super::model::ParaText {
+                    content: format!("{existing}{replacement}"),
+                });
+            }
+        }
+        // Orphan EqEdit with no open paragraph to anchor to — start one
+        // rather than dropping the equation (#99).
+        None => {
+            *current_paragraph = Some(Paragraph {
+                text: Some(super::model::ParaText { content: replacement }),
+                ..Paragraph::default()
+            });
+        }
+    }
 }
 
 /// Finds the end (exclusive) of the block starting at `records[start_idx]`: the index

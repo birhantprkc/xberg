@@ -9,7 +9,7 @@ use crate::Result;
 use crate::extraction::derive::strip_math_delimiters;
 use crate::extractors::security::SecurityBudget;
 use crate::utils::xml_utils::EntityReader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesEnd, BytesStart, Event};
 
 /// The child elements a format uses inside a formula.
 pub(crate) struct FormulaElements<'a> {
@@ -87,6 +87,141 @@ fn strip_latex_document_wrapper(tex: &str) -> &str {
     body.trim()
 }
 
+/// Mutable state threaded through a formula subtree's event loop: everything captured so
+/// far (verbatim TeX, MathML subtrees, the equation label, and flattened fallback text) plus
+/// the flags tracking which of those a given event currently feeds. Grouped into one struct,
+/// with one method per event kind, so the loop in [`extract_formula_latex`] stays a plain
+/// dispatch and each event's handling gets its own nesting budget. ~keep
+#[derive(Default)]
+struct FormulaCapture {
+    fallback_text: String,
+    tex_math: String,
+    label: String,
+    mathml_xmls: Vec<String>,
+    capture: Option<String>,
+    capture_depth: usize,
+    capture_in_alternatives: bool,
+    alternatives_depth: usize,
+    alternatives_math_seen: bool,
+    in_tex_math: bool,
+    in_label: bool,
+}
+
+impl FormulaCapture {
+    /// Handle a start tag: either extend an in-progress `math` capture, begin a new one, or
+    /// toggle one of the TeX/label/alternatives flags. Assumes the caller has already run
+    /// `budget.enter()` and advanced the overall element depth.
+    fn handle_start(
+        &mut self,
+        s: &BytesStart<'_>,
+        names: &FormulaElements<'_>,
+        budget: &mut SecurityBudget,
+    ) -> Result<()> {
+        let name = s.name();
+        let local = local_name_of(name.as_ref());
+        if let Some(buf) = self.capture.as_mut() {
+            self.capture_depth += 1;
+            let before = buf.len();
+            write_start_tag(buf, s, false);
+            budget.account_text(buf.len() - before)?;
+        } else if local == "math" {
+            let mut buf = String::new();
+            write_start_tag(&mut buf, s, false);
+            budget.account_text(buf.len())?;
+            self.capture = Some(buf);
+            self.capture_depth = 1;
+            self.capture_in_alternatives = self.alternatives_depth > 0;
+        } else if local == "alternatives" {
+            self.alternatives_depth += 1;
+        } else if local == names.tex {
+            self.in_tex_math = true;
+        } else if names.label.is_some_and(|name| local == name) {
+            self.in_label = true;
+        }
+        Ok(())
+    }
+
+    /// Handle a self-closing tag: append it to an in-progress `math` capture, if any.
+    fn handle_empty(&mut self, s: &BytesStart<'_>, budget: &mut SecurityBudget) -> Result<()> {
+        if let Some(buf) = self.capture.as_mut() {
+            let before = buf.len();
+            write_start_tag(buf, s, true);
+            budget.account_text(buf.len() - before)?;
+        }
+        Ok(())
+    }
+
+    /// Handle an end tag: close an in-progress `math` capture (recording it once its depth
+    /// unwinds to zero) or, outside a capture, clear whichever TeX/label/alternatives flag it
+    /// closes. Assumes the caller has already run `budget.leave()`.
+    fn handle_end(&mut self, e: &BytesEnd<'_>, names: &FormulaElements<'_>) {
+        let Some(buf) = self.capture.as_mut() else {
+            let name = e.name();
+            let local = local_name_of(name.as_ref());
+            if local == names.tex {
+                self.in_tex_math = false;
+            } else if names.label.is_some_and(|name| local == name) {
+                self.in_label = false;
+            } else if local == "alternatives" {
+                self.alternatives_depth = self.alternatives_depth.saturating_sub(1);
+            }
+            return;
+        };
+        buf.push_str("</");
+        buf.push_str(local_name_of(e.name().as_ref()));
+        buf.push('>');
+        self.capture_depth -= 1;
+        if self.capture_depth == 0
+            && let Some(xml) = self.capture.take()
+        {
+            self.record_captured_math(xml);
+        }
+    }
+
+    /// Record a finished `math` capture. Inside `<alternatives>` every `math` sibling is one
+    /// more representation of the SAME formula: keep the first. Outside, each sibling is its
+    /// own equation.
+    fn record_captured_math(&mut self, xml: String) {
+        if !self.capture_in_alternatives {
+            self.mathml_xmls.push(xml);
+        } else if !self.alternatives_math_seen {
+            self.alternatives_math_seen = true;
+            self.mathml_xmls.push(xml);
+        }
+    }
+
+    /// Route decoded text content to the capture, the TeX buffer, the label, or the fallback
+    /// text, whichever is currently active.
+    fn handle_text(&mut self, decoded: &str) {
+        if let Some(buf) = self.capture.as_mut() {
+            buf.push_str(&quick_xml::escape::escape(decoded));
+        } else if self.in_tex_math {
+            self.tex_math.push_str(decoded);
+        } else if self.in_label {
+            if !self.label.is_empty() {
+                self.label.push(' ');
+            }
+            self.label.push_str(decoded);
+        } else {
+            self.fallback_text.push_str(decoded);
+            self.fallback_text.push(' ');
+        }
+    }
+
+    /// Route decoded CDATA content the same way as text, except TeX wins over an in-progress
+    /// `math` capture (CDATA is how some sources wrap verbatim TeX containing `<`/`&`).
+    fn handle_cdata(&mut self, decoded: &str) {
+        if self.in_tex_math {
+            self.tex_math.push_str(decoded);
+        } else if let Some(buf) = self.capture.as_mut() {
+            buf.push_str(&quick_xml::escape::escape(decoded));
+        } else {
+            self.fallback_text.push_str(decoded);
+            self.fallback_text.push(' ');
+        }
+    }
+}
+
 /// Extract the LaTeX for a formula subtree.
 ///
 /// The caller has consumed the formula start tag. The preference order is:
@@ -97,17 +232,7 @@ pub(crate) fn extract_formula_latex(
     budget: &mut SecurityBudget,
     names: &FormulaElements<'_>,
 ) -> Result<String> {
-    let mut fallback_text = String::new();
-    let mut tex_math = String::new();
-    let mut label = String::new();
-    let mut mathml_xmls: Vec<String> = Vec::new();
-    let mut capture: Option<String> = None;
-    let mut capture_depth = 0usize;
-    let mut capture_in_alternatives = false;
-    let mut alternatives_depth = 0usize;
-    let mut alternatives_math_seen = false;
-    let mut in_tex_math = false;
-    let mut in_label = false;
+    let mut state = FormulaCapture::default();
     let mut depth = 0usize;
 
     loop {
@@ -116,68 +241,14 @@ pub(crate) fn extract_formula_latex(
             Ok(Event::Start(s)) => {
                 budget.enter()?;
                 depth += 1;
-                let name = s.name();
-                let local = local_name_of(name.as_ref());
-                if let Some(buf) = capture.as_mut() {
-                    capture_depth += 1;
-                    let before = buf.len();
-                    write_start_tag(buf, &s, false);
-                    budget.account_text(buf.len() - before)?;
-                } else if local == "math" {
-                    let mut buf = String::new();
-                    write_start_tag(&mut buf, &s, false);
-                    budget.account_text(buf.len())?;
-                    capture = Some(buf);
-                    capture_depth = 1;
-                    capture_in_alternatives = alternatives_depth > 0;
-                } else if local == "alternatives" {
-                    alternatives_depth += 1;
-                } else if local == names.tex {
-                    in_tex_math = true;
-                } else if names.label.is_some_and(|name| local == name) {
-                    in_label = true;
-                }
+                state.handle_start(&s, names, budget)?;
             }
             Ok(Event::Empty(s)) => {
-                if let Some(buf) = capture.as_mut() {
-                    let before = buf.len();
-                    write_start_tag(buf, &s, true);
-                    budget.account_text(buf.len() - before)?;
-                }
+                state.handle_empty(&s, budget)?;
             }
             Ok(Event::End(e)) => {
                 budget.leave();
-                if let Some(buf) = capture.as_mut() {
-                    buf.push_str("</");
-                    buf.push_str(local_name_of(e.name().as_ref()));
-                    buf.push('>');
-                    capture_depth -= 1;
-                    if capture_depth == 0
-                        && let Some(xml) = capture.take()
-                    {
-                        // Inside `<alternatives>` every `math` sibling is one
-                        // more representation of the SAME formula: keep the
-                        // first. Outside, each sibling is its own equation.
-                        if capture_in_alternatives {
-                            if !alternatives_math_seen {
-                                alternatives_math_seen = true;
-                                mathml_xmls.push(xml);
-                            }
-                        } else {
-                            mathml_xmls.push(xml);
-                        }
-                    }
-                } else {
-                    let name = e.name();
-                    let local = local_name_of(name.as_ref());
-                    if local == names.tex {
-                        in_tex_math = false;
-                    } else if names.label.is_some_and(|name| local == name) {
-                        in_label = false;
-                    } else if local == "alternatives" {
-                        alternatives_depth = alternatives_depth.saturating_sub(1);
-                    }
-                }
+                state.handle_end(&e, names);
                 if depth == 0 {
                     break;
                 }
@@ -190,19 +261,7 @@ pub(crate) fn extract_formula_latex(
                 }
                 budget.check_entity(&decoded)?;
                 budget.account_text(decoded.len())?;
-                if let Some(buf) = capture.as_mut() {
-                    buf.push_str(&quick_xml::escape::escape(&decoded));
-                } else if in_tex_math {
-                    tex_math.push_str(&decoded);
-                } else if in_label {
-                    if !label.is_empty() {
-                        label.push(' ');
-                    }
-                    label.push_str(&decoded);
-                } else {
-                    fallback_text.push_str(&decoded);
-                    fallback_text.push(' ');
-                }
+                state.handle_text(&decoded);
             }
             Ok(Event::CData(t)) => {
                 let decoded = t.as_ref().to_string();
@@ -211,14 +270,7 @@ pub(crate) fn extract_formula_latex(
                 }
                 budget.check_entity(&decoded)?;
                 budget.account_text(decoded.len())?;
-                if in_tex_math {
-                    tex_math.push_str(&decoded);
-                } else if let Some(buf) = capture.as_mut() {
-                    buf.push_str(&quick_xml::escape::escape(&decoded));
-                } else {
-                    fallback_text.push_str(&decoded);
-                    fallback_text.push(' ');
-                }
+                state.handle_cdata(&decoded);
             }
             Ok(Event::Eof) => break,
             Err(e) => {
@@ -227,6 +279,21 @@ pub(crate) fn extract_formula_latex(
             _ => {}
         }
     }
+
+    finalize_formula_latex(state, budget)
+}
+
+/// Resolve a finished [`FormulaCapture`] into LaTeX: verbatim TeX wins, then the captured
+/// `math` subtree(s) converted through the shared MathML converter, then flattened fallback
+/// text. A non-empty equation label becomes a LaTeX `\tag` on either of the first two.
+fn finalize_formula_latex(state: FormulaCapture, budget: &mut SecurityBudget) -> Result<String> {
+    let FormulaCapture {
+        mut fallback_text,
+        tex_math,
+        label,
+        mathml_xmls,
+        ..
+    } = state;
 
     // An equation label (`<label>1.1</label>`) becomes a LaTeX `\tag` so the
     // equation number survives the conversion. `\tag` renders inside parens,

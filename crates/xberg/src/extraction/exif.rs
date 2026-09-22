@@ -20,7 +20,7 @@ use std::collections::HashMap;
 /// HEIC/HEIF, AVIF and several video containers in a single pure-Rust API.
 #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "heic"))]
 pub(crate) fn extract_exif_data(bytes: &[u8]) -> HashMap<String, String> {
-    use nom_exif::{Exif, ExifIter, ExifTag, MediaParser, MediaSource};
+    use nom_exif::{Exif, ExifIter, MediaParser, MediaSource};
 
     let mut exif_map = HashMap::new();
 
@@ -37,19 +37,21 @@ pub(crate) fn extract_exif_data(bytes: &[u8]) -> HashMap<String, String> {
     };
     let exif: Exif = iter.into();
 
-    // IFD0 tag codes not present in nom-exif 3.6.2's curated `ExifTag` enum.
-    // Looked up via `Exif::get_by_code` at the main IFD, same as the enum-based
-    // tags below but bypassing the enum since these codes have no variant. ~keep
-    const ARTIST_TAG_CODE: u16 = 0x013B;
-    // Windows Explorer's "XP" tag family: BYTE arrays holding null-terminated
-    // UTF-16LE text. Not part of the base TIFF/EXIF spec, but commonly written
-    // by Windows Photo/Explorer property sheets and read back by most tooling.
-    const XP_TITLE_TAG_CODE: u16 = 0x9C9B;
-    const XP_COMMENT_TAG_CODE: u16 = 0x9C9C;
-    const XP_KEYWORDS_TAG_CODE: u16 = 0x9C9D;
-    const XP_SUBJECT_TAG_CODE: u16 = 0x9C9E;
+    insert_known_exif_tags(&exif, &mut exif_map);
+    insert_artist_tag(&exif, &mut exif_map);
+    insert_xp_tags(&exif, &mut exif_map);
 
-    const TAGS: &[(ExifTag, &str)] = &[
+    exif_map.extend(extract_xmp_data(bytes));
+
+    exif_map
+}
+
+/// Every EXIF field `nom-exif` exposes through its curated [`nom_exif::ExifTag`] enum, paired with
+/// the display name it surfaces under in [`extract_exif_data`]'s output map.
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "heic"))]
+const KNOWN_EXIF_TAGS: &[(nom_exif::ExifTag, &str)] = {
+    use nom_exif::ExifTag;
+    &[
         (ExifTag::Make, "Make"),
         (ExifTag::Model, "Model"),
         (ExifTag::Software, "Software"),
@@ -123,17 +125,39 @@ pub(crate) fn extract_exif_data(bytes: &[u8]) -> HashMap<String, String> {
         (ExifTag::GPSProcessingMethod, "GPSProcessingMethod"),
         (ExifTag::ThumbnailOffset, "ThumbnailOffset"),
         (ExifTag::ThumbnailLength, "ThumbnailLength"),
-    ];
+    ]
+};
 
-    for (tag, field_name) in TAGS {
+/// Insert every EXIF field `nom-exif` exposes through its curated [`nom_exif::ExifTag`] enum.
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "heic"))]
+fn insert_known_exif_tags(exif: &nom_exif::Exif, exif_map: &mut HashMap<String, String>) {
+    for (tag, field_name) in KNOWN_EXIF_TAGS {
         if let Some(value) = exif.get(*tag) {
             exif_map.insert((*field_name).to_string(), value.to_string());
         }
     }
+}
+
+/// Insert the IFD0 `Artist` tag, looked up by code since it has no variant in nom-exif 3.6.2's
+/// curated `ExifTag` enum. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "heic"))]
+fn insert_artist_tag(exif: &nom_exif::Exif, exif_map: &mut HashMap<String, String>) {
+    const ARTIST_TAG_CODE: u16 = 0x013B;
 
     if let Some(value) = exif.get_by_code(nom_exif::IfdIndex::MAIN, ARTIST_TAG_CODE) {
         exif_map.insert("Artist".to_string(), value.to_string());
     }
+}
+
+/// Insert Windows Explorer's "XP" tag family: BYTE arrays holding null-terminated UTF-16LE text.
+/// Not part of the base TIFF/EXIF spec, but commonly written by Windows Photo/Explorer property
+/// sheets and read back by most tooling. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "heic"))]
+fn insert_xp_tags(exif: &nom_exif::Exif, exif_map: &mut HashMap<String, String>) {
+    const XP_TITLE_TAG_CODE: u16 = 0x9C9B;
+    const XP_COMMENT_TAG_CODE: u16 = 0x9C9C;
+    const XP_KEYWORDS_TAG_CODE: u16 = 0x9C9D;
+    const XP_SUBJECT_TAG_CODE: u16 = 0x9C9E;
 
     const XP_TAGS: &[(u16, &str)] = &[
         (XP_TITLE_TAG_CODE, "XPTitle"),
@@ -148,10 +172,6 @@ pub(crate) fn extract_exif_data(bytes: &[u8]) -> HashMap<String, String> {
             exif_map.insert((*field_name).to_string(), text);
         }
     }
-
-    exif_map.extend(extract_xmp_data(bytes));
-
-    exif_map
 }
 
 /// Decode a Windows "XP" tag value (a BYTE array holding null-terminated
