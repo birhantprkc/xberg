@@ -61,31 +61,60 @@ impl PdfPageIndexCache {
     fn remove(&mut self, document: FPDF_DOCUMENT, page: FPDF_PAGE) -> Option<PdfPageCachedProperties> {
         let props = self.pages_by_index.remove(&(document, page));
 
-        if let Some(props) = props.as_ref() {
-            self.indices_by_page.remove(&(document, props.index));
+        let Some(removed_index) = props.as_ref().map(|props| props.index) else {
+            return props;
+        };
 
-            if self.documents_by_maximum_index.get(&document).copied() == Some(props.index) {
-                let keys = self.indices_by_page.keys();
+        self.indices_by_page.remove(&(document, removed_index));
 
-                if keys.len() == 0 {
-                    self.documents_by_maximum_index.remove(&document);
-                } else {
-                    let mut maximum = 0;
-
-                    for (key, index) in keys {
-                        if *key == document {
-                            let index = *index;
-
-                            maximum = index.max(maximum);
-                        }
-                    }
-
-                    self.documents_by_maximum_index.insert(document, maximum);
-                }
-            }
+        if self.documents_by_maximum_index.get(&document).copied() == Some(removed_index) {
+            self.recompute_maximum_index(document);
         }
 
         props
+    }
+
+    /// Recomputes and caches the highest remaining [PdfPageIndex] for `document` after its
+    /// previously-cached maximum index was removed.
+    #[inline]
+    fn recompute_maximum_index(&mut self, document: FPDF_DOCUMENT) {
+        if self.indices_by_page.is_empty() {
+            self.documents_by_maximum_index.remove(&document);
+            return;
+        }
+
+        let maximum = self
+            .indices_by_page
+            .keys()
+            .filter(|(doc, _)| *doc == document)
+            .map(|(_, index)| *index)
+            .max()
+            .unwrap_or(0);
+
+        self.documents_by_maximum_index.insert(document, maximum);
+    }
+
+    /// Removes and re-caches the page at `old_index` in `document` under `new_index`, preserving
+    /// its content regeneration strategy. No-op if no page is cached at `old_index`.
+    #[inline]
+    fn reindex_page_if_present(&mut self, document: FPDF_DOCUMENT, old_index: PdfPageIndex, new_index: PdfPageIndex) {
+        let Some(page) = self.indices_by_page.get(&(document, old_index)).copied() else {
+            return;
+        };
+
+        let content_regeneration_strategy = self
+            .remove(document, page)
+            .map(|props| props.content_regeneration_strategy)
+            .unwrap_or(PdfPageContentRegenerationStrategy::AutomaticOnEveryChange);
+
+        self.set(
+            document,
+            page,
+            PdfPageCachedProperties {
+                index: new_index,
+                content_regeneration_strategy,
+            },
+        );
     }
 
     /// Adjusts all cached [PdfPageIndex] values for the given document as necessary to accommodate
@@ -96,24 +125,7 @@ impl PdfPageIndexCache {
             Some(maximum_index_for_document) => {
                 if maximum_index_for_document > index {
                     for index in (index..=maximum_index_for_document).rev() {
-                        if let Some(page) = self.indices_by_page.get(&(document, index)).copied() {
-                            let props = self.remove(document, page);
-
-                            let content_regeneration_strategy = if let Some(props) = props {
-                                props.content_regeneration_strategy
-                            } else {
-                                PdfPageContentRegenerationStrategy::AutomaticOnEveryChange
-                            };
-
-                            self.set(
-                                document,
-                                page,
-                                PdfPageCachedProperties {
-                                    index: index + count,
-                                    content_regeneration_strategy,
-                                },
-                            );
-                        }
+                        self.reindex_page_if_present(document, index, index + count);
                     }
                 }
 
@@ -140,24 +152,7 @@ impl PdfPageIndexCache {
 
         if maximum_index_for_document > index {
             for index in index + 1..=maximum_index_for_document {
-                if let Some(page) = self.indices_by_page.get(&(document, index)).copied() {
-                    let props = self.remove(document, page);
-
-                    let content_regeneration_strategy = if let Some(props) = props {
-                        props.content_regeneration_strategy
-                    } else {
-                        PdfPageContentRegenerationStrategy::AutomaticOnEveryChange
-                    };
-
-                    self.set(
-                        document,
-                        page,
-                        PdfPageCachedProperties {
-                            index: index - count,
-                            content_regeneration_strategy,
-                        },
-                    );
-                }
+                self.reindex_page_if_present(document, index, index - count);
             }
         } else {
             maximum_index_for_document = index;
@@ -261,9 +256,30 @@ unsafe impl Sync for PdfPageIndexCache {}
 
 #[cfg(test)]
 mod tests {
+    use super::{FPDF_DOCUMENT, FPDF_PAGE};
     use crate::pdf::document::page::index_cache::PdfPageIndexCache;
     use crate::prelude::*;
     use crate::utils::test::test_bind_to_pdfium;
+
+    /// Asserts that `document`/`page` currently has a cached index equal to `expected_index`.
+    fn assert_cached_index(document: FPDF_DOCUMENT, page: FPDF_PAGE, expected_index: PdfPageIndex) {
+        let cache = PdfPageIndexCache::lock();
+        let props = cache.get(document, page);
+
+        assert!(props.is_some());
+        assert_eq!(props.unwrap().index, expected_index);
+    }
+
+    /// Asserts that `document` currently has a cached maximum index equal to `expected_maximum`.
+    fn assert_maximum_index(document: FPDF_DOCUMENT, expected_maximum: PdfPageIndex) {
+        let cache = PdfPageIndexCache::lock();
+
+        assert!(cache.documents_by_maximum_index.contains_key(&document));
+        assert_eq!(
+            cache.documents_by_maximum_index.get(&document).copied().unwrap(),
+            expected_maximum
+        );
+    }
 
     #[test]
     fn test_cache_instantiation() -> Result<(), PdfiumError> {
@@ -313,58 +329,11 @@ mod tests {
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 3);
 
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document_0.handle(), document_0_page_0.page_handle())
-                    .is_some()
-            );
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document_0.handle(), document_0_page_0.page_handle())
-                    .unwrap()
-                    .index
-                    == 0
-            );
+            assert_cached_index(document_0.handle(), document_0_page_0.page_handle(), 0);
+            assert_cached_index(document_0.handle(), document_0_page_1.page_handle(), 1);
+            assert_cached_index(document_0.handle(), document_0_page_2.page_handle(), 2);
 
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document_0.handle(), document_0_page_1.page_handle())
-                    .is_some()
-            );
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document_0.handle(), document_0_page_1.page_handle())
-                    .unwrap()
-                    .index
-                    == 1
-            );
-
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document_0.handle(), document_0_page_2.page_handle())
-                    .is_some()
-            );
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document_0.handle(), document_0_page_2.page_handle())
-                    .unwrap()
-                    .index
-                    == 2
-            );
-
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document_0.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document_0.handle())
-                    .copied()
-                    .unwrap(),
-                2
-            );
+            assert_maximum_index(document_0.handle(), 2);
 
             let mut document_1 = pdfium.create_new_pdf()?;
 
@@ -391,71 +360,12 @@ mod tests {
 
                 assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 7);
 
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_0.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_0.page_handle())
-                        .unwrap()
-                        .index,
-                    0
-                );
+                assert_cached_index(document_1.handle(), document_1_page_0.page_handle(), 0);
+                assert_cached_index(document_1.handle(), document_1_page_1.page_handle(), 1);
+                assert_cached_index(document_1.handle(), document_1_page_2.page_handle(), 2);
+                assert_cached_index(document_1.handle(), document_1_page_3.page_handle(), 3);
 
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_1.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_1.page_handle())
-                        .unwrap()
-                        .index,
-                    1
-                );
-
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_2.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_2.page_handle())
-                        .unwrap()
-                        .index,
-                    2
-                );
-
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_3.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document_1.handle(), document_1_page_3.page_handle())
-                        .unwrap()
-                        .index,
-                    3
-                );
-
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .documents_by_maximum_index
-                        .contains_key(&document_1.handle())
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .documents_by_maximum_index
-                        .get(&document_1.handle())
-                        .copied()
-                        .unwrap(),
-                    3
-                );
+                assert_maximum_index(document_1.handle(), 3);
             }
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 3);
@@ -475,18 +385,7 @@ mod tests {
         let page_handle = {
             let page = document.pages_mut().create_page_at_start(PdfPagePaperSize::a4())?;
 
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document.handle(), page.page_handle())
-                    .is_some()
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .get(document.handle(), page.page_handle())
-                    .unwrap()
-                    .index,
-                0
-            );
+            assert_cached_index(document.handle(), page.page_handle(), 0);
 
             page.page_handle()
         };
@@ -510,139 +409,35 @@ mod tests {
             }
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 100);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                99
-            );
+            assert_maximum_index(document.handle(), 99);
 
             for (index, page) in pages.iter().enumerate() {
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document.handle(), page.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document.handle(), page.page_handle())
-                        .unwrap()
-                        .index,
-                    index as PdfPageIndex
-                );
+                assert_cached_index(document.handle(), page.page_handle(), index as PdfPageIndex);
             }
 
             let inserted = document.pages_mut().create_page_at_start(PdfPagePaperSize::a4())?;
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 101);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                100
-            );
-
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document.handle(), inserted.page_handle())
-                    .is_some()
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .get(document.handle(), inserted.page_handle())
-                    .unwrap()
-                    .index,
-                0
-            );
+            assert_maximum_index(document.handle(), 100);
+            assert_cached_index(document.handle(), inserted.page_handle(), 0);
 
             for (index, page) in pages.iter().enumerate() {
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document.handle(), page.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document.handle(), page.page_handle())
-                        .unwrap()
-                        .index,
-                    index as PdfPageIndex + 1
-                );
+                assert_cached_index(document.handle(), page.page_handle(), index as PdfPageIndex + 1);
             }
 
             let inserted = document.pages_mut().create_page_at_index(PdfPagePaperSize::a4(), 50)?;
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 102);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                101
-            );
-
-            assert!(
-                PdfPageIndexCache::lock()
-                    .get(document.handle(), inserted.page_handle())
-                    .is_some()
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .get(document.handle(), inserted.page_handle())
-                    .unwrap()
-                    .index,
-                50
-            );
+            assert_maximum_index(document.handle(), 101);
+            assert_cached_index(document.handle(), inserted.page_handle(), 50);
 
             for (index, page) in pages.iter().enumerate() {
                 if index < 49 {
-                    assert!(
-                        PdfPageIndexCache::lock()
-                            .get(document.handle(), page.page_handle())
-                            .is_some()
-                    );
-                    assert_eq!(
-                        PdfPageIndexCache::lock()
-                            .get(document.handle(), page.page_handle())
-                            .unwrap()
-                            .index,
-                        index as PdfPageIndex + 1
-                    );
+                    assert_cached_index(document.handle(), page.page_handle(), index as PdfPageIndex + 1);
                 }
 
                 if index > 49 {
-                    assert!(
-                        PdfPageIndexCache::lock()
-                            .get(document.handle(), page.page_handle())
-                            .is_some()
-                    );
-                    assert_eq!(
-                        PdfPageIndexCache::lock()
-                            .get(document.handle(), page.page_handle())
-                            .unwrap()
-                            .index,
-                        index as PdfPageIndex + 2
-                    );
+                    assert_cached_index(document.handle(), page.page_handle(), index as PdfPageIndex + 2);
                 }
             }
         }
@@ -664,49 +459,22 @@ mod tests {
             }
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 100);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                99
-            );
+            assert_maximum_index(document.handle(), 99);
 
             for (index, page) in pages.iter().enumerate() {
                 assert!(page.is_some());
 
-                let document = document.handle();
-                let page = page.as_ref().unwrap().page_handle();
-
-                assert!(PdfPageIndexCache::lock().get(document, page).is_some());
-                assert_eq!(
-                    PdfPageIndexCache::lock().get(document, page).unwrap().index,
-                    index as PdfPageIndex
+                assert_cached_index(
+                    document.handle(),
+                    page.as_ref().unwrap().page_handle(),
+                    index as PdfPageIndex,
                 );
             }
 
             pages.first_mut().unwrap().take().unwrap().delete()?;
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 99);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                98
-            );
+            assert_maximum_index(document.handle(), 98);
 
             for (index, page) in pages.iter().enumerate() {
                 if index == 0 {
@@ -714,13 +482,10 @@ mod tests {
                 } else {
                     assert!(page.is_some());
 
-                    let document = document.handle();
-                    let page = page.as_ref().unwrap().page_handle();
-
-                    assert!(PdfPageIndexCache::lock().get(document, page).is_some());
-                    assert_eq!(
-                        PdfPageIndexCache::lock().get(document, page).unwrap().index,
-                        index as PdfPageIndex - 1
+                    assert_cached_index(
+                        document.handle(),
+                        page.as_ref().unwrap().page_handle(),
+                        index as PdfPageIndex - 1,
                     );
                 }
             }
@@ -728,19 +493,7 @@ mod tests {
             pages.get_mut(50).unwrap().take().unwrap().delete()?;
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 98);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                97
-            );
+            assert_maximum_index(document.handle(), 97);
 
             for (index, page) in pages.iter().enumerate() {
                 if index == 0 || index == 50 {
@@ -748,24 +501,18 @@ mod tests {
                 } else if index < 50 {
                     assert!(page.is_some());
 
-                    let document = document.handle();
-                    let page = page.as_ref().unwrap().page_handle();
-
-                    assert!(PdfPageIndexCache::lock().get(document, page).is_some());
-                    assert_eq!(
-                        PdfPageIndexCache::lock().get(document, page).unwrap().index,
-                        index as PdfPageIndex - 1
+                    assert_cached_index(
+                        document.handle(),
+                        page.as_ref().unwrap().page_handle(),
+                        index as PdfPageIndex - 1,
                     );
                 } else if index > 50 {
                     assert!(page.is_some());
 
-                    let document = document.handle();
-                    let page = page.as_ref().unwrap().page_handle();
-
-                    assert!(PdfPageIndexCache::lock().get(document, page).is_some());
-                    assert_eq!(
-                        PdfPageIndexCache::lock().get(document, page).unwrap().index,
-                        index as PdfPageIndex - 2
+                    assert_cached_index(
+                        document.handle(),
+                        page.as_ref().unwrap().page_handle(),
+                        index as PdfPageIndex - 2,
                     );
                 }
             }
@@ -788,66 +535,19 @@ mod tests {
             }
 
             assert_eq!(PdfPageIndexCache::lock().pages_by_index.len(), 100);
-            assert!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .contains_key(&document.handle())
-            );
-            assert_eq!(
-                PdfPageIndexCache::lock()
-                    .documents_by_maximum_index
-                    .get(&document.handle())
-                    .copied()
-                    .unwrap(),
-                99
-            );
+            assert_maximum_index(document.handle(), 99);
 
             for (index, page) in pages.iter().enumerate() {
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .get(document.handle(), page.page_handle())
-                        .is_some()
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .get(document.handle(), page.page_handle())
-                        .unwrap()
-                        .index,
-                    index as PdfPageIndex
-                );
+                assert_cached_index(document.handle(), page.page_handle(), index as PdfPageIndex);
             }
 
             for index in (0..100).rev() {
-                assert!(
-                    PdfPageIndexCache::lock()
-                        .documents_by_maximum_index
-                        .contains_key(&document.handle())
-                );
-                assert_eq!(
-                    PdfPageIndexCache::lock()
-                        .documents_by_maximum_index
-                        .get(&document.handle())
-                        .copied()
-                        .unwrap(),
-                    index
-                );
+                assert_maximum_index(document.handle(), index);
 
                 PdfPageIndexCache::lock().delete(document.handle(), index, 1);
 
                 if index > 0 {
-                    assert!(
-                        PdfPageIndexCache::lock()
-                            .documents_by_maximum_index
-                            .contains_key(&document.handle())
-                    );
-                    assert_eq!(
-                        PdfPageIndexCache::lock()
-                            .documents_by_maximum_index
-                            .get(&document.handle())
-                            .copied()
-                            .unwrap(),
-                        index - 1
-                    );
+                    assert_maximum_index(document.handle(), index - 1);
                 }
             }
 

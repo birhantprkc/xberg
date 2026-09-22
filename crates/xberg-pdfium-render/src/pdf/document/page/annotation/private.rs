@@ -116,6 +116,11 @@ pub(crate) mod internal {
     }
 
     /// Internal crate-specific functionality common to all [PdfPageAnnotation] objects.
+    ///
+    /// This trait carries only the handful of primitives every concrete annotation type must
+    /// supply itself; the default-implemented functionality built on top of them lives in
+    /// [PdfPageAnnotationPrivateDefaults] and [PdfPageAnnotationPrivateStyle], both of which are
+    /// blanket-implemented for every type that implements this trait. ~keep
     pub(crate) trait PdfPageAnnotationPrivate<'a>: PdfPageAnnotationCommon {
         /// Returns the internal `FPDF_ANNOTATION` handle for this [PdfPageAnnotation].
         fn handle(&self) -> FPDF_ANNOTATION;
@@ -126,6 +131,17 @@ pub(crate) mod internal {
         /// Returns the ownership hierarchy for this [PdfPageAnnotation].
         fn ownership(&self) -> &PdfPageObjectOwnership;
 
+        /// Internal implementation of [PdfPageAnnotationCommon::objects()].
+        fn objects_impl(&self) -> &PdfPageAnnotationObjects<'_>;
+
+        /// Internal implementation of [PdfPageAnnotationCommon::attachment_points()].
+        fn attachment_points_impl(&self) -> &PdfPageAnnotationAttachmentPoints<'_>;
+    }
+
+    /// Default-implemented crate-specific functionality for reading and writing the string-valued
+    /// and geometric properties common to all [PdfPageAnnotation] objects. Blanket-implemented for
+    /// every type that implements [PdfPageAnnotationPrivate]. ~keep
+    pub(crate) trait PdfPageAnnotationPrivateDefaults<'a>: PdfPageAnnotationPrivate<'a> {
         /// Returns the [PdfPageAnnotationType] of this [PdfPageAnnotation].
         fn get_annotation_type(&self) -> PdfPageAnnotationType {
             PdfPageAnnotationType::from_pdfium(self.bindings().FPDFAnnot_GetSubtype(self.handle()))
@@ -306,7 +322,14 @@ pub(crate) mod internal {
         fn set_modification_date_impl(&mut self, date: DateTime<Utc>) -> Result<(), PdfiumError> {
             self.set_string_value("M", &date_time_to_pdf_string(date))
         }
+    }
 
+    impl<'a, T> PdfPageAnnotationPrivateDefaults<'a> for T where T: PdfPageAnnotationPrivate<'a> {}
+
+    /// Default-implemented crate-specific functionality for reading and writing the markup,
+    /// color, and flag-based properties common to all [PdfPageAnnotation] objects.
+    /// Blanket-implemented for every type that implements [PdfPageAnnotationPrivate]. ~keep
+    pub(crate) trait PdfPageAnnotationPrivateStyle<'a>: PdfPageAnnotationPrivateDefaults<'a> {
         /// Internal implementation of [PdfPageAnnotationCommon::is_markup_annotation()].
         #[inline]
         fn is_markup_annotation_impl(&self) -> bool {
@@ -471,13 +494,9 @@ pub(crate) mod internal {
                 ))
             }
         }
-
-        /// Internal implementation of [PdfPageAnnotationCommon::objects()].
-        fn objects_impl(&self) -> &PdfPageAnnotationObjects<'_>;
-
-        /// Internal implementation of [PdfPageAnnotationCommon::attachment_points()].
-        fn attachment_points_impl(&self) -> &PdfPageAnnotationAttachmentPoints<'_>;
     }
+
+    impl<'a, T> PdfPageAnnotationPrivateStyle<'a> for T where T: PdfPageAnnotationPrivateDefaults<'a> {}
 }
 
 #[cfg(test)]

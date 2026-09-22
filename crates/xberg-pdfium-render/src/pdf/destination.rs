@@ -11,6 +11,7 @@ use crate::pdf::document::pages::PdfPageIndex;
 use crate::pdf::points::PdfPoints;
 use crate::pdf::rect::PdfRect;
 use crate::utils::mem::create_sized_buffer;
+use std::os::raw::c_ulong;
 
 #[cfg(doc)]
 use crate::pdf::document::page::PdfPage;
@@ -79,7 +80,8 @@ pub enum PdfDestinationViewSettings {
 }
 
 impl PdfDestinationViewSettings {
-    pub(crate) fn from_pdfium(destination: &PdfDestination) -> Result<PdfDestinationViewSettings, PdfiumError> {
+    /// Extracts the (x, y, zoom) location Pdfium reports for `destination`, if any.
+    fn location_in_page(destination: &PdfDestination) -> (Option<PdfPoints>, Option<PdfPoints>, Option<f32>) {
         let mut has_x_value = destination.bindings.FALSE();
 
         let mut has_y_value = destination.bindings.FALSE();
@@ -92,7 +94,7 @@ impl PdfDestinationViewSettings {
 
         let mut zoom_value: FS_FLOAT = 0.0;
 
-        let (x, y, zoom) = if destination
+        if !destination
             .bindings
             .is_true(destination.bindings.FPDFDest_GetLocationInPage(
                 destination.destination_handle,
@@ -102,47 +104,42 @@ impl PdfDestinationViewSettings {
                 &mut x_value,
                 &mut y_value,
                 &mut zoom_value,
-            )) {
-            let x = if destination.bindings.is_true(has_x_value) {
-                Some(PdfPoints::new(x_value))
-            } else {
-                None
-            };
+            ))
+        {
+            return (None, None, None);
+        }
 
-            let y = if destination.bindings.is_true(has_y_value) {
-                Some(PdfPoints::new(y_value))
-            } else {
-                None
-            };
-
-            let zoom = if destination.bindings.is_true(has_zoom_value) {
-                if zoom_value != 0.0 { Some(zoom_value) } else { None }
-            } else {
-                None
-            };
-
-            (x, y, zoom)
+        let x = if destination.bindings.is_true(has_x_value) {
+            Some(PdfPoints::new(x_value))
         } else {
-            (None, None, None)
+            None
         };
 
-        let mut p_num_params = 0;
-
-        let mut p_params: Vec<FS_FLOAT> = create_sized_buffer(4);
-
-        let view = destination.bindings.FPDFDest_GetView(
-            destination.destination_handle,
-            &mut p_num_params,
-            p_params.as_mut_ptr(),
-        );
-
-        let view_mode = {
-            #[cfg(target_arch = "wasm32")]
-            let v: u32 = view;
-            #[cfg(not(target_arch = "wasm32"))]
-            let v: u32 = view as u32;
-            v
+        let y = if destination.bindings.is_true(has_y_value) {
+            Some(PdfPoints::new(y_value))
+        } else {
+            None
         };
+
+        let zoom = if destination.bindings.is_true(has_zoom_value) {
+            if zoom_value != 0.0 { Some(zoom_value) } else { None }
+        } else {
+            None
+        };
+
+        (x, y, zoom)
+    }
+
+    /// Maps a Pdfium view-mode constant and its accompanying parameters onto the equivalent
+    /// [PdfDestinationViewSettings].
+    fn view_settings_for_mode(
+        view_mode: u32,
+        p_num_params: c_ulong,
+        p_params: &[FS_FLOAT],
+        x: Option<PdfPoints>,
+        y: Option<PdfPoints>,
+        zoom: Option<f32>,
+    ) -> Result<PdfDestinationViewSettings, PdfiumError> {
         match view_mode {
             PDFDEST_VIEW_UNKNOWN_MODE => Ok(PdfDestinationViewSettings::Unknown),
             PDFDEST_VIEW_XYZ => {
@@ -210,6 +207,30 @@ impl PdfDestinationViewSettings {
             },
             _ => Err(PdfiumError::UnknownPdfDestinationViewType),
         }
+    }
+
+    pub(crate) fn from_pdfium(destination: &PdfDestination) -> Result<PdfDestinationViewSettings, PdfiumError> {
+        let (x, y, zoom) = Self::location_in_page(destination);
+
+        let mut p_num_params = 0;
+
+        let mut p_params: Vec<FS_FLOAT> = create_sized_buffer(4);
+
+        let view = destination.bindings.FPDFDest_GetView(
+            destination.destination_handle,
+            &mut p_num_params,
+            p_params.as_mut_ptr(),
+        );
+
+        let view_mode = {
+            #[cfg(target_arch = "wasm32")]
+            let v: u32 = view;
+            #[cfg(not(target_arch = "wasm32"))]
+            let v: u32 = view as u32;
+            v
+        };
+
+        Self::view_settings_for_mode(view_mode, p_num_params, &p_params, x, y, zoom)
     }
 }
 
