@@ -4,6 +4,7 @@
 //! Content streams contain a sequence of operators that define the appearance
 //! of a page, including text positioning, graphics state, and colors.
 
+use crate::error::Error;
 use crate::object::Object;
 
 /// A content stream operator.
@@ -521,292 +522,346 @@ impl Operator {
     /// assert!(op.validate_operands(&operands).is_ok());
     /// ```
     pub fn validate_operands_for_raw_operator(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
-        use crate::error::Error;
-
         match operator_name {
-            // Path construction operators - PDF Spec Section 8.5.2 ~keep
-            "m" => {
-                if operands.len() != 2 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'm' (moveto) requires 2 operands (x, y), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "l" => {
-                if operands.len() != 2 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'l' (lineto) requires 2 operands (x, y), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "c" => {
-                if operands.len() != 6 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'c' (curveto) requires 6 operands (x1, y1, x2, y2, x3, y3), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "v" => {
-                if operands.len() != 4 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'v' (curveto) requires 4 operands (x2, y2, x3, y3), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "y" => {
-                if operands.len() != 4 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'y' (curveto) requires 4 operands (x1, y1, x3, y3), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "h" => {
-                if !operands.is_empty() {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'h' (closepath) requires 0 operands, got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "re" => {
-                if operands.len() != 4 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 're' (rectangle) requires 4 operands (x, y, width, height), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
-            // Text positioning operators - PDF Spec Section 9.4.2 ~keep
-            "Td" => {
-                if operands.len() != 2 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Td' requires 2 operands (tx, ty), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "TD" => {
-                if operands.len() != 2 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'TD' requires 2 operands (tx, ty), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "Tm" => {
-                if operands.len() != 6 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tm' requires 6 operands (a, b, c, d, e, f), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "T*" => {
-                if !operands.is_empty() {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'T*' requires 0 operands, got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
-            // Text showing operators - PDF Spec Section 9.4.3 ~keep
-            "Tj" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tj' requires 1 operand (string), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "TJ" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'TJ' requires 1 operand (array), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "'" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator ''' requires 1 operand (string), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "\"" => {
-                if operands.len() != 3 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator '\"' requires 3 operands (word_space, char_space, string), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
-            // Text state operators - PDF Spec Section 9.3 ~keep
-            "Tc" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tc' requires 1 operand (char_space), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "Tw" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tw' requires 1 operand (word_space), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "Tz" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tz' requires 1 operand (scale), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "TL" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'TL' requires 1 operand (leading), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "Tf" => {
-                if operands.len() != 2 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tf' requires 2 operands (font, size), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "Tr" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Tr' requires 1 operand (render), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "Ts" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Ts' requires 1 operand (rise), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
-            "q" | "Q" => {
-                if !operands.is_empty() {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator '{}' requires 0 operands, got {}",
-                        operator_name,
-                        operands.len()
-                    )));
-                }
-            }
-            "cm" => {
-                if operands.len() != 6 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'cm' requires 6 operands (a, b, c, d, e, f), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
-            // Color operators - PDF Spec Section 8.6.8 ~keep
-            "rg" => {
-                if operands.len() != 3 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'rg' requires 3 operands (r, g, b), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "RG" => {
-                if operands.len() != 3 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'RG' requires 3 operands (r, g, b), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "g" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'g' requires 1 operand (gray), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "G" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'G' requires 1 operand (gray), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "k" => {
-                if operands.len() != 4 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'k' requires 4 operands (c, m, y, k), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-            "K" => {
-                if operands.len() != 4 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'K' requires 4 operands (c, m, y, k), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
-            // Text object operators - PDF Spec Section 9.4 ~keep
-            "BT" | "ET" => {
-                if !operands.is_empty() {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator '{}' requires 0 operands, got {}",
-                        operator_name,
-                        operands.len()
-                    )));
-                }
-            }
-
-            // XObject operator - PDF Spec Section 8.8 ~keep
-            "Do" => {
-                if operands.len() != 1 {
-                    return Err(Error::InvalidPdf(format!(
-                        "Operator 'Do' requires 1 operand (name), got {}",
-                        operands.len()
-                    )));
-                }
-            }
-
+            "m" | "l" | "c" | "v" | "y" | "h" | "re" => validate_path_construction_operands(operator_name, operands),
+            "Td" | "TD" | "Tm" | "T*" => validate_text_positioning_operands(operator_name, operands),
+            "Tj" | "TJ" | "'" | "\"" => validate_text_showing_operands(operator_name, operands),
+            "Tc" | "Tw" | "Tz" | "TL" | "Tf" | "Tr" | "Ts" => validate_text_state_operands(operator_name, operands),
+            "q" | "Q" | "cm" => validate_graphics_state_operands(operator_name, operands),
+            "rg" | "RG" | "g" | "G" | "k" | "K" => validate_color_operands(operator_name, operands),
+            "BT" | "ET" => validate_text_object_operands(operator_name, operands),
+            "Do" => validate_xobject_operands(operator_name, operands),
             _ => {
                 tracing::trace!(
                     operator = operator_name,
                     "no operand validation implemented for operator"
                 );
+                Ok(())
             }
         }
-
-        Ok(())
     }
+}
+
+// Path construction operators - PDF Spec Section 8.5.2 ~keep
+fn validate_path_construction_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "m" => {
+            if operands.len() != 2 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'm' (moveto) requires 2 operands (x, y), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "l" => {
+            if operands.len() != 2 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'l' (lineto) requires 2 operands (x, y), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "c" => {
+            if operands.len() != 6 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'c' (curveto) requires 6 operands (x1, y1, x2, y2, x3, y3), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "v" => {
+            if operands.len() != 4 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'v' (curveto) requires 4 operands (x2, y2, x3, y3), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "y" => {
+            if operands.len() != 4 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'y' (curveto) requires 4 operands (x1, y1, x3, y3), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "h" => {
+            if !operands.is_empty() {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'h' (closepath) requires 0 operands, got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "re" => {
+            if operands.len() != 4 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 're' (rectangle) requires 4 operands (x, y, width, height), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Text positioning operators - PDF Spec Section 9.4.2 ~keep
+fn validate_text_positioning_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "Td" => {
+            if operands.len() != 2 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Td' requires 2 operands (tx, ty), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "TD" => {
+            if operands.len() != 2 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'TD' requires 2 operands (tx, ty), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "Tm" => {
+            if operands.len() != 6 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tm' requires 6 operands (a, b, c, d, e, f), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "T*" => {
+            if !operands.is_empty() {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'T*' requires 0 operands, got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Text showing operators - PDF Spec Section 9.4.3 ~keep
+fn validate_text_showing_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "Tj" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tj' requires 1 operand (string), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "TJ" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'TJ' requires 1 operand (array), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "'" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator ''' requires 1 operand (string), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "\"" => {
+            if operands.len() != 3 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator '\"' requires 3 operands (word_space, char_space, string), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Text state operators - PDF Spec Section 9.3 ~keep
+fn validate_text_state_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "Tc" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tc' requires 1 operand (char_space), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "Tw" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tw' requires 1 operand (word_space), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "Tz" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tz' requires 1 operand (scale), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "TL" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'TL' requires 1 operand (leading), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "Tf" => {
+            if operands.len() != 2 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tf' requires 2 operands (font, size), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "Tr" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Tr' requires 1 operand (render), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "Ts" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Ts' requires 1 operand (rise), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Graphics state operators - PDF Spec Section 8.4 ~keep
+fn validate_graphics_state_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "q" | "Q" => {
+            if !operands.is_empty() {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator '{}' requires 0 operands, got {}",
+                    operator_name,
+                    operands.len()
+                )));
+            }
+        }
+        "cm" => {
+            if operands.len() != 6 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'cm' requires 6 operands (a, b, c, d, e, f), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Color operators - PDF Spec Section 8.6.8 ~keep
+fn validate_color_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "rg" => {
+            if operands.len() != 3 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'rg' requires 3 operands (r, g, b), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "RG" => {
+            if operands.len() != 3 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'RG' requires 3 operands (r, g, b), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "g" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'g' requires 1 operand (gray), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "G" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'G' requires 1 operand (gray), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "k" => {
+            if operands.len() != 4 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'k' requires 4 operands (c, m, y, k), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        "K" => {
+            if operands.len() != 4 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'K' requires 4 operands (c, m, y, k), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Text object operators - PDF Spec Section 9.4 ~keep
+fn validate_text_object_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "BT" | "ET" => {
+            if !operands.is_empty() {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator '{}' requires 0 operands, got {}",
+                    operator_name,
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// XObject operator - PDF Spec Section 8.8 ~keep
+fn validate_xobject_operands(operator_name: &str, operands: &[Object]) -> crate::error::Result<()> {
+    match operator_name {
+        "Do" => {
+            if operands.len() != 1 {
+                return Err(Error::InvalidPdf(format!(
+                    "Operator 'Do' requires 1 operand (name), got {}",
+                    operands.len()
+                )));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
