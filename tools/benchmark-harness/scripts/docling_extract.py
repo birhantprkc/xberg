@@ -100,27 +100,11 @@ def extract_sync(file_path: str, converter: DocumentConverter, output_format: st
     }
 
 
-def extract_batch(
-    file_paths: list[str], ocr_enabled: bool, output_format: str = "markdown", ocr_language: str | None = None
-) -> dict[str, Any]:
-    """Extract multiple files using docling-jobkit's in-process converter manager.
-
-    docling-jobkit's ``DoclingConverterManager`` is the batch engine (it wraps docling's
-    ``convert_all`` with jobkit's option handling and the docling-slim pipeline). It is driven
-    in-process and single-process here: the harness times this whole subprocess as one cold batch,
-    so jobkit's own multiprocessing is intentionally not used. Unlike a fixed-partition batch it
-    accepts any number of eligible documents. Rendering is done locally (``_render``) so batch
-    output matches the single-file path exactly. ``convert_all`` preserves input order and count,
-    so ``results`` stays 1:1 with ``file_paths``.
-    """
-    from docling.datamodel.base_models import ConversionStatus, OutputFormat
-    from docling_jobkit.convert.manager import (
-        DoclingConverterManager,
-        DoclingConverterManagerConfig,
-    )
+def _build_batch_convert_options(ocr_enabled: bool, ocr_language: str | None) -> Any:
+    """Build jobkit's ConvertDocumentsOptions for a batch run, mirroring the single-file OCR flag."""
+    from docling.datamodel.base_models import OutputFormat
     from docling_jobkit.datamodel.convert import ConvertDocumentsOptions
 
-    manager = DoclingConverterManager(config=DoclingConverterManagerConfig(options_cache_size=1))
     # ``to_formats`` drives jobkit's own writer, which we bypass (we render from the
     # DoclingDocument ourselves), so it only needs to be a valid default. ``do_ocr`` mirrors the
     # harness OCR flag; ``abort_on_error`` stays False so one bad document does not sink the batch.
@@ -134,7 +118,67 @@ def extract_batch(
         # jobkit's ConvertDocumentsOptions forwards ocr_lang to the same EasyOCR engine
         # as the single-file path; only set it when the fixture pins a language.
         option_kwargs["ocr_lang"] = easyocr_langs
-    options = ConvertDocumentsOptions(**option_kwargs)
+    return ConvertDocumentsOptions(**option_kwargs)
+
+
+def _render_batch_result(result: Any, output_format: str) -> dict[str, Any]:
+    """Render one jobkit conversion result into the harness's per-file output shape."""
+    from docling.datamodel.base_models import ConversionStatus
+
+    # PARTIAL_SUCCESS means docling converted the document but hit recoverable problems on
+    # some pages; the DoclingDocument still carries real content. Rendering only SUCCESS
+    # scored those documents as empty, which understated docling in batch mode while the
+    # single-file path (``extract_sync``) renders them unconditionally. Render whenever a
+    # document is present and carry the degraded status through as metadata. ~keep
+    if result.document is not None and result.status in (
+        ConversionStatus.SUCCESS,
+        ConversionStatus.PARTIAL_SUCCESS,
+    ):
+        content = _render(result.document, output_format)
+        metadata: dict[str, Any] = {"framework": "docling", "output_format": output_format}
+        if result.status != ConversionStatus.SUCCESS:
+            metadata["status"] = result.status.name
+            if result.errors:
+                metadata["partial_errors"] = str(result.errors)
+        return {
+            "content": content,
+            "metadata": metadata,
+            "_peak_memory_bytes": _get_peak_memory_bytes(),
+        }
+
+    error = str(result.errors) if result.errors else "Unknown error"
+    return {
+        "content": "",
+        "error": error,
+        "metadata": {
+            "framework": "docling",
+            "error": error,
+            "status": result.status.name,
+        },
+        "_peak_memory_bytes": _get_peak_memory_bytes(),
+    }
+
+
+def extract_batch(
+    file_paths: list[str], ocr_enabled: bool, output_format: str = "markdown", ocr_language: str | None = None
+) -> dict[str, Any]:
+    """Extract multiple files using docling-jobkit's in-process converter manager.
+
+    docling-jobkit's ``DoclingConverterManager`` is the batch engine (it wraps docling's
+    ``convert_all`` with jobkit's option handling and the docling-slim pipeline). It is driven
+    in-process and single-process here: the harness times this whole subprocess as one cold batch,
+    so jobkit's own multiprocessing is intentionally not used. Unlike a fixed-partition batch it
+    accepts any number of eligible documents. Rendering is done locally (``_render``) so batch
+    output matches the single-file path exactly. ``convert_all`` preserves input order and count,
+    so ``results`` stays 1:1 with ``file_paths``.
+    """
+    from docling_jobkit.convert.manager import (
+        DoclingConverterManager,
+        DoclingConverterManagerConfig,
+    )
+
+    manager = DoclingConverterManager(config=DoclingConverterManagerConfig(options_cache_size=1))
+    options = _build_batch_convert_options(ocr_enabled, ocr_language)
 
     start = time.perf_counter()
     outputs: list[dict[str, Any]] = []
@@ -142,40 +186,7 @@ def extract_batch(
     # (``convert_all`` under the hood preserves input order and count, so ``outputs`` stays 1:1
     # with ``file_paths``). ~keep
     for result in manager.convert_documents(sources=list(file_paths), options=options):
-        item: dict[str, Any]
-        # PARTIAL_SUCCESS means docling converted the document but hit recoverable problems on
-        # some pages; the DoclingDocument still carries real content. Rendering only SUCCESS
-        # scored those documents as empty, which understated docling in batch mode while the
-        # single-file path (``extract_sync``) renders them unconditionally. Render whenever a
-        # document is present and carry the degraded status through as metadata. ~keep
-        if result.document is not None and result.status in (
-            ConversionStatus.SUCCESS,
-            ConversionStatus.PARTIAL_SUCCESS,
-        ):
-            content = _render(result.document, output_format)
-            metadata: dict[str, Any] = {"framework": "docling", "output_format": output_format}
-            if result.status != ConversionStatus.SUCCESS:
-                metadata["status"] = result.status.name
-                if result.errors:
-                    metadata["partial_errors"] = str(result.errors)
-            item = {
-                "content": content,
-                "metadata": metadata,
-                "_peak_memory_bytes": _get_peak_memory_bytes(),
-            }
-        else:
-            error = str(result.errors) if result.errors else "Unknown error"
-            item = {
-                "content": "",
-                "error": error,
-                "metadata": {
-                    "framework": "docling",
-                    "error": error,
-                    "status": result.status.name,
-                },
-                "_peak_memory_bytes": _get_peak_memory_bytes(),
-            }
-        outputs.append(item)
+        outputs.append(_render_batch_result(result, output_format))
 
     total_duration_ms = (time.perf_counter() - start) * 1000.0
     return {

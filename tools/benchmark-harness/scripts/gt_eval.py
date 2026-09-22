@@ -137,46 +137,50 @@ def _segment_recall(oracle_flat: list[str], gt_set: set[str], lo: float, hi: flo
     return len([t for t in seg if t in gt_set]) / len(seg)
 
 
-def evaluate(pdf_path: Path, gt_md: str, source: str = "") -> Eval:
-    ev = Eval()
-    g_tok = tokens(gt_md)
-    ev.gt_tokens = len(g_tok)
-    # Empty / near-empty GT (e.g. a failed html_to_gfm produced "") is always bad, oracle-independent. ~keep
+def _reject_near_empty_gt(ev: Eval, g_tok: list[str]) -> bool:
+    """Empty/near-empty GT (e.g. a failed html_to_gfm produced "") is always bad, oracle-independent. ~keep"""
     if len(g_tok) < 3:
         ev.verdict, ev.reasons = "REJECT", [f"empty/near-empty GT ({len(g_tok)} tokens)"]
-        return ev
+        return True
+    return False
 
-    pages, oracle_raw = oracle_pages(pdf_path)
-    ev.pages = len(pages)
-    ev.empty_pages = sum(1 for p in pages if len(p) < EMPTY_PAGE_TOKENS)
-    oracle_flat = [t for p in pages for t in p]
-    o_set, g_set = set(oracle_flat), set(g_tok)
-    ev.oracle_tokens = len(oracle_flat)
 
+def _reject_if_no_oracle(ev: Eval, oracle_flat: list[str]) -> bool:
+    """Route docs whose oracle has too few tokens to NO_ORACLE/TRIVIAL instead of scoring them."""
     if len(oracle_flat) < MIN_ORACLE_TOKENS:
         ev.verdict = "NO_ORACLE" if not oracle_flat else "TRIVIAL"
         ev.reasons = [
             "no extractable text layer (scanned/image)" if not oracle_flat else f"oracle only {len(oracle_flat)} tokens"
         ]
         ev.cohorts = ["forced-OCR"] if not oracle_flat else []
-        return ev
+        return True
+    return False
 
-    inter = len(g_set & o_set)
-    ev.recall = inter / len(o_set)
-    ev.precision = inter / max(1, len(g_set))
-    ev.coverage = len(g_tok) / max(1, len(oracle_flat))
-    ev.head_recall = _segment_recall(oracle_flat, g_set, 0.0, 0.5)
-    ev.tail_recall = _segment_recall(oracle_flat, g_set, 0.75, 1.0)
 
-    # A page with no text layer only matters when it HIDES GT content — i.e. coverage is low. A blank
-    # trailing page (common in per-page crops; GT fully covered by the text page) is not a scan. ~keep
+def _classify_cohort(ev: Eval) -> tuple[bool, float]:
+    """Append the page-emptiness cohort to ev and report whether a scan is suspected.
+
+    A page with no text layer only matters when it HIDES GT content — i.e. coverage is low. A blank
+    trailing page (common in per-page crops; GT fully covered by the text page) is not a scan. ~keep
+    """
     frac_empty = ev.empty_pages / max(1, ev.pages)
     scan_suspect = frac_empty >= SCAN_PAGE_FRACTION and ev.coverage < TRUNC_COVERAGE
     if scan_suspect:
         ev.cohorts.append("forced-OCR" if frac_empty > 0.8 else "selective-OCR")
     else:
         ev.cohorts.append("native-clean")
+    return scan_suspect, frac_empty
 
+
+def _detect_reject_reasons(ev: Eval, gt_md: str, o_set: set[str], frac_empty: float) -> list[str]:
+    """Detect REJECT-worthy defects: truncation (two shapes) and a fabricated table.
+
+    NOTE: an exact-string GT-vs-oracle digit-contradiction check was tried and removed — it
+    false-rejected 30% of authoritative source-derived academic GT (pdftotext mangles subscript/
+    equation/citation number glyphs), while its only real win (prose hallucination like pdfa_019)
+    is already routed to REVIEW via the scanned-page path. Truncation + table-label + precision
+    cover the real defects without that noise. `numbers()`/`_MATH_CODE` kept for the sidecar work. ~keep
+    """
     reasons = []
     # Truncation, shape A: clean prefix whose recall drops off in the oracle tail. ~keep
     if ev.coverage < TRUNC_COVERAGE and ev.head_recall >= TRUNC_HEAD_RECALL and ev.tail_recall <= TRUNC_TAIL_RECALL:
@@ -201,13 +205,36 @@ def evaluate(pdf_path: Path, gt_md: str, source: str = "") -> Eval:
             reasons.append(
                 f"fabricated table: header-token support {ev.worst_table_label_support:.2f} < {TABLE_LABEL_SUPPORT}"
             )
+    return reasons
 
-    # NOTE: an exact-string GT-vs-oracle digit-contradiction check was tried and removed — it
-    # false-rejected 30% of authoritative source-derived academic GT (pdftotext mangles subscript/
-    # equation/citation number glyphs), while its only real win (prose hallucination like pdfa_019)
-    # is already routed to REVIEW via the scanned-page path. Truncation + table-label + precision
-    # cover the real defects without that noise. `numbers()`/`_MATH_CODE` kept for the sidecar work. ~keep
 
+def evaluate(pdf_path: Path, gt_md: str, source: str = "") -> Eval:
+    ev = Eval()
+    g_tok = tokens(gt_md)
+    ev.gt_tokens = len(g_tok)
+    if _reject_near_empty_gt(ev, g_tok):
+        return ev
+
+    pages, oracle_raw = oracle_pages(pdf_path)
+    ev.pages = len(pages)
+    ev.empty_pages = sum(1 for p in pages if len(p) < EMPTY_PAGE_TOKENS)
+    oracle_flat = [t for p in pages for t in p]
+    o_set, g_set = set(oracle_flat), set(g_tok)
+    ev.oracle_tokens = len(oracle_flat)
+
+    if _reject_if_no_oracle(ev, oracle_flat):
+        return ev
+
+    inter = len(g_set & o_set)
+    ev.recall = inter / len(o_set)
+    ev.precision = inter / max(1, len(g_set))
+    ev.coverage = len(g_tok) / max(1, len(oracle_flat))
+    ev.head_recall = _segment_recall(oracle_flat, g_set, 0.0, 0.5)
+    ev.tail_recall = _segment_recall(oracle_flat, g_set, 0.75, 1.0)
+
+    scan_suspect, frac_empty = _classify_cohort(ev)
+
+    reasons = _detect_reject_reasons(ev, gt_md, o_set, frac_empty)
     if reasons:
         ev.verdict, ev.reasons = "REJECT", reasons
         return ev

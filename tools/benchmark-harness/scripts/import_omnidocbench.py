@@ -225,6 +225,14 @@ def group_pages_by_pdf(pages: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def find_pdf_by_stem_prefix(directory: Path, pdf_name: str) -> Path | None:
+    """Return a PDF in `directory` whose stem is a prefix match for `pdf_name`, either way."""
+    for pdf_file in directory.glob("*.pdf"):
+        if pdf_name.startswith(pdf_file.stem) or pdf_file.stem.startswith(pdf_name):
+            return pdf_file
+    return None
+
+
 def find_pdf_for_document(pdf_name: str, pages: list[dict], ori_pdfs_dir: Path) -> Path | None:
     """Find the original PDF file for a document group."""
     if not ori_pdfs_dir.exists():
@@ -239,18 +247,95 @@ def find_pdf_for_document(pdf_name: str, pages: list[dict], ori_pdfs_dir: Path) 
         if pdf_file.stem == pdf_name:
             return pdf_file
 
-    if pages:
-        image_path = pages[0].get("page_info", {}).get("image_path", "")
-        parts = image_path.split("/")
-        if len(parts) >= 2:
-            subdir = parts[0]
-            subdir_path = ori_pdfs_dir / subdir
-            if subdir_path.exists():
-                for pdf_file in subdir_path.glob("*.pdf"):
-                    if pdf_name.startswith(pdf_file.stem) or pdf_file.stem.startswith(pdf_name):
-                        return pdf_file
+    if not pages:
+        return None
 
-    return None
+    image_path = pages[0].get("page_info", {}).get("image_path", "")
+    parts = image_path.split("/")
+    if len(parts) < 2:
+        return None
+
+    subdir_path = ori_pdfs_dir / parts[0]
+    if not subdir_path.exists():
+        return None
+
+    return find_pdf_by_stem_prefix(subdir_path, pdf_name)
+
+
+# Outcomes of importing a single OmniDocBench document group; `main` uses these to keep its
+# summary counters, so they must stay in sync with the branches in `import_single_document`. ~keep
+IMPORT_STATUS_EXISTS = "exists"
+IMPORT_STATUS_NO_PDF = "no_pdf"
+IMPORT_STATUS_EMPTY = "empty"
+IMPORT_STATUS_CREATED = "created"
+
+
+def import_single_document(
+    pdf_name: str,
+    doc_pages: list[dict],
+    ori_pdfs_dir: Path,
+    fixtures_dir: Path,
+    gt_dir: Path,
+) -> str:
+    """Import one OmniDocBench document group into a fixture and ground truth, if possible."""
+    fixture_name = re.sub(r"[^a-zA-Z0-9_-]", "_", f"omnidoc_{pdf_name}")
+
+    fixture_path = fixtures_dir / f"{fixture_name}.json"
+    gt_md_path = gt_dir / f"{fixture_name}.md"
+    gt_txt_path = gt_dir / f"{fixture_name}.txt"
+
+    if fixture_path.exists():
+        return IMPORT_STATUS_EXISTS
+
+    pdf_path = find_pdf_for_document(pdf_name, doc_pages, ori_pdfs_dir)
+    if pdf_path is None:
+        return IMPORT_STATUS_NO_PDF
+
+    page_markdowns = []
+    for page in doc_pages:
+        md = page_to_markdown(page)
+        if md.strip():
+            page_markdowns.append(md)
+
+    if not page_markdowns:
+        return IMPORT_STATUS_EMPTY
+
+    full_markdown = "\n\n".join(page_markdowns)
+    full_text = strip_markdown_to_text(full_markdown)
+
+    gt_md_path.write_text(full_markdown)
+    gt_txt_path.write_text(full_text)
+
+    doc_rel = os.path.relpath(pdf_path, fixtures_dir)
+    gt_md_rel = os.path.relpath(gt_md_path, fixtures_dir)
+    gt_txt_rel = os.path.relpath(gt_txt_path, fixtures_dir)
+
+    first_page = doc_pages[0].get("page_info", {})
+    page_attr = first_page.get("page_attribute", {})
+
+    fixture = {
+        "document": doc_rel,
+        "file_type": "pdf",
+        "file_size": pdf_path.stat().st_size,
+        "expected_frameworks": ["xberg"],
+        "metadata": {
+            "description": f"OmniDocBench: {page_attr.get('data_source', 'unknown')}",
+            "source": "omnidocbench",
+            "size_category": "small" if pdf_path.stat().st_size < 500_000 else "medium",
+            "language": page_attr.get("language", "unknown"),
+            "layout": page_attr.get("layout", "unknown"),
+            "data_source": page_attr.get("data_source", "unknown"),
+            "page_count": len(doc_pages),
+        },
+        "ground_truth": {
+            "text_file": gt_txt_rel,
+            "markdown_file": gt_md_rel,
+            "source": "omnidocbench",
+        },
+    }
+
+    fixture_path.write_text(json.dumps(fixture, indent=2) + "\n")
+    return IMPORT_STATUS_CREATED
 
 
 def main() -> None:
@@ -290,69 +375,19 @@ def main() -> None:
     skipped_empty = 0
 
     for pdf_name, doc_pages in sorted(doc_groups.items()):
-        fixture_name = f"omnidoc_{pdf_name}"
-        fixture_name = re.sub(r"[^a-zA-Z0-9_-]", "_", fixture_name)
+        status = import_single_document(pdf_name, doc_pages, ori_pdfs_dir, fixtures_dir, gt_dir)
 
-        fixture_path = fixtures_dir / f"{fixture_name}.json"
-        gt_md_path = gt_dir / f"{fixture_name}.md"
-        gt_txt_path = gt_dir / f"{fixture_name}.txt"
-
-        if fixture_path.exists():
+        if status == IMPORT_STATUS_EXISTS:
             skipped_exists += 1
             continue
-
-        pdf_path = find_pdf_for_document(pdf_name, doc_pages, ori_pdfs_dir)
-        if pdf_path is None:
+        if status == IMPORT_STATUS_NO_PDF:
             skipped_no_pdf += 1
             continue
-
-        page_markdowns = []
-        for page in doc_pages:
-            md = page_to_markdown(page)
-            if md.strip():
-                page_markdowns.append(md)
-
-        if not page_markdowns:
+        if status == IMPORT_STATUS_EMPTY:
             skipped_empty += 1
             continue
 
-        full_markdown = "\n\n".join(page_markdowns)
-        full_text = strip_markdown_to_text(full_markdown)
-
-        gt_md_path.write_text(full_markdown)
-        gt_txt_path.write_text(full_text)
-
-        doc_rel = os.path.relpath(pdf_path, fixtures_dir)
-        gt_md_rel = os.path.relpath(gt_md_path, fixtures_dir)
-        gt_txt_rel = os.path.relpath(gt_txt_path, fixtures_dir)
-
-        first_page = doc_pages[0].get("page_info", {})
-        page_attr = first_page.get("page_attribute", {})
-
-        fixture = {
-            "document": doc_rel,
-            "file_type": "pdf",
-            "file_size": pdf_path.stat().st_size,
-            "expected_frameworks": ["xberg"],
-            "metadata": {
-                "description": f"OmniDocBench: {page_attr.get('data_source', 'unknown')}",
-                "source": "omnidocbench",
-                "size_category": "small" if pdf_path.stat().st_size < 500_000 else "medium",
-                "language": page_attr.get("language", "unknown"),
-                "layout": page_attr.get("layout", "unknown"),
-                "data_source": page_attr.get("data_source", "unknown"),
-                "page_count": len(doc_pages),
-            },
-            "ground_truth": {
-                "text_file": gt_txt_rel,
-                "markdown_file": gt_md_rel,
-                "source": "omnidocbench",
-            },
-        }
-
-        fixture_path.write_text(json.dumps(fixture, indent=2) + "\n")
         created += 1
-
         if created % 50 == 0:
             print(f"  {created} fixtures created...", file=sys.stderr)
 

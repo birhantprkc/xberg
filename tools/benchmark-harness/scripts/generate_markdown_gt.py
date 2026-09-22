@@ -148,7 +148,8 @@ def generate_markdown(
     return text.strip() + "\n"
 
 
-def main() -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for generate_markdown_gt."""
     parser = argparse.ArgumentParser(description="Generate markdown ground truth from PDFs using Gemini")
     parser.add_argument(
         "--filter", type=str, default=None, help="Only process fixtures whose name contains this string"
@@ -163,6 +164,53 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=1.0, help="Delay between API calls in seconds (rate limiting)")
     parser.add_argument("--timeout", type=int, default=120, help="Per-request timeout in seconds (default: 120)")
     parser.add_argument("--max-size", type=int, default=None, help="Skip PDFs larger than this many KB")
+    return parser
+
+
+def _process_fixture(item: dict, gt_dir: Path, args: argparse.Namespace, client: genai.Client | None) -> str:
+    """Process one fixture per the CLI flags; returns the stats bucket it belongs in."""
+    name = item["name"]
+    md_path = gt_dir / f"{name}.md"
+    file_size_kb = item["doc_path"].stat().st_size / 1024
+
+    if md_path.exists() and not args.force:
+        return "skipped"
+
+    if args.max_size and file_size_kb > args.max_size:
+        print(f"  Skipping {name} ({file_size_kb:.0f} KB > {args.max_size} KB)")
+        return "skipped"
+
+    if args.dry_run:
+        print(f"  [DRY] {name} ({file_size_kb:.0f} KB)")
+        return "generated"
+
+    print(f"  Processing {name} ({file_size_kb:.0f} KB)...", end=" ", flush=True)
+    try:
+        start = time.time()
+        markdown = generate_markdown(client, item["doc_path"], args.model, timeout=args.timeout)
+        elapsed = time.time() - start
+
+        gt_dir.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(markdown, encoding="utf-8")
+
+        lines = markdown.strip().split("\n")
+        headings = sum(1 for l in lines if l.startswith("#"))
+        tables = sum(1 for l in lines if "|" in l and "---" not in l)
+        print(f"OK ({elapsed:.1f}s, {len(lines)} lines, {headings} headings, {tables} table rows)")
+
+        time.sleep(args.delay)
+        return "generated"
+
+    except _Timeout:
+        print(f"TIMEOUT ({args.timeout}s)")
+        return "errors"
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return "errors"
+
+
+def main() -> int:
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     repo_root = get_repo_root()
@@ -179,6 +227,7 @@ def main() -> int:
     fixtures = discover_fixtures(fixtures_dir, args.filter)
     print(f"Found {len(fixtures)} PDF fixtures")
 
+    client: genai.Client | None = None
     if not args.dry_run:
         client = genai.Client(
             vertexai=True,
@@ -189,47 +238,7 @@ def main() -> int:
     stats = {"generated": 0, "skipped": 0, "errors": 0}
 
     for item in fixtures:
-        name = item["name"]
-        md_path = gt_dir / f"{name}.md"
-        file_size_kb = item["doc_path"].stat().st_size / 1024
-
-        if md_path.exists() and not args.force:
-            stats["skipped"] += 1
-            continue
-
-        if args.max_size and file_size_kb > args.max_size:
-            print(f"  Skipping {name} ({file_size_kb:.0f} KB > {args.max_size} KB)")
-            stats["skipped"] += 1
-            continue
-
-        if args.dry_run:
-            print(f"  [DRY] {name} ({file_size_kb:.0f} KB)")
-            stats["generated"] += 1
-            continue
-
-        print(f"  Processing {name} ({file_size_kb:.0f} KB)...", end=" ", flush=True)
-        try:
-            start = time.time()
-            markdown = generate_markdown(client, item["doc_path"], args.model, timeout=args.timeout)
-            elapsed = time.time() - start
-
-            gt_dir.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(markdown, encoding="utf-8")
-
-            lines = markdown.strip().split("\n")
-            headings = sum(1 for l in lines if l.startswith("#"))
-            tables = sum(1 for l in lines if "|" in l and "---" not in l)
-            print(f"OK ({elapsed:.1f}s, {len(lines)} lines, {headings} headings, {tables} table rows)")
-            stats["generated"] += 1
-
-            time.sleep(args.delay)
-
-        except _Timeout:
-            print(f"TIMEOUT ({args.timeout}s)")
-            stats["errors"] += 1
-        except Exception as e:
-            print(f"ERROR: {e}")
-            stats["errors"] += 1
+        stats[_process_fixture(item, gt_dir, args, client)] += 1
 
     print(f"\n{'=' * 50}")
     print(f"Generated: {stats['generated']}")

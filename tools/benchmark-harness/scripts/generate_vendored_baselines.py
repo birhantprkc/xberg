@@ -157,6 +157,18 @@ def lines_to_markdown(lines: list[str]) -> str:
     return "\n\n".join(paragraphs) + "\n" if paragraphs else ""
 
 
+def clean_rec_texts(rec_texts: object) -> list[str]:
+    """Return the non-empty, stripped strings from a PaddleOCR `rec_text` field."""
+    if not isinstance(rec_texts, (list, tuple)):
+        return []
+    cleaned: list[str] = []
+    for candidate in rec_texts:
+        text = str(candidate).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
 def run_paddleocr_python(document_path: str, language: str) -> tuple[str, float]:
     """Run PaddleOCR Python v3.4+ using the predict() API."""
     os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
@@ -169,12 +181,7 @@ def run_paddleocr_python(document_path: str, language: str) -> tuple[str, float]
     all_lines: list[str] = []
     for img in images:
         for result in ocr.predict(img):
-            rec_texts = result.get("rec_text", [])
-            if isinstance(rec_texts, (list, tuple)):
-                for t in rec_texts:
-                    text = str(t).strip()
-                    if text:
-                        all_lines.append(text)
+            all_lines.extend(clean_rec_texts(result.get("rec_text", [])))
     elapsed_ms = (time.monotonic() - start) * 1000
 
     return lines_to_markdown(all_lines), elapsed_ms

@@ -242,21 +242,8 @@ homepage = "https://xberg.io"
         f.write(vendor_toml)
 
 
-def main() -> None:
-    """Main vendoring function."""
-    repo_root: Path = get_repo_root()
-
-    print("=== Vendoring xberg core crate ===")
-
-    workspace_deps: dict[str, object] = get_workspace_deps(repo_root)
-    core_version: str = get_workspace_version(repo_root)
-
-    print(f"Core version: {core_version}")
-    print(f"Workspace dependencies: {len(workspace_deps)}")
-
-    vendor_base: Path = repo_root / "packages" / "ruby" / "vendor"
-
-    crate_names = ["xberg", "xberg-ffi", "xberg-tesseract", "xberg-paddle-ocr", "rb-sys"]
+def _clean_vendor_directories(vendor_base: Path, crate_names: list[str]) -> None:
+    """Remove previously vendored crate directories and the generated Cargo.toml."""
     for name in crate_names:
         crate_path = vendor_base / name
         if crate_path.exists():
@@ -266,16 +253,9 @@ def main() -> None:
         vendor_cargo.unlink()
     print("Cleaned vendor crate directories")
 
-    vendor_base.mkdir(parents=True, exist_ok=True)
 
-    crates_to_copy: list[tuple[str, str]] = [
-        ("crates/xberg", "xberg"),
-        ("crates/xberg-ffi", "xberg-ffi"),
-        ("crates/xberg-tesseract", "xberg-tesseract"),
-        ("crates/xberg-paddle-ocr", "xberg-paddle-ocr"),
-        ("vendor/rb-sys", "rb-sys"),
-    ]
-
+def _copy_crates_to_vendor(repo_root: Path, vendor_base: Path, crates_to_copy: list[tuple[str, str]]) -> list[str]:
+    """Copy each source crate into vendor_base, returning the names that were copied."""
     copied_crates: list[str] = []
     for src_rel, dest_name in crates_to_copy:
         src: Path = repo_root / src_rel
@@ -289,7 +269,11 @@ def main() -> None:
                 print(f"Warning: Failed to copy {dest_name}: {e}", file=sys.stderr)
         else:
             print(f"Warning: Source directory not found: {src_rel}")
+    return copied_crates
 
+
+def _clean_build_artifacts(vendor_base: Path, copied_crates: list[str]) -> None:
+    """Remove build artifact directories and temp files from copied crates."""
     artifact_dirs: list[str] = [".fastembed_cache", "target"]
     temp_patterns: list[str] = ["*.swp", "*.bak", "*.tmp", "*~"]
 
@@ -307,6 +291,11 @@ def main() -> None:
 
     print("Cleaned build artifacts")
 
+
+def _update_crate_cargo_tomls(
+    vendor_base: Path, copied_crates: list[str], core_version: str, workspace_deps: dict[str, object]
+) -> None:
+    """Replace workspace = true fields in each copied crate's Cargo.toml."""
     for crate_dir in copied_crates:
         crate_toml = vendor_base / crate_dir / "Cargo.toml"
         if crate_toml.exists():
@@ -330,6 +319,9 @@ def main() -> None:
             replace_workspace_deps_in_toml(crate_toml, workspace_deps)
             print(f"Updated {crate_dir}/Cargo.toml")
 
+
+def _relink_local_crate_paths(vendor_base: Path, copied_crates: list[str]) -> None:
+    """Point xberg-ffi and xberg at their vendored sibling crates by relative path."""
     if "xberg-ffi" in copied_crates and "xberg" in copied_crates:
         ffi_toml = vendor_base / "xberg-ffi" / "Cargo.toml"
         if ffi_toml.exists():
@@ -363,9 +355,9 @@ def main() -> None:
             with open(xberg_toml, "w") as f:
                 f.write(content)
 
-    generate_vendor_cargo_toml(repo_root, workspace_deps, core_version, copied_crates)
-    print("Generated vendor/Cargo.toml")
 
+def _update_native_extension_toml(repo_root: Path) -> None:
+    """Point the Ruby native extension's Cargo.toml at the vendored crates."""
     native_toml = repo_root / "packages" / "ruby" / "ext" / "xberg_rb" / "native" / "Cargo.toml"
     if native_toml.exists():
         with open(native_toml) as f:
@@ -381,6 +373,9 @@ def main() -> None:
 
         print("Updated native extension Cargo.toml to use vendored crates")
 
+
+def _print_vendor_summary(core_version: str, copied_crates: list[str]) -> None:
+    """Print the final vendoring summary, mirroring what was copied and relinked."""
     print(f"\nVendoring complete (core version: {core_version})")
     print(f"Copied crates: {', '.join(sorted(copied_crates))}")
 
@@ -394,6 +389,46 @@ def main() -> None:
             print("  - rb-sys from crates.io")
     else:
         print("Warning: Some required crates were not copied. Check for missing source directories.")
+
+
+def main() -> None:
+    """Main vendoring function."""
+    repo_root: Path = get_repo_root()
+
+    print("=== Vendoring xberg core crate ===")
+
+    workspace_deps: dict[str, object] = get_workspace_deps(repo_root)
+    core_version: str = get_workspace_version(repo_root)
+
+    print(f"Core version: {core_version}")
+    print(f"Workspace dependencies: {len(workspace_deps)}")
+
+    vendor_base: Path = repo_root / "packages" / "ruby" / "vendor"
+
+    crate_names = ["xberg", "xberg-ffi", "xberg-tesseract", "xberg-paddle-ocr", "rb-sys"]
+    _clean_vendor_directories(vendor_base, crate_names)
+
+    vendor_base.mkdir(parents=True, exist_ok=True)
+
+    crates_to_copy: list[tuple[str, str]] = [
+        ("crates/xberg", "xberg"),
+        ("crates/xberg-ffi", "xberg-ffi"),
+        ("crates/xberg-tesseract", "xberg-tesseract"),
+        ("crates/xberg-paddle-ocr", "xberg-paddle-ocr"),
+        ("vendor/rb-sys", "rb-sys"),
+    ]
+
+    copied_crates: list[str] = _copy_crates_to_vendor(repo_root, vendor_base, crates_to_copy)
+
+    _clean_build_artifacts(vendor_base, copied_crates)
+    _update_crate_cargo_tomls(vendor_base, copied_crates, core_version, workspace_deps)
+    _relink_local_crate_paths(vendor_base, copied_crates)
+
+    generate_vendor_cargo_toml(repo_root, workspace_deps, core_version, copied_crates)
+    print("Generated vendor/Cargo.toml")
+
+    _update_native_extension_toml(repo_root)
+    _print_vendor_summary(core_version, copied_crates)
 
 
 if __name__ == "__main__":
