@@ -26,6 +26,15 @@ const DETECTION_PLAN_CACHE_CAPACITY: usize = 4;
 /// `(height, width)` of a DBNet input — the key a shape-pinned plan is built for.
 type InputShape = (usize, usize);
 
+/// Detection acceptance thresholds, bundled so [`DbNet::get_text_boxes_core`] stays under
+/// the workspace parameter-count limit. ~keep
+#[derive(Debug, Clone, Copy)]
+struct DetectionThresholds {
+    box_score_thresh: f32,
+    box_thresh: f32,
+    un_clip_ratio: f32,
+}
+
 /// How a loaded DBNet is executed.
 enum Detector {
     /// One plan that accepts any input shape, reused for every page (`ort`).
@@ -207,9 +216,11 @@ impl DbNet {
                 scale.scale_width,
                 scale.scale_height,
             ),
-            box_score_thresh,
-            box_thresh,
-            un_clip_ratio,
+            DetectionThresholds {
+                box_score_thresh,
+                box_thresh,
+                un_clip_ratio,
+            },
         )?;
 
         Ok(text_boxes)
@@ -247,11 +258,14 @@ impl DbNet {
         rows: u32,
         cols: u32,
         s: &ScaleParam,
-        box_score_thresh: f32,
-        box_thresh: f32,
-        un_clip_ratio: f32,
+        thresholds: DetectionThresholds,
     ) -> Result<Vec<TextBox>, OcrError> {
         let max_side_thresh = 3.0;
+        let DetectionThresholds {
+            box_score_thresh,
+            box_thresh,
+            un_clip_ratio,
+        } = thresholds;
 
         let threshold_img = Self::binarize_predictions(pred_data, rows, cols, box_thresh)?;
         let dilated_img = Self::dilate_db_mask(&threshold_img);
@@ -303,26 +317,31 @@ impl DbNet {
                 continue;
             }
 
-            let mut final_points = Vec::new();
-            for item in clip_min_box {
-                let x = (item.x / s.scale_width) as u32;
-                let ptx = x.min(s.src_width);
-
-                let y = (item.y / s.scale_height) as u32;
-                let pty = y.min(s.src_height);
-
-                final_points.push(ocr_result::Point { x: ptx, y: pty });
-            }
-
             let text_box = TextBox {
                 score,
-                points: final_points,
+                points: Self::scale_points_to_source(&clip_min_box, s),
             };
 
             rs_boxes.push(text_box);
         }
 
         Ok(rs_boxes)
+    }
+
+    /// Map DBNet's detection-space points (in the resized page's pixel grid) back to the
+    /// original page pixel grid, clamped to its bounds. ~keep
+    fn scale_points_to_source(points: &[imageproc::point::Point<f32>], s: &ScaleParam) -> Vec<ocr_result::Point> {
+        points
+            .iter()
+            .map(|item| {
+                let x = (item.x / s.scale_width) as u32;
+                let y = (item.y / s.scale_height) as u32;
+                ocr_result::Point {
+                    x: x.min(s.src_width),
+                    y: y.min(s.src_height),
+                }
+            })
+            .collect()
     }
 
     fn binarize_predictions(

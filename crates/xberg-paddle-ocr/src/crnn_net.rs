@@ -307,25 +307,7 @@ impl CrnnNet {
                 let img = part_imgs[orig_idx];
                 let resized =
                     image::imageops::resize(img, dst_width, CRNN_DST_HEIGHT, image::imageops::FilterType::Triangle);
-
-                let cols = resized.width() as usize;
-                let rows = resized.height() as usize;
-                let raw = resized.as_raw();
-                assert_eq!(raw.len(), rows * cols * 3, "unexpected image buffer size");
-                let adjusted = [
-                    CRNN_MEAN_VALUES[0] * CRNN_NORM_VALUES[0],
-                    CRNN_MEAN_VALUES[1] * CRNN_NORM_VALUES[1],
-                    CRNN_MEAN_VALUES[2] * CRNN_NORM_VALUES[2],
-                ];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        let base = r * cols * 3 + c * 3;
-                        for ch in 0..3 {
-                            batch_data[[batch_idx, ch, r, c]] =
-                                raw[base + ch] as f32 * CRNN_NORM_VALUES[ch] - adjusted[ch];
-                        }
-                    }
-                }
+                Self::write_batch_row(&mut batch_data, batch_idx, &resized);
             }
 
             let (shape, flat_data) = inference::run_flat(backend.as_ref(), batch_data.into_dyn())?;
@@ -356,6 +338,28 @@ impl CrnnNet {
 
         results.sort_by_key(|&(idx, _)| idx);
         Ok(results.into_iter().map(|(_, tl)| tl).collect())
+    }
+
+    /// Normalize one resized crop into row `batch_idx` of `batch_data`, matching
+    /// [`crate::ocr_utils::OcrUtils::substract_mean_normalize`]'s per-channel formula. ~keep
+    fn write_batch_row(batch_data: &mut Array4<f32>, batch_idx: usize, resized: &image::RgbImage) {
+        let cols = resized.width() as usize;
+        let rows = resized.height() as usize;
+        let raw = resized.as_raw();
+        assert_eq!(raw.len(), rows * cols * 3, "unexpected image buffer size");
+        let adjusted = [
+            CRNN_MEAN_VALUES[0] * CRNN_NORM_VALUES[0],
+            CRNN_MEAN_VALUES[1] * CRNN_NORM_VALUES[1],
+            CRNN_MEAN_VALUES[2] * CRNN_NORM_VALUES[2],
+        ];
+        for r in 0..rows {
+            for c in 0..cols {
+                let base = r * cols * 3 + c * 3;
+                for ch in 0..3 {
+                    batch_data[[batch_idx, ch, r, c]] = raw[base + ch] as f32 * CRNN_NORM_VALUES[ch] - adjusted[ch];
+                }
+            }
+        }
     }
 
     fn get_detailed_text_line(&self, img_src: &image::RgbImage) -> Result<DetailedTextLine, OcrError> {

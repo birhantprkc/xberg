@@ -13,8 +13,8 @@ use crate::{
     db_net::DbNet,
     ocr_error::OcrError,
     ocr_result::{
-        DetailedOcrResult, DetailedTextBlock, DetailedTextLine, OcrResult, Point, RecognizedWord, TextBlock, TextBox,
-        WordBlock,
+        Angle, DetailedOcrResult, DetailedTextBlock, DetailedTextLine, OcrResult, Point, RecognizedWord, TextBlock,
+        TextBox, WordBlock,
     },
     ocr_utils::OcrUtils,
     scale_param::ScaleParam,
@@ -80,6 +80,32 @@ impl CropProjectionMetadata {
             self.crop_width
         }
     }
+}
+
+/// Page padding and pre-padding pixel dimensions, bundled so word-geometry projection
+/// functions stay under the workspace parameter-count limit. ~keep
+#[derive(Debug, Clone, Copy)]
+struct PageGeometry {
+    padding: u32,
+    dimensions: (u32, u32),
+}
+
+/// Detection, classification and recognition options threaded through one detection pass.
+/// Grouped so the private `detect_base_detailed`/`detect_once_detailed` helpers stay under the
+/// workspace parameter-count limit; the public `detect*` methods below keep their existing
+/// individual-argument signatures unchanged. ~keep
+#[derive(Debug, Clone, Copy)]
+struct DetectionOptions {
+    padding: u32,
+    box_score_thresh: f32,
+    box_thresh: f32,
+    un_clip_ratio: f32,
+    do_angle: bool,
+    most_angle: bool,
+    angle_rollback: bool,
+    angle_rollback_threshold: f32,
+    cls_thresh: f32,
+    rec_batch_size: u32,
 }
 
 #[derive(Debug)]
@@ -235,25 +261,16 @@ impl PaddleOcrEngine {
     fn detect_base_detailed(
         &self,
         img_src: &image::RgbImage,
-        padding: u32,
         max_side_len: u32,
-        box_score_thresh: f32,
-        box_thresh: f32,
-        un_clip_ratio: f32,
-        do_angle: bool,
-        most_angle: bool,
-        angle_rollback: bool,
-        angle_rollback_threshold: f32,
-        cls_thresh: f32,
-        rec_batch_size: u32,
+        options: DetectionOptions,
     ) -> Result<DetailedOcrResult, OcrError> {
         tracing::debug!(
             width = img_src.width(),
             height = img_src.height(),
-            padding = padding,
+            padding = options.padding,
             max_side_len = max_side_len,
-            do_angle = do_angle,
-            angle_rollback = angle_rollback,
+            do_angle = options.do_angle,
+            angle_rollback = options.angle_rollback,
             "PaddleOCR: starting detection"
         );
 
@@ -264,9 +281,9 @@ impl PaddleOcrEngine {
         } else {
             resize = max_side_len;
         }
-        resize += 2 * padding;
+        resize += 2 * options.padding;
 
-        let padding_src = OcrUtils::make_padding(img_src, padding)?;
+        let padding_src = OcrUtils::make_padding(img_src, options.padding)?;
 
         let scale = ScaleParam::get_scale_param(&padding_src, resize);
         tracing::debug!(
@@ -275,20 +292,7 @@ impl PaddleOcrEngine {
             "PaddleOCR: image resized"
         );
 
-        self.detect_once_detailed(
-            &padding_src,
-            &scale,
-            padding,
-            box_score_thresh,
-            box_thresh,
-            un_clip_ratio,
-            do_angle,
-            most_angle,
-            angle_rollback,
-            angle_rollback_threshold,
-            cls_thresh,
-            rec_batch_size,
-        )
+        self.detect_once_detailed(&padding_src, &scale, options)
     }
 
     /// Detect text in image
@@ -344,17 +348,19 @@ impl PaddleOcrEngine {
     ) -> Result<DetailedOcrResult, OcrError> {
         self.detect_base_detailed(
             img_src,
-            padding,
             max_side_len,
-            box_score_thresh,
-            box_thresh,
-            un_clip_ratio,
-            do_angle,
-            most_angle,
-            false,
-            0.0,
-            Self::DEFAULT_CLS_THRESH,
-            Self::DEFAULT_REC_BATCH_SIZE,
+            DetectionOptions {
+                padding,
+                box_score_thresh,
+                box_thresh,
+                un_clip_ratio,
+                do_angle,
+                most_angle,
+                angle_rollback: false,
+                angle_rollback_threshold: 0.0,
+                cls_thresh: Self::DEFAULT_CLS_THRESH,
+                rec_batch_size: Self::DEFAULT_REC_BATCH_SIZE,
+            },
         )
     }
 
@@ -402,17 +408,19 @@ impl PaddleOcrEngine {
     ) -> Result<DetailedOcrResult, OcrError> {
         self.detect_base_detailed(
             img_src,
-            padding,
             max_side_len,
-            box_score_thresh,
-            box_thresh,
-            un_clip_ratio,
-            do_angle,
-            most_angle,
-            false,
-            0.0,
-            Self::DEFAULT_CLS_THRESH,
-            rec_batch_size,
+            DetectionOptions {
+                padding,
+                box_score_thresh,
+                box_thresh,
+                un_clip_ratio,
+                do_angle,
+                most_angle,
+                angle_rollback: false,
+                angle_rollback_threshold: 0.0,
+                cls_thresh: Self::DEFAULT_CLS_THRESH,
+                rec_batch_size,
+            },
         )
     }
 
@@ -474,17 +482,19 @@ impl PaddleOcrEngine {
     ) -> Result<DetailedOcrResult, OcrError> {
         self.detect_base_detailed(
             img_src,
-            padding,
             max_side_len,
-            box_score_thresh,
-            box_thresh,
-            un_clip_ratio,
-            do_angle,
-            most_angle,
-            true,
-            angle_rollback_threshold,
-            Self::DEFAULT_CLS_THRESH,
-            Self::DEFAULT_REC_BATCH_SIZE,
+            DetectionOptions {
+                padding,
+                box_score_thresh,
+                box_thresh,
+                un_clip_ratio,
+                do_angle,
+                most_angle,
+                angle_rollback: true,
+                angle_rollback_threshold,
+                cls_thresh: Self::DEFAULT_CLS_THRESH,
+                rec_batch_size: Self::DEFAULT_REC_BATCH_SIZE,
+            },
         )
     }
 
@@ -542,21 +552,16 @@ impl PaddleOcrEngine {
         }
     }
 
-    fn detect_once_detailed(
+    /// Run DB-net detection, sort boxes into reading order, and precompute each region's crop
+    /// geometry for later word-bound projection. ~keep
+    fn detect_and_project(
         &self,
         img_src: &image::RgbImage,
         scale: &ScaleParam,
-        padding: u32,
         box_score_thresh: f32,
         box_thresh: f32,
         un_clip_ratio: f32,
-        do_angle: bool,
-        most_angle: bool,
-        angle_rollback: bool,
-        angle_rollback_threshold: f32,
-        cls_thresh: f32,
-        rec_batch_size: u32,
-    ) -> Result<DetailedOcrResult, OcrError> {
+    ) -> Result<(Vec<TextBox>, Vec<image::RgbImage>, Vec<Option<CropProjectionMetadata>>), OcrError> {
         tracing::debug!("PaddleOCR: running DB-net text detection");
         let mut text_boxes = self
             .db_net
@@ -578,6 +583,31 @@ impl PaddleOcrEngine {
             .map(|(text_box, part_image)| CropProjectionMetadata::new(&text_box.points, part_image))
             .collect::<Vec<_>>();
 
+        Ok((text_boxes, part_images, crop_projections))
+    }
+
+    fn detect_once_detailed(
+        &self,
+        img_src: &image::RgbImage,
+        scale: &ScaleParam,
+        options: DetectionOptions,
+    ) -> Result<DetailedOcrResult, OcrError> {
+        let DetectionOptions {
+            padding,
+            box_score_thresh,
+            box_thresh,
+            un_clip_ratio,
+            do_angle,
+            most_angle,
+            angle_rollback,
+            angle_rollback_threshold,
+            cls_thresh,
+            rec_batch_size,
+        } = options;
+
+        let (text_boxes, part_images, crop_projections) =
+            self.detect_and_project(img_src, scale, box_score_thresh, box_thresh, un_clip_ratio)?;
+
         if do_angle {
             tracing::debug!(num_regions = part_images.len(), "PaddleOCR: running angle classifier");
         }
@@ -594,20 +624,8 @@ impl PaddleOcrEngine {
             );
         }
 
-        let mut rotated_images: Vec<image::RgbImage> = Vec::with_capacity(part_images.len());
-
-        let mut angle_rollback_records = HashMap::<usize, ImageBuffer<image::Rgb<u8>, Vec<u8>>>::new();
-
-        for (index, (angle, mut part_image)) in angles.iter().zip(part_images).enumerate() {
-            if angle.index == 1 {
-                if angle_rollback {
-                    angle_rollback_records.insert(index, part_image.clone());
-                }
-
-                OcrUtils::mat_rotate_clock_wise_180(&mut part_image);
-            }
-            rotated_images.push(part_image);
-        }
+        let (rotated_images, angle_rollback_records) =
+            Self::rotate_for_recognition(&angles, part_images, angle_rollback);
 
         tracing::debug!(
             num_regions = rotated_images.len(),
@@ -633,6 +651,60 @@ impl PaddleOcrEngine {
             );
         }
 
+        let text_blocks = Self::build_text_blocks(
+            &text_boxes,
+            &angles,
+            text_lines,
+            &rollback_applied,
+            &crop_projections,
+            PageGeometry {
+                padding,
+                dimensions: img_src.dimensions(),
+            },
+        );
+
+        Ok(DetailedOcrResult { text_blocks })
+    }
+
+    /// Rotate 180° any region the angle classifier flagged upside-down, recording a
+    /// pre-rotation copy for `angle_rollback` (see [`Self::recognize_detailed_with_rollbacks`])
+    /// before doing so. ~keep
+    fn rotate_for_recognition(
+        angles: &[Angle],
+        part_images: Vec<image::RgbImage>,
+        angle_rollback: bool,
+    ) -> (
+        Vec<image::RgbImage>,
+        HashMap<usize, ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
+    ) {
+        let mut rotated_images: Vec<image::RgbImage> = Vec::with_capacity(part_images.len());
+        let mut angle_rollback_records = HashMap::<usize, ImageBuffer<image::Rgb<u8>, Vec<u8>>>::new();
+
+        for (index, (angle, mut part_image)) in angles.iter().zip(part_images).enumerate() {
+            if angle.index == 1 {
+                if angle_rollback {
+                    angle_rollback_records.insert(index, part_image.clone());
+                }
+
+                OcrUtils::mat_rotate_clock_wise_180(&mut part_image);
+            }
+            rotated_images.push(part_image);
+        }
+
+        (rotated_images, angle_rollback_records)
+    }
+
+    /// Assemble the final [`DetailedTextBlock`]s from one detection pass's per-region outputs;
+    /// `text_boxes`, `angles`, `text_lines` and `crop_projections` are all aligned to the same
+    /// box/line index. ~keep
+    fn build_text_blocks(
+        text_boxes: &[TextBox],
+        angles: &[Angle],
+        text_lines: Vec<DetailedTextLine>,
+        rollback_applied: &[bool],
+        crop_projections: &[Option<CropProjectionMetadata>],
+        page: PageGeometry,
+    ) -> Vec<DetailedTextBlock> {
         let mut text_blocks = Vec::with_capacity(text_lines.len());
         for (i, text_line) in text_lines.into_iter().enumerate() {
             let rotation_retained = Self::rotation_retained(angles[i].index, rollback_applied[i]);
@@ -647,16 +719,15 @@ impl PaddleOcrEngine {
                 line_column_count,
                 crop_projections[i],
                 rotation_retained,
-                padding,
-                img_src.dimensions(),
+                page,
             );
             let block = TextBlock {
                 box_points: text_boxes[i]
                     .points
                     .iter()
                     .map(|p| Point {
-                        x: ((p.x as f32) - padding as f32) as u32,
-                        y: ((p.y as f32) - padding as f32) as u32,
+                        x: ((p.x as f32) - page.padding as f32) as u32,
+                        y: ((p.y as f32) - page.padding as f32) as u32,
                     })
                     .collect(),
                 box_score: text_boxes[i].score,
@@ -672,8 +743,7 @@ impl PaddleOcrEngine {
                 rotation_retained,
             });
         }
-
-        Ok(DetailedOcrResult { text_blocks })
+        text_blocks
     }
 
     fn recognize_detailed_with_rollbacks(
@@ -729,8 +799,7 @@ impl PaddleOcrEngine {
         line_column_count: f32,
         projection: Option<CropProjectionMetadata>,
         rotation_retained: bool,
-        padding: u32,
-        padded_dimensions: (u32, u32),
+        page: PageGeometry,
     ) -> Vec<WordBlock> {
         let Some(projection) = projection else {
             return words.into_iter().map(Into::into).collect();
@@ -754,7 +823,7 @@ impl PaddleOcrEngine {
             .map(|(word, bounds)| {
                 let box_points = bounds
                     .and_then(|bounds| {
-                        Self::project_word_bounds(projection, bounds, rotation_retained, padding, padded_dimensions)
+                        Self::project_word_bounds(projection, bounds, rotation_retained, page.padding, page.dimensions)
                     })
                     .unwrap_or_default();
                 WordBlock { word, box_points }
@@ -900,285 +969,5 @@ impl PaddleOcrEngine {
 pub type OcrLite = PaddleOcrEngine;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ocr_result::{TextBox, TextLine};
-
-    fn make_box(x: u32, y: u32) -> TextBox {
-        TextBox {
-            points: vec![
-                Point { x, y },
-                Point { x: x + 100, y },
-                Point { x: x + 100, y: y + 20 },
-                Point { x, y: y + 20 },
-            ],
-            score: 0.9,
-        }
-    }
-
-    fn make_detailed_line() -> DetailedTextLine {
-        DetailedTextLine {
-            line: TextLine {
-                text: "ab".to_string(),
-                text_score: 0.8,
-            },
-            words: vec![RecognizedWord {
-                text: "ab".to_string(),
-                columns: vec![2, 3],
-                start_column: 2,
-                end_column: 3,
-                confidence: 0.8,
-            }],
-            line_column_count: 10.0,
-        }
-    }
-
-    fn project_test_line(
-        box_points: Vec<Point>,
-        crop_dimensions: (u32, u32),
-        rotation_retained: bool,
-        padded_dimensions: (u32, u32),
-    ) -> Vec<Point> {
-        let crop = image::RgbImage::new(crop_dimensions.0, crop_dimensions.1);
-        let projection = CropProjectionMetadata::new(&box_points, &crop);
-        let line = make_detailed_line();
-        PaddleOcrEngine::build_word_blocks(
-            &line.line,
-            line.words,
-            line.line_column_count,
-            projection,
-            rotation_retained,
-            10,
-            padded_dimensions,
-        )[0]
-        .box_points
-        .clone()
-    }
-
-    #[test]
-    fn should_project_horizontal_word_columns_to_source_quadrilateral() {
-        let points = make_box(10, 20).points;
-
-        let projected = project_test_line(points, (100, 20), false, (120, 60));
-
-        assert_eq!(
-            projected,
-            [
-                Point { x: 20, y: 10 },
-                Point { x: 40, y: 10 },
-                Point { x: 40, y: 30 },
-                Point { x: 20, y: 30 },
-            ]
-        );
-    }
-
-    #[test]
-    fn should_reverse_retained_180_degree_rotation_when_projecting_word() {
-        let points = make_box(10, 20).points;
-
-        let projected = project_test_line(points, (100, 20), true, (120, 60));
-
-        assert_eq!(
-            projected,
-            [
-                Point { x: 60, y: 10 },
-                Point { x: 80, y: 10 },
-                Point { x: 80, y: 30 },
-                Point { x: 60, y: 30 },
-            ]
-        );
-    }
-
-    #[test]
-    fn should_not_reverse_180_degree_rotation_after_angle_rollback() {
-        assert!(PaddleOcrEngine::rotation_retained(1, false));
-        assert!(!PaddleOcrEngine::rotation_retained(1, true));
-
-        let projected = project_test_line(make_box(10, 20).points, (100, 20), false, (120, 60));
-
-        assert_eq!(projected[0], Point { x: 20, y: 10 });
-        assert_eq!(projected[2], Point { x: 40, y: 30 });
-    }
-
-    #[test]
-    fn should_reverse_vertical_crop_rotation_when_projecting_word() {
-        let points = vec![
-            Point { x: 10, y: 10 },
-            Point { x: 30, y: 10 },
-            Point { x: 30, y: 110 },
-            Point { x: 10, y: 110 },
-        ];
-
-        let projected = project_test_line(points, (100, 20), false, (40, 120));
-
-        assert_eq!(
-            projected,
-            [
-                Point { x: 0, y: 20 },
-                Point { x: 20, y: 20 },
-                Point { x: 20, y: 40 },
-                Point { x: 0, y: 40 },
-            ]
-        );
-    }
-
-    #[test]
-    fn should_omit_geometry_for_degenerate_crop_projection() {
-        let points = vec![Point { x: 10, y: 10 }; 4];
-
-        let projected = project_test_line(points, (0, 0), false, (40, 40));
-
-        assert!(projected.is_empty());
-    }
-
-    #[test]
-    fn should_clamp_padded_batch_columns_to_effective_timeline() {
-        let crop = image::RgbImage::new(100, 20);
-        let projection = CropProjectionMetadata::new(&make_box(10, 20).points, &crop);
-        let mut line = make_detailed_line();
-        line.words[0].columns = vec![8, 9];
-        line.words[0].start_column = 8;
-        line.words[0].end_column = 9;
-        line.line_column_count = 5.0;
-
-        let words = PaddleOcrEngine::build_word_blocks(
-            &line.line,
-            line.words,
-            line.line_column_count,
-            projection,
-            false,
-            10,
-            (120, 60),
-        );
-
-        assert_eq!(words.len(), 1);
-        assert_eq!(words[0].word.columns, [8, 9]);
-        assert_eq!(
-            words[0].box_points,
-            [
-                Point { x: 65, y: 10 },
-                Point { x: 100, y: 10 },
-                Point { x: 100, y: 30 },
-                Point { x: 65, y: 30 },
-            ]
-        );
-    }
-
-    #[test]
-    fn should_convert_detailed_result_to_exact_legacy_fields() {
-        let block = TextBlock {
-            box_points: make_box(5, 7).points,
-            box_score: 0.9,
-            angle_index: 1,
-            angle_score: 0.8,
-            text: "hello".to_string(),
-            text_score: 0.7,
-        };
-        let detailed = DetailedOcrResult {
-            text_blocks: vec![DetailedTextBlock {
-                block: block.clone(),
-                words: vec![WordBlock::from(RecognizedWord {
-                    text: "hello".to_string(),
-                    columns: vec![1, 2, 3],
-                    start_column: 1,
-                    end_column: 3,
-                    confidence: 0.7,
-                })],
-                line_column_count: 5.0,
-                rotation_retained: true,
-            }],
-        };
-
-        let legacy: OcrResult = detailed.into();
-
-        assert_eq!(legacy.text_blocks.len(), 1);
-        assert_eq!(legacy.text_blocks[0].box_points, block.box_points);
-        assert_eq!(legacy.text_blocks[0].box_score, block.box_score);
-        assert_eq!(legacy.text_blocks[0].angle_index, block.angle_index);
-        assert_eq!(legacy.text_blocks[0].angle_score, block.angle_score);
-        assert_eq!(legacy.text_blocks[0].text, block.text);
-        assert_eq!(legacy.text_blocks[0].text_score, block.text_score);
-    }
-
-    #[test]
-    fn test_sort_text_boxes_top_to_bottom() {
-        let mut boxes = vec![make_box(10, 100), make_box(10, 50), make_box(10, 10)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(boxes[0].points[0].y, 10);
-        assert_eq!(boxes[1].points[0].y, 50);
-        assert_eq!(boxes[2].points[0].y, 100);
-    }
-
-    #[test]
-    fn test_sort_text_boxes_same_line_left_to_right() {
-        let mut boxes = vec![make_box(200, 10), make_box(100, 10), make_box(50, 10)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(boxes[0].points[0].x, 50);
-        assert_eq!(boxes[1].points[0].x, 100);
-        assert_eq!(boxes[2].points[0].x, 200);
-    }
-
-    #[test]
-    fn test_sort_text_boxes_visual_line_jitter_left_to_right() {
-        let mut boxes = vec![make_box(200, 10), make_box(50, 19)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(boxes.iter().map(|b| b.points[0].x).collect::<Vec<_>>(), vec![50, 200]);
-    }
-
-    #[test]
-    fn test_sort_text_boxes_tolerance_boundary_stays_top_to_bottom() {
-        let mut boxes = vec![make_box(200, 10), make_box(50, 20)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(boxes.iter().map(|b| b.points[0].x).collect::<Vec<_>>(), vec![200, 50]);
-    }
-
-    #[test]
-    fn test_sort_text_boxes_bubbles_across_visual_line() {
-        let mut boxes = vec![make_box(300, 10), make_box(200, 12), make_box(50, 14)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(
-            boxes.iter().map(|b| b.points[0].x).collect::<Vec<_>>(),
-            vec![50, 200, 300]
-        );
-    }
-
-    #[test]
-    fn test_sort_text_boxes_does_not_transitively_merge_lines() {
-        let mut boxes = vec![make_box(300, 0), make_box(200, 9), make_box(100, 18)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(
-            boxes.iter().map(|b| b.points[0].x).collect::<Vec<_>>(),
-            vec![200, 300, 100]
-        );
-    }
-
-    #[test]
-    fn test_sort_text_boxes_multi_line() {
-        let mut boxes = vec![
-            make_box(300, 50),
-            make_box(100, 100),
-            make_box(50, 50),
-            make_box(200, 100),
-        ];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-
-        assert_eq!(boxes[0].points[0].x, 50);
-        assert_eq!(boxes[1].points[0].x, 300);
-        assert_eq!(boxes[2].points[0].x, 100);
-        assert_eq!(boxes[3].points[0].x, 200);
-    }
-
-    #[test]
-    fn test_sort_text_boxes_empty() {
-        let mut boxes: Vec<TextBox> = vec![];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert!(boxes.is_empty());
-    }
-
-    #[test]
-    fn test_sort_text_boxes_single() {
-        let mut boxes = vec![make_box(10, 20)];
-        PaddleOcrEngine::sort_text_boxes(&mut boxes);
-        assert_eq!(boxes.len(), 1);
-    }
-}
+#[path = "ocr_lite/tests.rs"]
+mod tests;
