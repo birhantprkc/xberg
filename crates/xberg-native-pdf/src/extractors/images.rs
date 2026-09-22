@@ -925,6 +925,25 @@ fn decode_dimension_bounded_image_stream(
     }
 }
 
+// Test-only count of calls into `extract_image_from_xobject`, the single function every
+// image-decode path (`PdfDocument::extract_images` and `PdfImageHandle::decode`) funnels
+// through. Thread-local rather than a process-wide `AtomicUsize`: `cargo test`'s default
+// runner puts each test on its own thread, so a thread-local counter needs no cross-test
+// locking to stay free of interference from unrelated tests decoding images concurrently
+// elsewhere in the same binary (GH#1732 regression coverage). A doc comment (`///`) here
+// would attach to the macro invocation rather than the generated static, which rustc
+// warns is meaningless -- a plain `//` comment avoids that warning. ~keep
+#[cfg(test)]
+thread_local! {
+    static DECODE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of this thread's [`DECODE_CALL_COUNT`].
+#[cfg(test)]
+pub(crate) fn decode_call_count() -> usize {
+    DECODE_CALL_COUNT.with(std::cell::Cell::get)
+}
+
 /// Extract an image from an XObject stream.
 pub fn extract_image_from_xobject(
     doc: Option<&crate::document::PdfDocument>,
@@ -933,6 +952,9 @@ pub fn extract_image_from_xobject(
     color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
 ) -> Result<PdfImage> {
     use crate::object::Object;
+
+    #[cfg(test)]
+    DECODE_CALL_COUNT.with(|count| count.set(count.get() + 1));
 
     let dict = xobject
         .as_dict()

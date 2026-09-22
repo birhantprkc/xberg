@@ -657,7 +657,6 @@ impl PdfDocument {
         Option<crate::extractors::auto::ReasonCode>,
     )> {
         use crate::content::{Operator, TextElement};
-        use crate::extractors::ImageData;
         use crate::extractors::auto::{ImageCodecClass, PageSignals, ProducerPrior};
 
         let (llx, lly, urx, ury) = self.get_page_media_box(page)?;
@@ -716,20 +715,36 @@ impl PdfDocument {
             (frag, rep)
         };
 
-        let images = self.extract_images(page).unwrap_or_default();
+        // Classify each embedded image from the cheap Phase 1 handle enumeration
+        // (`page_image_handles`, content-stream/CTM walk only) instead of
+        // `extract_images`, which fully decodes pixel data. `handle.bbox` and
+        // `handle.filter_chain` carry everything this loop needs -- bbox is
+        // computed during the same Phase 1 walk `decode()` would later reuse
+        // unchanged, and DCTDecode/CCITTFaxDecode presence in `filter_chain`
+        // reproduces `ImageData::Jpeg` vs `ccitt_params().is_some()` exactly,
+        // since those are the same filter checks `extract_image_from_xobject`
+        // uses to pick a decode branch. The embedded-image extraction pass
+        // (`pdf/native/images.rs` in the `xberg` crate) is the only remaining
+        // caller that actually needs decoded pixels for these images (GH#1732). ~keep
+        let images = self.page_image_handles(page).unwrap_or_default();
         let mut img_area = 0.0f32;
         let mut codec = ImageCodecClass::None;
         for im in &images {
-            if let Some(b) = im.bbox() {
-                img_area += Self::rect_isect_area(b, px0, py0, px1, py1);
-            }
-            let c = if im.ccitt_params().is_some() {
+            img_area += Self::rect_isect_area(&im.bbox, px0, py0, px1, py1);
+            let has_ccitt = im
+                .filter_chain
+                .iter()
+                .any(|f| matches!(f, crate::extractors::images::PdfFilter::CCITTFaxDecode));
+            let has_dct = im
+                .filter_chain
+                .iter()
+                .any(|f| matches!(f, crate::extractors::images::PdfFilter::DCTDecode));
+            let c = if has_ccitt {
                 ImageCodecClass::Ccitt
+            } else if has_dct {
+                ImageCodecClass::Dct
             } else {
-                match im.data() {
-                    ImageData::Jpeg(_) => ImageCodecClass::Dct,
-                    _ => ImageCodecClass::Other,
-                }
+                ImageCodecClass::Other
             };
             codec = match (codec, c) {
                 (ImageCodecClass::None, x) => x,

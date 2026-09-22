@@ -1740,6 +1740,9 @@ mod tests;
 #[cfg(test)]
 mod ink_dict_extractor_tests;
 
+#[cfg(test)]
+mod open_signals_tests;
+
 mod annotations;
 mod catalog;
 mod columns;
