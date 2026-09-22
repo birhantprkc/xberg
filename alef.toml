@@ -609,7 +609,6 @@ traineddata = "traineddata"
 "crates/xberg-cli/src/commands/overrides/mod.rs" = ["type-too-long"]
 "crates/xberg-cli/src/main.rs" = ["file-too-long", "function-too-long", "type-too-long"]
 "crates/xberg-cli/tests/commands_test.rs" = ["file-too-long"]
-"crates/xberg-libwpd/src/shim.cpp" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/annotation_types.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/src/annotations.rs" = ["function-too-long", "nesting-too-deep"]
   "cyclomatic-complexity",
