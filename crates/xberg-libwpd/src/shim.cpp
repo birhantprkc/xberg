@@ -1,21 +1,17 @@
 /* Flat C shim over libwpd + librevenge for Xberg.
  *
- * libwpd exposes no `extract()` call. It drives librevenge's SAX-like
- * RVNGTextInterface: the caller passes a concrete implementation into
- * WPDocument::parse and libwpd invokes its callbacks. This file provides such
- * an implementation (DocumentBuilder) that records a flat, format-agnostic
- * internal document (a `std::vector<Node>`) as libwpd walks the document, and
- * exposes it to Rust through a flat C API returning an owned binary blob that
- * the Rust side frees and decodes into a typed document model (see
- * `serialize` below and `src/dto.rs`). This shim performs no text or Markdown
- * rendering itself — that would throw away structure a caller might want
- * (table cell spans, list nesting, note numbering) that the flat node vector
- * still carries; format-specific rendering, if wanted, belongs above this
- * layer, over the typed `WpdDocument` Rust decodes.
+ * libwpd exposes no `extract()` call: it drives librevenge's SAX-like
+ * RVNGTextInterface, calling back into a concrete implementation passed to
+ * WPDocument::parse. `DocumentBuilder` below is that implementation; it
+ * records a flat, format-agnostic `std::vector<Node>` as libwpd walks the
+ * document, exposed to Rust as an owned binary blob (see `serialize` and
+ * `src/dto.rs`) the Rust side frees and decodes into a typed document model.
+ * This shim does no text/Markdown rendering itself — that would throw away
+ * structure (table cell spans, list nesting, note numbering) the flat node
+ * vector still carries; rendering, if wanted, belongs above this layer.
  *
  * Every entry point catches all C++ exceptions: libwpd throws on malformed
- * input, and an exception must never unwind across the FFI boundary.
- ~keep */
+ * input, and an exception must never unwind across the FFI boundary. ~keep */
 #include <librevenge-stream/librevenge-stream.h>
 #include <librevenge/librevenge.h>
 #include <libwpd/libwpd.h>
@@ -32,13 +28,12 @@ namespace {
 using librevenge::RVNGPropertyList;
 using librevenge::RVNGString;
 
-/* One recorded event from the libwpd/librevenge callback walk. The document
- * is a flat `std::vector<Node>`; serialization (see `serialize` below) is the
- * only place that knows about the wire encoding. `text`/`text2` and
- * `level`/`counter`/`counter2` are reused across kinds rather than giving
- * every kind its own dedicated fields (a link's href, a field's placeholder
- * kind, a metadata key/value pair, and a table cell's column/span all borrow
- * the same slots); each kind's comment below says what it puts there. ~keep */
+/* One recorded event from the libwpd/librevenge callback walk. `text`/`text2`
+ * and `level`/`counter`/`counter2` are reused across kinds (a link's href, a
+ * field's placeholder, a metadata key/value, a table cell's column/span)
+ * rather than giving every kind its own fields; each kind's comment below
+ * says what it puts there. `serialize` below is the only place that knows
+ * about the wire encoding. ~keep */
 enum class NodeKind {
   Text,
   Tab,
@@ -102,9 +97,7 @@ public:
   std::vector<Node> nodes;
 
   void insertText(const RVNGString &s) override {
-    // `size()` is the byte length; `len()` is the UTF-8 *character* count,
-    // which would both truncate multibyte text and stop at an embedded NUL.
-    // ~keep
+    // `size()` (bytes) avoids `len()`'s multibyte truncation/NUL-stop. ~keep
     if (s.cstr())
       nodes.push_back({NodeKind::Text, std::string(s.cstr(), s.size())});
   }
@@ -202,9 +195,7 @@ public:
       return;
     ListLevel &level = listStack_.back();
     Node n{NodeKind::ListItemStart};
-    // Level is serialized as a u8; clamp so a pathologically deep nesting
-    // can't wrap to a small value on the narrowing cast (cf. the 1..=6 guard
-    // on heading level in openParagraph). ~keep
+    // Clamp before the narrowing cast to u8 so deep nesting can't wrap. ~keep
     size_t depth = listStack_.size();
     n.level = static_cast<int>(depth > 255 ? 255 : depth);
     n.ordered = level.ordered;
@@ -215,11 +206,8 @@ public:
     nodes.push_back(n);
   }
 
-  // Headers and footers recur on every page rather than at one point in the
-  // flow; they are recorded as their own bracketing start/end events so a
-  // consumer of the decoded event stream can place them wherever it wants
-  // (typically once, at the start/end of the document) instead of the shim
-  // splicing them inline into the flow itself. ~keep
+  // Headers/footers recur every page; bracketing events let a consumer
+  // place them wherever, instead of the shim splicing them inline. ~keep
   void openHeader(const RVNGPropertyList &) override {
     nodes.push_back({NodeKind::HeaderStart});
   }
@@ -229,14 +217,8 @@ public:
   }
   void closeFooter() override { nodes.push_back({NodeKind::FooterEnd}); }
 
-  // Footnotes, endnotes, comments and text boxes never belong inline in the
-  // narrative. Notes are reference constructs anchored at a point in the
-  // flow with their body recorded separately in event order; footnotes and
-  // endnotes are kept as distinct node kinds (rather than one merged "note"
-  // kind) so a consumer can number and label them as two separate sequences
-  // instead of interleaving them under one counter. Comments and text boxes
-  // have no such numbering in the source and are recorded as their own
-  // bracketing start/end pair wherever they occur. ~keep
+  // Footnote/endnote are distinct kinds (not one merged "note" kind) so a
+  // consumer can number/label them as two sequences, not one counter. ~keep
   void openFootnote(const RVNGPropertyList &) override {
     nodes.push_back({NodeKind::NoteStart});
   }
@@ -257,8 +239,7 @@ public:
   void openLink(const RVNGPropertyList &props) override {
     const librevenge::RVNGProperty *href = props["xlink:href"];
     Node n{NodeKind::LinkStart};
-    // Explicit (ptr, size) construction, like insertText: implicit
-    // std::string(const char*) would truncate at an embedded NUL. ~keep
+    // (ptr, size), like insertText: avoids truncating at an embedded NUL. ~keep
     if (href && href->getStr().cstr())
       n.text = std::string(href->getStr().cstr(), href->getStr().size());
     nodes.push_back(n);
@@ -270,10 +251,8 @@ public:
     std::string fieldType =
         type && type->getStr().cstr() ? type->getStr().cstr() : "";
     Node n{NodeKind::FieldInsert};
-    // A dropped field silently loses information a reader can't recover
-    // (a page number that never appears anywhere in body text); render an
-    // explicit placeholder instead so the field's presence, at least,
-    // survives extraction. ~keep
+    // A dropped field silently loses info a reader can't recover; render an
+    // explicit placeholder so the field's presence at least survives. ~keep
     if (fieldType == "text:page-number")
       n.text = "page";
     else if (fieldType == "text:page-count")
@@ -289,17 +268,9 @@ public:
     nodes.push_back(n);
   }
 
-  // setDocumentMetaData is always the first callback libwpd makes, so these
-  // nodes land at the very front of `nodes` regardless of when they're
-  // rendered. Only a handful of the keys RVNGTextInterface documents are
-  // captured — enough to round-trip the common case (title, author, subject,
-  // keywords) without building a full structured metadata API on the Rust
-  // side. The "Author" summary field is emitted by libwpd as
-  // `meta:initial-creator`; `dc:creator` is WordPerfect's separate "Typist"
-  // field (see WP6ContentListener), so both are captured but the Rust side
-  // maps only `meta:initial-creator` to the document author. `dc:title` is not
-  // emitted by libwpd 0.10.3 but is captured defensively for other versions.
-  // ~keep
+  // libwpd emits "Author" as `meta:initial-creator`; `dc:creator` is
+  // WordPerfect's separate "Typist" field — the Rust side maps only
+  // `meta:initial-creator` to the document author. ~keep
   void setDocumentMetaData(const RVNGPropertyList &props) override {
     static const char *const kKeys[] = {
         "dc:title", "meta:initial-creator", "dc:creator",   "dc:subject",
@@ -311,8 +282,7 @@ public:
         continue;
       Node n{NodeKind::MetaData};
       n.text = key;
-      // Explicit (ptr, size): implicit std::string(const char*) would
-      // truncate a value containing an embedded NUL. ~keep
+      // (ptr, size): avoids truncating a value with an embedded NUL. ~keep
       n.text2 = std::string(value->getStr().cstr(), value->getStr().size());
       nodes.push_back(n);
     }
@@ -329,10 +299,8 @@ public:
   void openSection(const RVNGPropertyList &) override {}
   void closeSection() override {}
 
-  // Table structure is recorded fully (open events too, not just the
-  // close-event markers the previous implementation emitted) so a consumer
-  // of the decoded event stream can lay cells out on a real grid: column,
-  // column span, row span and whether a row is a header row. ~keep
+  // Recorded fully (open events too) so a consumer can lay cells out on a
+  // real grid: column, column span, row span, header-row flag. ~keep
   void openTable(const RVNGPropertyList &) override {
     nodes.push_back({NodeKind::TableStart});
   }
@@ -499,30 +467,67 @@ void putString(std::string &out, const std::string &s) {
   out += s;
 }
 
-// Non-negative counts/spans are clamped to at least 1 by the callers that
-// populate `Node::counter`/`counter2` (see `openTableCell`); this only guards
-// against a negative value ever reaching the wire regardless of caller. ~keep
+// Callers clamp counts/spans to at least 1; this only guards a negative value
+// reaching the wire. ~keep
 uint32_t nonNegative(int v) { return v < 0 ? 0 : static_cast<uint32_t>(v); }
 
-/* Encodes one event node. `MetaData` nodes must be filtered out by the caller
- * before reaching here — they have no event representation. ~keep */
-void putEvent(std::string &out, const Node &n) {
+// No wire payload beyond a tag; `NoteEnd`/`EndnoteEnd` both map to
+// `Tag::NoteEnd` (the footnote/endnote split is on the *start* bool). ~keep
+struct SimpleTagMapping {
+  NodeKind kind;
+  Tag tag;
+};
+
+constexpr SimpleTagMapping kSimpleTags[] = {
+    {NodeKind::Tab, Tag::Tab},
+    {NodeKind::Space, Tag::Space},
+    {NodeKind::LineBreak, Tag::LineBreak},
+    {NodeKind::ParagraphEnd, Tag::ParagraphEnd},
+    {NodeKind::ListItemEnd, Tag::ListItemEnd},
+    {NodeKind::BoldStart, Tag::BoldStart},
+    {NodeKind::BoldEnd, Tag::BoldEnd},
+    {NodeKind::ItalicStart, Tag::ItalicStart},
+    {NodeKind::ItalicEnd, Tag::ItalicEnd},
+    {NodeKind::UnderlineStart, Tag::UnderlineStart},
+    {NodeKind::UnderlineEnd, Tag::UnderlineEnd},
+    {NodeKind::StrikethroughStart, Tag::StrikethroughStart},
+    {NodeKind::StrikethroughEnd, Tag::StrikethroughEnd},
+    {NodeKind::SuperscriptStart, Tag::SuperscriptStart},
+    {NodeKind::SuperscriptEnd, Tag::SuperscriptEnd},
+    {NodeKind::SubscriptStart, Tag::SubscriptStart},
+    {NodeKind::SubscriptEnd, Tag::SubscriptEnd},
+    {NodeKind::TableStart, Tag::TableStart},
+    {NodeKind::TableCellEnd, Tag::CellEnd},
+    {NodeKind::TableRowEnd, Tag::RowEnd},
+    {NodeKind::TableEnd, Tag::TableEnd},
+    {NodeKind::HeaderStart, Tag::HeaderStart},
+    {NodeKind::HeaderEnd, Tag::HeaderEnd},
+    {NodeKind::FooterStart, Tag::FooterStart},
+    {NodeKind::FooterEnd, Tag::FooterEnd},
+    {NodeKind::NoteEnd, Tag::NoteEnd},
+    {NodeKind::EndnoteEnd, Tag::NoteEnd},
+    {NodeKind::AsideEnd, Tag::AsideEnd},
+    {NodeKind::LinkEnd, Tag::LinkEnd},
+};
+
+// Writes `kind`'s tag if it is one of `kSimpleTags`. Returns whether it was.
+bool putSimpleEvent(std::string &out, NodeKind kind) {
+  for (const SimpleTagMapping &mapping : kSimpleTags) {
+    if (mapping.kind == kind) {
+      putTag(out, mapping.tag);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Only reached for a kind absent from `kSimpleTags` (`MetaData` is filtered out
+// earlier, by `serialize`). ~keep
+void putPayloadEvent(std::string &out, const Node &n) {
   switch (n.kind) {
   case NodeKind::Text:
     putTag(out, Tag::Text);
     putString(out, n.text);
-    break;
-  case NodeKind::Tab:
-    putTag(out, Tag::Tab);
-    break;
-  case NodeKind::Space:
-    putTag(out, Tag::Space);
-    break;
-  case NodeKind::LineBreak:
-    putTag(out, Tag::LineBreak);
-    break;
-  case NodeKind::ParagraphEnd:
-    putTag(out, Tag::ParagraphEnd);
     break;
   case NodeKind::ListItemStart:
     putTag(out, Tag::ListItemStart);
@@ -530,51 +535,9 @@ void putEvent(std::string &out, const Node &n) {
     putU8(out, static_cast<uint8_t>(n.level));
     putU32(out, nonNegative(n.counter));
     break;
-  case NodeKind::ListItemEnd:
-    putTag(out, Tag::ListItemEnd);
-    break;
   case NodeKind::Heading:
     putTag(out, Tag::HeadingStart);
     putU8(out, static_cast<uint8_t>(n.level));
-    break;
-  case NodeKind::BoldStart:
-    putTag(out, Tag::BoldStart);
-    break;
-  case NodeKind::BoldEnd:
-    putTag(out, Tag::BoldEnd);
-    break;
-  case NodeKind::ItalicStart:
-    putTag(out, Tag::ItalicStart);
-    break;
-  case NodeKind::ItalicEnd:
-    putTag(out, Tag::ItalicEnd);
-    break;
-  case NodeKind::UnderlineStart:
-    putTag(out, Tag::UnderlineStart);
-    break;
-  case NodeKind::UnderlineEnd:
-    putTag(out, Tag::UnderlineEnd);
-    break;
-  case NodeKind::StrikethroughStart:
-    putTag(out, Tag::StrikethroughStart);
-    break;
-  case NodeKind::StrikethroughEnd:
-    putTag(out, Tag::StrikethroughEnd);
-    break;
-  case NodeKind::SuperscriptStart:
-    putTag(out, Tag::SuperscriptStart);
-    break;
-  case NodeKind::SuperscriptEnd:
-    putTag(out, Tag::SuperscriptEnd);
-    break;
-  case NodeKind::SubscriptStart:
-    putTag(out, Tag::SubscriptStart);
-    break;
-  case NodeKind::SubscriptEnd:
-    putTag(out, Tag::SubscriptEnd);
-    break;
-  case NodeKind::TableStart:
-    putTag(out, Tag::TableStart);
     break;
   case NodeKind::TableRowStart:
     putTag(out, Tag::RowStart);
@@ -590,63 +553,36 @@ void putEvent(std::string &out, const Node &n) {
     putTag(out, Tag::CoveredCell);
     putI32(out, n.level);
     break;
-  case NodeKind::TableCellEnd:
-    putTag(out, Tag::CellEnd);
-    break;
-  case NodeKind::TableRowEnd:
-    putTag(out, Tag::RowEnd);
-    break;
-  case NodeKind::TableEnd:
-    putTag(out, Tag::TableEnd);
-    break;
-  case NodeKind::HeaderStart:
-    putTag(out, Tag::HeaderStart);
-    break;
-  case NodeKind::HeaderEnd:
-    putTag(out, Tag::HeaderEnd);
-    break;
-  case NodeKind::FooterStart:
-    putTag(out, Tag::FooterStart);
-    break;
-  case NodeKind::FooterEnd:
-    putTag(out, Tag::FooterEnd);
-    break;
   case NodeKind::NoteStart:
     putTag(out, Tag::NoteStart);
     putBool(out, false);
-    break;
-  case NodeKind::NoteEnd:
-    putTag(out, Tag::NoteEnd);
     break;
   case NodeKind::EndnoteStart:
     putTag(out, Tag::NoteStart);
     putBool(out, true);
     break;
-  case NodeKind::EndnoteEnd:
-    putTag(out, Tag::NoteEnd);
-    break;
   case NodeKind::AsideStart:
     putTag(out, Tag::AsideStart);
     putString(out, n.text);
-    break;
-  case NodeKind::AsideEnd:
-    putTag(out, Tag::AsideEnd);
     break;
   case NodeKind::LinkStart:
     putTag(out, Tag::LinkStart);
     putString(out, n.text);
     break;
-  case NodeKind::LinkEnd:
-    putTag(out, Tag::LinkEnd);
-    break;
   case NodeKind::FieldInsert:
     putTag(out, Tag::Field);
     putString(out, n.text);
     break;
-  case NodeKind::MetaData:
-    // Handled separately by `serialize`; never reaches here.
+  default: // MetaData; every other kind is handled by putSimpleEvent.
     break;
   }
+}
+
+/* Encodes one event node. `MetaData` nodes must be filtered out by the caller
+ * before reaching here — they have no event representation. ~keep */
+void putEvent(std::string &out, const Node &n) {
+  if (!putSimpleEvent(out, n.kind))
+    putPayloadEvent(out, n);
 }
 } // namespace wire
 
@@ -662,9 +598,7 @@ std::string serialize(const std::vector<Node> &nodes) {
   }
 
   std::string out;
-  // Rough up-front capacity so the blob doesn't repeatedly reallocate while
-  // appending; ~8 bytes/node covers a tag plus small fixed payloads (text
-  // nodes grow it further, which amortized doubling then absorbs). ~keep
+  // ~8 bytes/node; amortized doubling absorbs bigger text nodes. ~keep
   constexpr size_t kBytesPerNodeEstimate = 8;
   out.reserve(nodes.size() * kBytesPerNodeEstimate + sizeof(uint32_t) * 2 + 1);
   wire::putU8(out, wire::kWireVersion);
@@ -751,8 +685,7 @@ int xberg_wpd_extract_document(const unsigned char *data, unsigned long len,
     *out_err = nullptr;
   if (!data || len == 0)
     return XBERG_WPD_INVALID_ARGS;
-  // RVNGStringStream takes an unsigned int; the Rust wrapper already rejects
-  // oversized buffers, but direct C callers reach this boundary too. ~keep
+  // RVNGStringStream takes unsigned int; direct C callers reach this too. ~keep
   if (len > (std::numeric_limits<unsigned int>::max)())
     return XBERG_WPD_INVALID_ARGS;
 
@@ -801,72 +734,138 @@ int xberg_wpd_extract_document(const unsigned char *data, unsigned long len,
 
 void xberg_wpd_free_string(char *s) { std::free(s); }
 
-/* Internal self-test for the header/footer/footnote separation captured by
- * `DocumentBuilder`: drives its callbacks directly, the same way libwpd
- * would, without needing a real WordPerfect document on disk. Exposed so the
- * Rust test suite has real evidence that footnote/header nodes are recorded
- * as distinct bracketing events rather than folded into body text. Asserts
- * directly on the recorded `std::vector<Node>` rather than on any rendering,
- * since rendering no longer exists in this shim. Not part of the crate's
- * public API contract. Returns non-zero on success. ~keep */
-int xberg_wpd_self_test_separation(void) try {
-  DocumentBuilder b;
+} // extern "C"
 
-  RVNGPropertyList empty;
-  b.openHeader(empty);
-  b.insertText(RVNGString("Confidential Draft"));
-  b.closeHeader();
-
-  b.openParagraph(empty);
-  b.insertText(RVNGString("Body start."));
-  b.openFootnote(empty);
-  b.insertText(RVNGString("See appendix A."));
-  b.closeFootnote();
-  b.insertText(RVNGString("Body continues."));
-  b.closeParagraph();
-
-  b.openFooter(empty);
-  b.insertText(RVNGString("Page 1 of 1"));
-  b.closeFooter();
-
-  const std::vector<Node> &n = b.nodes;
-  auto kindAt = [&](size_t i) { return n[i].kind; };
-  bool ok = n.size() == 12;
-  ok = ok && kindAt(0) == NodeKind::HeaderStart;
-  ok = ok && kindAt(1) == NodeKind::Text && n[1].text == "Confidential Draft";
-  ok = ok && kindAt(2) == NodeKind::HeaderEnd;
-  ok = ok && kindAt(3) == NodeKind::Text && n[3].text == "Body start.";
-  ok = ok && kindAt(4) == NodeKind::NoteStart;
-  ok = ok && kindAt(5) == NodeKind::Text && n[5].text == "See appendix A.";
-  ok = ok && kindAt(6) == NodeKind::NoteEnd;
-  ok = ok && kindAt(7) == NodeKind::Text && n[7].text == "Body continues.";
-  ok = ok && kindAt(8) == NodeKind::ParagraphEnd;
-  ok = ok && kindAt(9) == NodeKind::FooterStart;
-  ok = ok && kindAt(10) == NodeKind::Text && n[10].text == "Page 1 of 1";
-  ok = ok && kindAt(11) == NodeKind::FooterEnd;
-
-  // The serialized blob must round-trip the same node kinds through the wire
-  // tags a byte-level Rust decoder would see, so the wire format itself is
-  // exercised, not just the recorded node vector. ~keep
-  std::string blob = serialize(n);
-  ok = ok && blob.size() > 0 &&
-       static_cast<uint8_t>(blob[0]) == wire::kWireVersion;
-
-  return ok ? 1 : 0;
-} catch (...) {
-  return 0;
+namespace {
+// Self-test support: top-level so a loop's branching counts once, here. ~keep
+const Node *findFirstKind(const std::vector<Node> &nodes, NodeKind kind) {
+  for (const Node &node : nodes)
+    if (node.kind == kind)
+      return &node;
+  return nullptr;
 }
 
-/* Internal self-test for the internal-document-model completeness work: link
- * hrefs, field placeholders, strikethrough spans, footnote/endnote
- * separation, table structure (header row, column span, a covered/merged
- * cell) and metadata. Same rationale as `xberg_wpd_self_test_separation`
- * above: real evidence without needing a WordPerfect fixture on disk for
- * every feature. Asserts directly on the recorded `std::vector<Node>` (and,
- * for the serialized-size sanity check, the wire blob) rather than on any
- * rendering. Returns non-zero on success. ~keep */
-int xberg_wpd_self_test_features(void) try {
-  DocumentBuilder b;
+bool containsKind(const std::vector<Node> &nodes, NodeKind kind) {
+  return findFirstKind(nodes, kind) != nullptr;
+}
+
+const Node *findMetaData(const std::vector<Node> &nodes, const char *key) {
+  for (const Node &node : nodes)
+    if (node.kind == NodeKind::MetaData && node.text == key)
+      return &node;
+  return nullptr;
+}
+
+// One expected (kind, text) pair; `text` nullptr skips the text check.
+struct ExpectedNode {
+  NodeKind kind;
+  const char *text;
+};
+
+// One loop instead of N chained `&&`s, so complexity doesn't scale with N.
+template <size_t N>
+bool matchesSequence(const std::vector<Node> &nodes,
+                     const ExpectedNode (&expected)[N]) {
+  if (nodes.size() != N)
+    return false;
+  for (size_t i = 0; i < N; ++i) {
+    if (nodes[i].kind != expected[i].kind)
+      return false;
+    if (expected[i].text && nodes[i].text != expected[i].text)
+      return false;
+  }
+  return true;
+}
+
+// Per-feature checks for `xberg_wpd_self_test_features`, so it stays flat.
+// ~keep
+bool testMetadataAndLinkFeatures(const std::vector<Node> &n) {
+  const Node *title = findMetaData(n, "dc:title");
+  const Node *creator = findMetaData(n, "dc:creator");
+  const Node *link = findFirstKind(n, NodeKind::LinkStart);
+  bool ok = title && title->text2 == "Sample Report";
+  ok = ok && creator && creator->text2 == "A. Writer";
+  ok = ok && link && link->text == "https://example.com/report";
+  ok = ok && containsKind(n, NodeKind::LinkEnd);
+  ok = ok && containsKind(n, NodeKind::StrikethroughStart) &&
+       containsKind(n, NodeKind::StrikethroughEnd);
+  return ok;
+}
+
+bool testFieldAndNoteFeatures(const std::vector<Node> &n) {
+  const Node *field = findFirstKind(n, NodeKind::FieldInsert);
+  bool ok = field && field->text == "page";
+  ok = ok && containsKind(n, NodeKind::NoteStart) &&
+       containsKind(n, NodeKind::NoteEnd);
+  ok = ok && containsKind(n, NodeKind::EndnoteStart) &&
+       containsKind(n, NodeKind::EndnoteEnd);
+  return ok;
+}
+
+bool testTableFeatures(const std::vector<Node> &n) {
+  const Node *headerRow = findFirstKind(n, NodeKind::TableRowStart);
+  bool ok = headerRow && headerRow->ordered;
+
+  int spanCellCount = 0;
+  for (const Node &node : n)
+    if (node.kind == NodeKind::TableCellStart && node.counter == 2)
+      spanCellCount++;
+  ok = ok && spanCellCount == 1;
+  ok = ok && containsKind(n, NodeKind::CoveredTableCell);
+
+  // Embedded '|'/linebreak survive verbatim; sanitizing was rendering-only.
+  // ~keep
+  bool foundRawPipeText = false;
+  for (const Node &node : n)
+    if (node.kind == NodeKind::Text && node.text == "Jo|e")
+      foundRawPipeText = true;
+  return ok && foundRawPipeText;
+}
+
+// libwpd can skip a covered cell for a vertical merge yet still stamp the
+// surviving cell with its true librevenge:column; row 2 omits the column-0
+// covered cell but its real cell must still carry column 1, not 0. ~keep
+bool testColumnReanchoring() {
+  RVNGPropertyList empty;
+  DocumentBuilder c;
+  c.openTable(empty);
+  c.openTableRow(empty);
+  RVNGPropertyList r1c0;
+  r1c0.insert("librevenge:column", 0);
+  c.openTableCell(r1c0);
+  c.insertText(RVNGString("r1c0"));
+  c.closeTableCell();
+  RVNGPropertyList r1c1;
+  r1c1.insert("librevenge:column", 1);
+  c.openTableCell(r1c1);
+  c.insertText(RVNGString("r1c1"));
+  c.closeTableCell();
+  c.closeTableRow();
+  c.openTableRow(empty);
+  RVNGPropertyList r2c1;
+  r2c1.insert("librevenge:column", 1);
+  c.openTableCell(r2c1);
+  c.insertText(RVNGString("r2c1"));
+  c.closeTableCell();
+  c.closeTableRow();
+  c.closeTable();
+
+  int r2CellColumn = -2;
+  bool afterSecondRow = false;
+  int rowEndsSeen = 0;
+  for (const Node &node : c.nodes) {
+    if (node.kind == NodeKind::TableRowEnd)
+      rowEndsSeen++;
+    if (rowEndsSeen == 1 && node.kind == NodeKind::TableCellStart)
+      afterSecondRow = true;
+    if (afterSecondRow && node.kind == NodeKind::TableCellStart)
+      r2CellColumn = node.level;
+  }
+  return r2CellColumn == 1;
+}
+
+// Builds the document `xberg_wpd_self_test_features` asserts over. ~keep
+void buildFeatureDocument(DocumentBuilder &b) {
   RVNGPropertyList empty;
 
   RVNGPropertyList meta;
@@ -917,8 +916,7 @@ int xberg_wpd_self_test_features(void) try {
 
   b.openTableRow(empty);
   b.openTableCell(empty);
-  // Embedded tab/newline must survive unmodified: sanitization was a
-  // rendering-only concern and no longer applies to the structured model.
+  // Embedded '|'/newline survive unmodified: sanitization was rendering-only.
   // ~keep
   b.insertText(RVNGString("Jo|e"));
   b.insertLineBreak();
@@ -930,112 +928,63 @@ int xberg_wpd_self_test_features(void) try {
   b.closeTableCell();
   b.closeTableRow();
   b.closeTable();
+}
+} // namespace
+
+extern "C" {
+
+// Real evidence footnote/header nodes are distinct events. Internal. ~keep
+int xberg_wpd_self_test_separation(void) try {
+  DocumentBuilder b;
+
+  RVNGPropertyList empty;
+  b.openHeader(empty);
+  b.insertText(RVNGString("Confidential Draft"));
+  b.closeHeader();
+
+  b.openParagraph(empty);
+  b.insertText(RVNGString("Body start."));
+  b.openFootnote(empty);
+  b.insertText(RVNGString("See appendix A."));
+  b.closeFootnote();
+  b.insertText(RVNGString("Body continues."));
+  b.closeParagraph();
+
+  b.openFooter(empty);
+  b.insertText(RVNGString("Page 1 of 1"));
+  b.closeFooter();
+
+  static const ExpectedNode kExpected[] = {
+      {NodeKind::HeaderStart, nullptr},  {NodeKind::Text, "Confidential Draft"},
+      {NodeKind::HeaderEnd, nullptr},    {NodeKind::Text, "Body start."},
+      {NodeKind::NoteStart, nullptr},    {NodeKind::Text, "See appendix A."},
+      {NodeKind::NoteEnd, nullptr},      {NodeKind::Text, "Body continues."},
+      {NodeKind::ParagraphEnd, nullptr}, {NodeKind::FooterStart, nullptr},
+      {NodeKind::Text, "Page 1 of 1"},   {NodeKind::FooterEnd, nullptr},
+  };
+  bool ok = matchesSequence(b.nodes, kExpected);
+
+  // Round-trips through the wire tags a Rust decoder would see. ~keep
+  std::string blob = serialize(b.nodes);
+  ok = ok && blob.size() > 0 &&
+       static_cast<uint8_t>(blob[0]) == wire::kWireVersion;
+
+  return ok ? 1 : 0;
+} catch (...) {
+  return 0;
+}
+
+// Covers links, fields, strikethrough, notes, table structure, metadata. ~keep
+int xberg_wpd_self_test_features(void) try {
+  DocumentBuilder b;
+  buildFeatureDocument(b);
 
   const std::vector<Node> &n = b.nodes;
+  bool ok = testMetadataAndLinkFeatures(n) && testFieldAndNoteFeatures(n) &&
+            testTableFeatures(n) && testColumnReanchoring();
 
-  auto findMetaData = [&](const char *key) -> const Node * {
-    for (const Node &node : n)
-      if (node.kind == NodeKind::MetaData && node.text == key)
-        return &node;
-    return nullptr;
-  };
-  const Node *title = findMetaData("dc:title");
-  const Node *creator = findMetaData("dc:creator");
-
-  auto contains = [&](NodeKind kind) {
-    return std::any_of(n.begin(), n.end(),
-                       [&](const Node &node) { return node.kind == kind; });
-  };
-  auto findFirst = [&](NodeKind kind) -> const Node * {
-    for (const Node &node : n)
-      if (node.kind == kind)
-        return &node;
-    return nullptr;
-  };
-
-  bool ok = true;
-  ok = ok && title && title->text2 == "Sample Report";
-  ok = ok && creator && creator->text2 == "A. Writer";
-
-  const Node *link = findFirst(NodeKind::LinkStart);
-  ok = ok && link && link->text == "https://example.com/report";
-  ok = ok && contains(NodeKind::LinkEnd);
-  ok = ok && contains(NodeKind::StrikethroughStart) &&
-       contains(NodeKind::StrikethroughEnd);
-
-  const Node *field = findFirst(NodeKind::FieldInsert);
-  ok = ok && field && field->text == "page";
-
-  ok = ok && contains(NodeKind::NoteStart) && contains(NodeKind::NoteEnd);
-  ok = ok && contains(NodeKind::EndnoteStart) && contains(NodeKind::EndnoteEnd);
-
-  const Node *headerRow = findFirst(NodeKind::TableRowStart);
-  ok = ok && headerRow && headerRow->ordered;
-
-  int spanCellCount = 0;
-  for (const Node &node : n)
-    if (node.kind == NodeKind::TableCellStart && node.counter == 2)
-      spanCellCount++;
-  ok = ok && spanCellCount == 1;
-
-  ok = ok && contains(NodeKind::CoveredTableCell);
-
-  // Embedded '|' and a line break inside a cell survive verbatim in the
-  // structured model; sanitizing them for a delimiter-based text format was
-  // a rendering concern that no longer applies. ~keep
-  bool foundRawPipeText = false;
-  for (const Node &node : n)
-    if (node.kind == NodeKind::Text && node.text == "Jo|e")
-      foundRawPipeText = true;
-  ok = ok && foundRawPipeText;
-
-  // A second table exercising column re-anchoring: libwpd documents that it
-  // sometimes fails to emit a covered cell for a vertical merge ("this case
-  // should not happen, but it happens in real-life documents"), yet it
-  // always stamps the surviving real cell with its true librevenge:column.
-  // Row 2 here omits the column-0 covered cell but declares its cell at
-  // column 1; the recorded node must still carry column 1, not column 0, so
-  // a consumer reconstructing the grid places it correctly. ~keep
-  DocumentBuilder c;
-  c.openTable(empty);
-  c.openTableRow(empty);
-  RVNGPropertyList r1c0;
-  r1c0.insert("librevenge:column", 0);
-  c.openTableCell(r1c0);
-  c.insertText(RVNGString("r1c0"));
-  c.closeTableCell();
-  RVNGPropertyList r1c1;
-  r1c1.insert("librevenge:column", 1);
-  c.openTableCell(r1c1);
-  c.insertText(RVNGString("r1c1"));
-  c.closeTableCell();
-  c.closeTableRow();
-  c.openTableRow(empty);
-  RVNGPropertyList r2c1;
-  r2c1.insert("librevenge:column", 1);
-  c.openTableCell(r2c1);
-  c.insertText(RVNGString("r2c1"));
-  c.closeTableCell();
-  c.closeTableRow();
-  c.closeTable();
-
-  int r2CellColumn = -2;
-  bool afterSecondRow = false;
-  int rowEndsSeen = 0;
-  for (const Node &node : c.nodes) {
-    if (node.kind == NodeKind::TableRowEnd)
-      rowEndsSeen++;
-    if (rowEndsSeen == 1 && node.kind == NodeKind::TableCellStart)
-      afterSecondRow = true;
-    if (afterSecondRow && node.kind == NodeKind::TableCellStart)
-      r2CellColumn = node.level;
-  }
-  ok = ok && r2CellColumn == 1;
-
-  // The serialized blob must be non-empty and version-tagged: a byte-level
-  // smoke check that `serialize` actually ran over this richer document
-  // rather than the wire format itself being asserted node-by-node here
-  // (that is `dto::decode`'s job, exercised from Rust). ~keep
+  // Smoke check that `serialize` ran over this richer document; the wire
+  // format itself is `dto::decode`'s job, exercised from Rust. ~keep
   std::string blob = serialize(n);
   ok = ok && blob.size() > 0 &&
        static_cast<uint8_t>(blob[0]) == wire::kWireVersion;
