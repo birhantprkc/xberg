@@ -1181,6 +1181,75 @@ fn line_has_grid_row_gaps(spans: &[xberg_native_pdf::layout::TextSpan], line: &S
     gap_count >= MIN_GRID_ROW_GAP_COUNT
 }
 
+// GH#1742 (reproducer page 4): a three-column table row opens only two internal
+// gaps, one short of `MIN_GRID_ROW_GAP_COUNT`, so it is never excluded from
+// `detect_split_x`'s vote and can still make the median land inside the table. Once
+// it has, that internal gap is real whitespace on every row that has it, so no span
+// crosses the split there either -- `redirect_split_out_of_content`'s own
+// `lines_crossing` count (spans literally straddling the split) stays far below
+// `MIN_DENSE_COLUMN_SPLIT_LINES` and the widened corridor search that would find the
+// true gutter never runs. Two is the floor for "this line has more than one
+// internal boundary" -- an ordinary two-column body line (including a hanging
+// clause number's own indent-to-gutter gap) has exactly one. It is deliberately
+// lower than `MIN_GRID_ROW_GAP_COUNT`: unlike the vote exclusion, a false positive
+// here only widens the search, and the redirect's existing downstream guards
+// (`both_sides_are_columns`, `corridor_is_hanging_label_indent`, the redirect
+// distance cap) still have to accept whatever candidate that search turns up. ~keep
+const MIN_TABLE_ROW_INTERNAL_GAP_COUNT: usize = 2;
+
+/// True if `line` has at least `MIN_TABLE_ROW_INTERNAL_GAP_COUNT` internal gaps each
+/// at least `min_gutter` wide, and `x` falls inside one of them.
+///
+/// Unlike `line_has_grid_row_gaps`, this does not exclude the line from anything --
+/// it is evidence for `redirect_split_out_of_content` that a split's freedom from
+/// `lines_crossing` on this particular line came from sitting in a multi-column
+/// row's own cell gap, not from genuinely clean whitespace.
+fn line_has_internal_gap_at(
+    spans: &[xberg_native_pdf::layout::TextSpan],
+    line: &SpanLine,
+    min_gutter: f32,
+    x: f32,
+) -> bool {
+    let mut edges: Vec<(f32, f32)> = line
+        .iter()
+        .filter(|&&index| span_has_ink(&spans[index]))
+        .map(|&index| (spans[index].bbox.left(), spans[index].bbox.right()))
+        .collect();
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut edges = edges.into_iter();
+    let Some((_, mut running_right)) = edges.next() else {
+        return false;
+    };
+    let mut gap_count = 0usize;
+    let mut x_in_a_gap = false;
+    for (left, right) in edges {
+        if left - running_right >= min_gutter {
+            gap_count += 1;
+            if x >= running_right && x <= left {
+                x_in_a_gap = true;
+            }
+        }
+        running_right = running_right.max(right);
+    }
+    gap_count >= MIN_TABLE_ROW_INTERNAL_GAP_COUNT && x_in_a_gap
+}
+
+/// How many non-furniture lines have `x` inside one of their own multi-column
+/// internal gaps (`line_has_internal_gap_at`).
+fn lines_with_internal_gap_at(
+    spans: &[xberg_native_pdf::layout::TextSpan],
+    lines: &[SpanLine],
+    furniture_width: f32,
+    min_gutter: f32,
+    x: f32,
+) -> usize {
+    lines
+        .iter()
+        .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
+        .filter(|&line| line_has_internal_gap_at(spans, line, min_gutter, x))
+        .count()
+}
+
 /// Establish the page's gutter x-position from independent per-line evidence.
 ///
 /// Each line is checked in isolation for an internal gap at least
@@ -1270,6 +1339,18 @@ fn detect_split_x(spans: &[xberg_native_pdf::layout::TextSpan], lines: &[SpanLin
 /// `corridor_is_hanging_label_indent` recognises and bounded on both sides by a
 /// column of running text (`both_sides_are_columns`). A split that sits in whitespace,
 /// or that a single heading crosses, never reaches that second search.
+///
+/// GH#1742 (reproducer page 4): a split can sit inside a table column without a
+/// single span crossing it at all, when the table's own leading never shares a line
+/// with the opposite column (see `line_has_grid_row_gaps`'s doc comment) -- every
+/// line that runs through the split does so through its own internal cell gap, never
+/// through a span. `lines_crossing` alone then stays at whatever incidental furniture
+/// or heading happens to cross, far below `MIN_DENSE_COLUMN_SPLIT_LINES`, and the
+/// widened search that would find the true gutter never runs even though the split
+/// is just as much inside a column as one that does cut a span on every line.
+/// `lines_with_internal_gap_at` counts that population directly and, once it alone
+/// clears the threshold, admits the split to the same widened search a literal
+/// `lines_crossing` count would have. ~keep
 fn redirect_split_out_of_content(
     spans: &[xberg_native_pdf::layout::TextSpan],
     lines: &[SpanLine],
@@ -1279,11 +1360,13 @@ fn redirect_split_out_of_content(
     let cuts_a_span = spans
         .iter()
         .any(|span| span.bbox.left() < split_x && span.bbox.right() > split_x);
-    if !cuts_a_span {
-        return split_x;
-    }
     let furniture_width = page_width * FULL_WIDTH_FURNITURE_FRACTION;
     let min_gutter = (page_width * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+    let split_inside_a_table_gap =
+        lines_with_internal_gap_at(spans, lines, furniture_width, min_gutter, split_x) >= MIN_DENSE_COLUMN_SPLIT_LINES;
+    if !cuts_a_span && !split_inside_a_table_gap {
+        return split_x;
+    }
     let max_redirect_distance = page_width * MAX_REDIRECT_DISTANCE_FRACTION;
     let widest_within_reach = |corridors: Vec<(f32, f32)>| {
         corridors
@@ -1298,13 +1381,16 @@ fn redirect_split_out_of_content(
 
     // No empty corridor within reach. A split that a single line runs through (a
     // heading set across both columns) is left where the per-line evidence put it,
-    // as before. A split that `MIN_DENSE_COLUMN_SPLIT_LINES` lines run through is
-    // not in a gutter at all -- it is inside a column, and every one of those lines
-    // is about to become a band boundary -- so the corridor search is widened to
-    // bands that at most `MAX_GUTTER_CROSSING_LINES` lines cross, minus the
-    // hanging-label indents that are wider than a real gutter on every
-    // clause-numbered page (the GH#1603 shape, seen from the corridor's side).
-    if lines_crossing(spans, lines, furniture_width, split_x) < MIN_DENSE_COLUMN_SPLIT_LINES {
+    // as before. A split that `MIN_DENSE_COLUMN_SPLIT_LINES` lines run through --
+    // literally, or (GH#1742) through their own internal cell gap without a span
+    // crossing at all -- is not in a gutter at all -- it is inside a column, and
+    // every one of those lines is about to become a band boundary -- so the corridor
+    // search is widened to bands that at most `MAX_GUTTER_CROSSING_LINES` lines
+    // cross, minus the hanging-label indents that are wider than a real gutter on
+    // every clause-numbered page (the GH#1603 shape, seen from the corridor's side).
+    if lines_crossing(spans, lines, furniture_width, split_x) < MIN_DENSE_COLUMN_SPLIT_LINES
+        && !split_inside_a_table_gap
+    {
         return split_x;
     }
     let max_label_width = page_width * MAX_DENSE_COLUMN_SPLIT_SNAP_SPAN_FRACTION;
@@ -4633,6 +4719,100 @@ mod tests {
             expected.iter().map(String::as_str).collect::<Vec<_>>(),
             "the table column must precede the prose column, with the page number \
              trailing as its own boundary line"
+        );
+    }
+
+    const GH1742_P4B_INTRO_WIDTH: f32 = 200.0;
+
+    /// GH#1742 (reproducer p4, real mechanism, traced against `/1742.pdf` page 4 with a
+    /// temporary instrumented test -- 271 spans, 122 lines, `detect_split_x` = 186.392,
+    /// exactly one line crossing that split, 71 lines with an internal gap at it).
+    ///
+    /// Unlike `gh1742_full_height_table_column_with_page_number` above, no span is
+    /// engineered to literally straddle the wrong split on more than one line: every
+    /// table row is a plain 3-column row (two internal gaps, below
+    /// `MIN_GRID_ROW_GAP_COUNT`, so fix #1 does not touch the vote), each row's own
+    /// gap is real whitespace, and the only span in the whole page that crosses
+    /// `detect_split_x`'s median is a single wide introductory line above the table
+    /// (the reporter's own carrier has exactly this shape: a paragraph before "Table
+    /// 2"). Before this fix, `redirect_split_out_of_content`'s `cuts_a_span` gate was
+    /// satisfied by that one intro line, but its own `lines_crossing` count then never
+    /// rose above 1 -- the ten table rows evidence the split is inside a column only
+    /// through their own internal gaps, never through a span crossing -- so the
+    /// widened corridor search never ran and the split stayed inside the table.
+    fn gh1742_full_height_table_column_no_crossing_spans() -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        let (col0_x, _) = GH1742_P4_TABLE_COLUMNS[0];
+        spans.push(span_with_width(
+            "an introductory paragraph precedes the table on its own line",
+            col0_x,
+            910.0,
+            GH1742_P4B_INTRO_WIDTH,
+            8.0,
+            8.0,
+        ));
+        for row in 0..GH1742_P4_NORMAL_ROWS {
+            let y = 900.0 - row as f32 * GH1742_P4_TABLE_ROW_HEIGHT - GH1742_P4_TABLE_Y_OFFSET;
+            for (column, &(x, width)) in GH1742_P4_TABLE_COLUMNS.iter().enumerate() {
+                spans.push(span_with_width(&format!("t{column}"), x, y, width, 6.5, 6.5));
+            }
+        }
+        for row in 0..GH1742_P4_NORMAL_ROWS {
+            let y = 900.0 - row as f32 * 14.0;
+            spans.push(span_with_width(
+                &format!("right column body text for row {row}"),
+                GH1742_RIGHT_X,
+                y,
+                GH1742_RIGHT_WIDTH,
+                11.0,
+                11.0,
+            ));
+        }
+        let page_number_width = 4.5;
+        let page_number_x = GH1742_TRUE_GUTTER_MID_X - page_number_width / 2.0;
+        spans.push(span_with_width("6", page_number_x, 40.0, page_number_width, 8.0, 8.0));
+        spans
+    }
+
+    /// GH#1742 (reproducer p4, real mechanism): with no span crossing the wrong split
+    /// on more than one line, `redirect_split_out_of_content` must still be reached
+    /// through `lines_with_internal_gap_at`'s table-row evidence, and the page must
+    /// still reorder table-then-prose rather than emit top-to-bottom.
+    #[test]
+    fn dense_two_column_page_with_table_column_and_no_crossing_spans_reorders_table_then_prose_gh1742() {
+        let spans = gh1742_full_height_table_column_no_crossing_spans();
+        let order = spans_sorted_top_to_bottom(&spans);
+        let lines = group_into_lines(&spans, &order);
+
+        let detected = detect_split_x(&spans, &lines, GH1742_PAGE_WIDTH).expect("table rows vote for a split");
+        let snapped = snap_split_left_of_hanging_labels(&spans, &lines, GH1742_PAGE_WIDTH, detected);
+        let furniture_width = GH1742_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+        assert_eq!(
+            lines_crossing(&spans, &lines, furniture_width, snapped),
+            1,
+            "only the intro line may cross the wrong split, or this fixture no longer \
+             exercises the no-span-crossing mechanism"
+        );
+
+        let mut spans = spans;
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1742_PAGE_WIDTH),
+            "a table column beside ordinary prose, with the wrong split crossed by only \
+             one line, must still be reordered"
+        );
+
+        let mut expected = vec!["an introductory paragraph precedes the table on its own line".to_string()];
+        for _row in 0..GH1742_P4_NORMAL_ROWS {
+            expected.extend((0..GH1742_P4_TABLE_COLUMNS.len()).map(|column| format!("t{column}")));
+        }
+        expected.extend((0..GH1742_P4_NORMAL_ROWS).map(|row| format!("right column body text for row {row}")));
+        expected.push("6".to_string());
+
+        assert_eq!(
+            spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the intro line and table column must precede the prose column, with the \
+             page number trailing as its own boundary line"
         );
     }
 
