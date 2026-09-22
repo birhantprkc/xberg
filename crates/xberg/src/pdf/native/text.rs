@@ -14,8 +14,23 @@ use crate::types::{PageBoundary, PageContent};
 use std::borrow::Cow;
 use xberg_native_pdf::document::ReadingOrder;
 
+/// Per-page fabricated-mapping character counts `(fabricated, total)`, indexed by zero-based
+/// page number, gathered while the main text pass reads each page's raw `ColumnAware` spans.
+///
+/// `None` when the document has default-off optional-content (OCG) layers: the text pass then
+/// reads layer-*filtered* spans for content assembly, which is not the same span set
+/// `scan_detect::page_has_fabricated_text` grades, so provenance falls back to reading each
+/// page separately for such documents rather than reporting counts that would silently change
+/// `fabricated_text_pages` (issue #1744).
+type PageProvenanceCounts = Option<Vec<(usize, usize)>>;
+
 /// Result type for PDF text extraction with optional page tracking.
-type PdfTextExtractionResult = (String, Option<Vec<PageBoundary>>, Option<Vec<PageContent>>);
+type PdfTextExtractionResult = (
+    String,
+    Option<Vec<PageBoundary>>,
+    Option<Vec<PageContent>>,
+    PageProvenanceCounts,
+);
 
 // #1574: these were 0.06/0.05 through 1.1.0. `top_margin_fraction`/`bottom_margin_fraction`
 // went from a dead config knob (unread before commit ddba546dca5) to an active OCR-paragraph
@@ -85,7 +100,7 @@ pub(crate) fn extract_text_and_metadata(
 ) -> Result<NativeUnifiedExtractionResult> {
     let page_config = extraction_config.and_then(|c| c.pages.as_ref());
     let margins = PageMarginFractions::from_extraction_config(extraction_config);
-    let (text, boundaries, page_contents) =
+    let (text, boundaries, page_contents, provenance_counts) =
         extract_text_from_native_document(doc, page_config, extraction_config, margins)?;
 
     let scanned_min_confidence = extraction_config
@@ -101,6 +116,7 @@ pub(crate) fn extract_text_and_metadata(
         &text,
         scanned_min_confidence,
         &ocr_quality_thresholds,
+        provenance_counts.as_deref(),
     )?;
 
     Ok((text, boundaries, page_contents, metadata))
@@ -175,15 +191,17 @@ pub(crate) fn extract_text_from_native_document(
 /// than repeating the literal. ~keep
 pub(crate) const PAGE_SEPARATOR: &str = "\n\n";
 
-/// Extract and clean one page's text.
+/// Extract and clean one page's text, alongside its fabricated-mapping counts when available.
+///
+/// See [`PageProvenanceCounts`] for when the second element is `None`.
 fn extract_one_page_text(
     doc: &xberg_native_pdf::PdfDocument,
     page_index: usize,
     excluded_layers: &std::collections::HashSet<String>,
     margins: PageMarginFractions,
-) -> Result<String> {
-    let page_text = extract_page_text_column_aware(doc, page_index, excluded_layers, margins)?;
-    Ok(apply_text_cleanup(&page_text).into_owned())
+) -> Result<(String, Option<(usize, usize)>)> {
+    let (page_text, provenance_counts) = extract_page_text_column_aware(doc, page_index, excluded_layers, margins)?;
+    Ok((apply_text_cleanup(&page_text).into_owned(), provenance_counts))
 }
 
 /// Extract every page's cleaned text, in page order.
@@ -198,7 +216,15 @@ fn extract_one_page_text(
 /// bytes on every run, while parsing the same pages two at a time over one handle drops
 /// text and lands on a different result each run. Removing that order dependence is
 /// GH#1725; until it is gone this loop must stay in page order. ~keep
-fn extract_all_page_texts(doc: &xberg_native_pdf::PdfDocument, margins: PageMarginFractions) -> Result<Vec<String>> {
+///
+/// Also returns each page's fabricated-mapping character counts (see [`PageProvenanceCounts`]),
+/// captured from the same raw `ColumnAware` spans this loop already reads for content, so the
+/// provenance pass in `pdf/scan_detect.rs` no longer has to read every page a second time
+/// (issue #1744).
+fn extract_all_page_texts(
+    doc: &xberg_native_pdf::PdfDocument,
+    margins: PageMarginFractions,
+) -> Result<(Vec<String>, PageProvenanceCounts)> {
     let page_count = doc
         .page_count()
         .map_err(|e| PdfError::TextExtractionFailed(format!("Failed to get page count: {}", e)))?;
@@ -207,10 +233,19 @@ fn extract_all_page_texts(doc: &xberg_native_pdf::PdfDocument, margins: PageMarg
     // `/OCProperties/D` (ISO 32000-1:2008 §8.11.4). Computed once per
     // document; empty for the common case of no `/OCProperties`.
     let excluded_layers = xberg_native_pdf::optional_content::compute_default_off_ocgs(doc);
+    let mut provenance_counts = excluded_layers.is_empty().then(|| Vec::with_capacity(page_count));
 
-    (0..page_count)
-        .map(|page_idx| extract_one_page_text(doc, page_idx, &excluded_layers, margins))
-        .collect()
+    let mut texts = Vec::with_capacity(page_count);
+    for page_idx in 0..page_count {
+        let (text, counts) = extract_one_page_text(doc, page_idx, &excluded_layers, margins)?;
+        texts.push(text);
+        if let Some(collected) = provenance_counts.as_mut() {
+            collected
+                .push(counts.expect("extract_one_page_text must report provenance counts when no layers are excluded"));
+        }
+    }
+
+    Ok((texts, provenance_counts))
 }
 
 /// Fast path: extract text without page tracking.
@@ -218,7 +253,7 @@ fn extract_all_page_texts(doc: &xberg_native_pdf::PdfDocument, margins: PageMarg
 /// Extracts every page through [`extract_all_page_texts`], then concatenates the
 /// pages in order into a single string.
 fn extract_text_fast_path(doc: &NativeDocument, margins: PageMarginFractions) -> Result<PdfTextExtractionResult> {
-    let page_texts = extract_all_page_texts(&doc.doc, margins)?;
+    let (page_texts, provenance_counts) = extract_all_page_texts(&doc.doc, margins)?;
 
     let separators = page_texts.len().saturating_sub(1) * PAGE_SEPARATOR.len();
     let mut content = String::with_capacity(page_texts.iter().map(String::len).sum::<usize>() + separators);
@@ -230,7 +265,7 @@ fn extract_text_fast_path(doc: &NativeDocument, margins: PageMarginFractions) ->
         content.push_str(page_text);
     }
 
-    Ok((content, None, None))
+    Ok((content, None, None, provenance_counts))
 }
 
 /// Extract text with page boundary and content tracking.
@@ -243,7 +278,7 @@ fn extract_text_with_tracking(
     config: &PageConfig,
     margins: PageMarginFractions,
 ) -> Result<PdfTextExtractionResult> {
-    let page_texts = extract_all_page_texts(&doc.doc, margins)?;
+    let (page_texts, provenance_counts) = extract_all_page_texts(&doc.doc, margins)?;
     let page_count = page_texts.len();
 
     let markers: Vec<String> = if config.insert_page_markers {
@@ -306,7 +341,7 @@ fn extract_text_with_tracking(
         }
     }
 
-    Ok((content, Some(boundaries), page_contents))
+    Ok((content, Some(boundaries), page_contents, provenance_counts))
 }
 
 /// Collect Widget annotation field values for the given page, sorted top-to-bottom.
@@ -2033,12 +2068,21 @@ fn retain_spans_inside_page_margins(
 ///
 /// Applies sparse-column and glyph-fragmentation repairs before assembling the
 /// page text.
+///
+/// Also returns the page's fabricated-mapping character counts, captured from the raw spans
+/// before margin filtering or reordering mutate them — `Some` only when `excluded_layers` is
+/// empty, i.e. `page_text_with_options_excluding_layers` took its fast path and made exactly
+/// the same `extract_page_text_with_options(.., ColumnAware)` call that
+/// `scan_detect::page_has_fabricated_text` used to make separately for every page (issue
+/// #1744). When layers are excluded the two callers would otherwise read different span sets,
+/// so provenance is left to its own separate read for such documents; see
+/// [`PageProvenanceCounts`]. ~keep
 fn extract_page_text_column_aware(
     doc: &xberg_native_pdf::PdfDocument,
     page_index: usize,
     excluded_layers: &std::collections::HashSet<String>,
     margins: PageMarginFractions,
-) -> Result<String> {
+) -> Result<(String, Option<(usize, usize)>)> {
     let (page_bottom, page_top) = page_vertical_bounds(doc, page_index)?;
     let mut widgets = collect_widget_field_values(doc, page_index);
     widgets
@@ -2059,32 +2103,31 @@ fn extract_page_text_column_aware(
         },
     )?;
 
+    let provenance_counts = excluded_layers
+        .is_empty()
+        .then(|| crate::pdf::scan_detect::fabricated_char_counts(&page_text_data.spans));
+
     retain_spans_inside_page_margins(&mut page_text_data.spans, page_bottom, page_top, margins);
 
     reorder_sparse_two_column_page(&mut page_text_data.spans, page_text_data.page_width);
     reorder_dense_two_column_page(&mut page_text_data.spans, page_text_data.page_width);
 
     let rotation_spans = page_text_data.spans.iter().map(rotation_span).collect::<Vec<_>>();
-    if let Some(mut text) = crate::extractors::pdf::rotation::repair_rotated_page_text(&rotation_spans) {
-        append_missing_widget_values(&mut text, &widgets);
-        return Ok(text);
-    }
-
-    if is_fragmented_span_list(&page_text_data.spans) {
+    let mut text = if let Some(repaired) = crate::extractors::pdf::rotation::repair_rotated_page_text(&rotation_spans) {
+        repaired
+    } else if is_fragmented_span_list(&page_text_data.spans) {
         tracing::debug!(
             span_count = page_text_data.spans.len(),
             "glyph fragmentation detected — rebuilding text from span positions (#962)"
         );
-        let mut text = rebuild_text_from_fragmented_spans(&page_text_data.spans);
-        append_missing_widget_values(&mut text, &widgets);
-        return Ok(text);
-    }
-
-    let mut text = assemble_page_text(&page_text_data.spans);
+        rebuild_text_from_fragmented_spans(&page_text_data.spans)
+    } else {
+        assemble_page_text(&page_text_data.spans)
+    };
 
     append_missing_widget_values(&mut text, &widgets);
 
-    Ok(text)
+    Ok((text, provenance_counts))
 }
 
 fn rotation_span(span: &xberg_native_pdf::layout::TextSpan) -> crate::extractors::pdf::rotation::TextSpan {
@@ -4564,7 +4607,9 @@ mod tests {
         let excluded_layers = xberg_native_pdf::optional_content::compute_default_off_ocgs(&doc.doc);
         let sequential: Vec<String> = (0..page_count)
             .map(|page_idx| {
-                extract_one_page_text(&doc.doc, page_idx, &excluded_layers, margins).expect("page must extract")
+                extract_one_page_text(&doc.doc, page_idx, &excluded_layers, margins)
+                    .expect("page must extract")
+                    .0
             })
             .collect();
         assert!(
@@ -4572,13 +4617,13 @@ mod tests {
             "fixture pages must carry text, otherwise this test proves nothing"
         );
 
-        let collected = extract_all_page_texts(&doc.doc, margins).expect("collecting every page must succeed");
+        let (collected, _) = extract_all_page_texts(&doc.doc, margins).expect("collecting every page must succeed");
         assert_eq!(
             collected, sequential,
             "the collected page texts must match a page-by-page run, page for page"
         );
 
-        let (content, _, _) =
+        let (content, _, _, _) =
             extract_text_from_native_document(&mut doc, None, None, margins).expect("fast path must succeed");
         // The separator is spelled out rather than read from `PAGE_SEPARATOR`: an assertion
         // built from the same constant the code writes cannot fail when that constant
@@ -4598,7 +4643,7 @@ mod tests {
             extract_pages: true,
             ..PageConfig::default()
         };
-        let (tracked, boundaries, pages) =
+        let (tracked, boundaries, pages, _) =
             extract_text_from_native_document(&mut doc, Some(&page_config), None, margins)
                 .expect("tracking path must succeed");
         let boundaries = boundaries.expect("tracking path must report boundaries");
@@ -4618,5 +4663,54 @@ mod tests {
             assert_eq!(pages[page_idx].content, sequential[page_idx]);
             assert_eq!(pages[page_idx].page_number, (page_idx + 1) as u32);
         }
+    }
+
+    /// #1744: the provenance pass in `pdf/scan_detect.rs` used to read every page's text a
+    /// second time to grade its fabricated-mapping ratio, after the main text pass had already
+    /// read the same raw spans once. `extract_text_and_metadata` must now carry those spans'
+    /// counts forward instead, so the whole-document separate read
+    /// (`scan_detect::fabricated_provenance_page_indices`) is never reached for a document with
+    /// no excluded optional-content layers — the common case.
+    ///
+    /// [`FABRICATED_PROVENANCE_SECOND_PASS_CALLS`](crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS)
+    /// is incremented only inside that whole-document function, so a count of zero after this
+    /// call proves the second read did not happen, not just that the final numbers happen to
+    /// agree. The expected page list is computed independently, on its own document handle,
+    /// before the counter is reset, so computing it cannot mask a regression. ~keep
+    #[test]
+    fn provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/non_ascii_text.pdf");
+        let bytes = std::fs::read(&path).expect("corpus document must read");
+        let thresholds = crate::core::config::OcrQualityThresholds::default();
+
+        let baseline_doc = NativeDocument::open_bytes(&bytes).expect("corpus document must open");
+        let expected_fabricated: Vec<u32> = crate::pdf::scan_detect::fabricated_provenance_page_indices(
+            &baseline_doc.doc,
+            thresholds.min_provenance_fallback_ratio,
+            thresholds.min_total_non_whitespace,
+        )
+        .into_iter()
+        .map(|index| index as u32 + 1)
+        .collect();
+        assert!(
+            !expected_fabricated.is_empty(),
+            "fixture must fabricate at least one page for this test to mean anything"
+        );
+
+        crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut doc = NativeDocument::open_bytes(&bytes).expect("corpus document must open a second time");
+        let (_, _, _, metadata) = extract_text_and_metadata(&mut doc, None).expect("extraction must succeed");
+
+        assert_eq!(
+            crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "extract_text_and_metadata must not read every page's text a second time for provenance (issue #1744)"
+        );
+        assert_eq!(
+            metadata.pdf_specific.fabricated_text_pages,
+            Some(expected_fabricated),
+            "fabricated_text_pages must match the pre-#1744 page-by-page computation exactly"
+        );
     }
 }

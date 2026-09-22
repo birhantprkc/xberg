@@ -9,6 +9,14 @@ use xberg_native_pdf::layout::TextSpan;
 #[cfg(test)]
 use crate::core::config::DEFAULT_SCANNED_MIN_CONFIDENCE;
 
+/// Counts calls to [`fabricated_provenance_page_indices`], the whole-document separate read
+/// over every page's raw spans. A caller holding per-page counts already gathered by the main
+/// text pass must never reach this function (issue #1744); tests reset and read it to prove
+/// that second read did not happen. ~keep
+#[cfg(test)]
+pub(crate) static FABRICATED_PROVENANCE_SECOND_PASS_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Below this raster coverage a page is text with a figure, never a scan.
 const IMAGE_COVERAGE_MIN: f32 = 0.80;
 
@@ -210,7 +218,7 @@ pub(crate) fn detect(doc: &PdfDocument) -> Option<ScanDetection> {
 ///
 /// Pure and independent of any [`PdfDocument`], so it is unit-testable with
 /// hand-built spans.
-fn fabricated_char_counts(spans: &[TextSpan]) -> (usize, usize) {
+pub(crate) fn fabricated_char_counts(spans: &[TextSpan]) -> (usize, usize) {
     let mut fabricated = 0usize;
     let mut total = 0usize;
     for span in spans {
@@ -221,6 +229,17 @@ fn fabricated_char_counts(spans: &[TextSpan]) -> (usize, usize) {
         }
     }
     (fabricated, total)
+}
+
+/// Whether `(fabricated, total)` non-whitespace character counts meet the fabricated-mapping
+/// threshold: `min_chars` or more total characters, at least `min_ratio` of which are
+/// fabricated (issue #1254). Shared by [`page_has_fabricated_text`] and
+/// [`fabricated_provenance_page_indices_from_counts`] so the ratio check has one definition.
+fn counts_meet_fabricated_threshold(fabricated: usize, total: usize, min_ratio: f64, min_chars: usize) -> bool {
+    if total < min_chars {
+        return false;
+    }
+    (fabricated as f64 / total as f64) >= min_ratio
 }
 
 /// Whether page `page_index` has a fabricated text layer: `min_chars` or more
@@ -243,11 +262,7 @@ fn page_has_fabricated_text(doc: &PdfDocument, page_index: usize, min_ratio: f64
     };
 
     let (fabricated, total) = fabricated_char_counts(&page_text.spans);
-    if total < min_chars {
-        return false;
-    }
-
-    (fabricated as f64 / total as f64) >= min_ratio
+    counts_meet_fabricated_threshold(fabricated, total, min_ratio, min_chars)
 }
 
 /// Zero-based indices of pages whose text layer is fabricated per
@@ -259,6 +274,9 @@ fn page_has_fabricated_text(doc: &PdfDocument, page_index: usize, min_ratio: f64
 /// selected by [`detect`], so this is evaluated separately and its result is
 /// meant to be unioned into the caller's scanned-page set.
 pub(crate) fn fabricated_provenance_page_indices(doc: &PdfDocument, min_ratio: f64, min_chars: usize) -> Vec<usize> {
+    #[cfg(test)]
+    FABRICATED_PROVENANCE_SECOND_PASS_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let Ok(page_count) = doc.page_count() else {
         return Vec::new();
     };
@@ -271,6 +289,27 @@ pub(crate) fn fabricated_provenance_page_indices(doc: &PdfDocument, min_ratio: f
         .into_iter()
         .enumerate()
         .filter_map(|(page_index, is_fabricated)| is_fabricated.then_some(page_index))
+        .collect()
+}
+
+/// Same result as [`fabricated_provenance_page_indices`], computed from `(fabricated, total)`
+/// non-whitespace character counts gathered while the main text pass already walked each
+/// page's spans, rather than reading every page a second time (issue #1744).
+///
+/// `counts` must be indexed by zero-based page number, one entry per page — exactly what the
+/// caller only has available when it read every page's raw `ColumnAware` spans (no optional-
+/// content layers were excluded); see `pdf/native/text.rs::extract_all_page_texts`.
+pub(crate) fn fabricated_provenance_page_indices_from_counts(
+    counts: &[(usize, usize)],
+    min_ratio: f64,
+    min_chars: usize,
+) -> Vec<usize> {
+    counts
+        .iter()
+        .enumerate()
+        .filter_map(|(page_index, &(fabricated, total))| {
+            counts_meet_fabricated_threshold(fabricated, total, min_ratio, min_chars).then_some(page_index)
+        })
         .collect()
 }
 

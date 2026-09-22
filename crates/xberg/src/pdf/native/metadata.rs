@@ -20,8 +20,10 @@ pub(crate) fn extract_metadata_from_native_document(
     content: &str,
     scanned_min_confidence: f64,
     ocr_quality_thresholds: &crate::core::config::OcrQualityThresholds,
+    provenance_counts: Option<&[(usize, usize)]>,
 ) -> Result<PdfExtractionMetadata> {
-    let pdf_specific = extract_pdf_specific_metadata(doc, scanned_min_confidence, ocr_quality_thresholds)?;
+    let pdf_specific =
+        extract_pdf_specific_metadata(doc, scanned_min_confidence, ocr_quality_thresholds, provenance_counts)?;
     let common = extract_common_metadata(doc)?;
 
     let page_structure = if let Some(boundaries) = page_boundaries {
@@ -48,6 +50,7 @@ fn extract_pdf_specific_metadata(
     doc: &mut NativeDocument,
     scanned_min_confidence: f64,
     ocr_quality_thresholds: &crate::core::config::OcrQualityThresholds,
+    provenance_counts: Option<&[(usize, usize)]>,
 ) -> Result<PdfMetadata> {
     let (major, minor) = doc.doc.version();
     let pdf_version = if major > 0 {
@@ -78,8 +81,12 @@ fn extract_pdf_specific_metadata(
 
     let producer = get_info_string(&mut doc.doc, "Producer");
 
-    let (scanned_confidence, scanned_pages, fabricated_text_pages) =
-        ocr_routing_pages(&doc.doc, scanned_min_confidence, ocr_quality_thresholds);
+    let (scanned_confidence, scanned_pages, fabricated_text_pages) = ocr_routing_pages(
+        &doc.doc,
+        scanned_min_confidence,
+        ocr_quality_thresholds,
+        provenance_counts,
+    );
 
     Ok(PdfMetadata {
         pdf_version,
@@ -118,6 +125,7 @@ fn ocr_routing_pages(
     doc: &xberg_native_pdf::PdfDocument,
     scanned_min_confidence: f64,
     ocr_quality_thresholds: &crate::core::config::OcrQualityThresholds,
+    provenance_counts: Option<&[(usize, usize)]>,
 ) -> (Option<f32>, Option<Vec<u32>>, Option<Vec<u32>>) {
     // Advisory: a document we cannot grade reports no scan evidence. ~keep
     let detection = crate::pdf::scan_detect::detect(doc);
@@ -131,11 +139,23 @@ fn ocr_routing_pages(
 
     let mut fabricated_text_pages: Option<Vec<u32>> = None;
     if ocr_quality_thresholds.enable_provenance_ocr_routing {
-        let fabricated_pages = crate::pdf::scan_detect::fabricated_provenance_page_indices(
-            doc,
-            ocr_quality_thresholds.min_provenance_fallback_ratio,
-            ocr_quality_thresholds.min_total_non_whitespace,
-        );
+        // The common case: the text pass already read every page's raw spans and handed us
+        // their fabricated-mapping counts, so no second per-page read is needed (issue
+        // #1744). `provenance_counts` is only `None` when the document excluded
+        // optional-content layers, in which case the text pass read filtered spans and
+        // provenance must fall back to reading the unfiltered spans itself.
+        let fabricated_pages = match provenance_counts {
+            Some(counts) => crate::pdf::scan_detect::fabricated_provenance_page_indices_from_counts(
+                counts,
+                ocr_quality_thresholds.min_provenance_fallback_ratio,
+                ocr_quality_thresholds.min_total_non_whitespace,
+            ),
+            None => crate::pdf::scan_detect::fabricated_provenance_page_indices(
+                doc,
+                ocr_quality_thresholds.min_provenance_fallback_ratio,
+                ocr_quality_thresholds.min_total_non_whitespace,
+            ),
+        };
         let one_indexed: Vec<u32> = fabricated_pages.iter().map(|index| *index as u32 + 1).collect();
         if !fabricated_pages.is_empty() {
             let mut merged = scanned_pages.unwrap_or_default();
