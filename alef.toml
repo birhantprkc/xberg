@@ -880,70 +880,42 @@ traineddata = "traineddata"
 "crates/xberg/src/engine/extract_impl.rs" = ["file-too-long", "function-too-long", "too-many-parameters"]
 "crates/xberg/src/engine/extract_impl/tests.rs" = ["file-too-long"]
 "crates/xberg/src/engine/structured/prompts.rs" = ["nesting-too-deep", "too-many-parameters"]
-"crates/xberg/src/extraction/archive/mod.rs" = ["file-too-long"]
-"crates/xberg/src/extraction/derive.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/diagram/mod.rs" = ["file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/doc/mod.rs" = ["file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/doctags.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/docx/drawing.rs" = ["function-too-long", "nesting-too-deep"]
-"crates/xberg/src/extraction/docx/math.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg/src/extraction/docx/parser.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
 ]
-"crates/xberg/src/extraction/docx/styles.rs" = ["cyclomatic-complexity", "file-too-long"]
-"crates/xberg/src/extraction/docx/table.rs" = ["file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/email.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
   "too-many-parameters",
 ]
-"crates/xberg/src/extraction/excel.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "too-many-parameters",
 ]
-"crates/xberg/src/extraction/exif.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/formula_xml.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep"]
-"crates/xberg/src/extraction/html/structure.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
 ]
-"crates/xberg/src/extraction/hwp/parser.rs" = ["function-too-long", "nesting-too-deep"]
-"crates/xberg/src/extraction/image.rs" = ["file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/image_decode.rs" = ["file-too-long"]
-"crates/xberg/src/extraction/image_kind.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
   "too-many-parameters",
 ]
-"crates/xberg/src/extraction/image_ocr.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/math_symbols.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/mathml.rs" = ["file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/ooxml_embedded.rs" = ["file-too-long", "function-too-long"]
-"crates/xberg/src/extraction/ppt/mod.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
 ]
-"crates/xberg/src/extraction/pptx/metadata.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep"]
-"crates/xberg/src/extraction/pptx/mod.rs" = ["file-too-long", "function-too-long", "nesting-too-deep"]
-"crates/xberg/src/extraction/pst.rs" = ["file-too-long", "function-too-long", "nesting-too-deep"]
-"crates/xberg/src/extraction/structured.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/transform/content.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/transform/elements.rs" = ["cyclomatic-complexity", "function-too-long"]
-"crates/xberg/src/extraction/transform/mod.rs" = ["function-too-long"]
-"crates/xberg/src/extraction/xml.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep"]
+"crates/xberg/src/extraction/image_kind.rs" = ["too-many-parameters"]
+"crates/xberg/src/extraction/ppt/mod.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
+"crates/xberg/src/extraction/pptx/tests.rs" = ["file-too-long", "function-too-long"]
 "crates/xberg/src/extractors/archive.rs" = ["function-too-long", "too-many-parameters"]
 "crates/xberg/src/extractors/asciidoc.rs" = ["file-too-long"]
 "crates/xberg/src/extractors/bibtex.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep"]
