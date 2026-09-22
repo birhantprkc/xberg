@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **(pdf): a numbered heading set as one `TJ` array with a kern for the tab no longer absorbs the other column's line at the top of a two-column page.** When a producer places a heading's marker and title in one `TJ` array with a kern standing in for the tab (`[(3.)-1329.5(Title )] TJ`), the kern becomes a space-only span that is always regular weight regardless of the surrounding bold context, which broke the reading-order heading-run detector's clustering right at the marker/title boundary. The narrower run this produced no longer covered the marker's column position, letting an unrelated span from the other column land inside the heading. The same page set with the marker in its own text object (no kern) already read correctly; it now reads the same way regardless of how the producer set the marker. (GH#1738)
+### Fixed
+
+- **(config): the configured thread budget is no longer silently dropped when two extractions start together.** `init_thread_pools` built the process-wide Rayon pool outside the `call_once` fence that guards it, so a second concurrent caller could be released -- with the atomics already set -- before the pool existed. If that caller reached its own parallel work before the first caller's `build_global()` finished, it silently installed Rayon's default pool first, and the configured `max_threads` was never applied for the life of the process. The pool now builds inside the same fence, so no caller observes the installed limits before the pool they describe actually exists. (GH#1750)
 
 ## [1.2.7] - 2026-09-22
 

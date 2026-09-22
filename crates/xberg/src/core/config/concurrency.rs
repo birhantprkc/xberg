@@ -641,13 +641,26 @@ impl ActiveLimits<'_> {
     /// Store the resolved budgets, once, and report whether this call stored
     /// them. A later call keeps the installed values and warns when it asked
     /// for a different recognition limit.
-    fn install(&self, config: Option<&ConcurrencyConfig>, budget: usize) -> bool {
+    ///
+    /// `build_pool` runs inside this same `call_once` fence, not after it
+    /// (GH#1750). It used to run only when this call reported `true`, outside
+    /// the closure: `call_once` released a second concurrent caller as soon as
+    /// the winner's closure returned, before the winner had built the global
+    /// Rayon pool the atomics describe. A released caller whose own extraction
+    /// reached a `par_iter` before that build finished installed Rayon's
+    /// *default* pool first, so the winner's own `build_global` then failed
+    /// against a pool already up — silently dropping the configured thread
+    /// budget for the rest of the process. Building inside the fence means no
+    /// caller observes the installed atomics, and so cannot run a parallel op,
+    /// before the pool they describe actually exists. ~keep
+    fn install(&self, config: Option<&ConcurrencyConfig>, budget: usize, build_pool: impl FnOnce(usize)) -> bool {
         let mut installed = false;
         self.once.call_once(|| {
             installed = true;
             self.thread_budget.store(budget.max(1), Ordering::Relaxed);
             self.recognition
                 .store(resolve_recognition_concurrency(config).max(1), Ordering::Relaxed);
+            build_pool(budget);
         });
         if !installed && let Some(requested) = config.and_then(|c| c.max_concurrent_ocr).map(|value| value.max(1)) {
             let active = self.recognition.load(Ordering::Relaxed);
@@ -658,6 +671,31 @@ impl ActiveLimits<'_> {
         installed
     }
 }
+
+/// Build the process-wide Rayon global pool with `budget` threads.
+///
+/// A build failure means a global pool already exists. The only way that can
+/// happen for a caller reached through [`ActiveLimits::install`] is another
+/// pool builder outside this crate's fence, since every in-crate path runs
+/// this from inside `install`'s `call_once` closure. Reported at `debug!`
+/// rather than escalated: the process still runs, just with whatever pool
+/// got there first.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_global_rayon_pool(budget: usize) {
+    if let Err(_err) = rayon::ThreadPoolBuilder::new().num_threads(budget).build_global() {
+        tracing::debug!(
+            budget,
+            "global rayon pool already initialized; reusing the existing pool \
+             (xberg thread budget not applied)"
+        );
+    }
+}
+
+/// wasm32 has no OS threads for Rayon's work-stealing pool to run on, so there
+/// is nothing to build here — matching the sequential fallback the other Rayon
+/// call sites in this crate take on this target.
+#[cfg(target_arch = "wasm32")]
+fn build_global_rayon_pool(_budget: usize) {}
 
 /// Initialize the process-wide CPU pools from `config` and return the budget.
 ///
@@ -685,16 +723,7 @@ pub(crate) fn init_thread_pools(config: Option<&ConcurrencyConfig>) -> usize {
         recognition: &ACTIVE_RECOGNITION_CONCURRENCY,
         latch_warned: &RECOGNITION_LATCH_WARNED,
     };
-    if limits.install(config, budget) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Err(_err) = rayon::ThreadPoolBuilder::new().num_threads(budget).build_global() {
-            tracing::debug!(
-                budget,
-                "global rayon pool already initialized; reusing the existing pool \
-                 (xberg thread budget not applied)"
-            );
-        }
-    }
+    limits.install(config, budget, build_global_rayon_pool);
     budget
 }
 
@@ -1299,12 +1328,18 @@ mod tests {
             .with(capture.clone());
 
         tracing::subscriber::with_default(subscriber, || {
-            assert!(limits.install(Some(&first), 8), "the first call installs the limits");
+            assert!(
+                limits.install(Some(&first), 8, |_| {}),
+                "the first call installs the limits"
+            );
             assert_eq!(recognition.load(Ordering::Relaxed), 3);
             assert_eq!(warn_event_count(&capture), 0, "the first extraction loses nothing");
 
             for _ in 0..3 {
-                assert!(!limits.install(Some(&second), 8), "a later call installs nothing");
+                assert!(
+                    !limits.install(Some(&second), 8, |_| {}),
+                    "a later call installs nothing"
+                );
             }
             assert_eq!(
                 recognition.load(Ordering::Relaxed),
@@ -1312,7 +1347,7 @@ mod tests {
                 "the second extraction's max_concurrent_ocr must not move the fixed limit"
             );
 
-            limits.install(Some(&first), 8);
+            limits.install(Some(&first), 8, |_| {});
         });
 
         assert!(
