@@ -11,6 +11,7 @@
 //!
 //! PDF Spec: ISO 32000-1:2008 §7.4.6 (CCITTFaxDecode); algorithm: ITU-T T.6/T.4.
 
+use crate::decoders::ccitt_tables::{BLACK_CODES, WHITE_CODES};
 use crate::decoders::{CcittParams, StreamDecoder};
 use crate::error::{Error, Result};
 use crate::extractors::ccitt_bilevel::{append_transition_row, transitions_to_bytes};
@@ -114,18 +115,7 @@ pub fn decode(data: &[u8], params: &CcittParams) -> Result<CcittDecoded> {
         }
     }
 
-    if let Some(h) = params.rows {
-        let white_row = transitions_to_bytes::<u16>(&[], width as usize)?;
-        while out.len() / bytes_per_row.max(1) < h as usize {
-            out.try_reserve(white_row.len()).map_err(|_| {
-                Error::Decode(format!(
-                    "Unable to grow CCITT output by {} padding bytes",
-                    white_row.len()
-                ))
-            })?;
-            out.extend_from_slice(&white_row);
-        }
-    }
+    pad_to_declared_rows(&mut out, bytes_per_row, width, params.rows)?;
 
     if out.is_empty() {
         return Err(Error::Decode("CCITT: no output produced".to_string()));
@@ -179,16 +169,8 @@ fn decode_g3(data: &[u8], params: &CcittParams) -> Result<CcittDecoded> {
             break;
         }
 
-        let one_d = if two_dimensional {
-            match reader.peek(1) {
-                Some(b) => {
-                    reader.consume(1);
-                    b == 1
-                }
-                None => break,
-            }
-        } else {
-            true
+        let Some(one_d) = decide_one_d(&mut reader, two_dimensional) else {
+            break;
         };
 
         current.clear();
@@ -217,18 +199,7 @@ fn decode_g3(data: &[u8], params: &CcittParams) -> Result<CcittDecoded> {
         }
     }
 
-    if let Some(h) = params.rows {
-        let white_row = transitions_to_bytes::<u16>(&[], width as usize)?;
-        while out.len() / bytes_per_row.max(1) < h as usize {
-            out.try_reserve(white_row.len()).map_err(|_| {
-                Error::Decode(format!(
-                    "Unable to grow CCITT output by {} padding bytes",
-                    white_row.len()
-                ))
-            })?;
-            out.extend_from_slice(&white_row);
-        }
-    }
+    pad_to_declared_rows(&mut out, bytes_per_row, width, params.rows)?;
     if out.is_empty() {
         return Err(Error::Decode("CCITT G3: no output produced".to_string()));
     }
@@ -263,6 +234,39 @@ fn transition_buffer(width: u16) -> Result<Vec<u16>> {
         .try_reserve_exact(capacity)
         .map_err(|_| Error::Decode(format!("Unable to allocate {capacity} CCITT row transitions")))?;
     Ok(transitions)
+}
+
+/// Pad `out` with white rows until it holds `rows` (a no-op if `rows` is `None`, meaning the
+/// declared height is unknown). Shared by [`decode`] and [`decode_g3`], which both decode fewer
+/// rows than `/Rows` declares on a truncated/damaged stream and must fill the remainder.
+fn pad_to_declared_rows(out: &mut Vec<u8>, bytes_per_row: usize, width: u16, rows: Option<u32>) -> Result<()> {
+    let Some(rows) = rows else {
+        return Ok(());
+    };
+    let white_row = transitions_to_bytes::<u16>(&[], width as usize)?;
+    while out.len() / bytes_per_row.max(1) < rows as usize {
+        out.try_reserve(white_row.len()).map_err(|_| {
+            Error::Decode(format!(
+                "Unable to grow CCITT output by {} padding bytes",
+                white_row.len()
+            ))
+        })?;
+        out.extend_from_slice(&white_row);
+    }
+    Ok(())
+}
+
+/// Determine whether the next Group 3 row uses 1-D or 2-D coding: always 1-D
+/// when the stream isn't mixed (`K <= 0`), otherwise read the tag bit that
+/// follows the row's EOL (`1` = 1-D, `0` = 2-D-relative). `None` means the
+/// stream ended before the tag bit could be read.
+fn decide_one_d(reader: &mut BitReader, two_dimensional: bool) -> Option<bool> {
+    if !two_dimensional {
+        return Some(true);
+    }
+    let b = reader.peek(1)?;
+    reader.consume(1);
+    Some(b == 1)
 }
 
 /// Decode one Group 3 1-D (Modified Huffman) row: runs alternate white→black
@@ -561,34 +565,11 @@ fn decode_row_g4(reader: &mut BitReader, reference: &[u16], width: u16, current:
                     seek_back(reference, &mut pos, a0);
                 }
             }
-            Mode::Horizontal => {
-                let r1 = match read_run(reader, !black) {
-                    Some(v) => v,
-                    None => return RowStatus::Error,
-                };
-                let r2 = match read_run(reader, black) {
-                    Some(v) => v,
-                    None => return RowStatus::Error,
-                };
-                let a1 = match a0.checked_add(r1) {
-                    Some(v) => v,
-                    None => return RowStatus::Error,
-                };
-                let a2 = match a1.checked_add(r2) {
-                    Some(v) => v,
-                    None => return RowStatus::Error,
-                };
-                if a1 < width && !try_push_transition(current, a1) {
-                    return RowStatus::AllocationFailed;
-                }
-                if a2 >= width {
-                    break;
-                }
-                if !try_push_transition(current, a2) {
-                    return RowStatus::AllocationFailed;
-                }
-                a0 = a2;
-            }
+            Mode::Horizontal => match decode_horizontal(reader, current, width, black, a0) {
+                HorizontalStep::Advance(new_a0) => a0 = new_a0,
+                HorizontalStep::EndOfRow => break,
+                HorizontalStep::Status(status) => return status,
+            },
             Mode::Extension => return RowStatus::Error,
             Mode::Eof => return RowStatus::EndOfBlock,
         }
@@ -600,224 +581,54 @@ fn decode_row_g4(reader: &mut BitReader, reference: &[u16], width: u16, current:
     RowStatus::Ok
 }
 
-// ---------------------------------------------------------------------------
-// Modified-Huffman run tables (generated from ITU-T T.4, verified prefix-free).
-// (len_bits, code, run_length); make-up codes have run >= 64.
-// --------------------------------------------------------------------------- ~keep
+/// Outcome of decoding one Horizontal-mode code pair within a G4/G3 row.
+enum HorizontalStep {
+    /// Row continues; `a0` advances to this position.
+    Advance(u16),
+    /// The second run reached or passed the right edge — the row is complete.
+    EndOfRow,
+    /// A terminal row failure (bad run code or buffer growth failure).
+    Status(RowStatus),
+}
 
-static WHITE_CODES: &[(u8, u16, u16)] = &[
-    (4, 0b0111, 2),
-    (4, 0b1000, 3),
-    (4, 0b1011, 4),
-    (4, 0b1100, 5),
-    (4, 0b1110, 6),
-    (4, 0b1111, 7),
-    (5, 0b00111, 10),
-    (5, 0b01000, 11),
-    (5, 0b10010, 128),
-    (5, 0b10011, 8),
-    (5, 0b10100, 9),
-    (5, 0b11011, 64),
-    (6, 0b000011, 13),
-    (6, 0b000111, 1),
-    (6, 0b001000, 12),
-    (6, 0b010111, 192),
-    (6, 0b011000, 1664),
-    (6, 0b101010, 16),
-    (6, 0b101011, 17),
-    (6, 0b110100, 14),
-    (6, 0b110101, 15),
-    (7, 0b0000011, 22),
-    (7, 0b0000100, 23),
-    (7, 0b0001000, 20),
-    (7, 0b0001100, 19),
-    (7, 0b0010011, 26),
-    (7, 0b0010111, 21),
-    (7, 0b0011000, 28),
-    (7, 0b0100100, 27),
-    (7, 0b0100111, 18),
-    (7, 0b0101000, 24),
-    (7, 0b0101011, 25),
-    (7, 0b0110111, 256),
-    (8, 0b00000010, 29),
-    (8, 0b00000011, 30),
-    (8, 0b00000100, 45),
-    (8, 0b00000101, 46),
-    (8, 0b00001010, 47),
-    (8, 0b00001011, 48),
-    (8, 0b00010010, 33),
-    (8, 0b00010011, 34),
-    (8, 0b00010100, 35),
-    (8, 0b00010101, 36),
-    (8, 0b00010110, 37),
-    (8, 0b00010111, 38),
-    (8, 0b00011010, 31),
-    (8, 0b00011011, 32),
-    (8, 0b00100100, 53),
-    (8, 0b00100101, 54),
-    (8, 0b00101000, 39),
-    (8, 0b00101001, 40),
-    (8, 0b00101010, 41),
-    (8, 0b00101011, 42),
-    (8, 0b00101100, 43),
-    (8, 0b00101101, 44),
-    (8, 0b00110010, 61),
-    (8, 0b00110011, 62),
-    (8, 0b00110100, 63),
-    (8, 0b00110101, 0),
-    (8, 0b00110110, 320),
-    (8, 0b00110111, 384),
-    (8, 0b01001010, 59),
-    (8, 0b01001011, 60),
-    (8, 0b01010010, 49),
-    (8, 0b01010011, 50),
-    (8, 0b01010100, 51),
-    (8, 0b01010101, 52),
-    (8, 0b01011000, 55),
-    (8, 0b01011001, 56),
-    (8, 0b01011010, 57),
-    (8, 0b01011011, 58),
-    (8, 0b01100100, 448),
-    (8, 0b01100101, 512),
-    (8, 0b01100111, 640),
-    (8, 0b01101000, 576),
-    (9, 0b010011000, 1472),
-    (9, 0b010011001, 1536),
-    (9, 0b010011010, 1600),
-    (9, 0b010011011, 1728),
-    (9, 0b011001100, 704),
-    (9, 0b011001101, 768),
-    (9, 0b011010010, 832),
-    (9, 0b011010011, 896),
-    (9, 0b011010100, 960),
-    (9, 0b011010101, 1024),
-    (9, 0b011010110, 1088),
-    (9, 0b011010111, 1152),
-    (9, 0b011011000, 1216),
-    (9, 0b011011001, 1280),
-    (9, 0b011011010, 1344),
-    (9, 0b011011011, 1408),
-    (11, 0b00000001000, 1792),
-    (11, 0b00000001100, 1856),
-    (11, 0b00000001101, 1920),
-    (12, 0b000000010010, 1984),
-    (12, 0b000000010011, 2048),
-    (12, 0b000000010100, 2112),
-    (12, 0b000000010101, 2176),
-    (12, 0b000000010110, 2240),
-    (12, 0b000000010111, 2304),
-    (12, 0b000000011100, 2368),
-    (12, 0b000000011101, 2432),
-    (12, 0b000000011110, 2496),
-    (12, 0b000000011111, 2560),
-];
-
-static BLACK_CODES: &[(u8, u16, u16)] = &[
-    (2, 0b10, 3),
-    (2, 0b11, 2),
-    (3, 0b010, 1),
-    (3, 0b011, 4),
-    (4, 0b0010, 6),
-    (4, 0b0011, 5),
-    (5, 0b00011, 7),
-    (6, 0b000100, 9),
-    (6, 0b000101, 8),
-    (7, 0b0000100, 10),
-    (7, 0b0000101, 11),
-    (7, 0b0000111, 12),
-    (8, 0b00000100, 13),
-    (8, 0b00000111, 14),
-    (9, 0b000011000, 15),
-    (10, 0b0000001000, 18),
-    (10, 0b0000001111, 64),
-    (10, 0b0000010111, 16),
-    (10, 0b0000011000, 17),
-    (10, 0b0000110111, 0),
-    (11, 0b00000001000, 1792),
-    (11, 0b00000001100, 1856),
-    (11, 0b00000001101, 1920),
-    (11, 0b00000010111, 24),
-    (11, 0b00000011000, 25),
-    (11, 0b00000101000, 23),
-    (11, 0b00000110111, 22),
-    (11, 0b00001100111, 19),
-    (11, 0b00001101000, 20),
-    (11, 0b00001101100, 21),
-    (12, 0b000000010010, 1984),
-    (12, 0b000000010011, 2048),
-    (12, 0b000000010100, 2112),
-    (12, 0b000000010101, 2176),
-    (12, 0b000000010110, 2240),
-    (12, 0b000000010111, 2304),
-    (12, 0b000000011100, 2368),
-    (12, 0b000000011101, 2432),
-    (12, 0b000000011110, 2496),
-    (12, 0b000000011111, 2560),
-    (12, 0b000000100100, 52),
-    (12, 0b000000100111, 55),
-    (12, 0b000000101000, 56),
-    (12, 0b000000101011, 59),
-    (12, 0b000000101100, 60),
-    (12, 0b000000110011, 320),
-    (12, 0b000000110100, 384),
-    (12, 0b000000110101, 448),
-    (12, 0b000000110111, 53),
-    (12, 0b000000111000, 54),
-    (12, 0b000001010010, 50),
-    (12, 0b000001010011, 51),
-    (12, 0b000001010100, 44),
-    (12, 0b000001010101, 45),
-    (12, 0b000001010110, 46),
-    (12, 0b000001010111, 47),
-    (12, 0b000001011000, 57),
-    (12, 0b000001011001, 58),
-    (12, 0b000001011010, 61),
-    (12, 0b000001011011, 256),
-    (12, 0b000001100100, 48),
-    (12, 0b000001100101, 49),
-    (12, 0b000001100110, 62),
-    (12, 0b000001100111, 63),
-    (12, 0b000001101000, 30),
-    (12, 0b000001101001, 31),
-    (12, 0b000001101010, 32),
-    (12, 0b000001101011, 33),
-    (12, 0b000001101100, 40),
-    (12, 0b000001101101, 41),
-    (12, 0b000011001000, 128),
-    (12, 0b000011001001, 192),
-    (12, 0b000011001010, 26),
-    (12, 0b000011001011, 27),
-    (12, 0b000011001100, 28),
-    (12, 0b000011001101, 29),
-    (12, 0b000011010010, 34),
-    (12, 0b000011010011, 35),
-    (12, 0b000011010100, 36),
-    (12, 0b000011010101, 37),
-    (12, 0b000011010110, 38),
-    (12, 0b000011010111, 39),
-    (12, 0b000011011010, 42),
-    (12, 0b000011011011, 43),
-    (13, 0b0000001001010, 640),
-    (13, 0b0000001001011, 704),
-    (13, 0b0000001001100, 768),
-    (13, 0b0000001001101, 832),
-    (13, 0b0000001010010, 1280),
-    (13, 0b0000001010011, 1344),
-    (13, 0b0000001010100, 1408),
-    (13, 0b0000001010101, 1472),
-    (13, 0b0000001011010, 1536),
-    (13, 0b0000001011011, 1600),
-    (13, 0b0000001100100, 1664),
-    (13, 0b0000001100101, 1728),
-    (13, 0b0000001101100, 512),
-    (13, 0b0000001101101, 576),
-    (13, 0b0000001110010, 896),
-    (13, 0b0000001110011, 960),
-    (13, 0b0000001110100, 1024),
-    (13, 0b0000001110101, 1088),
-    (13, 0b0000001110110, 1152),
-    (13, 0b0000001110111, 1216),
-];
+/// T.6/T.4 Horizontal mode: read two runs (opposite-color-first) and push up
+/// to two transition columns. Split out of [`decode_row_g4`] purely to bring
+/// that function's cyclomatic complexity under the repo's linter cap; the
+/// logic is unchanged from the inline `Mode::Horizontal` arm.
+fn decode_horizontal(
+    reader: &mut BitReader,
+    current: &mut Vec<u16>,
+    width: u16,
+    black: bool,
+    a0: u16,
+) -> HorizontalStep {
+    let r1 = match read_run(reader, !black) {
+        Some(v) => v,
+        None => return HorizontalStep::Status(RowStatus::Error),
+    };
+    let r2 = match read_run(reader, black) {
+        Some(v) => v,
+        None => return HorizontalStep::Status(RowStatus::Error),
+    };
+    let a1 = match a0.checked_add(r1) {
+        Some(v) => v,
+        None => return HorizontalStep::Status(RowStatus::Error),
+    };
+    let a2 = match a1.checked_add(r2) {
+        Some(v) => v,
+        None => return HorizontalStep::Status(RowStatus::Error),
+    };
+    if a1 < width && !try_push_transition(current, a1) {
+        return HorizontalStep::Status(RowStatus::AllocationFailed);
+    }
+    if a2 >= width {
+        return HorizontalStep::EndOfRow;
+    }
+    if !try_push_transition(current, a2) {
+        return HorizontalStep::Status(RowStatus::AllocationFailed);
+    }
+    HorizontalStep::Advance(a2)
+}
 
 #[cfg(test)]
 mod tests {

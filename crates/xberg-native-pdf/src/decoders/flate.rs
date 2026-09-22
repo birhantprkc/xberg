@@ -103,6 +103,85 @@ fn check_limit(output: &[u8], limit: u64) -> Result<()> {
     Ok(())
 }
 
+/// True if `output` is non-empty and plausibly real content per
+/// [`looks_like_real_stream`], after validating it against the decompression
+/// cap. Shared by every recovery strategy's "accept this partial output?" check.
+fn accept_as_partial(output: &[u8], limit: u64) -> Result<bool> {
+    if output.is_empty() || !looks_like_real_stream(output) {
+        return Ok(false);
+    }
+    check_limit(output, limit)?;
+    Ok(true)
+}
+
+/// Outcome of a primary (non-fallback) decode attempt: accepted output — a
+/// clean decode or an accepted partial recovery — or a failure whose error is
+/// kept for the final "all strategies failed" message.
+enum PrimaryAttempt {
+    Recovered(Vec<u8>),
+    Failed(std::io::Error),
+}
+
+/// Strategy 1: decode `input` as zlib-wrapped deflate. Partial recovery:
+/// return only if the output *looks like* a plausible stream. The pre-fix
+/// behaviour accepted any non-empty buffer, which let strategies 2 and 3
+/// return misaligned-deflate garbage (`P\xffj!}` × 16) that the text
+/// extractor then emitted as zero bytes of output. ~keep
+fn try_zlib_decode(input: &[u8], limit: u64) -> Result<PrimaryAttempt> {
+    let mut decoder = ZlibDecoder::new(input).take(limit);
+    let mut output = Vec::new();
+
+    match decoder.read_to_end(&mut output) {
+        Ok(_) => {
+            check_limit(&output, limit)?;
+            Ok(PrimaryAttempt::Recovered(output))
+        }
+        Err(e) => {
+            if accept_as_partial(&output, limit)? {
+                tracing::warn!(
+                    filter = "FlateDecode",
+                    bytes = output.len(),
+                    error = %e,
+                    "partial recovery: extracted bytes before corruption"
+                );
+                return Ok(PrimaryAttempt::Recovered(output));
+            }
+            Ok(PrimaryAttempt::Failed(e))
+        }
+    }
+}
+
+/// Strategy 2: try raw deflate (no zlib wrapper).
+/// Some PDFs have corrupt zlib headers but valid deflate data. ~keep
+fn try_raw_deflate(input: &[u8], limit: u64) -> Result<PrimaryAttempt> {
+    tracing::debug!(filter = "FlateDecode", "zlib decode failed, trying raw deflate");
+    let mut deflate_decoder = DeflateDecoder::new(input).take(limit);
+    let mut output = Vec::new();
+
+    match deflate_decoder.read_to_end(&mut output) {
+        Ok(_) => {
+            check_limit(&output, limit)?;
+            tracing::warn!(
+                filter = "FlateDecode",
+                bytes = output.len(),
+                "recovered via raw deflate fallback after corrupt zlib header"
+            );
+            Ok(PrimaryAttempt::Recovered(output))
+        }
+        Err(deflate_err) => {
+            if accept_as_partial(&output, limit)? {
+                tracing::warn!(
+                    filter = "FlateDecode",
+                    bytes = output.len(),
+                    "raw deflate partial recovery: extracted bytes before error"
+                );
+                return Ok(PrimaryAttempt::Recovered(output));
+            }
+            Ok(PrimaryAttempt::Failed(deflate_err))
+        }
+    }
+}
+
 /// FlateDecode filter implementation.
 ///
 /// Decompresses data using the zlib/deflate algorithm. The decompression cap
@@ -133,245 +212,212 @@ impl FlateDecoder {
 
 impl StreamDecoder for FlateDecoder {
     fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut decoder = ZlibDecoder::new(input).take(self.max_decompressed_bytes);
-        let mut output = Vec::new();
+        let limit = self.max_decompressed_bytes;
 
-        match decoder.read_to_end(&mut output) {
-            Ok(_) => {
-                check_limit(&output, self.max_decompressed_bytes)?;
-                Ok(output)
-            }
-            Err(e) => {
-                // Partial recovery: return only if output *looks like* a
-                // plausible stream. The pre-fix behaviour accepted any
-                // non-empty buffer, which let strategies 2 and 3 return
-                // misaligned-deflate garbage (`P\xffj!}` × 16) that the text
-                // extractor then emitted as zero bytes of output. ~keep
-                if !output.is_empty() && looks_like_real_stream(&output) {
-                    check_limit(&output, self.max_decompressed_bytes)?;
-                    tracing::warn!(
-                        filter = "FlateDecode",
-                        bytes = output.len(),
-                        error = %e,
-                        "partial recovery: extracted bytes before corruption"
-                    );
-                    return Ok(output);
-                }
+        let zlib_err = match try_zlib_decode(input, limit)? {
+            PrimaryAttempt::Recovered(output) => return Ok(output),
+            PrimaryAttempt::Failed(e) => e,
+        };
+        let deflate_err = match try_raw_deflate(input, limit)? {
+            PrimaryAttempt::Recovered(output) => return Ok(output),
+            PrimaryAttempt::Failed(e) => e,
+        };
 
-                // Strategy 2: Try raw deflate (no zlib wrapper)
-                // Some PDFs have corrupt zlib headers but valid deflate data ~keep
-                tracing::debug!(filter = "FlateDecode", "zlib decode failed, trying raw deflate");
-                output.clear();
-                let mut deflate_decoder = DeflateDecoder::new(input).take(self.max_decompressed_bytes);
-
-                match deflate_decoder.read_to_end(&mut output) {
-                    Ok(_) => {
-                        check_limit(&output, self.max_decompressed_bytes)?;
-                        tracing::warn!(
-                            filter = "FlateDecode",
-                            bytes = output.len(),
-                            "recovered via raw deflate fallback after corrupt zlib header"
-                        );
-                        Ok(output)
-                    }
-                    Err(deflate_err) => {
-                        if !output.is_empty() && looks_like_real_stream(&output) {
-                            check_limit(&output, self.max_decompressed_bytes)?;
-                            tracing::warn!(
-                                filter = "FlateDecode",
-                                bytes = output.len(),
-                                "raw deflate partial recovery: extracted bytes before error"
-                            );
-                            return Ok(output);
-                        }
-
-                        if input.len() > 2 {
-                            tracing::debug!(
-                                filter = "FlateDecode",
-                                "trying deflate after skipping potential corrupt zlib header"
-                            );
-                            output.clear();
-                            let mut deflate_decoder =
-                                DeflateDecoder::new(&input[2..]).take(self.max_decompressed_bytes);
-
-                            match deflate_decoder.read_to_end(&mut output) {
-                                Ok(_) => {
-                                    check_limit(&output, self.max_decompressed_bytes)?;
-                                    tracing::warn!(
-                                        filter = "FlateDecode",
-                                        bytes = output.len(),
-                                        "recovered by skipping corrupt zlib header bytes"
-                                    );
-                                    return Ok(output);
-                                }
-                                Err(_) => {
-                                    if !output.is_empty() && looks_like_real_stream(&output) {
-                                        check_limit(&output, self.max_decompressed_bytes)?;
-                                        tracing::warn!(
-                                            filter = "FlateDecode",
-                                            bytes = output.len(),
-                                            "header-skip partial recovery"
-                                        );
-                                        return Ok(output);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Strategy 4: Try fixing corrupt zlib header byte
-                        // If first byte has invalid compression method, replace with 0x78 (standard deflate)
-                        // ~keep
-                        if input.len() >= 2 {
-                            let first_byte = input[0];
-                            let compression_method = first_byte & 0x0F;
-                            if compression_method != 8 {
-                                tracing::debug!(
-                                    filter = "FlateDecode",
-                                    compression_method,
-                                    header_byte = format_args!("0x{:02x}", first_byte),
-                                    "invalid compression method in header byte, trying corrected header"
-                                );
-                                let mut corrected = input.to_vec();
-                                // Replace CM bits (0-3) with 8 (deflate), keep CINFO bits (4-7)
-                                // ~keep
-                                corrected[0] = (first_byte & 0xF0) | 0x08;
-
-                                output.clear();
-                                let mut decoder = ZlibDecoder::new(&corrected[..]).take(self.max_decompressed_bytes);
-                                match decoder.read_to_end(&mut output) {
-                                    Ok(_) if !output.is_empty() => {
-                                        check_limit(&output, self.max_decompressed_bytes)?;
-                                        tracing::warn!(
-                                            filter = "FlateDecode",
-                                            bytes = output.len(),
-                                            "recovered via corrected zlib header byte"
-                                        );
-                                        return Ok(output);
-                                    }
-                                    Err(_) if !output.is_empty() && looks_like_real_stream(&output) => {
-                                        check_limit(&output, self.max_decompressed_bytes)?;
-                                        tracing::warn!(
-                                            filter = "FlateDecode",
-                                            bytes = output.len(),
-                                            "header-correction partial recovery"
-                                        );
-                                        return Ok(output);
-                                    }
-                                    _ => {
-                                        tracing::debug!(filter = "FlateDecode", "header correction failed");
-                                    }
-                                }
-                            }
-                        }
-
-                        // Strategy 5: Brute-force scan for valid deflate data
-                        // Try starting deflate decompression from offsets 0-20
-                        // BUT validate the output contains valid PDF operators ~keep
-                        tracing::debug!(filter = "FlateDecode", "trying brute-force scan for valid deflate data");
-                        let max_offset = std::cmp::min(20, input.len());
-                        for offset in 0..max_offset {
-                            if offset == 0 || offset == 2 {
-                                continue;
-                            }
-
-                            output.clear();
-                            let mut deflate_decoder =
-                                DeflateDecoder::new(&input[offset..]).take(self.max_decompressed_bytes);
-
-                            match deflate_decoder.read_to_end(&mut output) {
-                                Ok(_) if !output.is_empty() => {
-                                    check_limit(&output, self.max_decompressed_bytes)?;
-                                    let decoded_str = String::from_utf8_lossy(&output);
-                                    let has_pdf_operators = decoded_str.contains("BT")
-                                        || decoded_str.contains("ET")
-                                        || decoded_str.contains("Tj")
-                                        || decoded_str.contains("TJ")
-                                        || decoded_str.contains("Tm")
-                                        || decoded_str.contains("Td");
-
-                                    if has_pdf_operators {
-                                        tracing::warn!(
-                                            filter = "FlateDecode",
-                                            offset,
-                                            bytes = output.len(),
-                                            "brute-force deflate recovery succeeded (validated PDF content)"
-                                        );
-                                        return Ok(output);
-                                    } else {
-                                        tracing::trace!(
-                                            filter = "FlateDecode",
-                                            offset,
-                                            bytes = output.len(),
-                                            "brute-force offset produced no valid PDF operators, trying next offset"
-                                        );
-                                        continue;
-                                    }
-                                }
-                                Err(_) if !output.is_empty() => {
-                                    check_limit(&output, self.max_decompressed_bytes)?;
-                                    let decoded_str = String::from_utf8_lossy(&output);
-                                    let has_pdf_operators = decoded_str.contains("BT")
-                                        || decoded_str.contains("ET")
-                                        || decoded_str.contains("Tj")
-                                        || decoded_str.contains("TJ")
-                                        || decoded_str.contains("Tm")
-                                        || decoded_str.contains("Td");
-
-                                    if has_pdf_operators {
-                                        tracing::warn!(
-                                            filter = "FlateDecode",
-                                            offset,
-                                            bytes = output.len(),
-                                            "brute-force partial recovery (validated PDF content)"
-                                        );
-                                        return Ok(output);
-                                    } else {
-                                        tracing::trace!(
-                                            filter = "FlateDecode",
-                                            offset,
-                                            "brute-force partial recovery has no valid PDF operators, \
-                                             trying next offset"
-                                        );
-                                        continue;
-                                    }
-                                }
-                                _ => continue,
-                            }
-                        }
-
-                        // SPEC COMPLIANCE FIX: Removed strategies 8-9 that violated PDF spec
-                        //
-                        // Previous strategies 8-9 would return raw uncompressed data for streams
-                        // labeled as /FlateDecode. This violates PDF Spec ISO 32000-1:2008,
-                        // Section 7.3.8.2 which states that if a stream has /Filter /FlateDecode,
-                        // it MUST be compressed with the FlateDecode algorithm.
-                        //
-                        // Returning raw data creates security risks:
-                        // 1. Malicious PDFs could bypass compression validation
-                        // 2. Type confusion attacks (treating compressed data as raw)
-                        // 3. Inconsistent behavior across PDF processors
-                        //
-                        // Correct behavior: If all decompression strategies fail, return an error.
-                        // The stream is either corrupted or malicious, and should not be processed.
-                        // ~keep
-
-                        Err(Error::Decode(format!(
-                            "FlateDecode decompression failed: stream is labeled as compressed but all decompression attempts failed. \
-                            This violates PDF Spec ISO 32000-1:2008, Section 7.3.8.2. \
-                            Zlib error: {}, Deflate error: {}. Compressed size: {} bytes.",
-                            e,
-                            deflate_err,
-                            input.len()
-                        )))
-                    }
-                }
-            }
+        if let Some(output) = try_header_skip_deflate(input, limit)? {
+            return Ok(output);
         }
+        if let Some(output) = try_corrected_header(input, limit)? {
+            return Ok(output);
+        }
+        if let Some(output) = try_brute_force_scan(input, limit)? {
+            return Ok(output);
+        }
+
+        // SPEC COMPLIANCE FIX: Removed strategies 8-9 that violated PDF spec
+        //
+        // Previous strategies 8-9 would return raw uncompressed data for streams
+        // labeled as /FlateDecode. This violates PDF Spec ISO 32000-1:2008,
+        // Section 7.3.8.2 which states that if a stream has /Filter /FlateDecode,
+        // it MUST be compressed with the FlateDecode algorithm.
+        //
+        // Returning raw data creates security risks:
+        // 1. Malicious PDFs could bypass compression validation
+        // 2. Type confusion attacks (treating compressed data as raw)
+        // 3. Inconsistent behavior across PDF processors
+        //
+        // Correct behavior: If all decompression strategies fail, return an error.
+        // The stream is either corrupted or malicious, and should not be processed.
+        // ~keep
+        Err(Error::Decode(format!(
+            "FlateDecode decompression failed: stream is labeled as compressed but all decompression attempts failed. \
+            This violates PDF Spec ISO 32000-1:2008, Section 7.3.8.2. \
+            Zlib error: {}, Deflate error: {}. Compressed size: {} bytes.",
+            zlib_err,
+            deflate_err,
+            input.len()
+        )))
     }
 
     fn name(&self) -> &str {
         "FlateDecode"
     }
+}
+
+/// Strategy 3: retry raw deflate after skipping the codestream's first two
+/// bytes — some PDFs pair a corrupt zlib header with otherwise-valid deflate
+/// data starting right after it. Returns `Ok(None)` to fall through to the
+/// next strategy.
+fn try_header_skip_deflate(input: &[u8], limit: u64) -> Result<Option<Vec<u8>>> {
+    if input.len() <= 2 {
+        return Ok(None);
+    }
+    tracing::debug!(
+        filter = "FlateDecode",
+        "trying deflate after skipping potential corrupt zlib header"
+    );
+    let mut output = Vec::new();
+    let mut deflate_decoder = DeflateDecoder::new(&input[2..]).take(limit);
+
+    match deflate_decoder.read_to_end(&mut output) {
+        Ok(_) => {
+            check_limit(&output, limit)?;
+            tracing::warn!(
+                filter = "FlateDecode",
+                bytes = output.len(),
+                "recovered by skipping corrupt zlib header bytes"
+            );
+            Ok(Some(output))
+        }
+        Err(_) => {
+            if accept_as_partial(&output, limit)? {
+                tracing::warn!(
+                    filter = "FlateDecode",
+                    bytes = output.len(),
+                    "header-skip partial recovery"
+                );
+                return Ok(Some(output));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Strategy 4: try fixing a corrupt zlib header byte. If the first byte has
+/// an invalid compression method, replace it with a standard deflate CMF and
+/// retry. ~keep
+fn try_corrected_header(input: &[u8], limit: u64) -> Result<Option<Vec<u8>>> {
+    if input.len() < 2 {
+        return Ok(None);
+    }
+    let first_byte = input[0];
+    let compression_method = first_byte & 0x0F;
+    if compression_method == 8 {
+        return Ok(None);
+    }
+    tracing::debug!(
+        filter = "FlateDecode",
+        compression_method,
+        header_byte = format_args!("0x{:02x}", first_byte),
+        "invalid compression method in header byte, trying corrected header"
+    );
+    let mut corrected = input.to_vec();
+    // Replace CM bits (0-3) with 8 (deflate), keep CINFO bits (4-7) ~keep
+    corrected[0] = (first_byte & 0xF0) | 0x08;
+
+    let mut output = Vec::new();
+    let mut decoder = ZlibDecoder::new(&corrected[..]).take(limit);
+    let read_ok = decoder.read_to_end(&mut output).is_ok();
+    if read_ok && !output.is_empty() {
+        check_limit(&output, limit)?;
+        tracing::warn!(
+            filter = "FlateDecode",
+            bytes = output.len(),
+            "recovered via corrected zlib header byte"
+        );
+        return Ok(Some(output));
+    }
+    if accept_as_partial(&output, limit)? {
+        tracing::warn!(
+            filter = "FlateDecode",
+            bytes = output.len(),
+            "header-correction partial recovery"
+        );
+        return Ok(Some(output));
+    }
+    tracing::debug!(filter = "FlateDecode", "header correction failed");
+    Ok(None)
+}
+
+/// Strategy 5: brute-force scan for valid deflate data. Tries starting
+/// deflate decompression from offsets 0-20, but validates the output
+/// contains valid PDF operators before accepting it. ~keep
+fn try_brute_force_scan(input: &[u8], limit: u64) -> Result<Option<Vec<u8>>> {
+    tracing::debug!(filter = "FlateDecode", "trying brute-force scan for valid deflate data");
+    let max_offset = std::cmp::min(20, input.len());
+    for offset in 0..max_offset {
+        if offset == 0 || offset == 2 {
+            continue;
+        }
+        if let Some(output) = try_offset_deflate(input, offset, limit)? {
+            return Ok(Some(output));
+        }
+    }
+    Ok(None)
+}
+
+/// One offset attempt for [`try_brute_force_scan`]: decode from `offset` and
+/// accept the output only if it contains a recognizable PDF content-stream
+/// operator, whether the read completed cleanly or errored partway through.
+fn try_offset_deflate(input: &[u8], offset: usize, limit: u64) -> Result<Option<Vec<u8>>> {
+    let mut output = Vec::new();
+    let mut deflate_decoder = DeflateDecoder::new(&input[offset..]).take(limit);
+    let read_ok = deflate_decoder.read_to_end(&mut output).is_ok();
+    if output.is_empty() {
+        return Ok(None);
+    }
+    check_limit(&output, limit)?;
+    let decoded_str = String::from_utf8_lossy(&output);
+    let has_pdf_operators = decoded_str.contains("BT")
+        || decoded_str.contains("ET")
+        || decoded_str.contains("Tj")
+        || decoded_str.contains("TJ")
+        || decoded_str.contains("Tm")
+        || decoded_str.contains("Td");
+
+    if !has_pdf_operators {
+        if read_ok {
+            tracing::trace!(
+                filter = "FlateDecode",
+                offset,
+                bytes = output.len(),
+                "brute-force offset produced no valid PDF operators, trying next offset"
+            );
+        } else {
+            tracing::trace!(
+                filter = "FlateDecode",
+                offset,
+                "brute-force partial recovery has no valid PDF operators, trying next offset"
+            );
+        }
+        return Ok(None);
+    }
+
+    if read_ok {
+        tracing::warn!(
+            filter = "FlateDecode",
+            offset,
+            bytes = output.len(),
+            "brute-force deflate recovery succeeded (validated PDF content)"
+        );
+    } else {
+        tracing::warn!(
+            filter = "FlateDecode",
+            offset,
+            bytes = output.len(),
+            "brute-force partial recovery (validated PDF content)"
+        );
+    }
+    Ok(Some(output))
 }
 
 #[cfg(test)]

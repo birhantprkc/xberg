@@ -19,6 +19,7 @@ mod ascii85;
 mod ascii_hex;
 mod brotli;
 pub(crate) mod ccitt;
+mod ccitt_tables;
 mod dct;
 mod flate;
 mod jbig2;
