@@ -78,23 +78,75 @@ mod imp {
         Ok(tensor)
     }
 
+    /// Generation stop criteria and the M-RoPE position at which decoding resumes, bundled so
+    /// [`generate_mrope`] stays under the workspace parameter-count limit. ~keep
+    pub struct GenerationLimits<'a> {
+        /// Position assigned to the first decoded token (== `max_position_in_prefill + 1`,
+        /// computed by the engine).
+        pub next_text_pos_start: u32,
+        pub max_new_tokens: usize,
+        pub eos_token_ids: &'a [u32],
+    }
+
+    /// Compute the next token from `logits`, applying the repetition penalty (if configured)
+    /// over the trailing token window, then greedy or nucleus sampling. Split out of
+    /// [`generate_mrope`] to keep that function under the workspace line-count limit. ~keep
+    fn sample_next_token(
+        logits: &Tensor,
+        output_ids: &[u32],
+        config: &MtpConfig,
+        eos_token_ids: &[u32],
+    ) -> Result<u32> {
+        let last_logits = logits
+            .squeeze(0)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Squeeze batch: {}", e)))?;
+
+        let windowed_ids = repetition_penalty_window(output_ids);
+        let penalized_logits = if config.repetition_penalty != 1.0 && !output_ids.is_empty() {
+            apply_repetition_penalty(&last_logits, windowed_ids, config.repetition_penalty)
+                .map_err(|e| CandleOcrError::InferenceFailed(format!("Repetition penalty: {}", e)))?
+        } else {
+            last_logits.clone()
+        };
+
+        let token_id = if config.sample {
+            sample_nucleus(&penalized_logits, config.top_p, config.temperature)
+        } else {
+            sample_greedy(&penalized_logits)
+        }
+        .map_err(|e| CandleOcrError::InferenceFailed(format!("Sampling: {}", e)))?;
+
+        if output_ids.len() < 5 && tracing::enabled!(tracing::Level::TRACE) {
+            super::super::glm_debug_tensor(&format!("logits_step{}", output_ids.len()), &penalized_logits);
+            tracing::trace!(
+                "[glm-debug] step{}: token_id={} is_eos={}",
+                output_ids.len(),
+                token_id,
+                eos_token_ids.contains(&token_id)
+            );
+        }
+
+        Ok(token_id)
+    }
+
     /// Run the decoding loop with explicit M-RoPE position_ids for the prefill
     /// pass and an incrementing `(t, h, w) = (next, next, next)` triple for
     /// each generated text token.
     ///
     /// `prefill_position_ids` must be shape `(3, 1, prefix_len)` — built by the
     /// engine to encode the vision-prefixed sequence's per-token positions.
-    /// `next_text_pos_start` is the position assigned to the first decoded
-    /// token (== `max_position_in_prefill + 1`, computed by the engine).
     pub fn generate_mrope(
         decoder: &mut Glm4Decoder,
         input_embeds: &Tensor,
         prefill_position_ids: &Tensor,
-        next_text_pos_start: u32,
         config: &MtpConfig,
-        max_new_tokens: usize,
-        eos_token_ids: &[u32],
+        limits: GenerationLimits,
     ) -> Result<Vec<u32>> {
+        let GenerationLimits {
+            next_text_pos_start,
+            max_new_tokens,
+            eos_token_ids,
+        } = limits;
         decoder.clear_kv_cache();
         let mut output_ids = Vec::new();
 
@@ -107,34 +159,7 @@ mod imp {
         let dev = input_embeds.device().clone();
 
         while output_ids.len() < max_new_tokens {
-            let last_logits = logits
-                .squeeze(0)
-                .map_err(|e| CandleOcrError::InferenceFailed(format!("Squeeze batch: {}", e)))?;
-
-            let windowed_ids = repetition_penalty_window(&output_ids);
-            let penalized_logits = if config.repetition_penalty != 1.0 && !output_ids.is_empty() {
-                apply_repetition_penalty(&last_logits, windowed_ids, config.repetition_penalty)
-                    .map_err(|e| CandleOcrError::InferenceFailed(format!("Repetition penalty: {}", e)))?
-            } else {
-                last_logits.clone()
-            };
-
-            let token_id = if config.sample {
-                sample_nucleus(&penalized_logits, config.top_p, config.temperature)
-            } else {
-                sample_greedy(&penalized_logits)
-            }
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Sampling: {}", e)))?;
-
-            if output_ids.len() < 5 && tracing::enabled!(tracing::Level::TRACE) {
-                super::super::glm_debug_tensor(&format!("logits_step{}", output_ids.len()), &penalized_logits);
-                tracing::trace!(
-                    "[glm-debug] step{}: token_id={} is_eos={}",
-                    output_ids.len(),
-                    token_id,
-                    eos_token_ids.contains(&token_id)
-                );
-            }
+            let token_id = sample_next_token(&logits, &output_ids, config, eos_token_ids)?;
 
             output_ids.push(token_id);
 
@@ -379,7 +404,7 @@ mod imp {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use imp::{generate, generate_mrope};
+pub use imp::{GenerationLimits, generate, generate_mrope};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]

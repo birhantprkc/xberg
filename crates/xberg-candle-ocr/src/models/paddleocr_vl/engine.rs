@@ -160,29 +160,7 @@ impl PaddleOcrVlEngine {
         let (img_width, img_height) = (img.width(), img.height());
         tracing::debug!(width = img_width, height = img_height, "PaddleOCR-VL: image dimensions");
 
-        let img_mean = Tensor::new(
-            &[[
-                self.processor_config.image_mean[0] as f32,
-                self.processor_config.image_mean[1] as f32,
-                self.processor_config.image_mean[2] as f32,
-            ]],
-            &self.device,
-        )
-        .map_err(|e| CandleOcrError::InferenceFailed(format!("Mean tensor: {}", e)))?
-        .reshape((3, 1, 1))
-        .map_err(|e| CandleOcrError::InferenceFailed(format!("Reshape mean: {}", e)))?;
-
-        let img_std = Tensor::new(
-            &[[
-                self.processor_config.image_std[0] as f32,
-                self.processor_config.image_std[1] as f32,
-                self.processor_config.image_std[2] as f32,
-            ]],
-            &self.device,
-        )
-        .map_err(|e| CandleOcrError::InferenceFailed(format!("Std tensor: {}", e)))?
-        .reshape((3, 1, 1))
-        .map_err(|e| CandleOcrError::InferenceFailed(format!("Reshape std: {}", e)))?;
+        let (img_mean, img_std) = self.image_mean_std_tensors()?;
 
         let dyn_img = image::DynamicImage::ImageRgb8(img);
         let pixel_values = self.processor.process_img(&dyn_img, &img_mean, &img_std)?;
@@ -237,6 +215,36 @@ impl PaddleOcrVlEngine {
         })
     }
 
+    /// Per-channel mean/std tensors, shaped `(3, 1, 1)`, from `processor_config`. Split out of
+    /// [`Self::process_image`] to keep that function under the workspace line-count limit. ~keep
+    fn image_mean_std_tensors(&self) -> Result<(Tensor, Tensor)> {
+        let img_mean = Tensor::new(
+            &[[
+                self.processor_config.image_mean[0] as f32,
+                self.processor_config.image_mean[1] as f32,
+                self.processor_config.image_mean[2] as f32,
+            ]],
+            &self.device,
+        )
+        .map_err(|e| CandleOcrError::InferenceFailed(format!("Mean tensor: {}", e)))?
+        .reshape((3, 1, 1))
+        .map_err(|e| CandleOcrError::InferenceFailed(format!("Reshape mean: {}", e)))?;
+
+        let img_std = Tensor::new(
+            &[[
+                self.processor_config.image_std[0] as f32,
+                self.processor_config.image_std[1] as f32,
+                self.processor_config.image_std[2] as f32,
+            ]],
+            &self.device,
+        )
+        .map_err(|e| CandleOcrError::InferenceFailed(format!("Std tensor: {}", e)))?
+        .reshape((3, 1, 1))
+        .map_err(|e| CandleOcrError::InferenceFailed(format!("Reshape std: {}", e)))?;
+
+        Ok((img_mean, img_std))
+    }
+
     /// Build input token tensor for the given task and number of image tokens.
     fn build_input_tokens(&self, num_image_tokens: usize) -> Result<Tensor> {
         let user_prefix = "User: ";
@@ -287,6 +295,22 @@ impl PaddleOcrVlEngine {
         grid_thw: &Tensor,
         max_length: usize,
     ) -> Result<Vec<u32>> {
+        let (prompt_tokens, logits) = self.prefill(input_ids, pixel_values, grid_thw, max_length)?;
+        let prompt_len = prompt_tokens.len();
+        let max_new_tokens = max_length.saturating_sub(prompt_len);
+        self.decode_loop(logits, prompt_len, max_new_tokens)
+    }
+
+    /// Build the image-token mask and cache positions, then run the prefill forward pass over
+    /// the full prompt. Returns `(prompt_tokens, initial_logits)`. Split out of
+    /// [`Self::generate`] to keep that function under the workspace line-count limit. ~keep
+    fn prefill(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        max_length: usize,
+    ) -> Result<(Vec<u32>, Tensor)> {
         let prompt_tokens = input_ids
             .to_vec2::<u32>()
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Input to_vec2: {}", e)))?
@@ -314,7 +338,7 @@ impl PaddleOcrVlEngine {
         let cache_position = Tensor::arange(0u32, prompt_len as u32, &self.device)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Cache position: {}", e)))?;
 
-        let mut logits = self
+        let logits = self
             .model
             .forward(
                 input_ids,
@@ -326,8 +350,14 @@ impl PaddleOcrVlEngine {
             )
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Forward: {}", e)))?;
 
+        Ok((prompt_tokens, logits))
+    }
+
+    /// Greedy-decode from `logits`, feeding each sampled token back through the cached forward
+    /// pass, until EOS, a degenerate repeat, or `max_new_tokens`. Split out of
+    /// [`Self::generate`] to keep that function under the workspace line-count limit. ~keep
+    fn decode_loop(&mut self, mut logits: Tensor, prompt_len: usize, max_new_tokens: usize) -> Result<Vec<u32>> {
         let mut generated: Vec<u32> = Vec::new();
-        let max_new_tokens = max_length.saturating_sub(prompt_len);
 
         for step in 0..max_new_tokens {
             let next_token = logits

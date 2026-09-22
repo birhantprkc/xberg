@@ -60,6 +60,58 @@ pub struct DeepseekOCREngine {
     dtype: DType,
 }
 
+/// Resolve the safetensors file(s) for a DeepSeek-OCR model directory: a single
+/// `model.safetensors`, or every shard named in `model.safetensors.index.json`. Split out of
+/// [`DeepseekOCREngine::init`] to keep that function under the workspace line-count limit. ~keep
+fn resolve_model_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let single_file = path.join("model.safetensors");
+    if single_file.exists() {
+        return Ok(vec![single_file]);
+    }
+
+    let index_file = path.join("model.safetensors.index.json");
+    if !index_file.exists() {
+        return Err(CandleOcrError::ModelLoadFailed(format!(
+            "DeepSeek-OCR weights not found: no model.safetensors or model.safetensors.index.json at {}",
+            path.display()
+        )));
+    }
+
+    let index_str = std::fs::read_to_string(&index_file)
+        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to read safetensors index: {}", e)))?;
+
+    let index: serde_json::Value = serde_json::from_str(&index_str)
+        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to parse safetensors index: {}", e)))?;
+
+    let mut files = std::collections::HashSet::new();
+    if let Some(weights) = index.get("weight_map").and_then(|m| m.as_object()) {
+        for (_key, val) in weights {
+            if let Some(filename) = val.as_str() {
+                files.insert(filename.to_string());
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return Err(CandleOcrError::ModelLoadFailed(
+            "DeepSeek-OCR safetensors index exists but contains no weight files".to_string(),
+        ));
+    }
+
+    let mut result = Vec::new();
+    for filename in files {
+        let shard_path = path.join(&filename);
+        if !shard_path.exists() {
+            return Err(CandleOcrError::ModelLoadFailed(format!(
+                "DeepSeek-OCR shard not found: {}",
+                shard_path.display()
+            )));
+        }
+        result.push(shard_path);
+    }
+    Ok(result)
+}
+
 impl DeepseekOCREngine {
     /// Create a new DeepSeek-OCR engine.
     ///
@@ -121,55 +173,7 @@ impl DeepseekOCREngine {
         let tokenizer = Tokenizer::from_file(&tokenizer_file)
             .map_err(|e| CandleOcrError::Tokenizer(format!("Failed to load DeepSeek-OCR tokenizer: {}", e)))?;
 
-        let model_files = {
-            let single_file = path.join("model.safetensors");
-            if single_file.exists() {
-                vec![single_file]
-            } else {
-                let index_file = path.join("model.safetensors.index.json");
-                if !index_file.exists() {
-                    return Err(CandleOcrError::ModelLoadFailed(format!(
-                        "DeepSeek-OCR weights not found: no model.safetensors or model.safetensors.index.json at {}",
-                        path.display()
-                    )));
-                }
-
-                let index_str = std::fs::read_to_string(&index_file)
-                    .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to read safetensors index: {}", e)))?;
-
-                let index: serde_json::Value = serde_json::from_str(&index_str).map_err(|e| {
-                    CandleOcrError::ModelLoadFailed(format!("Failed to parse safetensors index: {}", e))
-                })?;
-
-                let mut files = std::collections::HashSet::new();
-                if let Some(weights) = index.get("weight_map").and_then(|m| m.as_object()) {
-                    for (_key, val) in weights {
-                        if let Some(filename) = val.as_str() {
-                            files.insert(filename.to_string());
-                        }
-                    }
-                }
-
-                if files.is_empty() {
-                    return Err(CandleOcrError::ModelLoadFailed(
-                        "DeepSeek-OCR safetensors index exists but contains no weight files".to_string(),
-                    ));
-                }
-
-                let mut result = Vec::new();
-                for filename in files {
-                    let shard_path = path.join(&filename);
-                    if !shard_path.exists() {
-                        return Err(CandleOcrError::ModelLoadFailed(format!(
-                            "DeepSeek-OCR shard not found: {}",
-                            shard_path.display()
-                        )));
-                    }
-                    result.push(shard_path);
-                }
-                result
-            }
-        };
+        let model_files = resolve_model_files(path)?;
 
         #[allow(unsafe_code)]
         let vb = {
@@ -235,40 +239,21 @@ impl DeepseekOCREngine {
     /// - Tokenization fails
     /// - Inference fails
     /// - Token decoding fails
-    pub fn process_image(&mut self, image_bytes: &[u8], prompt: Option<&str>) -> Result<String> {
-        tracing::debug!(
-            image_size = image_bytes.len(),
-            version = self.version,
-            "DeepSeek-OCR: starting inference"
-        );
-        let img = image::load_from_memory(image_bytes)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Image decode: {}", e)))?;
-
-        let (img_width, img_height) = (img.width(), img.height());
-        tracing::debug!(width = img_width, height = img_height, "DeepSeek-OCR: image dimensions");
-
+    /// Build the local-crop tensors (`image_crop`, `images_spatial_crop`) and the resulting
+    /// image-token count for `img`, choosing between the tiled "Gundam" grid and the
+    /// global-view-only path per [`crop_grid_for`]. Split out of [`Self::process_image`] to
+    /// keep that function under the workspace line-count limit. ~keep
+    fn build_crop_tensors(
+        &self,
+        img: &image::DynamicImage,
+        mean: &Tensor,
+        std: &Tensor,
+    ) -> Result<(Tensor, Tensor, usize)> {
         let channels = 3usize;
-        let image_token_id = self.processor.image_token_id();
-
-        let mean = Tensor::from_slice(&[IMAGE_MEAN_STD; 3], (3, 1, 1), &self.device)
-            .and_then(|t| t.to_dtype(self.dtype))
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Mean tensor: {}", e)))?;
-        let std = Tensor::from_slice(&[IMAGE_MEAN_STD; 3], (3, 1, 1), &self.device)
-            .and_then(|t| t.to_dtype(self.dtype))
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Std tensor: {}", e)))?;
-
-        let pad = (IMAGE_MEAN_STD * 255.0) as u8;
-        let global_view =
-            crate::vendor::aha::image::resize_with_edge_padding(&img, BASE_SIZE, BASE_SIZE, [pad, pad, pad]);
-        let images_ori = crate::vendor::aha::image::img_transform(&global_view, &mean, &std, &self.device, self.dtype)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Global transform: {}", e)))?
-            .unsqueeze(0)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Global batch: {}", e)))?;
-
-        let (image_crop, images_spatial_crop, num_image_tokens) = match crop_grid_for(img_width, img_height) {
+        match crop_grid_for(img.width(), img.height()) {
             Some(_) => {
                 let (tiles, (w_crop, h_crop)) = crate::vendor::aha::image::dynamic_preprocess(
-                    &img,
+                    img,
                     CROP_MIN_TILES,
                     CROP_MAX_TILES,
                     CROP_TILE_SIZE,
@@ -281,7 +266,7 @@ impl DeepseekOCREngine {
                 let mut tile_tensors = Vec::with_capacity(tiles.len());
                 for tile in &tiles {
                     let tile_tensor =
-                        crate::vendor::aha::image::img_transform(tile, &mean, &std, &self.device, self.dtype)
+                        crate::vendor::aha::image::img_transform(tile, mean, std, &self.device, self.dtype)
                             .map_err(|e| CandleOcrError::InferenceFailed(format!("Crop transform: {}", e)))?;
                     tile_tensors.push(tile_tensor);
                 }
@@ -290,7 +275,7 @@ impl DeepseekOCREngine {
                 let images_spatial_crop = Tensor::new(&[[w_crop, h_crop]], &self.device)
                     .map_err(|e| CandleOcrError::InferenceFailed(format!("Spatial crop tensor: {}", e)))?;
 
-                (image_crop, images_spatial_crop, image_token_count(w_crop, h_crop))
+                Ok((image_crop, images_spatial_crop, image_token_count(w_crop, h_crop)))
             }
             None => {
                 let image_crop = Tensor::zeros(
@@ -302,9 +287,20 @@ impl DeepseekOCREngine {
                 let images_spatial_crop = Tensor::new(&[[1u32, 1u32]], &self.device)
                     .map_err(|e| CandleOcrError::InferenceFailed(format!("Spatial crop tensor: {}", e)))?;
 
-                (image_crop, images_spatial_crop, image_token_count(0, 0))
+                Ok((image_crop, images_spatial_crop, image_token_count(0, 0)))
             }
-        };
+        }
+    }
+
+    /// Build the prompt/image token id sequence (`input_ids`, `prompt_ids`) and its
+    /// image/text `images_seq_mask`. Split out of [`Self::process_image`] to keep that function
+    /// under the workspace line-count limit. ~keep
+    fn build_input_tensors(
+        &self,
+        prompt: Option<&str>,
+        num_image_tokens: usize,
+        image_token_id: u32,
+    ) -> Result<(Tensor, Vec<i64>, Tensor)> {
         let prompt_text = prompt.unwrap_or(DEFAULT_OCR_PROMPT);
         let text_ids: Vec<u32> = self
             .tokenizer
@@ -336,21 +332,15 @@ impl DeepseekOCREngine {
         let images_seq_mask = Tensor::new(mask.as_slice(), &self.device)
             .map_err(|e| CandleOcrError::InferenceFailed(format!("Seq mask tensor: {}", e)))?;
 
-        let mm_data = crate::vendor::aha::MultiModalData::new(vec![
-            Some(images_ori),
-            Some(image_crop),
-            Some(images_seq_mask),
-            Some(images_spatial_crop),
-        ]);
+        Ok((input_ids, prompt_ids, images_seq_mask))
+    }
 
-        tracing::debug!("DeepSeek-OCR: clearing cache and running forward_initial");
-        self.model.clear_kv_cache();
-
-        let mut logits = self
-            .model
-            .forward_initial(&input_ids, 0, mm_data)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Initial forward: {}", e)))?;
-
+    /// Autoregressive decode loop: repeatedly sample the next token from `logits`, feed it back
+    /// through `forward_step`, and stop at a model stop token, a degenerate repeat, or
+    /// `max_new_tokens`. Returns the full token sequence (`prompt_ids` prefix included). Split
+    /// out of [`Self::process_image`] to keep that function under the workspace line-count
+    /// limit. ~keep
+    fn decode_loop(&mut self, mut logits: Tensor, prompt_ids: &[i64]) -> Result<Vec<u32>> {
         let max_new_tokens = self.config.max_new_tokens;
         let stop_ids = self.model.stop_token_ids();
         let mut output_tokens = prompt_ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
@@ -406,6 +396,59 @@ impl DeepseekOCREngine {
                 .forward_step(&next_token_tensor, prompt_ids.len() + step)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Forward step {}: {}", step, e)))?;
         }
+
+        Ok(output_tokens)
+    }
+
+    pub fn process_image(&mut self, image_bytes: &[u8], prompt: Option<&str>) -> Result<String> {
+        tracing::debug!(
+            image_size = image_bytes.len(),
+            version = self.version,
+            "DeepSeek-OCR: starting inference"
+        );
+        let img = image::load_from_memory(image_bytes)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Image decode: {}", e)))?;
+
+        let (img_width, img_height) = (img.width(), img.height());
+        tracing::debug!(width = img_width, height = img_height, "DeepSeek-OCR: image dimensions");
+
+        let image_token_id = self.processor.image_token_id();
+
+        let mean = Tensor::from_slice(&[IMAGE_MEAN_STD; 3], (3, 1, 1), &self.device)
+            .and_then(|t| t.to_dtype(self.dtype))
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Mean tensor: {}", e)))?;
+        let std = Tensor::from_slice(&[IMAGE_MEAN_STD; 3], (3, 1, 1), &self.device)
+            .and_then(|t| t.to_dtype(self.dtype))
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Std tensor: {}", e)))?;
+
+        let pad = (IMAGE_MEAN_STD * 255.0) as u8;
+        let global_view =
+            crate::vendor::aha::image::resize_with_edge_padding(&img, BASE_SIZE, BASE_SIZE, [pad, pad, pad]);
+        let images_ori = crate::vendor::aha::image::img_transform(&global_view, &mean, &std, &self.device, self.dtype)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Global transform: {}", e)))?
+            .unsqueeze(0)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Global batch: {}", e)))?;
+
+        let (image_crop, images_spatial_crop, num_image_tokens) = self.build_crop_tensors(&img, &mean, &std)?;
+        let (input_ids, prompt_ids, images_seq_mask) =
+            self.build_input_tensors(prompt, num_image_tokens, image_token_id)?;
+
+        let mm_data = crate::vendor::aha::MultiModalData::new(vec![
+            Some(images_ori),
+            Some(image_crop),
+            Some(images_seq_mask),
+            Some(images_spatial_crop),
+        ]);
+
+        tracing::debug!("DeepSeek-OCR: clearing cache and running forward_initial");
+        self.model.clear_kv_cache();
+
+        let logits = self
+            .model
+            .forward_initial(&input_ids, 0, mm_data)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Initial forward: {}", e)))?;
+
+        let output_tokens = self.decode_loop(logits, &prompt_ids)?;
 
         let generated = output_tokens.get(prompt_ids.len()..).unwrap_or(&[]);
         let output_text = self

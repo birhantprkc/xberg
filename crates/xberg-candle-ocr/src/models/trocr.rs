@@ -264,31 +264,10 @@ impl TrocrEngine {
     ///
     /// - Image decode fails
     /// - Model inference fails
-    pub fn process_image(&self, image_bytes: &[u8]) -> Result<CandleOcrOutput> {
-        if image_bytes.is_empty() {
-            return Err(CandleOcrError::UnsupportedConfig("Empty image data".to_string()));
-        }
-
-        tracing::debug!(image_size = image_bytes.len(), "TrOCR: preprocessing image");
-
-        let processor = crate::models::image_processor::ImageProcessor::default();
-        let image_tensor = processor
-            .process(image_bytes, &self.device)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Image preprocessing failed: {}", e)))?;
-
-        tracing::debug!(tensor_shape = ?image_tensor.shape().dims(), "TrOCR: image tensor shape after preprocessing");
-
-        let mut model_guard = self.model.lock();
-        model_guard.reset_kv_cache();
-
-        tracing::debug!("TrOCR: running encoder forward pass");
-        let encoder_hidden_states = model_guard
-            .encoder()
-            .forward(&image_tensor)
-            .map_err(|e| CandleOcrError::InferenceFailed(format!("Encoder forward failed: {}", e)))?;
-
-        tracing::debug!(encoder_shape = ?encoder_hidden_states.shape().dims(), "TrOCR: encoder hidden states shape");
-
+    /// Autoregressively decode token ids from `encoder_hidden_states`, one token per iteration,
+    /// stopping at `eos_token_id` or 1000 iterations. Split out of [`Self::process_image`] to
+    /// keep that function under the workspace line-count limit. ~keep
+    fn decode_tokens(&self, model: &mut trocr::TrOCRModel, encoder_hidden_states: &Tensor) -> Result<Vec<u32>> {
         let decoder_start_token_id = self.decoder_start_token_id;
         let eos_token_id = self.eos_token_id;
 
@@ -310,8 +289,8 @@ impl TrocrEngine {
                 .unsqueeze(0)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Token unsqueeze failed: {}", e)))?;
 
-            let logits = model_guard
-                .decode(&input_ids, &encoder_hidden_states, start_pos)
+            let logits = model
+                .decode(&input_ids, encoder_hidden_states, start_pos)
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Decoder forward failed: {}", e)))?;
 
             let logits = logits
@@ -350,6 +329,36 @@ impl TrocrEngine {
                 break;
             }
         }
+
+        Ok(token_ids)
+    }
+
+    pub fn process_image(&self, image_bytes: &[u8]) -> Result<CandleOcrOutput> {
+        if image_bytes.is_empty() {
+            return Err(CandleOcrError::UnsupportedConfig("Empty image data".to_string()));
+        }
+
+        tracing::debug!(image_size = image_bytes.len(), "TrOCR: preprocessing image");
+
+        let processor = crate::models::image_processor::ImageProcessor::default();
+        let image_tensor = processor
+            .process(image_bytes, &self.device)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Image preprocessing failed: {}", e)))?;
+
+        tracing::debug!(tensor_shape = ?image_tensor.shape().dims(), "TrOCR: image tensor shape after preprocessing");
+
+        let mut model_guard = self.model.lock();
+        model_guard.reset_kv_cache();
+
+        tracing::debug!("TrOCR: running encoder forward pass");
+        let encoder_hidden_states = model_guard
+            .encoder()
+            .forward(&image_tensor)
+            .map_err(|e| CandleOcrError::InferenceFailed(format!("Encoder forward failed: {}", e)))?;
+
+        tracing::debug!(encoder_shape = ?encoder_hidden_states.shape().dims(), "TrOCR: encoder hidden states shape");
+
+        let token_ids = self.decode_tokens(&mut model_guard, &encoder_hidden_states)?;
 
         let decoded_text = self
             .tokenizer

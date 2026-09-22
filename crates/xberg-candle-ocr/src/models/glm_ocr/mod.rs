@@ -205,6 +205,68 @@ mod engine {
         pub(crate) special: tokenizer::SpecialTokens,
     }
 
+    /// Download and load a pinned GLM-OCR revision's config, tokenizer, and weights. Split out
+    /// of [`GlmOcrEngine::new_with_hf`] to keep that function under the workspace line-count
+    /// limit. ~keep
+    fn load_model_resources(
+        cache_dir: Option<&std::path::Path>,
+        revision: &str,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<(GlmOcrConfig, Tokenizer, VarBuilder)> {
+        let config_file = crate::download_guard::hf_download(
+            "zai-org/GLM-OCR",
+            "config.json",
+            revision,
+            cache_dir,
+            super::GLM_OCR_CONFIG_SHA256,
+        )
+        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to get config: {}", e)))?;
+        let config_str = std::fs::read_to_string(&config_file)
+            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to read config: {}", e)))?;
+        let config: GlmOcrConfig = serde_json::from_str(&config_str)
+            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Config parse error: {}", e)))?;
+
+        let tokenizer_file = crate::download_guard::hf_download(
+            "zai-org/GLM-OCR",
+            "tokenizer.json",
+            revision,
+            cache_dir,
+            super::GLM_OCR_TOKENIZER_SHA256,
+        )
+        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to get tokenizer: {}", e)))?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_file)
+            .map_err(|e| CandleOcrError::Tokenizer(format!("Tokenizer load error: {}", e)))?;
+
+        let model_file = crate::download_guard::hf_download(
+            "zai-org/GLM-OCR",
+            "model.safetensors",
+            revision,
+            cache_dir,
+            super::GLM_OCR_MODEL_SHA256,
+        )
+        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to get model weights: {e}")))?;
+        let model_files = [model_file];
+
+        tracing::debug!("Loading GLM-OCR weights from {:?}", model_files);
+
+        #[allow(unsafe_code)]
+        let vb = if model_files.len() == 1 {
+            unsafe {
+                VarBuilder::from_mmaped_safetensors(&[&model_files[0]], dtype, device)
+                    .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to load safetensors: {}", e)))?
+            }
+        } else {
+            unsafe {
+                let file_refs: Vec<&std::path::Path> = model_files.iter().map(|f| f.as_path()).collect();
+                VarBuilder::from_mmaped_safetensors(&file_refs, dtype, device)
+                    .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to load safetensors shards: {}", e)))?
+            }
+        };
+
+        Ok((config, tokenizer, vb))
+    }
+
     impl GlmOcrEngine {
         /// Immutable Hugging Face revision covered by the built-in checksums.
         pub fn revision() -> &'static str {
@@ -245,56 +307,7 @@ mod engine {
                 )));
             }
 
-            let config_file = crate::download_guard::hf_download(
-                "zai-org/GLM-OCR",
-                "config.json",
-                revision,
-                cache_dir,
-                super::GLM_OCR_CONFIG_SHA256,
-            )
-            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to get config: {}", e)))?;
-            let config_str = std::fs::read_to_string(&config_file)
-                .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to read config: {}", e)))?;
-            let config: GlmOcrConfig = serde_json::from_str(&config_str)
-                .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Config parse error: {}", e)))?;
-
-            let tokenizer_file = crate::download_guard::hf_download(
-                "zai-org/GLM-OCR",
-                "tokenizer.json",
-                revision,
-                cache_dir,
-                super::GLM_OCR_TOKENIZER_SHA256,
-            )
-            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to get tokenizer: {}", e)))?;
-            let tokenizer = Tokenizer::from_file(&tokenizer_file)
-                .map_err(|e| CandleOcrError::Tokenizer(format!("Tokenizer load error: {}", e)))?;
-
-            let model_file = crate::download_guard::hf_download(
-                "zai-org/GLM-OCR",
-                "model.safetensors",
-                revision,
-                cache_dir,
-                super::GLM_OCR_MODEL_SHA256,
-            )
-            .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to get model weights: {e}")))?;
-            let model_files = [model_file];
-
-            tracing::debug!("Loading GLM-OCR weights from {:?}", model_files);
-
-            #[allow(unsafe_code)]
-            let vb = if model_files.len() == 1 {
-                unsafe {
-                    VarBuilder::from_mmaped_safetensors(&[&model_files[0]], dtype, &device)
-                        .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to load safetensors: {}", e)))?
-                }
-            } else {
-                unsafe {
-                    let file_refs: Vec<&std::path::Path> = model_files.iter().map(|f| f.as_path()).collect();
-                    VarBuilder::from_mmaped_safetensors(&file_refs, dtype, &device).map_err(|e| {
-                        CandleOcrError::ModelLoadFailed(format!("Failed to load safetensors shards: {}", e))
-                    })?
-                }
-            };
+            let (config, tokenizer, vb) = load_model_resources(cache_dir, revision, &device, dtype)?;
 
             let special = tokenizer::resolve_special_tokens(&tokenizer)?;
 
@@ -360,33 +373,21 @@ mod engine {
             self.process_image_inner(image_bytes, self.task)
         }
 
-        fn process_image_inner(&self, image_bytes: &[u8], task: GlmOcrTask) -> Result<CandleOcrOutput> {
-            tracing::debug!(image_size = image_bytes.len(), task = %task, "GLM-OCR: starting inference");
-            // `patch_size`/`t_patch_size` must match the vision encoder's `config.json`-derived
-            // values (the encoder rejects pixel_values whose H/W are not multiples of
-            // `patch_size`), so they are taken from the same deserialized `VisionConfig` rather
-            // than from `PreprocessConfig::default()`. The remaining fields (min/max pixel
-            // budget, CLIP mean/std) have no `config.json` counterpart and keep their defaults.
-            let preprocess_config = preprocess::PreprocessConfig {
-                patch_size: self.config.vision_config.patch_size,
-                t_patch_size: self.config.vision_config.temporal_patch_size,
-                ..preprocess::PreprocessConfig::default()
-            };
-            let (pixel_values, grid_thw) =
-                preprocess::preprocess(image_bytes, &preprocess_config, &self.device, self.dtype)?;
-            super::glm_debug_tensor("pixel_values", &pixel_values);
-
-            let grid_vec = grid_thw
-                .to_vec2::<u32>()
-                .map_err(|e| CandleOcrError::InferenceFailed(format!("Grid shape error: {}", e)))?;
-            let g = &grid_vec[0];
-            let h_patches = g[1] as usize;
-            let w_patches = g[2] as usize;
-
+        /// Run the vision encoder and connector over `pixel_values`, returning the projected
+        /// vision embeddings plus the merged patch grid `(h_merged, w_merged)` and the
+        /// resulting image-token count after spatial merge. Split out of
+        /// [`Self::process_image_inner`] to keep that function under the workspace line-count
+        /// limit. ~keep
+        fn encode_and_project(
+            &self,
+            pixel_values: &Tensor,
+            h_patches: usize,
+            w_patches: usize,
+        ) -> Result<(Tensor, usize, usize, usize)> {
             let vision_embeds = {
                 let vision = self.vision.lock();
                 vision
-                    .forward(&pixel_values)
+                    .forward(pixel_values)
                     .map_err(|e| CandleOcrError::InferenceFailed(format!("Vision encoding: {}", e)))?
             };
             super::glm_debug_tensor("vision_embeds", &vision_embeds);
@@ -404,6 +405,19 @@ mod engine {
             let w_merged = w_patches / merge;
             let num_image_tokens_after_merge = h_merged * w_merged;
 
+            Ok((projected, h_merged, w_merged, num_image_tokens_after_merge))
+        }
+
+        /// Build the token sequence with image placeholders, embed it, and splice the
+        /// projected vision embeddings into the placeholder positions. Returns
+        /// `(input_embeds, image_tokens_start)`. Split out of [`Self::process_image_inner`] to
+        /// keep that function under the workspace line-count limit. ~keep
+        fn build_input_embeds(
+            &self,
+            task: GlmOcrTask,
+            num_image_tokens_after_merge: usize,
+            projected: &Tensor,
+        ) -> Result<(Tensor, usize)> {
             let (input_ids, image_tokens_start) = tokenizer::build_input_ids(
                 &self.special,
                 &self.tokenizer,
@@ -426,16 +440,31 @@ mod engine {
 
             let input_embeds = Self::splice_embeddings(
                 &text_embeds,
-                &projected,
+                projected,
                 image_tokens_start,
                 num_image_tokens_after_merge,
             )?;
             super::glm_debug_tensor("text_embeds", &text_embeds);
             super::glm_debug_tensor("input_embeds", &input_embeds);
 
-            let seq_len = input_embeds
-                .dim(1)
-                .map_err(|e| CandleOcrError::InferenceFailed(format!("Seq len: {}", e)))?;
+            Ok((input_embeds, image_tokens_start))
+        }
+
+        /// Build the flattened `(3, 1, seq_len)` M-RoPE position tensor for a vision-prefixed
+        /// sequence, and the position assigned to the first decoded text token. Positions
+        /// before `image_tokens_start` and after the vision region are plain sequential
+        /// offsets; positions inside the vision region encode `(t, h, w)` via
+        /// `image_tokens_start` plus the row/column within the merged patch grid. Split out of
+        /// [`Self::process_image_inner`] to keep that function under the workspace line-count
+        /// limit. ~keep
+        fn build_mrope_position_ids(
+            &self,
+            seq_len: usize,
+            image_tokens_start: usize,
+            num_image_tokens_after_merge: usize,
+            h_merged: usize,
+            w_merged: usize,
+        ) -> Result<(Tensor, u32)> {
             let vision_end = image_tokens_start + num_image_tokens_after_merge;
             let vision_max_offset = h_merged.max(w_merged);
             let post_vision_base = image_tokens_start + vision_max_offset;
@@ -475,6 +504,50 @@ mod engine {
 
             let next_text_pos_start = (post_vision_base + (seq_len - vision_end)) as u32;
 
+            Ok((prefill_position_ids, next_text_pos_start))
+        }
+
+        fn process_image_inner(&self, image_bytes: &[u8], task: GlmOcrTask) -> Result<CandleOcrOutput> {
+            tracing::debug!(image_size = image_bytes.len(), task = %task, "GLM-OCR: starting inference");
+            // `patch_size`/`t_patch_size` must match the vision encoder's `config.json`-derived
+            // values (the encoder rejects pixel_values whose H/W are not multiples of
+            // `patch_size`), so they are taken from the same deserialized `VisionConfig` rather
+            // than from `PreprocessConfig::default()`. The remaining fields (min/max pixel
+            // budget, CLIP mean/std) have no `config.json` counterpart and keep their defaults.
+            let preprocess_config = preprocess::PreprocessConfig {
+                patch_size: self.config.vision_config.patch_size,
+                t_patch_size: self.config.vision_config.temporal_patch_size,
+                ..preprocess::PreprocessConfig::default()
+            };
+            let (pixel_values, grid_thw) =
+                preprocess::preprocess(image_bytes, &preprocess_config, &self.device, self.dtype)?;
+            super::glm_debug_tensor("pixel_values", &pixel_values);
+
+            let grid_vec = grid_thw
+                .to_vec2::<u32>()
+                .map_err(|e| CandleOcrError::InferenceFailed(format!("Grid shape error: {}", e)))?;
+            let g = &grid_vec[0];
+            let h_patches = g[1] as usize;
+            let w_patches = g[2] as usize;
+
+            let (projected, h_merged, w_merged, num_image_tokens_after_merge) =
+                self.encode_and_project(&pixel_values, h_patches, w_patches)?;
+
+            let (input_embeds, image_tokens_start) =
+                self.build_input_embeds(task, num_image_tokens_after_merge, &projected)?;
+
+            let seq_len = input_embeds
+                .dim(1)
+                .map_err(|e| CandleOcrError::InferenceFailed(format!("Seq len: {}", e)))?;
+
+            let (prefill_position_ids, next_text_pos_start) = self.build_mrope_position_ids(
+                seq_len,
+                image_tokens_start,
+                num_image_tokens_after_merge,
+                h_merged,
+                w_merged,
+            )?;
+
             let output_ids = {
                 let mut decoder = self.decoder.lock();
                 decoder.clear_kv_cache();
@@ -483,10 +556,12 @@ mod engine {
                     &mut decoder,
                     &input_embeds,
                     &prefill_position_ids,
-                    next_text_pos_start,
                     &self.config.mtp_config,
-                    self.config.max_new_tokens,
-                    &self.special.eos_token_ids,
+                    mtp::GenerationLimits {
+                        next_text_pos_start,
+                        max_new_tokens: self.config.max_new_tokens,
+                        eos_token_ids: &self.special.eos_token_ids,
+                    },
                 )
                 .map_err(|e| CandleOcrError::InferenceFailed(format!("Generation: {}", e)))?
             };
