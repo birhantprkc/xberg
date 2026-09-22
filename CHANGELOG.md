@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **(config): the configured thread budget is no longer silently dropped when two extractions start together.** `init_thread_pools` built the process-wide Rayon pool outside the `call_once` fence that guards it, so a second concurrent caller could be released -- with the atomics already set -- before the pool existed. If that caller reached its own parallel work before the first caller's `build_global()` finished, it silently installed Rayon's default pool first, and the configured `max_threads` was never applied for the life of the process. The pool now builds inside the same fence, so no caller observes the installed limits before the pool they describe actually exists. (GH#1750)
+### Fixed
+
+- **(pdf): the dense two-column repair no longer lets a table's own grid vote for the page's gutter.** On a two-column page that also carries a table, `detect_split_x` counted a table row's internal cell gaps as gutter evidence -- a 5-column table's rows outvoted the page's real two-column lines and placed the split inside a column, and the same votes fed the hanging-label snap, so a numeric table column straddling the true gutter could be mistaken for a stack of hanging clause numbers and pull an already-correct split back into the table. Both now skip a line whose inked spans open four or more internal gaps, the shape of a table row of five or more columns; a two-column line with a hanging number on each margin opens three, so three would exclude the very lines that carry the gutter. Separately, `both_sides_are_columns` (gating the split's widened-corridor rescue) required both sides of a candidate gutter to classify as prose, stricter than the per-band reorder gate it feeds, which already accepts one non-prose (table) side when the two sides do not pair up row for row; it now applies the same test. (GH#1742)
 
 ## [1.2.7] - 2026-09-22
 

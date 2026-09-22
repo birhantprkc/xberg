@@ -1132,6 +1132,55 @@ fn line_has_width_furniture(
     line.iter().any(|&index| spans[index].bbox.width >= furniture_width)
 }
 
+// GH#1742: a table row's own multiple internal cell gaps are not gutter evidence, but
+// nothing before this excluded them from the vote. A two-column line with a hanging
+// number on EACH margin -- both the GH#1484/#1603 fixtures and the reporter's own
+// carrier construct rows shaped exactly this way -- already opens three internal gaps
+// (the left number-to-text indent, the gutter itself, and the right number-to-text
+// indent), so three is not a safe ceiling: `redirect_split_out_of_content_must_not_
+// relocate_into_a_hanging_number_indent_gh1603` and `split_inside_a_column_is_moved_
+// to_a_gutter_one_footer_line_crosses` both regress at three, because it excludes the
+// very lines that carry the true gutter. A genuine table row does not stop at three:
+// the reporter's own reproducer tables are five columns (four gaps) and the issue's
+// own narrower three-column shape is called out as *not* covered by this rule at all.
+// Four sits one above the two-hanging-number ceiling and at the four-gap floor the
+// reproducer's own tables measure. ~keep
+const MIN_GRID_ROW_GAP_COUNT: usize = 4;
+
+/// True if `line`'s inked spans are separated by at least `MIN_GRID_ROW_GAP_COUNT`
+/// internal gaps each at least `min_gutter` wide -- the shape of a multi-column table
+/// row, never a hanging-number or ordinary prose line.
+///
+/// GH#1742: on a two-column page that also carries a table, a table row on its own
+/// leading is never grouped into a shared line with the opposite column (see
+/// `redirect_split_out_of_content`'s doc comment), so its own internal cell gaps are
+/// the only gaps `widest_gap_midpoint` ever sees for that line -- and the widest of
+/// them, deep inside the table, was being counted as if it were gutter evidence.
+/// Excluding a line with this many internal gaps from the vote (in `detect_split_x`)
+/// and from the hanging-label snap's candidate pool (in `aligned_hanging_label_left_edge`)
+/// removes that pollution at its source, before any downstream redirect or guard has
+/// to reason about it. ~keep
+fn line_has_grid_row_gaps(spans: &[xberg_native_pdf::layout::TextSpan], line: &SpanLine, min_gutter: f32) -> bool {
+    let mut edges: Vec<(f32, f32)> = line
+        .iter()
+        .filter(|&&index| span_has_ink(&spans[index]))
+        .map(|&index| (spans[index].bbox.left(), spans[index].bbox.right()))
+        .collect();
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut edges = edges.into_iter();
+    let Some((_, mut running_right)) = edges.next() else {
+        return false;
+    };
+    let mut gap_count = 0usize;
+    for (left, right) in edges {
+        if left - running_right >= min_gutter {
+            gap_count += 1;
+        }
+        running_right = running_right.max(right);
+    }
+    gap_count >= MIN_GRID_ROW_GAP_COUNT
+}
+
 /// Establish the page's gutter x-position from independent per-line evidence.
 ///
 /// Each line is checked in isolation for an internal gap at least
@@ -1164,6 +1213,7 @@ fn detect_split_x(spans: &[xberg_native_pdf::layout::TextSpan], lines: &[SpanLin
         .iter()
         .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
         .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+        .filter(|&line| !line_has_grid_row_gaps(spans, line, min_gutter))
         .filter_map(|line| {
             let edges = line
                 .iter()
@@ -1266,31 +1316,49 @@ fn redirect_split_out_of_content(
     widest_within_reach(corridors).unwrap_or(split_x)
 }
 
-/// True if the page's non-furniture spans on either side of `x` each form a
-/// column the reorder would accept (`RegionClass::Prose` or `Reference`).
+/// True if a split at `x` is one `reorder_band_columns` would actually accept once it
+/// is handed one: both sides read as a column (`RegionClass::Prose` or `Reference`),
+/// or one side does and the two sides do not pair up row for row.
 ///
-/// This is the occupancy test a corridor has to pass before a split is moved
-/// into it from inside a column: a gutter separates two columns of running
-/// text, whereas the gap between a table's cells, between a legend's letters
-/// and their captions, or between a narrative column and a chart, separates
-/// content the per-band reorder gates would refuse -- and a split placed there
-/// still reorders whatever band those gates happen to let through. Requiring
-/// both sides to read as columns keeps the widened search on the pages it was
-/// written for.
+/// This is the occupancy test a corridor has to pass before a split is moved into it
+/// from inside a column: a gutter separates two columns of running text, whereas the
+/// gap between a table's cells, between a legend's letters and their captions, or
+/// between a narrative column and a chart, separates content the per-band reorder
+/// gates would refuse -- and a split placed there still reorders whatever band those
+/// gates happen to let through.
+///
+/// GH#1742: requiring literally *both* sides to classify as `Prose`/`Reference` was
+/// stricter than the gate `reorder_band_columns` itself applies once a band is handed
+/// a split -- that gate already accepts one `Table`/`Form`/`Mixed` side, provided the
+/// two sides do not pair up row for row (`MAX_CROSS_GUTTER_ROW_PAIRING_FRACTION`, the
+/// GH#1545 fix). A page whose left column is a table top to bottom and whose right
+/// column is ordinary prose (reproducer p4) never passed the stricter gate, so the
+/// widened search always discarded the true gutter and left the split inside the
+/// table. Mirroring the same two-part test here closes that gap without weakening it:
+/// a label/value table that pairs almost every row (`split_inside_a_table_column_is_
+/// not_moved_to_the_cell_gap`) still fails on pairing fraction alone. ~keep
 fn both_sides_are_columns(
     spans: &[xberg_native_pdf::layout::TextSpan],
     lines: &[SpanLine],
     furniture_width: f32,
     x: f32,
 ) -> bool {
-    let (left, right): (Vec<usize>, Vec<usize>) = lines
+    let indices: Vec<usize> = lines
         .iter()
         .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
         .flat_map(|line| line.iter().copied())
         .filter(|&index| span_has_ink(&spans[index]))
-        .partition(|&index| spans[index].bbox.x < x);
-    xberg_native_pdf::layout::classify_region(spans, &left).is_reorderable_column()
-        && xberg_native_pdf::layout::classify_region(spans, &right).is_reorderable_column()
+        .collect();
+    let (left, right): (Vec<usize>, Vec<usize>) = indices.iter().copied().partition(|&index| spans[index].bbox.x < x);
+    let left_reorderable = xberg_native_pdf::layout::classify_region(spans, &left).is_reorderable_column();
+    let right_reorderable = xberg_native_pdf::layout::classify_region(spans, &right).is_reorderable_column();
+    if left_reorderable && right_reorderable {
+        return true;
+    }
+    if !left_reorderable && !right_reorderable {
+        return false;
+    }
+    cross_gutter_row_pairing_fraction(spans, &indices, x) <= MAX_CROSS_GUTTER_ROW_PAIRING_FRACTION
 }
 
 /// How many non-furniture lines have an inked span written across `x`.
@@ -1479,8 +1547,9 @@ fn snap_split_left_of_hanging_labels(
     mut split_x: f32,
 ) -> f32 {
     let max_snap_width = page_width * MAX_DENSE_COLUMN_SPLIT_SNAP_SPAN_FRACTION;
+    let min_gutter = (page_width * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
     for _ in 0..MAX_DENSE_COLUMN_SPLIT_SNAP_PASSES {
-        let Some(left_edge) = aligned_hanging_label_left_edge(spans, lines, max_snap_width, split_x) else {
+        let Some(left_edge) = aligned_hanging_label_left_edge(spans, lines, max_snap_width, min_gutter, split_x) else {
             break;
         };
         split_x = left_edge;
@@ -1488,14 +1557,20 @@ fn snap_split_left_of_hanging_labels(
     split_x
 }
 
+/// GH#1742: `min_gutter` excludes a table's own grid rows from the candidate pool the
+/// same way `detect_split_x` does (`line_has_grid_row_gaps`) -- a numeric table column
+/// whose cells straddle the split is otherwise indistinguishable from a stack of
+/// hanging clause numbers, and was being snapped to as if it were one.
 fn aligned_hanging_label_left_edge(
     spans: &[xberg_native_pdf::layout::TextSpan],
     lines: &[SpanLine],
     max_snap_width: f32,
+    min_gutter: f32,
     split_x: f32,
 ) -> Option<f32> {
     let mut left_edges = lines
         .iter()
+        .filter(|&line| !line_has_grid_row_gaps(spans, line, min_gutter))
         .filter_map(|line| {
             line.iter()
                 .filter_map(|&index| {
@@ -2994,13 +3069,14 @@ mod tests {
         let order = spans_sorted_top_to_bottom(&spans);
         let lines = group_into_lines(&spans, &order);
         let max_snap_width = PAGE_WIDTH * MAX_DENSE_COLUMN_SPLIT_SNAP_SPAN_FRACTION;
+        let min_gutter = (PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
 
         assert_eq!(
-            aligned_hanging_label_left_edge(&spans, &lines, max_snap_width, INITIAL_SPLIT_X),
+            aligned_hanging_label_left_edge(&spans, &lines, max_snap_width, min_gutter, INITIAL_SPLIT_X),
             Some(FIRST_FRAGMENT_LEFT)
         );
         assert_eq!(
-            aligned_hanging_label_left_edge(&spans, &lines, max_snap_width, FIRST_FRAGMENT_LEFT),
+            aligned_hanging_label_left_edge(&spans, &lines, max_snap_width, min_gutter, FIRST_FRAGMENT_LEFT),
             Some(SECOND_FRAGMENT_LEFT)
         );
         assert_eq!(
@@ -4214,6 +4290,326 @@ mod tests {
             "the two cell gaps are corridors either way; nothing new opens"
         );
         assert_eq!(strict.len(), 2);
+    }
+
+    const GH1742_PAGE_WIDTH: f32 = 595.0;
+    const GH1742_LEFT_X: f32 = 38.0;
+    const GH1742_RIGHT_X: f32 = 307.0;
+    const GH1742_LEFT_WIDTH: f32 = 250.0;
+    const GH1742_RIGHT_WIDTH: f32 = 240.0;
+    const GH1742_TRUE_GUTTER_MID_X: f32 = (288.0 + 307.0) / 2.0;
+    const GH1742_TABLE_COLUMNS: [(f32, f32); 5] =
+        [(38.0, 30.0), (84.0, 30.0), (130.0, 30.0), (176.0, 30.0), (222.0, 10.0)];
+    const GH1742_TABLE_ROWS: usize = 10;
+    const GH1742_TABLE_ROW_HEIGHT: f32 = 9.0;
+
+    /// GH#1742 (reproducer p1 shape): six paired prose rows carry the page's real
+    /// gutter evidence (left column ends at 288, right column starts at 307), then a
+    /// 5-column table -- own, denser leading, last column narrow -- fills the rest of
+    /// the left column, and a single centred page number sits in the gutter near the
+    /// foot of the page. Before the fix, the table's 10 rows each vote once for their
+    /// own widest *internal* cell gap (deep inside the table, nowhere near the real
+    /// gutter), outvoting the 6 genuine gutter lines and landing the median at 76.0 --
+    /// measured directly in `detect_split_x_ignores_table_grid_row_votes_gh1742` below.
+    fn gh1742_two_column_page_with_lower_table_and_page_number() -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        for row in 0..MIN_DENSE_COLUMN_SPLIT_LINES {
+            let y = 900.0 - row as f32 * 14.0;
+            spans.push(span_with_width(
+                &format!("left column body text for row {row}"),
+                GH1742_LEFT_X,
+                y,
+                GH1742_LEFT_WIDTH,
+                11.0,
+                11.0,
+            ));
+            spans.push(span_with_width(
+                &format!("right column body text for row {row}"),
+                GH1742_RIGHT_X,
+                y,
+                GH1742_RIGHT_WIDTH,
+                11.0,
+                11.0,
+            ));
+        }
+        let table_top = 900.0 - MIN_DENSE_COLUMN_SPLIT_LINES as f32 * 14.0 - 6.0;
+        for row in 0..GH1742_TABLE_ROWS {
+            let y = table_top - row as f32 * GH1742_TABLE_ROW_HEIGHT;
+            for (column, &(x, width)) in GH1742_TABLE_COLUMNS.iter().enumerate() {
+                spans.push(span_with_width(&format!("c{column}"), x, y, width, 6.5, 6.5));
+            }
+        }
+        let page_number_width = 4.5;
+        let page_number_x = GH1742_TRUE_GUTTER_MID_X - page_number_width / 2.0;
+        spans.push(span_with_width("6", page_number_x, 40.0, page_number_width, 8.0, 8.0));
+        spans
+    }
+
+    /// GH#1742: `detect_split_x`'s median must survive a table's own internal-gap
+    /// votes and land in the true gutter. Measured on this fixture pre-fix: the
+    /// table's 10 rows each contribute one vote for their widest internal cell gap
+    /// (76.0, between the table's first two columns), outvoting the 6 real gutter
+    /// votes (297.5) and landing the median at 76.0 -- deep inside the left column.
+    #[test]
+    fn detect_split_x_ignores_table_grid_row_votes_gh1742() {
+        let spans = gh1742_two_column_page_with_lower_table_and_page_number();
+        let order = spans_sorted_top_to_bottom(&spans);
+        let lines = group_into_lines(&spans, &order);
+
+        let detected = detect_split_x(&spans, &lines, GH1742_PAGE_WIDTH)
+            .expect("six paired prose rows meet the quorum on their own");
+        assert!(
+            (detected - GH1742_TRUE_GUTTER_MID_X).abs() < 0.5,
+            "the table's grid rows must not pollute the vote; expected the true gutter \
+             at {GH1742_TRUE_GUTTER_MID_X}, got {detected}"
+        );
+    }
+
+    /// GH#1742 end to end (reproducer p1 shape): the page must reorder column-major --
+    /// the whole left column (prose then table, in their existing top-to-bottom order)
+    /// followed by the whole right column, with the page number left as its own
+    /// trailing boundary line. Before the fix, the polluted vote (76.0) lands inside
+    /// both the left prose spans and one of the table's own columns, every line
+    /// becomes a single-line boundary band, no band ever reorders, and the page is
+    /// left exactly as extracted -- interleaved left/right rows, exactly the reported
+    /// defect. Measured directly against unmodified code: `reorder_dense_two_column_page`
+    /// returns `false` and every span keeps its original (interleaved) position.
+    #[test]
+    fn dense_two_column_page_with_lower_table_and_page_number_reorders_by_column_gh1742() {
+        let mut spans = gh1742_two_column_page_with_lower_table_and_page_number();
+
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1742_PAGE_WIDTH),
+            "a two-column page with a table in the lower half of one column and a \
+             page number in the gutter must still be reordered"
+        );
+
+        let mut expected: Vec<String> = (0..MIN_DENSE_COLUMN_SPLIT_LINES)
+            .map(|row| format!("left column body text for row {row}"))
+            .collect();
+        for _row in 0..GH1742_TABLE_ROWS {
+            expected.extend((0..GH1742_TABLE_COLUMNS.len()).map(|column| format!("c{column}")));
+        }
+        expected.extend((0..MIN_DENSE_COLUMN_SPLIT_LINES).map(|row| format!("right column body text for row {row}")));
+        expected.push("6".to_string());
+
+        assert_eq!(
+            spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "left column (prose then table) must precede the right column, with the \
+             page number trailing as its own boundary line"
+        );
+    }
+
+    const GH1742_P6_TABLE_ROWS: usize = 8;
+    const GH1742_P6_TABLE_COLUMNS: [(f32, f32); 4] = [(38.0, 30.0), (84.0, 30.0), (130.0, 30.0), (176.0, 30.0)];
+    // The table's fifth column starts just inside the left column and straddles the
+    // gutter, matching the reporter's own measurement of a numeric column that begins
+    // in-column and runs past the true split. ~keep
+    const GH1742_P6_STRADDLE_COLUMN_X: f32 = 283.0;
+    const GH1742_P6_STRADDLE_COLUMN_WIDTH: f32 = 32.0;
+
+    /// GH#1742 (reproducer p6 shape): a full-width table sits above two ordinary prose
+    /// columns; the table's fifth column starts inside the left column and straddles
+    /// the true gutter. Before the fix, `aligned_hanging_label_left_edge` read that
+    /// numeric column as a stack of hanging clause numbers and snapped the split from
+    /// the true gutter into the table's own fourth-column gap; `detect_split_x` was
+    /// separately polluted by the table's own multi-column internal gaps. Fixing the
+    /// vote (`line_has_grid_row_gaps` in both `detect_split_x` and
+    /// `aligned_hanging_label_left_edge`) removes both failure paths at once: the table
+    /// rows never enter the vote, so the median comes only from the six real gutter
+    /// lines below, and the same exclusion removes the straddling column from the
+    /// snap's candidate pool. Every table row still straddles the (correct) split, so
+    /// each stays a single boundary line in its own top-to-bottom, left-to-right
+    /// order -- "table, then prose", matching the reporter's own expected output.
+    fn gh1742_full_width_table_above_two_column_prose() -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        for row in 0..GH1742_P6_TABLE_ROWS {
+            let y = 950.0 - row as f32 * 9.0;
+            for (column, &(x, width)) in GH1742_P6_TABLE_COLUMNS.iter().enumerate() {
+                spans.push(span_with_width(&format!("c{column}"), x, y, width, 6.5, 6.5));
+            }
+            spans.push(span_with_width(
+                "269,533",
+                GH1742_P6_STRADDLE_COLUMN_X,
+                y,
+                GH1742_P6_STRADDLE_COLUMN_WIDTH,
+                6.5,
+                6.5,
+            ));
+        }
+        let prose_top = 950.0 - GH1742_P6_TABLE_ROWS as f32 * 9.0 - 20.0;
+        for row in 0..MIN_DENSE_COLUMN_SPLIT_LINES {
+            let y = prose_top - row as f32 * 14.0;
+            spans.push(span_with_width(
+                &format!("left column body text for row {row}"),
+                GH1742_LEFT_X,
+                y,
+                GH1742_LEFT_WIDTH,
+                11.0,
+                11.0,
+            ));
+            spans.push(span_with_width(
+                &format!("right column body text for row {row}"),
+                GH1742_RIGHT_X,
+                y,
+                GH1742_RIGHT_WIDTH,
+                11.0,
+                11.0,
+            ));
+        }
+        spans
+    }
+
+    #[test]
+    fn detect_split_x_ignores_full_width_table_grid_row_votes_gh1742() {
+        let spans = gh1742_full_width_table_above_two_column_prose();
+        let order = spans_sorted_top_to_bottom(&spans);
+        let lines = group_into_lines(&spans, &order);
+
+        let detected = detect_split_x(&spans, &lines, GH1742_PAGE_WIDTH)
+            .expect("six paired prose rows meet the quorum on their own");
+        assert!(
+            (detected - GH1742_TRUE_GUTTER_MID_X).abs() < 0.5,
+            "the full-width table's grid rows must not pollute the vote; expected the \
+             true gutter at {GH1742_TRUE_GUTTER_MID_X}, got {detected}"
+        );
+
+        let snapped = snap_split_left_of_hanging_labels(&spans, &lines, GH1742_PAGE_WIDTH, detected);
+        assert_eq!(
+            snapped, detected,
+            "the straddling numeric column must not be read as a hanging-label stack"
+        );
+    }
+
+    #[test]
+    fn dense_two_column_page_with_full_width_table_above_reorders_table_then_prose_gh1742() {
+        let mut spans = gh1742_full_width_table_above_two_column_prose();
+
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1742_PAGE_WIDTH),
+            "a full-width table above a two-column prose body must still be reordered"
+        );
+
+        let mut expected = Vec::new();
+        for _row in 0..GH1742_P6_TABLE_ROWS {
+            expected.extend((0..GH1742_P6_TABLE_COLUMNS.len()).map(|column| format!("c{column}")));
+            expected.push("269,533".to_string());
+        }
+        expected.extend((0..MIN_DENSE_COLUMN_SPLIT_LINES).map(|row| format!("left column body text for row {row}")));
+        expected.extend((0..MIN_DENSE_COLUMN_SPLIT_LINES).map(|row| format!("right column body text for row {row}")));
+
+        assert_eq!(
+            spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the table must stay in its own row order, followed by the reordered \
+             left-then-right prose columns"
+        );
+    }
+
+    const GH1742_P4_NORMAL_ROWS: usize = 10;
+    const GH1742_P4_COLLAPSED_ROWS: usize = 6;
+    // Three columns, wide last column -- only two internal gaps per row, below
+    // `MIN_GRID_ROW_GAP_COUNT`, so fix #1 alone does not remove these rows from the
+    // vote. Left column occupies the full page height; the right column is ordinary
+    // prose on its own (unrelated) leading, never sharing a baseline with the table.
+    // Positioned so the (wrong) per-row vote sits within `MAX_REDIRECT_DISTANCE_FRACTION`
+    // of the true gutter -- otherwise the pre-existing GH#1603 distance cap discards
+    // any candidate the widened search finds, independent of fix #3. ~keep
+    const GH1742_P4_TABLE_COLUMNS: [(f32, f32); 3] = [(38.0, 147.0), (200.0, 30.0), (245.0, 45.0)];
+    const GH1742_P4_TABLE_ROW_HEIGHT: f32 = 9.0;
+    // A deliberately offset leading (not a multiple of the table's or prose's own row
+    // height) so no table row ever lands on the same visual line as a prose row. ~keep
+    const GH1742_P4_TABLE_Y_OFFSET: f32 = 0.7;
+
+    /// GH#1742 (reproducer p4 shape): the entire left column, top to bottom, is a
+    /// 3-column table (wide last column, so only two internal gaps per row -- fix #1's
+    /// `MIN_GRID_ROW_GAP_COUNT` of four does not exclude these rows from the vote);
+    /// the right column is ordinary prose; a centred page number sits in the gutter.
+    ///
+    /// Ten rows keep the plain 3-column shape and vote for their own internal gap
+    /// (deep inside the table); six rows collapse the second column into the third
+    /// (one wide cell starting right after the first), so they contribute no vote but
+    /// their wide cell occupies exactly the x-range the other ten rows vote for --
+    /// forcing that wrong median to both cut a span and cross
+    /// `MIN_DENSE_COLUMN_SPLIT_LINES` lines, which is what sends
+    /// `redirect_split_out_of_content` into the widened low-occupancy search rather
+    /// than leaving the (already-wrong) median untouched. `page_whitespace_corridors`
+    /// still finds nothing there (the page number closes the true gutter), and the
+    /// widened search's own candidate is refused by `both_sides_are_columns` unless
+    /// the left (table) side is allowed to be `Table`/`Mixed`/`Form` -- exactly the gap
+    /// fix #3 closes, mirroring what `reorder_band_columns` already accepts once a
+    /// split is actually handed to it.
+    fn gh1742_full_height_table_column_with_page_number() -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        for row in 0..GH1742_P4_NORMAL_ROWS {
+            let y = 900.0 - row as f32 * GH1742_P4_TABLE_ROW_HEIGHT - GH1742_P4_TABLE_Y_OFFSET;
+            for (column, &(x, width)) in GH1742_P4_TABLE_COLUMNS.iter().enumerate() {
+                spans.push(span_with_width(&format!("t{column}"), x, y, width, 6.5, 6.5));
+            }
+        }
+        for row in 0..GH1742_P4_COLLAPSED_ROWS {
+            let y =
+                900.0 - (GH1742_P4_NORMAL_ROWS + row) as f32 * GH1742_P4_TABLE_ROW_HEIGHT - GH1742_P4_TABLE_Y_OFFSET;
+            let (col0_x, col0_width) = GH1742_P4_TABLE_COLUMNS[0];
+            let (col2_x, col2_width) = GH1742_P4_TABLE_COLUMNS[2];
+            spans.push(span_with_width("t0", col0_x, y, col0_width, 6.5, 6.5));
+            spans.push(span_with_width(
+                "wide",
+                col0_x + col0_width,
+                y,
+                col2_x + col2_width - (col0_x + col0_width),
+                6.5,
+                6.5,
+            ));
+        }
+        for row in 0..(GH1742_P4_NORMAL_ROWS + GH1742_P4_COLLAPSED_ROWS) {
+            let y = 900.0 - row as f32 * 14.0;
+            spans.push(span_with_width(
+                &format!("right column body text for row {row}"),
+                GH1742_RIGHT_X,
+                y,
+                GH1742_RIGHT_WIDTH,
+                11.0,
+                11.0,
+            ));
+        }
+        let page_number_width = 4.5;
+        let page_number_x = GH1742_TRUE_GUTTER_MID_X - page_number_width / 2.0;
+        spans.push(span_with_width("6", page_number_x, 40.0, page_number_width, 8.0, 8.0));
+        spans
+    }
+
+    #[test]
+    fn dense_two_column_page_with_full_height_table_column_reorders_table_then_prose_gh1742() {
+        let mut spans = gh1742_full_height_table_column_with_page_number();
+
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1742_PAGE_WIDTH),
+            "a full-height table column beside ordinary prose, with a page number in \
+             the gutter, must still be reordered"
+        );
+
+        let mut expected = Vec::new();
+        for _row in 0..GH1742_P4_NORMAL_ROWS {
+            expected.extend((0..GH1742_P4_TABLE_COLUMNS.len()).map(|column| format!("t{column}")));
+        }
+        for _row in 0..GH1742_P4_COLLAPSED_ROWS {
+            expected.push("t0".to_string());
+            expected.push("wide".to_string());
+        }
+        expected.extend(
+            (0..(GH1742_P4_NORMAL_ROWS + GH1742_P4_COLLAPSED_ROWS))
+                .map(|row| format!("right column body text for row {row}")),
+        );
+        expected.push("6".to_string());
+
+        assert_eq!(
+            spans.iter().map(|span| span.text.as_str()).collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the table column must precede the prose column, with the page number \
+             trailing as its own boundary line"
+        );
     }
 
     const GH1655_PAGE_WIDTH: f32 = 595.28;
