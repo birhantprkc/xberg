@@ -3,6 +3,8 @@ use super::super::*;
 #[cfg(any(feature = "core-cli", feature = "analysis"))]
 use super::{config_from_json, default_overrides};
 #[cfg(any(feature = "core-cli", feature = "analysis"))]
+use xberg::ChunkingConfig;
+#[cfg(any(feature = "core-cli", feature = "analysis"))]
 use xberg::ExtractionConfig;
 
 #[cfg(any(feature = "core-cli", feature = "analysis"))]
