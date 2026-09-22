@@ -41,6 +41,63 @@ use std::ptr::null_mut;
 ///   non-generated char to measure the gap
 ///
 /// This avoids the PdfPageTextChar wrapper overhead and minimizes FFI roundtrips.
+
+/// Parameters for [`should_emit_generated_space`], bundled so that helper stays under the
+/// workspace parameter-count limit. ~keep
+struct GeneratedSpaceSearch {
+    /// First character index to search from (inclusive).
+    next_search_start: i32,
+    /// End of the character range (exclusive).
+    end: i32,
+    /// Right edge, in device units, of the character preceding the generated space.
+    prev_right_x: f32,
+    /// Font size to fall back to when the next real character reports none.
+    prev_font_size: f32,
+    space_ratio: f32,
+}
+
+/// Whether a generated space should be emitted, based on the horizontal gap between
+/// `prev_right_x` and the next real (non-generated) character at or after `next_search_start`,
+/// up to `end`. Matches the original inline decision exactly: no real character before `end`
+/// (or a `GetCharBox` failure on the one found) also emits a space. Split out of
+/// [`filter_generated_spaces_direct`] to keep that function's nesting under the workspace
+/// limit. ~keep
+fn should_emit_generated_space(
+    text_page_handle: FPDF_TEXTPAGE,
+    bindings: &dyn PdfiumLibraryBindings,
+    search: GeneratedSpaceSearch,
+) -> bool {
+    let GeneratedSpaceSearch {
+        next_search_start,
+        end,
+        prev_right_x,
+        prev_font_size,
+        space_ratio,
+    } = search;
+    let mut j = next_search_start;
+    while j < end {
+        let jdx = j as c_int;
+        if bindings.FPDFText_IsGenerated(text_page_handle, jdx) == 0 {
+            let mut left = 0.0_f64;
+            let mut bottom = 0.0_f64;
+            let mut right = 0.0_f64;
+            let mut top = 0.0_f64;
+            return if bindings.FPDFText_GetCharBox(text_page_handle, jdx, &mut left, &mut right, &mut bottom, &mut top)
+                != 0
+            {
+                let gap = left as f32 - prev_right_x;
+                let next_fs = bindings.FPDFText_GetFontSize(text_page_handle, jdx) as f32;
+                let ref_fs = if next_fs > 0.0 { next_fs } else { prev_font_size };
+                gap > ref_fs * space_ratio
+            } else {
+                true
+            };
+        }
+        j += 1;
+    }
+    true
+}
+
 pub(super) fn filter_generated_spaces_direct(
     text_page_handle: crate::bindgen::FPDF_TEXTPAGE,
     start: i32,
@@ -62,40 +119,20 @@ pub(super) fn filter_generated_spaces_direct(
         let idx = i as std::os::raw::c_int;
 
         if bindings.FPDFText_IsGenerated(text_page_handle, idx) != 0 {
-            if let Some(prev_r) = prev_right_x {
-                let mut j = i + 1;
-                while j < end {
-                    let jdx = j as std::os::raw::c_int;
-                    if bindings.FPDFText_IsGenerated(text_page_handle, jdx) == 0 {
-                        let mut left = 0.0_f64;
-                        let mut bottom = 0.0_f64;
-                        let mut right = 0.0_f64;
-                        let mut top = 0.0_f64;
-                        if bindings.FPDFText_GetCharBox(
-                            text_page_handle,
-                            jdx,
-                            &mut left,
-                            &mut right,
-                            &mut bottom,
-                            &mut top,
-                        ) != 0
-                        {
-                            let gap = left as f32 - prev_r;
-                            let next_fs = bindings.FPDFText_GetFontSize(text_page_handle, jdx) as f32;
-                            let ref_fs = if next_fs > 0.0 { next_fs } else { prev_font_size };
-                            if gap > ref_fs * space_ratio {
-                                result.push(' ');
-                            }
-                        } else {
-                            result.push(' ');
-                        }
-                        break;
-                    }
-                    j += 1;
-                }
-                if j >= end {
-                    result.push(' ');
-                }
+            if let Some(prev_r) = prev_right_x
+                && should_emit_generated_space(
+                    text_page_handle,
+                    bindings,
+                    GeneratedSpaceSearch {
+                        next_search_start: i + 1,
+                        end,
+                        prev_right_x: prev_r,
+                        prev_font_size,
+                        space_ratio,
+                    },
+                )
+            {
+                result.push(' ');
             }
             i += 1;
             continue;
