@@ -1,6 +1,8 @@
 use super::test_support::make_doc;
 use super::*;
-use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
+#[cfg(any(feature = "pdf", feature = "ocr"))]
+use crate::types::internal::InternalDocument;
+use crate::types::internal::{ElementKind, InternalElement};
 
 #[test]
 fn test_derive_extraction_result_basic() {
