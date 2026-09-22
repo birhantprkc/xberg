@@ -434,59 +434,8 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
     }
 
     let confidence = unsafe { TessResultIteratorConfidence(raw, TessPageIteratorLevel::RIL_WORD as c_int) };
-
-    let font_attrs = {
-        let mut is_bold = 0;
-        let mut is_italic = 0;
-        let mut is_underlined = 0;
-        let mut is_monospace = 0;
-        let mut is_serif = 0;
-        let mut is_smallcaps = 0;
-        let mut pointsize = 0;
-        let mut font_id = 0;
-        let result = unsafe {
-            TessResultIteratorWordFontAttributes(
-                raw,
-                &mut is_bold,
-                &mut is_italic,
-                &mut is_underlined,
-                &mut is_monospace,
-                &mut is_serif,
-                &mut is_smallcaps,
-                &mut pointsize,
-                &mut font_id,
-            )
-        };
-        if result != 0 {
-            Some(FontAttributes {
-                is_bold: is_bold != 0,
-                is_italic: is_italic != 0,
-                is_underlined: is_underlined != 0,
-                is_monospace: is_monospace != 0,
-                is_serif: is_serif != 0,
-                is_smallcaps: is_smallcaps != 0,
-                pointsize,
-                font_id,
-            })
-        } else {
-            None
-        }
-    };
-
-    // `TessResultIteratorWordRecognitionLanguage` returns a pointer owned by
-    // Tesseract (not by us), so it must NOT be freed via `TessDeleteText` —
-    // matching `ResultIterator::word_recognition_language`. A null pointer
-    // means Tesseract could not attribute this word to a specific language
-    // (e.g. non-LSTM engines, or a word outside the recognized text);
-    // that's a normal, non-fatal case, so it maps to `None`, not an error. ~keep
-    let language = {
-        let lang_ptr = unsafe { TessResultIteratorWordRecognitionLanguage(raw) };
-        if lang_ptr.is_null() {
-            None
-        } else {
-            unsafe { CStr::from_ptr(lang_ptr) }.to_str().ok().map(str::to_owned)
-        }
-    };
+    let font_attrs = extract_word_font_attributes(raw);
+    let language = extract_word_recognition_language(raw);
 
     Ok(WordData {
         text,
@@ -498,6 +447,65 @@ fn extract_word_data_unlocked(raw: *mut c_void) -> Result<WordData> {
         font_attrs,
         language,
     })
+}
+
+/// The current word's font attributes, or `None` when Tesseract reports it has none (the C API
+/// signals this via a zero return, not a null pointer). Split out of
+/// [`extract_word_data_unlocked`] to keep that function under the workspace line-count limit. ~keep
+fn extract_word_font_attributes(raw: *mut c_void) -> Option<FontAttributes> {
+    let mut is_bold = 0;
+    let mut is_italic = 0;
+    let mut is_underlined = 0;
+    let mut is_monospace = 0;
+    let mut is_serif = 0;
+    let mut is_smallcaps = 0;
+    let mut pointsize = 0;
+    let mut font_id = 0;
+    let result = unsafe {
+        TessResultIteratorWordFontAttributes(
+            raw,
+            &mut is_bold,
+            &mut is_italic,
+            &mut is_underlined,
+            &mut is_monospace,
+            &mut is_serif,
+            &mut is_smallcaps,
+            &mut pointsize,
+            &mut font_id,
+        )
+    };
+    if result != 0 {
+        Some(FontAttributes {
+            is_bold: is_bold != 0,
+            is_italic: is_italic != 0,
+            is_underlined: is_underlined != 0,
+            is_monospace: is_monospace != 0,
+            is_serif: is_serif != 0,
+            is_smallcaps: is_smallcaps != 0,
+            pointsize,
+            font_id,
+        })
+    } else {
+        None
+    }
+}
+
+/// The current word's recognition language (e.g. `"eng"`, `"deu"`).
+///
+/// `TessResultIteratorWordRecognitionLanguage` returns a pointer owned by Tesseract (not by
+/// us), so it must NOT be freed via `TessDeleteText` — matching
+/// `ResultIterator::word_recognition_language`. A null pointer means Tesseract could not
+/// attribute this word to a specific language (e.g. non-LSTM engines, or a word outside the
+/// recognized text); that's a normal, non-fatal case, so it maps to `None`, not an error. Split
+/// out of [`extract_word_data_unlocked`] to keep that function under the workspace line-count
+/// limit. ~keep
+fn extract_word_recognition_language(raw: *mut c_void) -> Option<String> {
+    let lang_ptr = unsafe { TessResultIteratorWordRecognitionLanguage(raw) };
+    if lang_ptr.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(lang_ptr) }.to_str().ok().map(str::to_owned)
+    }
 }
 
 impl Drop for ResultIterator {
