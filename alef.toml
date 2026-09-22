@@ -1250,22 +1250,17 @@ traineddata = "traineddata"
   "file-too-long",
   "type-too-long",
 ]
-"tools/benchmark-harness/src/adapters/subprocess.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/aggregate.rs" = ["file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/comparison.rs" = ["file-too-long", "function-too-long"]
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
 ]
-"tools/benchmark-harness/src/main.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
   "type-too-long",
 ]
-"tools/benchmark-harness/src/runner.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
