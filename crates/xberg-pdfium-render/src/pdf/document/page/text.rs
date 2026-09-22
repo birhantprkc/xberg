@@ -27,21 +27,6 @@ use std::fmt::{Display, Formatter};
 use std::os::raw::{c_double, c_int};
 use std::ptr::null_mut;
 
-/// Shared gap-based space filtering for respaced text methods.
-///
-/// Iterates `chars` and builds a `String`, emitting a space for each generated
-/// space character only when the horizontal gap to the next real character
-/// exceeds `font_size * space_ratio`. This is the single implementation shared
-/// by `all_respaced`, `inside_rect_respaced`, and `PdfPageTextSegment::text_respaced`.
-/// Filter generated spaces using direct FFI calls for minimal overhead.
-///
-/// Single pass over character indices. For each character:
-/// - Non-generated: 2 FFI calls (GetUnicode + GetCharBox)
-/// - Generated space: 1 FFI call (IsGenerated), plus GetCharBox only for the next
-///   non-generated char to measure the gap
-///
-/// This avoids the PdfPageTextChar wrapper overhead and minimizes FFI roundtrips.
-
 /// Parameters for [`should_emit_generated_space`], bundled so that helper stays under the
 /// workspace parameter-count limit. ~keep
 struct GeneratedSpaceSearch {
@@ -98,6 +83,20 @@ fn should_emit_generated_space(
     true
 }
 
+/// Shared gap-based space filtering for respaced text methods.
+///
+/// Iterates `chars` and builds a `String`, emitting a space for each generated
+/// space character only when the horizontal gap to the next real character
+/// exceeds `font_size * space_ratio`. This is the single implementation shared
+/// by `all_respaced`, `inside_rect_respaced`, and `PdfPageTextSegment::text_respaced`.
+/// Filter generated spaces using direct FFI calls for minimal overhead.
+///
+/// Single pass over character indices. For each character:
+/// - Non-generated: 2 FFI calls (GetUnicode + GetCharBox)
+/// - Generated space: 1 FFI call (IsGenerated), plus GetCharBox only for the next
+///   non-generated char to measure the gap
+///
+/// This avoids the PdfPageTextChar wrapper overhead and minimizes FFI roundtrips.
 pub(super) fn filter_generated_spaces_direct(
     text_page_handle: crate::bindgen::FPDF_TEXTPAGE,
     start: i32,
