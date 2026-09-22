@@ -229,7 +229,15 @@ fn page_text_is_the_same_read_forward_and_backward() {
     };
 
     let trimmed = |pages: &[String]| pages.iter().map(|page| page.trim().to_string()).collect::<Vec<_>>();
-    assert_eq!(trimmed(&forward), vec!["a", "b"], "forward read: page 2 must decode through its own font");
-    assert_eq!(trimmed(&backward), vec!["a", "b"], "backward read: page 1 must decode through its own font");
+    assert_eq!(
+        trimmed(&forward),
+        vec!["a", "b"],
+        "forward read: page 2 must decode through its own font"
+    );
+    assert_eq!(
+        trimmed(&backward),
+        vec!["a", "b"],
+        "backward read: page 1 must decode through its own font"
+    );
     assert_eq!(forward, backward, "page text depends on the order the pages were read");
 }

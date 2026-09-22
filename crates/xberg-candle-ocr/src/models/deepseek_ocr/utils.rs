@@ -501,8 +501,14 @@ mod tests {
     fn interpolate_linear_1d_matches_the_per_position_reference_within_tolerance() {
         const TOLERANCE: f32 = 1e-6;
         let dev = Device::Cpu;
-        let cases: [(usize, usize, usize, usize); 6] =
-            [(1, 64, 127, 79), (1, 64, 79, 127), (1, 64, 27, 127), (2, 3, 5, 12), (1, 64, 127, 2), (1, 1, 2, 9)];
+        let cases: [(usize, usize, usize, usize); 6] = [
+            (1, 64, 127, 79),
+            (1, 64, 79, 127),
+            (1, 64, 27, 127),
+            (2, 3, 5, 12),
+            (1, 64, 127, 2),
+            (1, 1, 2, 9),
+        ];
         for &(batch, channels, src_len, target) in &cases {
             for strided in [false, true] {
                 let input = if strided {
@@ -513,13 +519,20 @@ mod tests {
                     pseudo_random_tensor((batch, channels, src_len), 7, &dev)
                 };
                 if strided && channels > 1 {
-                    assert!(!input.is_contiguous(), "input must be strided for this case to have power");
+                    assert!(
+                        !input.is_contiguous(),
+                        "input must be strided for this case to have power"
+                    );
                 }
 
                 let expected = reference_interpolate_linear_1d(&input, target);
                 let actual = interpolate_linear_1d(&input, target, None).expect("interpolate");
 
-                assert_eq!(actual.dims(), expected.dims(), "shape for {batch}x{channels}x{src_len}->{target}");
+                assert_eq!(
+                    actual.dims(),
+                    expected.dims(),
+                    "shape for {batch}x{channels}x{src_len}->{target}"
+                );
                 let expected = expected.flatten_all().and_then(|t| t.to_vec1::<f32>()).expect("read");
                 let actual = actual.flatten_all().and_then(|t| t.to_vec1::<f32>()).expect("read");
                 let worst = expected
@@ -572,7 +585,11 @@ mod tests {
             let mask_tensor = Tensor::from_vec(mask.clone(), (1, mask.len()), &dev).expect("mask");
             let expected = reference_masked_scatter_dim0(&dst.squeeze(0).expect("dst"), &src, mask);
             let actual = masked_scatter_dim0(&dst, &src, &mask_tensor).expect("scatter");
-            assert_eq!(actual.dims(), &[1, expected.dim(0).expect("rows"), hidden], "shape for {mask:?}");
+            assert_eq!(
+                actual.dims(),
+                &[1, expected.dim(0).expect("rows"), hidden],
+                "shape for {mask:?}"
+            );
             let expected = expected.to_vec2::<f32>().expect("read");
             let actual = actual.squeeze(0).and_then(|t| t.to_vec2::<f32>()).expect("read");
             assert_eq!(actual, expected, "rows for {mask:?}");
