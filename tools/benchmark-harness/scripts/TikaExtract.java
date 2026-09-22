@@ -16,10 +16,6 @@ import org.apache.tika.sax.BodyContentHandler;
 
 public final class TikaExtract {
   private static final double NANOS_IN_MILLISECOND = 1_000_000.0;
-  /** Length of the JSON key {@code "path"} including surrounding quotes. */
-  private static final int PATH_KEY_LENGTH = 6;
-
-  private static final char LAST_CONTROL_CHAR = 0x1F;
 
   private TikaExtract() {}
 
@@ -65,12 +61,13 @@ public final class TikaExtract {
         "true".equalsIgnoreCase(System.getenv("TIKA_BENCHMARK_DEBUG"));
 
     if (debug) {
-      debugLog("java.version", System.getProperty("java.version"));
-      debugLog("os.name", System.getProperty("os.name"));
-      debugLog("os.arch", System.getProperty("os.arch"));
-      debugLog("Mode", mode);
-      debugLog("OCR enabled", String.valueOf(ocrEnabled));
-      debugLog("Files to process", String.valueOf(positionalArgs.size() - 1));
+      TikaJson.debugLog("java.version", System.getProperty("java.version"));
+      TikaJson.debugLog("os.name", System.getProperty("os.name"));
+      TikaJson.debugLog("os.arch", System.getProperty("os.arch"));
+      TikaJson.debugLog("Mode", mode);
+      TikaJson.debugLog("OCR enabled", String.valueOf(ocrEnabled));
+      TikaJson.debugLog("Files to process",
+                        String.valueOf(positionalArgs.size() - 1));
     }
 
     try {
@@ -87,7 +84,8 @@ public final class TikaExtract {
       }
     } catch (Exception e) {
       if (debug) {
-        debugLog("Processing failed with exception", e.getClass().getName());
+        TikaJson.debugLog("Processing failed with exception",
+                          e.getClass().getName());
         e.printStackTrace(System.err);
       } else {
         e.printStackTrace(System.err);
@@ -100,7 +98,7 @@ public final class TikaExtract {
                                       String ocrLanguage, boolean debug)
       throws Exception {
     if (debug) {
-      debugLog("Input file", filePath);
+      TikaJson.debugLog("Input file", filePath);
     }
 
     Path path = Path.of(filePath);
@@ -109,22 +107,22 @@ public final class TikaExtract {
 
     try {
       if (debug) {
-        debugLog("Starting extraction", "");
+        TikaJson.debugLog("Starting extraction", "");
       }
       data = extractFile(path.toFile(), ocrEnabled, ocrLanguage);
       if (debug) {
-        debugLog("Extraction completed", "");
+        TikaJson.debugLog("Extraction completed", "");
       }
     } catch (Exception e) {
       if (debug) {
-        debugLog("Extraction failed", e.getClass().getName());
+        TikaJson.debugLog("Extraction failed", e.getClass().getName());
         e.printStackTrace(System.err);
       }
       throw e;
     }
 
     double elapsedMs = (System.nanoTime() - start) / NANOS_IN_MILLISECOND;
-    String json = toJson(data, elapsedMs, ocrEnabled);
+    String json = TikaJson.toJson(data, elapsedMs, ocrEnabled);
     System.out.print(json);
   }
 
@@ -143,7 +141,7 @@ public final class TikaExtract {
     boolean first = true;
     for (String filePath : filePaths) {
       if (debug) {
-        debugLog("Processing file", filePath);
+        TikaJson.debugLog("Processing file", filePath);
       }
 
       try {
@@ -160,16 +158,16 @@ public final class TikaExtract {
 
         double batchTotalMs =
             (System.nanoTime() - batchStart) / NANOS_IN_MILLISECOND;
-        jsonArray.append(
-            toJsonWithBatch(data, elapsedMs, batchTotalMs, ocrEnabled));
+        jsonArray.append(TikaJson.toJsonWithBatch(data, elapsedMs, batchTotalMs,
+                                                  ocrEnabled));
 
         if (debug) {
-          debugLog("File processed", filePath);
+          TikaJson.debugLog("File processed", filePath);
         }
       } catch (Exception e) {
         if (debug) {
-          debugLog("Failed to process file", filePath);
-          debugLog("Exception", e.getClass().getName());
+          TikaJson.debugLog("Failed to process file", filePath);
+          TikaJson.debugLog("Exception", e.getClass().getName());
           e.printStackTrace(System.err);
         } else {
           System.err.printf("Error processing %s: %s%n", filePath,
@@ -211,7 +209,7 @@ public final class TikaExtract {
           continue;
         }
         if (filePath.startsWith("{")) {
-          filePath = parseJsonPath(filePath);
+          filePath = TikaJson.parseJsonPath(filePath);
         }
         try {
           Path path = Path.of(filePath);
@@ -219,13 +217,13 @@ public final class TikaExtract {
           ExtractionData data = extractFileWithParser(
               path.toFile(), sharedParser, sharedOcrConfig);
           double elapsedMs = (System.nanoTime() - start) / NANOS_IN_MILLISECOND;
-          String json = toJson(data, elapsedMs, ocrEnabled);
+          String json = TikaJson.toJson(data, elapsedMs, ocrEnabled);
           System.out.println(json);
           System.out.flush();
         } catch (Exception e) {
           String errorJson = String.format(
               "{\"error\":%s,\"_extraction_time_ms\":0,\"_ocr_used\":false}",
-              quote(e.getMessage()));
+              TikaJson.quote(e.getMessage()));
           System.out.println(errorJson);
           System.out.flush();
         }
@@ -296,6 +294,46 @@ public final class TikaExtract {
 
     return new ExtractionData(content, mimeType);
   }
+}
+
+/**
+ * Result of a single Tika extraction: the extracted text plus its detected MIME
+ * type.
+ *
+ * <p>Top-level (not nested in {@link TikaExtract}) so it, and the JSON/logging
+ * helpers in
+ * {@link TikaJson} that consume it, don't count toward {@code TikaExtract}'s
+ * own line budget.
+ * {@code TikaExtract.java} is compiled via {@code javac -d <dir>
+ * TikaExtract.java} with no
+ * {@code -sourcepath}, so this class must live in the same source file rather
+ * than a sibling one javac would need to discover on its own. ~keep
+ */
+final class ExtractionData {
+  private final String content;
+  private final String mimeType;
+
+  ExtractionData(String content, String mimeType) {
+    this.content = content;
+    this.mimeType = mimeType;
+  }
+
+  String getContent() { return content; }
+
+  String getMimeType() { return mimeType; }
+}
+
+/**
+ * JSON rendering, debug logging, and the request-line parsing used by {@link
+ * TikaExtract}.
+ */
+final class TikaJson {
+  /** Length of the JSON key {@code "path"} including surrounding quotes. */
+  private static final int PATH_KEY_LENGTH = 6;
+
+  private static final char LAST_CONTROL_CHAR = 0x1F;
+
+  private TikaJson() {}
 
   /**
    * Determine if OCR was actually used based on MIME type and OCR config.
@@ -308,8 +346,8 @@ public final class TikaExtract {
     return mimeType != null && mimeType.startsWith("image/");
   }
 
-  private static String toJson(ExtractionData data, double elapsedMs,
-                               boolean ocrEnabled) {
+  static String toJson(ExtractionData data, double elapsedMs,
+                       boolean ocrEnabled) {
     StringBuilder builder = new StringBuilder();
     builder.append('{');
     builder.append("\"content\":").append(quote(data.getContent())).append(',');
@@ -323,9 +361,8 @@ public final class TikaExtract {
     return builder.toString();
   }
 
-  private static String toJsonWithBatch(ExtractionData data, double elapsedMs,
-                                        double batchTotalMs,
-                                        boolean ocrEnabled) {
+  static String toJsonWithBatch(ExtractionData data, double elapsedMs,
+                                double batchTotalMs, boolean ocrEnabled) {
     StringBuilder builder = new StringBuilder();
     builder.append('{');
     builder.append("\"content\":").append(quote(data.getContent())).append(',');
@@ -345,7 +382,7 @@ public final class TikaExtract {
    * Parse a JSON request line to extract the "path" field.
    * Minimal JSON parsing to avoid adding a dependency.
    */
-  private static String parseJsonPath(String json) {
+  static String parseJsonPath(String json) {
     int idx = json.indexOf("\"path\"");
     if (idx < 0) {
       return json;
@@ -366,7 +403,7 @@ public final class TikaExtract {
     return json.substring(start, end);
   }
 
-  private static String quote(String value) {
+  static String quote(String value) {
     if (value == null) {
       return "null";
     }
@@ -408,24 +445,10 @@ public final class TikaExtract {
     return sb.toString();
   }
 
-  private static void debugLog(String key, String value) {
+  static void debugLog(String key, String value) {
     if (value == null) {
       value = "(null)";
     }
     System.err.printf("[BENCHMARK_DEBUG] %-30s = %s%n", key, value);
-  }
-
-  private static class ExtractionData {
-    private final String content;
-    private final String mimeType;
-
-    ExtractionData(String content, String mimeType) {
-      this.content = content;
-      this.mimeType = mimeType;
-    }
-
-    String getContent() { return content; }
-
-    String getMimeType() { return mimeType; }
   }
 }
