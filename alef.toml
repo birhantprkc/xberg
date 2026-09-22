@@ -1247,34 +1247,17 @@ traineddata = "traineddata"
 "crates/xberg/tests/typst_behavioral_tests.rs" = ["file-too-long"]
 "docs-site/src/content/docs/cli/usage.mdx" = ["file-too-long"]
 "docs-site/src/content/docs/guides/ocr.mdx" = ["file-too-long"]
-"integrations/java/spring-ai/src/main/java/io/xberg/springai/XbergDocumentReader.java" = ["type-too-long"]
-"integrations/java/spring-ai/src/test/java/io/xberg/springai/XbergDocumentReaderTest.java" = [
   "file-too-long",
   "type-too-long",
 ]
-"integrations/node/n8n-nodes-xberg/nodes/Xberg/Xberg.node.ts" = ["type-too-long"]
-"integrations/python/langchain/src/langchain_xberg/loader.py" = ["type-too-long"]
-"scripts/ci/ruby/vendor-xberg-core.py" = ["function-too-long"]
-"tools/benchmark-harness/scripts/TikaExtract.java" = ["type-too-long"]
-"tools/benchmark-harness/scripts/docling_extract.py" = ["function-too-long"]
-"tools/benchmark-harness/scripts/generate_markdown_gt.py" = ["function-too-long"]
-"tools/benchmark-harness/scripts/generate_vendored_baselines.py" = ["nesting-too-deep"]
-"tools/benchmark-harness/scripts/gt_eval.py" = ["function-too-long"]
-"tools/benchmark-harness/scripts/import_omnidocbench.py" = ["function-too-long", "nesting-too-deep"]
-"tools/benchmark-harness/src/adapters/native.rs" = ["function-too-long"]
 "tools/benchmark-harness/src/adapters/subprocess.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/adapters/xberg.rs" = ["function-too-long"]
 "tools/benchmark-harness/src/aggregate.rs" = ["file-too-long", "function-too-long"]
 "tools/benchmark-harness/src/comparison.rs" = ["file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/consolidate.rs" = ["nesting-too-deep"]
-"tools/benchmark-harness/src/embed_benchmark.rs" = ["function-too-long"]
-"tools/benchmark-harness/src/fixture.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
   "nesting-too-deep",
 ]
-"tools/benchmark-harness/src/gap_report.rs" = ["function-too-long"]
 "tools/benchmark-harness/src/main.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
@@ -1282,15 +1265,6 @@ traineddata = "traineddata"
   "nesting-too-deep",
   "type-too-long",
 ]
-"tools/benchmark-harness/src/markdown_quality.rs" = ["cyclomatic-complexity", "function-too-long"]
-"tools/benchmark-harness/src/model_benchmark.rs" = ["function-too-long"]
-"tools/benchmark-harness/src/monitoring.rs" = ["file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/noise_detection.rs" = ["file-too-long", "nesting-too-deep"]
-"tools/benchmark-harness/src/output.rs" = ["function-too-long"]
-"tools/benchmark-harness/src/pipeline_benchmark.rs" = ["file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/profile_report.rs" = ["file-too-long", "function-too-long"]
-"tools/benchmark-harness/src/provenance.rs" = ["function-too-long"]
-"tools/benchmark-harness/src/quality.rs" = ["file-too-long"]
 "tools/benchmark-harness/src/runner.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
@@ -1299,7 +1273,6 @@ traineddata = "traineddata"
   "too-many-parameters",
 ]
 "tools/benchmark-harness/src/sizes.rs" = ["cyclomatic-complexity", "file-too-long", "nesting-too-deep"]
-"tools/benchmark-harness/src/split_benchmark.rs" = ["function-too-long"]
 "tools/benchmark-harness/src/structural_sidecar.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
@@ -1312,7 +1285,6 @@ traineddata = "traineddata"
   "function-too-long",
   "too-many-parameters",
 ]
-"tools/benchmark-harness/tests/validate_artifacts.rs" = ["file-too-long"]
 # --- end quality-debt baseline ---
 # Quality metrics do not apply to test code. A test function's length is its assertion
 # count and a table-driven test's arity mirrors its cases; splitting either to satisfy a
