@@ -208,12 +208,12 @@ mod engine {
     /// Download and load a pinned GLM-OCR revision's config, tokenizer, and weights. Split out
     /// of [`GlmOcrEngine::new_with_hf`] to keep that function under the workspace line-count
     /// limit. ~keep
-    fn load_model_resources(
+    fn load_model_resources<'device>(
         cache_dir: Option<&std::path::Path>,
         revision: &str,
-        device: &Device,
+        device: &'device Device,
         dtype: DType,
-    ) -> Result<(GlmOcrConfig, Tokenizer, VarBuilder)> {
+    ) -> Result<(GlmOcrConfig, Tokenizer, VarBuilder<'device>)> {
         let config_file = crate::download_guard::hf_download(
             "zai-org/GLM-OCR",
             "config.json",
@@ -325,6 +325,11 @@ mod engine {
                 vb.pp("lm_head"),
             )
             .map_err(|e| CandleOcrError::ModelLoadFailed(format!("Failed to load decoder: {}", e)))?;
+
+            // The mmap-backed `VarBuilder` borrows `device`, and every weight it holds has now
+            // been loaded into the submodules above, so release it before `device` moves into
+            // the engine below. ~keep
+            drop(vb);
 
             decoder.clear_kv_cache();
 

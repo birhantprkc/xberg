@@ -250,20 +250,6 @@ impl TrocrEngine {
         ))
     }
 
-    /// Process a single image and extract text via OCR.
-    ///
-    /// # Arguments
-    ///
-    /// * `image_bytes` - Raw JPEG/PNG/TIFF image data
-    ///
-    /// # Returns
-    ///
-    /// Extracted text with optional confidence score.
-    ///
-    /// # Errors
-    ///
-    /// - Image decode fails
-    /// - Model inference fails
     /// Autoregressively decode token ids from `encoder_hidden_states`, one token per iteration,
     /// stopping at `eos_token_id` or 1000 iterations. Split out of [`Self::process_image`] to
     /// keep that function under the workspace line-count limit. ~keep
@@ -333,6 +319,20 @@ impl TrocrEngine {
         Ok(token_ids)
     }
 
+    /// Process a single image and extract text via OCR.
+    ///
+    /// # Arguments
+    ///
+    /// * `image_bytes` - Raw JPEG/PNG/TIFF image data
+    ///
+    /// # Returns
+    ///
+    /// Extracted text with optional confidence score.
+    ///
+    /// # Errors
+    ///
+    /// - Image decode fails
+    /// - Model inference fails
     pub fn process_image(&self, image_bytes: &[u8]) -> Result<CandleOcrOutput> {
         if image_bytes.is_empty() {
             return Err(CandleOcrError::UnsupportedConfig("Empty image data".to_string()));

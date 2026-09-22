@@ -217,28 +217,6 @@ impl DeepseekOCREngine {
         self.dtype
     }
 
-    /// Process an image and return the recognized text.
-    ///
-    /// Runs the full inference pipeline:
-    /// 1. Decode image bytes to DynamicImage
-    /// 2. Preprocess to tensor format (images_ori, image_crop, images_seq_mask, images_spatial_crop)
-    /// 3. Tokenize prompt
-    /// 4. Run autoregressive token generation via forward_initial and forward_step
-    /// 5. Decode the output token sequence to text
-    ///
-    /// # Arguments
-    ///
-    /// * `image_bytes` - Raw image data (PNG, JPG, etc.)
-    /// * `prompt` - Optional prompt override (otherwise uses default OCR prompt)
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::CandleOcrError`] if:
-    /// - Image decoding fails
-    /// - Preprocessing fails
-    /// - Tokenization fails
-    /// - Inference fails
-    /// - Token decoding fails
     /// Build the local-crop tensors (`image_crop`, `images_spatial_crop`) and the resulting
     /// image-token count for `img`, choosing between the tiled "Gundam" grid and the
     /// global-view-only path per [`crop_grid_for`]. Split out of [`Self::process_image`] to
@@ -400,6 +378,28 @@ impl DeepseekOCREngine {
         Ok(output_tokens)
     }
 
+    /// Process an image and return the recognized text.
+    ///
+    /// Runs the full inference pipeline:
+    /// 1. Decode image bytes to DynamicImage
+    /// 2. Preprocess to tensor format (images_ori, image_crop, images_seq_mask, images_spatial_crop)
+    /// 3. Tokenize prompt
+    /// 4. Run autoregressive token generation via forward_initial and forward_step
+    /// 5. Decode the output token sequence to text
+    ///
+    /// # Arguments
+    ///
+    /// * `image_bytes` - Raw image data (PNG, JPG, etc.)
+    /// * `prompt` - Optional prompt override (otherwise uses default OCR prompt)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::CandleOcrError`] if:
+    /// - Image decoding fails
+    /// - Preprocessing fails
+    /// - Tokenization fails
+    /// - Inference fails
+    /// - Token decoding fails
     pub fn process_image(&mut self, image_bytes: &[u8], prompt: Option<&str>) -> Result<String> {
         tracing::debug!(
             image_size = image_bytes.len(),
