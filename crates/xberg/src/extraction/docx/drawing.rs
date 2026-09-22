@@ -117,6 +117,149 @@ pub enum WrapType {
     Through,
 }
 
+/// Parse a `positionH`/`positionV` element and apply its offset to the matching field on
+/// the drawing's anchor, consuming through the element's own end tag.
+fn apply_drawing_position(
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+    drawing: &mut Drawing,
+    e: &BytesStart,
+    is_horizontal: bool,
+) {
+    let element_name = if is_horizontal { "positionH" } else { "positionV" };
+    let default_relative_from = if is_horizontal { "page" } else { "paragraph" };
+    let relative_from = get_attr(e, "relativeFrom").unwrap_or_else(|| default_relative_from.to_string());
+    let offset = parse_position(reader, element_name);
+    // `parse_position` reads through its own end tag without touching `budget`;
+    // refund the caller's `enter()`.
+    budget.leave();
+    if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+        let position = Some(Position { relative_from, offset });
+        if is_horizontal {
+            anchor.position_h = position;
+        } else {
+            anchor.position_v = position;
+        }
+    }
+}
+
+/// Handle one `Event::Start` child element of `<w:drawing>`, mutating `drawing` and the
+/// manual `depth` counter `parse_drawing` uses to find its own closing tag (see that
+/// function's doc comment for why `depth` and `budget`'s document-wide accounting are
+/// unrelated mechanisms).
+fn handle_drawing_start_event(
+    e: &BytesStart,
+    drawing: &mut Drawing,
+    depth: &mut i32,
+    reader: &mut Reader<&[u8]>,
+    budget: &mut SecurityBudget,
+) -> Result<(), SecurityError> {
+    let local = e.local_name();
+    let local_name = local.as_ref();
+
+    match local_name {
+        "inline" => {
+            drawing.drawing_type = DrawingType::Inline;
+            *depth += 1;
+        }
+        "anchor" => {
+            let anchor = AnchorProperties {
+                behind_doc: get_attr_bool(e, "behindDoc"),
+                layout_in_cell: get_attr_bool(e, "layoutInCell"),
+                relative_height: get_attr_i64(e, "relativeHeight"),
+                ..Default::default()
+            };
+            drawing.drawing_type = DrawingType::Anchored(anchor);
+            *depth += 1;
+        }
+        "positionH" => apply_drawing_position(reader, budget, drawing, e, true),
+        "positionV" => apply_drawing_position(reader, budget, drawing, e, false),
+        "blip" => {
+            if drawing.image_ref.is_none() {
+                drawing.image_ref = get_attr(e, "embed").or_else(|| get_attr(e, "link"));
+            }
+            *depth += 1;
+        }
+        "txbxContent" => {
+            // Consumes through its own `</w:txbxContent>` end tag, so it
+            // must not also increment `depth` (#81). `collect_txbx_content_text`
+            // now threads `budget` through and balances the `enter()` above
+            // internally, so no manual `budget.leave()` is needed here. ~keep
+            let text = collect_txbx_content_text(reader, budget)?;
+            if !text.is_empty() {
+                drawing.text_box_content = Some(text);
+            }
+        }
+        "wrapSquare" | "wrapTight" | "wrapTopAndBottom" | "wrapThrough" => {
+            if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+                match local_name {
+                    "wrapSquare" => anchor.wrap_type = WrapType::Square,
+                    "wrapTight" => anchor.wrap_type = WrapType::Tight,
+                    "wrapTopAndBottom" => anchor.wrap_type = WrapType::TopAndBottom,
+                    "wrapThrough" => anchor.wrap_type = WrapType::Through,
+                    _ => {}
+                }
+            }
+            *depth += 1;
+        }
+        _ => {
+            *depth += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply one `Event::Empty` child element of `<w:drawing>` to `drawing`.
+fn apply_drawing_empty_event(e: &BytesStart, drawing: &mut Drawing) {
+    let local = e.local_name();
+    let local_name = local.as_ref();
+
+    match local_name {
+        "extent" => {
+            if let (Some(cx), Some(cy)) = (get_attr_i64(e, "cx"), get_attr_i64(e, "cy")) {
+                drawing.extent = Some(Extent { cx, cy });
+            }
+        }
+        "docPr" => {
+            drawing.doc_properties = Some(DocProperties {
+                id: get_attr(e, "id"),
+                name: get_attr(e, "name"),
+                description: get_attr(e, "descr"),
+            });
+        }
+        "blip" if drawing.image_ref.is_none() => {
+            drawing.image_ref = get_attr(e, "embed").or_else(|| get_attr(e, "link"));
+        }
+        "wrapNone" => {
+            if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+                anchor.wrap_type = WrapType::None;
+            }
+        }
+        "wrapSquare" => {
+            if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+                anchor.wrap_type = WrapType::Square;
+            }
+        }
+        "wrapTight" => {
+            if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+                anchor.wrap_type = WrapType::Tight;
+            }
+        }
+        "wrapTopAndBottom" => {
+            if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+                anchor.wrap_type = WrapType::TopAndBottom;
+            }
+        }
+        "wrapThrough" => {
+            if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
+                anchor.wrap_type = WrapType::Through;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Parse a drawing object starting after the `<w:drawing>` Start event.
 ///
 /// This function reads events until it encounters the closing `</w:drawing>` tag,
@@ -144,129 +287,10 @@ pub(crate) fn parse_drawing(reader: &mut Reader<&[u8]>, budget: &mut SecurityBud
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                let local = e.local_name();
-                let local_name = local.as_ref();
-
-                match local_name {
-                    "inline" => {
-                        drawing.drawing_type = DrawingType::Inline;
-                        depth += 1;
-                    }
-                    "anchor" => {
-                        let anchor = AnchorProperties {
-                            behind_doc: get_attr_bool(e, "behindDoc"),
-                            layout_in_cell: get_attr_bool(e, "layoutInCell"),
-                            relative_height: get_attr_i64(e, "relativeHeight"),
-                            ..Default::default()
-                        };
-                        drawing.drawing_type = DrawingType::Anchored(anchor);
-                        depth += 1;
-                    }
-                    "positionH" => {
-                        let relative_from = get_attr(e, "relativeFrom").unwrap_or_else(|| "page".to_string());
-                        let position = parse_position(reader, "positionH");
-                        // `parse_position` reads through its own `</wp:positionH>`
-                        // without touching `budget`; refund the enter above.
-                        budget.leave();
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.position_h = Some(Position {
-                                relative_from,
-                                offset: position,
-                            });
-                        }
-                    }
-                    "positionV" => {
-                        let relative_from = get_attr(e, "relativeFrom").unwrap_or_else(|| "paragraph".to_string());
-                        let position = parse_position(reader, "positionV");
-                        // Same as `positionH`: consumes its own end tag.
-                        budget.leave();
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.position_v = Some(Position {
-                                relative_from,
-                                offset: position,
-                            });
-                        }
-                    }
-                    "blip" => {
-                        if drawing.image_ref.is_none() {
-                            drawing.image_ref = get_attr(e, "embed").or_else(|| get_attr(e, "link"));
-                        }
-                        depth += 1;
-                    }
-                    "txbxContent" => {
-                        // Consumes through its own `</w:txbxContent>` end tag, so it
-                        // must not also increment `depth` (#81). `collect_txbx_content_text`
-                        // now threads `budget` through and balances the `enter()` above
-                        // internally, so no manual `budget.leave()` is needed here. ~keep
-                        let text = collect_txbx_content_text(reader, budget)?;
-                        if !text.is_empty() {
-                            drawing.text_box_content = Some(text);
-                        }
-                    }
-                    "wrapSquare" | "wrapTight" | "wrapTopAndBottom" | "wrapThrough" => {
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            match local_name {
-                                "wrapSquare" => anchor.wrap_type = WrapType::Square,
-                                "wrapTight" => anchor.wrap_type = WrapType::Tight,
-                                "wrapTopAndBottom" => anchor.wrap_type = WrapType::TopAndBottom,
-                                "wrapThrough" => anchor.wrap_type = WrapType::Through,
-                                _ => {}
-                            }
-                        }
-                        depth += 1;
-                    }
-                    _ => {
-                        depth += 1;
-                    }
-                }
+                handle_drawing_start_event(e, &mut drawing, &mut depth, reader, budget)?;
             }
             Ok(Event::Empty(ref e)) => {
-                let local = e.local_name();
-                let local_name = local.as_ref();
-
-                match local_name {
-                    "extent" => {
-                        if let (Some(cx), Some(cy)) = (get_attr_i64(e, "cx"), get_attr_i64(e, "cy")) {
-                            drawing.extent = Some(Extent { cx, cy });
-                        }
-                    }
-                    "docPr" => {
-                        drawing.doc_properties = Some(DocProperties {
-                            id: get_attr(e, "id"),
-                            name: get_attr(e, "name"),
-                            description: get_attr(e, "descr"),
-                        });
-                    }
-                    "blip" if drawing.image_ref.is_none() => {
-                        drawing.image_ref = get_attr(e, "embed").or_else(|| get_attr(e, "link"));
-                    }
-                    "wrapNone" => {
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.wrap_type = WrapType::None;
-                        }
-                    }
-                    "wrapSquare" => {
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.wrap_type = WrapType::Square;
-                        }
-                    }
-                    "wrapTight" => {
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.wrap_type = WrapType::Tight;
-                        }
-                    }
-                    "wrapTopAndBottom" => {
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.wrap_type = WrapType::TopAndBottom;
-                        }
-                    }
-                    "wrapThrough" => {
-                        if let DrawingType::Anchored(ref mut anchor) = drawing.drawing_type {
-                            anchor.wrap_type = WrapType::Through;
-                        }
-                    }
-                    _ => {}
-                }
+                apply_drawing_empty_event(e, &mut drawing);
             }
             Ok(Event::End(e)) => {
                 budget.leave();
