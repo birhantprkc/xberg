@@ -1266,13 +1266,6 @@ traineddata = "traineddata"
   "nesting-too-deep",
   "too-many-parameters",
 ]
-"tools/benchmark-harness/src/sizes.rs" = ["cyclomatic-complexity", "file-too-long", "nesting-too-deep"]
-"tools/benchmark-harness/src/structural_sidecar.rs" = [
-  "cyclomatic-complexity",
-  "file-too-long",
-  "function-too-long",
-  "nesting-too-deep",
-]
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
