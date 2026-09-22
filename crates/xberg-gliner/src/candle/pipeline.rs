@@ -108,7 +108,7 @@ fn gather_and_span_rep(
 /// [`run_pipeline`] to keep that function under the workspace line-count limit. ~keep
 fn compute_pred_count_and_struct_proj(
     hidden: &Tensor,
-    schema_positions: &[usize],
+    schema_positions: &[i64],
     heads: &crate::candle::heads::AllHeads,
     device: &candle_core::Device,
 ) -> crate::candle::Result<(usize, Option<Tensor>)> {
