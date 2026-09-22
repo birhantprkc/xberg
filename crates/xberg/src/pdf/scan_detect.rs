@@ -145,6 +145,38 @@ fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageScanSignals>
     })
 }
 
+/// Apply `page_work` to every page index, in parallel across the configured thread budget.
+///
+/// Both page passes in this module read one page each through a shared `&PdfDocument`, which
+/// `xberg_native_pdf` asserts is `Send + Sync` (`_assert_send_sync::<PdfDocument>()` in its
+/// `document` module) with its interior state behind mutexes for exactly this reason. They ran
+/// as plain sequential loops over `0..page_count`, so scan detection and provenance routing
+/// held one core for the whole document whatever `ConcurrencyConfig::max_threads` was set to,
+/// and no thread budget could shorten them (issue #1723). This is the same shape as the
+/// page-rendering pass in `extractors/pdf/ocr/rendering.rs` (issue #1666).
+///
+/// `into_par_iter()` over a `Range<usize>` is an `IndexedParallelIterator`, so `collect()`
+/// returns one entry per page in page order. Both callers index their result by page, so their
+/// output is positional and unchanged. ~keep
+fn map_pages<T, F>(page_count: usize, page_work: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync + Send,
+{
+    // rayon's work-stealing pool needs OS threads; wasm32 has none, so this falls back to a
+    // sequential iterator there, matching the gate on the paragraph pass in
+    // `pdf/structure/pipeline.rs`. ~keep
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        (0..page_count).into_par_iter().map(page_work).collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        (0..page_count).map(page_work).collect()
+    }
+}
+
 /// Grade every page of `doc`.
 ///
 /// Infallible: an unreadable page scores `0.0` rather than failing extraction.
@@ -152,9 +184,9 @@ fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageScanSignals>
 pub(crate) fn detect(doc: &PdfDocument) -> Option<ScanDetection> {
     let page_count = doc.page_count().ok()?;
 
-    let page_confidence: Vec<f32> = (0..page_count)
-        .map(|page_index| page_signals(doc, page_index).as_ref().map_or(0.0, score_page))
-        .collect();
+    let page_confidence = map_pages(page_count, |page_index| {
+        page_signals(doc, page_index).as_ref().map_or(0.0, score_page)
+    });
 
     let confidence = page_confidence.iter().copied().fold(0.0_f32, f32::max);
 
@@ -231,14 +263,143 @@ pub(crate) fn fabricated_provenance_page_indices(doc: &PdfDocument, min_ratio: f
         return Vec::new();
     };
 
-    (0..page_count)
-        .filter(|&page_index| page_has_fabricated_text(doc, page_index, min_ratio, min_chars))
+    let fabricated = map_pages(page_count, |page_index| {
+        page_has_fabricated_text(doc, page_index, min_ratio, min_chars)
+    });
+
+    fabricated
+        .into_iter()
+        .enumerate()
+        .filter_map(|(page_index, is_fabricated)| is_fabricated.then_some(page_index))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both page passes go through [`map_pages`], so the order guarantee is pinned on it
+    /// directly. A pass that only counted pages would still be green on a shuffled result,
+    /// and every caller indexes its result by page number.
+    #[test]
+    fn map_pages_returns_one_entry_per_page_in_page_order() {
+        let page_count = 1024;
+        let squares = map_pages(page_count, |page_index| page_index * page_index);
+        assert_eq!(
+            squares,
+            (0..page_count)
+                .map(|page_index| page_index * page_index)
+                .collect::<Vec<_>>(),
+            "map_pages must return one entry per page, in page order"
+        );
+    }
+
+    /// The pass must reach more than one thread. Asserted against a pool this test builds
+    /// rather than the machine's core count, so it means the same thing on a one-core runner
+    /// as on the 32-core box the issue was measured on, and against the closure's own record
+    /// rather than wall clock, which flakes under load.
+    ///
+    /// Each page holds its thread for [`DISPATCH_PAGE_HOLD`]: with no work per page, one
+    /// worker drains the whole range before the others wake on a loaded runner (22 of 60
+    /// runs under a 12-core load), and the pass then looks sequential. ~keep
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn map_pages_dispatches_pages_across_the_pool() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        const DISPATCH_PAGE_COUNT: usize = 512;
+        const DISPATCH_POOL_THREADS: usize = 8;
+        const DISPATCH_PAGE_HOLD: std::time::Duration = std::time::Duration::from_micros(200);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(DISPATCH_POOL_THREADS)
+            .build()
+            .expect("the test's own pool must build");
+        let threads: Mutex<HashSet<std::thread::ThreadId>> = Mutex::new(HashSet::new());
+
+        let pages = pool.install(|| {
+            map_pages(DISPATCH_PAGE_COUNT, |page_index| {
+                threads
+                    .lock()
+                    .expect("thread record must not be poisoned")
+                    .insert(std::thread::current().id());
+                std::thread::sleep(DISPATCH_PAGE_HOLD);
+                page_index
+            })
+        });
+
+        assert_eq!(pages, (0..DISPATCH_PAGE_COUNT).collect::<Vec<_>>());
+        let distinct = threads.lock().expect("thread record must not be poisoned").len();
+        assert!(
+            distinct > 1,
+            "map_pages ran every page on {distinct} thread(s): the pass did not dispatch across the pool"
+        );
+    }
+
+    /// The wiring, on a real document: both passes must agree with a page-by-page run, entry
+    /// for entry. This is what says `detect` and `fabricated_provenance_page_indices` read the
+    /// pages they claim to and report them in page order, which the seam test above cannot
+    /// say on its own.
+    ///
+    /// The fixture is chosen so that a reordering is visible: its pages do not all score the
+    /// same, and some but not all of them carry a fabricated mapping (15 of 18). On a
+    /// born-digital fixture every page scores `0.0` and no page is fabricated, so the two
+    /// comparisons below would pass on any permutation. Both properties are asserted on the
+    /// sequential run so the fixture cannot drift into that shape unnoticed.
+    ///
+    /// The parallel pass runs on its own freshly opened handle. A handle the sequential pass
+    /// has already walked has every font and page object cached, so a concurrent read
+    /// through it never races a cold load, which is the shape #1737 exists to make
+    /// order-independent. ~keep
+    #[test]
+    fn both_page_passes_match_a_page_by_page_run() {
+        let thresholds = crate::core::config::OcrQualityThresholds::default();
+        let min_ratio = thresholds.min_provenance_fallback_ratio;
+        let min_chars = thresholds.min_total_non_whitespace;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/non_ascii_text.pdf");
+        let sequential_doc = PdfDocument::open(&path).expect("corpus document must open");
+        let page_count = sequential_doc
+            .page_count()
+            .expect("corpus document must report a page count");
+        assert!(
+            page_count > 1,
+            "a single-page fixture cannot detect a reordering; got {page_count} page(s)"
+        );
+
+        let sequential_scores: Vec<f32> = (0..page_count)
+            .map(|page_index| {
+                page_signals(&sequential_doc, page_index)
+                    .as_ref()
+                    .map_or(0.0, score_page)
+            })
+            .collect();
+        let sequential_fabricated: Vec<usize> = (0..page_count)
+            .filter(|&page_index| page_has_fabricated_text(&sequential_doc, page_index, min_ratio, min_chars))
+            .collect();
+        assert!(
+            sequential_scores.iter().any(|&score| score != sequential_scores[0]),
+            "fixture must score its pages differently for a reordering to be visible; got {sequential_scores:?}"
+        );
+        assert!(
+            !sequential_fabricated.is_empty() && sequential_fabricated.len() < page_count,
+            "fixture must fabricate some but not all pages for a reordering to be visible; \
+             got {sequential_fabricated:?} of {page_count}"
+        );
+
+        let parallel_doc = PdfDocument::open(&path).expect("corpus document must open a second time");
+        let detection = detect(&parallel_doc).expect("detection must run on the corpus document");
+        assert_eq!(
+            detection.page_confidence, sequential_scores,
+            "scan confidences must match a page-by-page run, page for page"
+        );
+        assert_eq!(
+            fabricated_provenance_page_indices(&parallel_doc, min_ratio, min_chars),
+            sequential_fabricated,
+            "fabricated-mapping pages must match a page-by-page run, in ascending page order"
+        );
+    }
 
     /// Scores are sums of `f32` weights, so `0.50 + 0.35 + 0.10` lands a few ULPs
     /// off `0.95`. Compare within tolerance rather than rounding the score.
