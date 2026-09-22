@@ -243,82 +243,17 @@ pub async fn run_pipeline_benchmark(config: &PipelineBenchmarkConfig) -> Result<
         config.paths.len()
     );
 
-    let dump_dir = if config.dump_outputs {
-        let dir = PathBuf::from("/tmp/xberg_pipeline");
-        let _ = std::fs::create_dir_all(&dir);
-        Some(dir)
-    } else {
-        None
-    };
+    let dump_dir = prepare_dump_dir(config.dump_outputs);
 
     let mut results = Vec::new();
     let total = docs.len();
 
     for (idx, doc) in docs.iter().enumerate() {
         eprint!("\r[{}/{}] {} ...", idx + 1, total, doc.name);
-        let gt_text = match doc.ground_truth_text.as_ref() {
-            Some(p) => match std::fs::read_to_string(p) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Warning: failed to read ground truth text {}: {}", p.display(), e);
-                    String::new()
-                }
-            },
-            None => String::new(),
-        };
-        let gt_markdown = match doc.ground_truth_markdown.as_ref() {
-            Some(p) => match std::fs::read_to_string(p) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("Warning: failed to read ground truth markdown {}: {}", p.display(), e);
-                    None
-                }
-            },
-            None => None,
-        };
-
-        let mut pipeline_results = Vec::new();
-
-        for &pipeline in &config.paths {
-            let pr = extract_and_score(pipeline, doc, &gt_text, gt_markdown.as_deref(), &config.fixtures_dir).await;
-
-            if let Some(ref dir) = dump_dir {
-                let doc_dir = dir.join(&doc.name);
-                let _ = std::fs::create_dir_all(&doc_dir);
-                let _ = std::fs::write(doc_dir.join(format!("{}.md", pipeline.name())), &pr.content);
-                if let Some(ref gt_md) = gt_markdown {
-                    let _ = std::fs::write(doc_dir.join("ground_truth.md"), gt_md);
-                }
-                let _ = std::fs::write(doc_dir.join("ground_truth_text.txt"), &gt_text);
-            }
-
-            pipeline_results.push(pr);
-        }
-
-        let best_sf1 = pipeline_results.iter().map(|r| r.sf1).fold(0.0_f64, f64::max);
-        let best_time = pipeline_results
-            .iter()
-            .map(|r| r.time_ms)
-            .filter(|t| !t.is_nan())
-            .fold(f64::INFINITY, f64::min);
-        if best_time.is_infinite() {
-            eprint!(
-                "\r[{}/{}] {:<30} SF1:{:.0}%\n",
-                idx + 1,
-                total,
-                doc.name,
-                best_sf1 * 100.0,
-            );
-        } else {
-            eprint!(
-                "\r[{}/{}] {:<30} SF1:{:.0}% {:.0}ms\n",
-                idx + 1,
-                total,
-                doc.name,
-                best_sf1 * 100.0,
-                best_time
-            );
-        }
+        let (gt_text, gt_markdown) = load_ground_truth(doc);
+        let pipeline_results =
+            run_doc_pipelines(config, doc, &gt_text, gt_markdown.as_deref(), dump_dir.as_deref()).await;
+        print_doc_progress(idx, total, doc, &pipeline_results);
 
         results.push(PipelineDocResult {
             name: doc.name.clone(),
@@ -331,6 +266,100 @@ pub async fn run_pipeline_benchmark(config: &PipelineBenchmarkConfig) -> Result<
     Ok(results)
 }
 
+/// Directory to dump per-document, per-pipeline markdown outputs into, when requested.
+fn prepare_dump_dir(dump_outputs: bool) -> Option<PathBuf> {
+    if !dump_outputs {
+        return None;
+    }
+    let dir = PathBuf::from("/tmp/xberg_pipeline");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// Read a document's ground truth text and (optional) ground truth markdown, warning on
+/// read failure rather than aborting the whole benchmark run.
+fn load_ground_truth(doc: &CorpusDocument) -> (String, Option<String>) {
+    let gt_text = match doc.ground_truth_text.as_ref() {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: failed to read ground truth text {}: {}", p.display(), e);
+                String::new()
+            }
+        },
+        None => String::new(),
+    };
+    let gt_markdown = match doc.ground_truth_markdown.as_ref() {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("Warning: failed to read ground truth markdown {}: {}", p.display(), e);
+                None
+            }
+        },
+        None => None,
+    };
+    (gt_text, gt_markdown)
+}
+
+/// Run every configured pipeline path against one document, optionally dumping each
+/// pipeline's output (and the ground truth) under `dump_dir`.
+async fn run_doc_pipelines(
+    config: &PipelineBenchmarkConfig,
+    doc: &CorpusDocument,
+    gt_text: &str,
+    gt_markdown: Option<&str>,
+    dump_dir: Option<&Path>,
+) -> Vec<PipelineResult> {
+    let mut pipeline_results = Vec::new();
+
+    for &pipeline in &config.paths {
+        let pr = extract_and_score(pipeline, doc, gt_text, gt_markdown, &config.fixtures_dir).await;
+
+        if let Some(dir) = dump_dir {
+            let doc_dir = dir.join(&doc.name);
+            let _ = std::fs::create_dir_all(&doc_dir);
+            let _ = std::fs::write(doc_dir.join(format!("{}.md", pipeline.name())), &pr.content);
+            if let Some(gt_md) = gt_markdown {
+                let _ = std::fs::write(doc_dir.join("ground_truth.md"), gt_md);
+            }
+            let _ = std::fs::write(doc_dir.join("ground_truth_text.txt"), gt_text);
+        }
+
+        pipeline_results.push(pr);
+    }
+
+    pipeline_results
+}
+
+/// Print the per-document progress line once every pipeline path has run.
+fn print_doc_progress(idx: usize, total: usize, doc: &CorpusDocument, pipeline_results: &[PipelineResult]) {
+    let best_sf1 = pipeline_results.iter().map(|r| r.sf1).fold(0.0_f64, f64::max);
+    let best_time = pipeline_results
+        .iter()
+        .map(|r| r.time_ms)
+        .filter(|t| !t.is_nan())
+        .fold(f64::INFINITY, f64::min);
+    if best_time.is_infinite() {
+        eprint!(
+            "\r[{}/{}] {:<30} SF1:{:.0}%\n",
+            idx + 1,
+            total,
+            doc.name,
+            best_sf1 * 100.0,
+        );
+    } else {
+        eprint!(
+            "\r[{}/{}] {:<30} SF1:{:.0}% {:.0}ms\n",
+            idx + 1,
+            total,
+            doc.name,
+            best_sf1 * 100.0,
+            best_time
+        );
+    }
+}
+
 /// Print a per-document + aggregate matrix table.
 pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, bottom_n: Option<usize>) {
     if results.is_empty() {
@@ -338,104 +367,114 @@ pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, 
         return;
     }
 
-    let display_results: Vec<&PipelineDocResult> = if let Some(n) = bottom_n {
-        let mut sorted: Vec<&PipelineDocResult> = results.iter().collect();
-        sorted.sort_by(|a, b| {
-            let a_worst = a
-                .results
-                .iter()
-                .map(|pr| sort_by.extract(pr))
-                .fold(f64::INFINITY, f64::min);
-            let b_worst = b
-                .results
-                .iter()
-                .map(|pr| sort_by.extract(pr))
-                .fold(f64::INFINITY, f64::min);
-            a_worst.partial_cmp(&b_worst).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        sorted.into_iter().take(n).collect()
-    } else {
-        results.iter().collect()
-    };
-
+    let display_results = select_display_results(results, sort_by, bottom_n);
     let pipelines: Vec<&str> = results[0].results.iter().map(|r| r.pipeline.name()).collect();
 
+    print_table_header(&pipelines);
+    for doc in &display_results {
+        print_table_row(doc);
+    }
+
+    eprintln!("{}", "-".repeat(36 + pipelines.len() * 35));
+    print_average_row(results, pipelines.len());
+    for aggregate in compute_aggregates(results) {
+        eprintln!("{}", format_coverage_line(&aggregate, results.len()));
+    }
+}
+
+/// Worst (per `sort_by`) metric across a document's pipeline results, used to rank
+/// documents when only the bottom `n` are being displayed.
+fn worst_metric(doc: &PipelineDocResult, sort_by: SortMetric) -> f64 {
+    doc.results
+        .iter()
+        .map(|pr| sort_by.extract(pr))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Select the documents to display, sorted worst-first and truncated to `bottom_n` when set.
+fn select_display_results(
+    results: &[PipelineDocResult],
+    sort_by: SortMetric,
+    bottom_n: Option<usize>,
+) -> Vec<&PipelineDocResult> {
+    let Some(n) = bottom_n else {
+        return results.iter().collect();
+    };
+    let mut sorted: Vec<&PipelineDocResult> = results.iter().collect();
+    sorted.sort_by(|a, b| {
+        worst_metric(a, sort_by)
+            .partial_cmp(&worst_metric(b, sort_by))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted.into_iter().take(n).collect()
+}
+
+fn print_table_header(pipelines: &[&str]) {
     eprint!("{:<30} {:>5}", "Document", "Type");
-    for p in &pipelines {
+    for p in pipelines {
         eprint!(" {:>8} {:>8} {:>8} {:>7}", format!("{} SF1", p), "TF1", "Ord", "ms");
     }
     eprintln!();
     eprintln!("{}", "-".repeat(36 + pipelines.len() * 35));
+}
 
-    for doc in &display_results {
-        eprint!(
-            "{:<30} {:>5}",
-            if doc.name.len() > 29 {
-                &doc.name[..29]
-            } else {
-                &doc.name
-            },
-            &doc.file_type,
-        );
-        for pr in &doc.results {
-            let sf1_str = if pr.sf1.is_nan() {
-                "    —   ".to_string()
-            } else {
-                format!("{:>7.1}%", pr.sf1 * 100.0)
-            };
-            let tf1_str = if pr.tf1.is_nan() {
-                "    —   ".to_string()
-            } else {
-                format!("{:>7.1}%", pr.tf1 * 100.0)
-            };
-            let ord_str = if pr.order_score.is_nan() {
-                "    —   ".to_string()
-            } else {
-                format!("{:>7.1}%", pr.order_score * 100.0)
-            };
-            let time_str = if pr.time_ms.is_nan() {
-                "    N/A".to_string()
-            } else {
-                format!("{:>7.0}", pr.time_ms)
-            };
-            eprint!(" {} {} {} {}", sf1_str, tf1_str, ord_str, time_str);
-        }
-        eprintln!();
+/// Format a percentage metric, or an em dash placeholder when it is NaN (unavailable).
+fn format_percent_or_dash(value: f64) -> String {
+    if value.is_nan() {
+        "    —   ".to_string()
+    } else {
+        format!("{:>7.1}%", value * 100.0)
     }
+}
 
-    eprintln!("{}", "-".repeat(36 + pipelines.len() * 35));
+fn print_table_row(doc: &PipelineDocResult) {
+    eprint!(
+        "{:<30} {:>5}",
+        if doc.name.len() > 29 {
+            &doc.name[..29]
+        } else {
+            &doc.name
+        },
+        &doc.file_type,
+    );
+    for pr in &doc.results {
+        let time_str = if pr.time_ms.is_nan() {
+            "    N/A".to_string()
+        } else {
+            format!("{:>7.0}", pr.time_ms)
+        };
+        eprint!(
+            " {} {} {} {}",
+            format_percent_or_dash(pr.sf1),
+            format_percent_or_dash(pr.tf1),
+            format_percent_or_dash(pr.order_score),
+            time_str
+        );
+    }
+    eprintln!();
+}
+
+/// Mean of the finite values a per-pipeline-column extractor yields across `results`, or
+/// `0.0` when none are finite (matches the pre-extraction inline behavior).
+fn column_mean(results: &[PipelineDocResult], pipeline_index: usize, extract: impl Fn(&PipelineResult) -> f64) -> f64 {
+    let values: Vec<f64> = results
+        .iter()
+        .map(|r| extract(&r.results[pipeline_index]))
+        .filter(|v| v.is_finite())
+        .collect();
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn print_average_row(results: &[PipelineDocResult], pipeline_count: usize) {
     eprint!("{:<30} {:>5}", "AVERAGE", "");
-    for (i, _) in pipelines.iter().enumerate() {
-        let sf1_vals: Vec<f64> = results
-            .iter()
-            .map(|r| r.results[i].sf1)
-            .filter(|v| v.is_finite())
-            .collect();
-        let sf1 = if !sf1_vals.is_empty() {
-            sf1_vals.iter().sum::<f64>() / sf1_vals.len() as f64
-        } else {
-            0.0
-        };
-        let tf1_vals: Vec<f64> = results
-            .iter()
-            .map(|r| r.results[i].tf1)
-            .filter(|v| v.is_finite())
-            .collect();
-        let tf1 = if !tf1_vals.is_empty() {
-            tf1_vals.iter().sum::<f64>() / tf1_vals.len() as f64
-        } else {
-            0.0
-        };
-        let order_vals: Vec<f64> = results
-            .iter()
-            .map(|r| r.results[i].order_score)
-            .filter(|v| v.is_finite())
-            .collect();
-        let order = if !order_vals.is_empty() {
-            order_vals.iter().sum::<f64>() / order_vals.len() as f64
-        } else {
-            0.0
-        };
+    for i in 0..pipeline_count {
+        let sf1 = column_mean(results, i, |pr| pr.sf1);
+        let tf1 = column_mean(results, i, |pr| pr.tf1);
+        let order = column_mean(results, i, |pr| pr.order_score);
         let time_vals: Vec<f64> = results
             .iter()
             .map(|r| r.results[i].time_ms)
@@ -461,9 +500,6 @@ pub fn print_pipeline_table(results: &[PipelineDocResult], sort_by: SortMetric, 
         }
     }
     eprintln!();
-    for aggregate in compute_aggregates(results) {
-        eprintln!("{}", format_coverage_line(&aggregate, results.len()));
-    }
 }
 
 fn format_coverage_line(aggregate: &PipelineAggregate, total_docs: usize) -> String {
@@ -706,12 +742,16 @@ fn hash_worktree() -> Option<String> {
 }
 
 fn scorer_hash() -> String {
+    // Paths are relative to this file's directory (`src/pipeline_benchmark/`); the quality
+    // module was split into `mod.rs` + `tests.rs` and this file into `mod.rs`, but the hash
+    // must keep covering the same logical scorer source as before the split. ~keep
     let mut hasher = blake3::Hasher::new();
     for source in [
-        include_bytes!("structural_sidecar.rs").as_slice(),
-        include_bytes!("quality.rs").as_slice(),
-        include_bytes!("markdown_quality.rs").as_slice(),
-        include_bytes!("pipeline_benchmark.rs").as_slice(),
+        include_bytes!("../structural_sidecar.rs").as_slice(),
+        include_bytes!("../quality/mod.rs").as_slice(),
+        include_bytes!("../quality/tests.rs").as_slice(),
+        include_bytes!("../markdown_quality.rs").as_slice(),
+        include_bytes!("mod.rs").as_slice(),
     ] {
         hash_bytes_into(&mut hasher, source);
     }
@@ -844,158 +884,4 @@ fn write_summary(summary: &PipelineRunSummary, path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-
-    fn test_config(fixtures_dir: PathBuf) -> PipelineBenchmarkConfig {
-        PipelineBenchmarkConfig {
-            fixtures_dir,
-            paths: vec![Pipeline::Baseline],
-            doc_filter: Vec::new(),
-            exact_doc_filter: Vec::new(),
-            dump_outputs: false,
-            json_output: None,
-            sort_by: SortMetric::Sf1,
-            bottom_n: None,
-            triage_blocks: false,
-        }
-    }
-
-    #[test]
-    fn structural_scoring_uses_content_after_50_kib() {
-        let prefix = format!("{}\n\n", "plain text ".repeat(6_000));
-        assert!(prefix.len() > 50 * 1024);
-        let markdown = format!("{prefix}# Tail heading\n");
-        let structural = score_structural_markdown(&markdown, &markdown);
-        assert_eq!(structural.sf1, 1.0);
-        assert_eq!(structural.per_type_sf1.get("heading"), Some(&1.0));
-    }
-
-    #[test]
-    fn aggregates_count_available_metrics_independently() {
-        let pipeline_result = |sf1, tf1| PipelineResult {
-            pipeline: Pipeline::Docling,
-            sf1,
-            tf1,
-            char_similarity: tf1,
-            order_score: tf1,
-            per_type_sf1: HashMap::new(),
-            per_type_precision: HashMap::new(),
-            per_type_recall: HashMap::new(),
-            time_ms: 10.0,
-            missing_tokens: Vec::new(),
-            extra_tokens: Vec::new(),
-            content: String::new(),
-        };
-        let doc_result = |name: &str, sf1, tf1| PipelineDocResult {
-            name: name.to_string(),
-            file_type: "pdf".to_string(),
-            file_size: 1,
-            results: vec![pipeline_result(sf1, tf1)],
-        };
-        let results = vec![
-            doc_result("all-metrics", 0.75, 0.75),
-            doc_result("tf1-only", f64::NAN, 0.25),
-        ];
-
-        let aggregates = compute_aggregates(&results);
-
-        assert_eq!(aggregates.len(), 1);
-        assert_eq!(aggregates[0].sf1_count, Some(1));
-        assert_eq!(aggregates[0].tf1_count, Some(2));
-        assert_eq!(aggregates[0].mean_tf1, 0.5);
-        assert_eq!(aggregates[0].p50_tf1, 0.75);
-        let serialized = serde_json::to_value(&aggregates).unwrap();
-        assert_eq!(serialized[0]["sf1_count"], 1);
-        assert_eq!(serialized[0]["tf1_count"], 2);
-        assert_eq!(
-            format_coverage_line(&aggregates[0], results.len()),
-            "  docling coverage: SF1 1/2 docs, TF1 2/2 docs"
-        );
-    }
-
-    #[test]
-    fn aggregates_preserve_all_unavailable_scores() {
-        let results = vec![PipelineDocResult {
-            name: "failure".to_string(),
-            file_type: "pdf".to_string(),
-            file_size: 1,
-            results: vec![PipelineResult {
-                pipeline: Pipeline::Docling,
-                sf1: f64::NAN,
-                tf1: f64::NAN,
-                char_similarity: f64::NAN,
-                order_score: f64::NAN,
-                per_type_sf1: HashMap::new(),
-                per_type_precision: HashMap::new(),
-                per_type_recall: HashMap::new(),
-                time_ms: f64::NAN,
-                missing_tokens: Vec::new(),
-                extra_tokens: Vec::new(),
-                content: String::new(),
-            }],
-        }];
-
-        let aggregates = compute_aggregates(&results);
-        let serialized = serde_json::to_value(&aggregates).unwrap();
-
-        assert!(aggregates[0].mean_sf1.is_nan());
-        assert!(aggregates[0].mean_tf1.is_nan());
-        assert_eq!(aggregates[0].sf1_count, Some(0));
-        assert_eq!(aggregates[0].tf1_count, Some(0));
-        assert!(aggregates[0].p50_sf1.is_nan());
-        assert!(aggregates[0].p50_tf1.is_nan());
-        assert!(serialized[0]["mean_sf1"].is_null());
-        assert!(serialized[0]["mean_tf1"].is_null());
-        assert!(serialized[0]["p50_sf1"].is_null());
-        assert!(serialized[0]["p50_tf1"].is_null());
-    }
-
-    #[test]
-    fn legacy_summary_deserializes_without_provenance() {
-        let summary: PipelineRunSummary = serde_json::from_value(serde_json::json!({
-            "timestamp": "2026-01-01T00:00:00Z",
-            "git_sha": "abc",
-            "doc_count": 0,
-            "pipeline_count": 0,
-            "aggregates": [{
-                "pipeline": "docling",
-                "mean_sf1": 0.0,
-                "mean_tf1": 0.0,
-                "mean_time_ms": 0.0,
-                "p50_sf1": 0.0,
-                "p50_tf1": 0.0,
-                "p50_time_ms": 0.0,
-                "p90_time_ms": 0.0
-            }],
-            "docs": []
-        }))
-        .unwrap();
-        assert!(summary.provenance.hash_algorithm.is_empty());
-        assert_eq!(summary.aggregates[0].sf1_count, None);
-        assert_eq!(summary.aggregates[0].tf1_count, None);
-        assert_eq!(
-            format_coverage_line(&summary.aggregates[0], 0),
-            "  docling coverage: unknown (legacy artifact)"
-        );
-    }
-
-    #[test]
-    fn config_hash_tracks_exact_selection() {
-        let mut config = test_config(PathBuf::from("fixtures"));
-        let before = hash_config(&config);
-        config.exact_doc_filter.push("fixture-a".to_string());
-        assert_ne!(before, hash_config(&config));
-    }
-
-    #[tokio::test]
-    async fn empty_selection_is_an_error() {
-        let fixtures = tempfile::tempdir().unwrap();
-        let error = run_pipeline_benchmark(&test_config(fixtures.path().to_path_buf()))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, crate::Error::Config(_)));
-    }
-}
+mod tests;
