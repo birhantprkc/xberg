@@ -3636,12 +3636,12 @@ mod tests {
         buf
     }
 
-    /// #1690: `render_selected_pages_from_document` must actually dispatch page renders
-    /// across the thread pool, not merely be fast. A wall-clock threshold on a shared
-    /// build box is the flaky test this round already has one of (xberg-enterprise#2786);
-    /// this asserts the MECHANISM instead of its timing consequence, so it cannot flake
-    /// under load -- it either used more than one OS thread to render the batch or it
-    /// did not, independent of how long that took.
+    /// #1690/#1747: `render_selected_pages_from_document` must actually dispatch page
+    /// renders across the thread pool, not merely be fast. A wall-clock threshold on a
+    /// shared build box is the flaky test this round already has one of
+    /// (xberg-enterprise#2786); this asserts the MECHANISM instead of its timing
+    /// consequence, so it cannot flake under load -- it either used more than one OS
+    /// thread to render the batch or it did not, independent of how long that took.
     ///
     /// The render calls run inside a thread pool this test builds itself (4 threads,
     /// not the ambient global pool), so the assertion never depends on how many CPUs the
@@ -3651,6 +3651,20 @@ mod tests {
     /// remaining range to a stolen thread whenever one is idle, and this batch has far
     /// more real per-page rendering work (rasterizing a full page) than the handful of
     /// pages needed for a work-stealing pool to actually steal.
+    ///
+    /// #1747: two defects let this pass without observing parallel dispatch at all. The
+    /// recorded thread set is process-global, so it is scoped here to this pool's own
+    /// named threads (`RENDER_POOL_PREFIX`) rather than every thread the whole process
+    /// ever ran a render on -- otherwise a concurrently running extraction adds its own
+    /// thread ids and a sequential regression can still read as parallel. And a freshly
+    /// built pool's workers start asleep: rayon wakes a sleeper through a futex, so the
+    /// thread running `install` can race through this batch before any wake lands and a
+    /// genuinely parallel pass records a single thread. `pool.broadcast` blocks until
+    /// every worker has run it, warming the pool before the measured dispatch -- the same
+    /// two fixes `pdf::native::images::parallel_tests` applies for #1732. ~keep
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    const RENDER_POOL_PREFIX: &str = "xberg-render-guard";
+
     #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
     #[test]
     #[serial_test::serial]
@@ -3663,19 +3677,115 @@ mod tests {
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
+            .thread_name(|index| format!("{RENDER_POOL_PREFIX}-{index}"))
             .build()
             .expect("building a dedicated 4-thread pool must succeed");
+        // Warm every worker before the measured dispatch; see the doc comment above. ~keep
+        pool.broadcast(|_| ());
         let result = pool.install(|| render_selected_pages_for_ocr(&pdf, &page_indices));
         assert!(result.is_ok(), "rendering the fixture must succeed: {:?}", result.err());
         assert_eq!(result.unwrap().len(), page_count, "every requested page must come back");
 
-        let threads = RENDER_CALL_THREAD_IDS.get().unwrap().lock().unwrap();
+        let recorded = RENDER_CALL_THREAD_NAMES.get().unwrap().lock().unwrap().clone();
+        let observed: std::collections::BTreeSet<&String> = recorded
+            .iter()
+            .filter(|name| name.starts_with(RENDER_POOL_PREFIX))
+            .collect();
         assert!(
-            threads.len() > 1,
-            "expected page renders to be observed on more than one OS thread (mechanism proof \
-             that rendering dispatched in parallel), got {} distinct thread(s): {:?}",
-            threads.len(),
-            *threads
+            observed.len() > 1,
+            "expected page renders to be observed on more than one of this pool's own named \
+             threads (mechanism proof that rendering dispatched in parallel), got {} of the \
+             pool's threads: {:?}; every thread recorded in this process: {:?}",
+            observed.len(),
+            observed,
+            recorded
+        );
+    }
+
+    /// #1747 control: an extraction running on a *different*, unnamed pool in the same
+    /// process must not be able to satisfy the scoped guard above. Recording every thread
+    /// unscoped would let this foreign pool's activity paper over a sequential regression
+    /// in the guard's own pool; scoping to `RENDER_POOL_PREFIX` must still fail and must
+    /// name the foreign thread it correctly ignored.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    #[serial_test::serial]
+    fn parallel_render_guard_ignores_a_foreign_pools_thread() {
+        clear_render_call_thread_ids();
+
+        let page_count = 4;
+        let pdf = build_minimal_multi_page_pdf(page_count);
+        let page_indices: Vec<usize> = (0..page_count).collect();
+
+        // Deliberately does not start with `RENDER_POOL_PREFIX`: a name sharing that prefix
+        // would satisfy the guard's own `starts_with` filter below and defeat this control. ~keep
+        const FOREIGN_PREFIX: &str = "xberg-foreign-control-pool";
+        let foreign_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|index| format!("{FOREIGN_PREFIX}-{index}"))
+            .build()
+            .expect("building the foreign single-thread pool must succeed");
+        foreign_pool.broadcast(|_| ());
+        let result = foreign_pool.install(|| render_selected_pages_for_ocr(&pdf, &page_indices));
+        assert!(
+            result.is_ok(),
+            "rendering on the foreign pool must succeed: {:?}",
+            result.err()
+        );
+
+        let recorded = RENDER_CALL_THREAD_NAMES.get().unwrap().lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|name| name.starts_with(FOREIGN_PREFIX)),
+            "the foreign pool's thread must have been recorded (unscoped) at all: {:?}",
+            recorded
+        );
+        let observed_for_guard: std::collections::BTreeSet<&String> = recorded
+            .iter()
+            .filter(|name| name.starts_with(RENDER_POOL_PREFIX))
+            .collect();
+        assert!(
+            observed_for_guard.is_empty(),
+            "the render guard's own pool never ran here, so scoping to {RENDER_POOL_PREFIX} must \
+             see nothing; got {:?} out of every recorded thread {:?}",
+            observed_for_guard,
+            recorded
+        );
+    }
+
+    /// #1747 control: the guard's own mechanism must fail, not merely pass vacuously, when
+    /// the render pass genuinely runs on one thread. A pool of one is the same shape a
+    /// sequential regression in `render_selected_pages_from_document` would produce.
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    #[serial_test::serial]
+    fn parallel_render_guard_fails_on_a_single_threaded_pool() {
+        clear_render_call_thread_ids();
+
+        let page_count = 20;
+        let pdf = build_minimal_multi_page_pdf(page_count);
+        let page_indices: Vec<usize> = (0..page_count).collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|index| format!("{RENDER_POOL_PREFIX}-{index}"))
+            .build()
+            .expect("building a dedicated single-thread pool must succeed");
+        pool.broadcast(|_| ());
+        let result = pool.install(|| render_selected_pages_for_ocr(&pdf, &page_indices));
+        assert!(result.is_ok(), "rendering the fixture must succeed: {:?}", result.err());
+
+        let recorded = RENDER_CALL_THREAD_NAMES.get().unwrap().lock().unwrap().clone();
+        let observed: std::collections::BTreeSet<&String> = recorded
+            .iter()
+            .filter(|name| name.starts_with(RENDER_POOL_PREFIX))
+            .collect();
+        assert_eq!(
+            observed.len(),
+            1,
+            "a one-thread pool must render on exactly its single named thread, not the {} the \
+             wide-pool guard requires; the guard's `> 1` assertion correctly fails on this shape: {:?}",
+            observed.len(),
+            observed
         );
     }
 
