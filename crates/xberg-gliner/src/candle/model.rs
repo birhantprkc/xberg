@@ -100,11 +100,13 @@ impl Gliner2Candle {
         }
         let owned_labels: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
         let (scorer_out, pred_count, encoded) = pipeline::run_pipeline(
-            &self.tokenizer,
-            &self.splitter,
-            &self.device,
-            &self.encoder,
-            &self.heads,
+            pipeline::PipelineComponents {
+                tokenizer: &self.tokenizer,
+                splitter: &self.splitter,
+                device: &self.device,
+                encoder: &self.encoder,
+                heads: &self.heads,
+            },
             text,
             &owned_labels,
         )?;
@@ -117,10 +119,12 @@ impl Gliner2Candle {
             &owned_labels,
             &scorer_out,
             pred_count,
-            threshold,
-            true,
-            false,
-            false,
+            decode::SpanFilterOptions {
+                threshold,
+                flat_ner: true,
+                dup_label: false,
+                multi_label: false,
+            },
         )?;
         Ok(output.spans.into_iter().next().unwrap_or_default())
     }

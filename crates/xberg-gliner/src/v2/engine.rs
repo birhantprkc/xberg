@@ -116,11 +116,13 @@ impl Gliner2 {
             &text,
             &encoded.words,
             &labels,
-            self.params.threshold,
-            self.params.max_width,
-            self.params.flat_ner,
-            self.params.dup_label,
-            self.params.multi_label,
+            crate::v2::decode::SpanDecodeOptions {
+                threshold: self.params.threshold,
+                max_width: self.params.max_width,
+                flat_ner: self.params.flat_ner,
+                dup_label: self.params.dup_label,
+                multi_label: self.params.multi_label,
+            },
         )
     }
 }

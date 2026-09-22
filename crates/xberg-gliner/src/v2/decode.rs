@@ -3,21 +3,34 @@ use ndarray::{ArrayViewD, Ix4};
 use crate::decode::{Span, SpanOutput, greedy_search};
 use crate::{GlinerError, Result, Token};
 
+/// Span-selection thresholds and NER overlap policy for one GLiNER2 decode pass. Grouped so
+/// [`decode_span_scores`] stays under the workspace parameter-count limit. ~keep
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpanDecodeOptions {
+    pub(crate) threshold: f32,
+    pub(crate) max_width: usize,
+    pub(crate) flat_ner: bool,
+    pub(crate) dup_label: bool,
+    pub(crate) multi_label: bool,
+}
+
 /// Decode GLiNER2's `span_scores` output `(1, num_labels, num_words, max_width)`
 /// into entity spans. Unlike GLiNER1's `logits`, `span_scores` values are already
 /// post-sigmoid probabilities; do not apply `sigmoid()` here.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_span_scores(
     span_scores: ArrayViewD<'_, f32>,
     text: &str,
     words: &[Token],
     labels: &[String],
-    threshold: f32,
-    max_width: usize,
-    flat_ner: bool,
-    dup_label: bool,
-    multi_label: bool,
+    options: SpanDecodeOptions,
 ) -> Result<SpanOutput> {
+    let SpanDecodeOptions {
+        threshold,
+        max_width,
+        flat_ner,
+        dup_label,
+        multi_label,
+    } = options;
     let num_words = words.len();
     let expected_shape = vec![1, labels.len(), num_words, max_width];
     let actual_shape = span_scores.shape().to_vec();
@@ -91,11 +104,13 @@ mod tests {
             text,
             &words,
             &labels,
-            0.5,
-            2,
-            true,
-            false,
-            false,
+            SpanDecodeOptions {
+                threshold: 0.5,
+                max_width: 2,
+                flat_ner: true,
+                dup_label: false,
+                multi_label: false,
+            },
         )
         .expect("decoded");
         assert_eq!(output.spans[0].len(), 1);
@@ -115,11 +130,13 @@ mod tests {
             text,
             &words,
             &labels,
-            0.5,
-            2,
-            true,
-            false,
-            false,
+            SpanDecodeOptions {
+                threshold: 0.5,
+                max_width: 2,
+                flat_ner: true,
+                dup_label: false,
+                multi_label: false,
+            },
         );
         assert!(result.is_err());
     }

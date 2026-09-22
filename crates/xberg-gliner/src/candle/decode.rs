@@ -42,71 +42,60 @@ pub(crate) fn build_span_idx(num_words: usize) -> crate::candle::Result<Array3<i
         .map_err(|e| crate::candle::GlinerCandleError::Backend(format!("build_span_idx shape: {e}")))
 }
 
+/// Score-filtering and NER overlap policy for one candle decode pass. Grouped so
+/// [`decode_span_scores`] stays under the workspace parameter-count limit. ~keep
+pub(crate) struct SpanFilterOptions {
+    pub(crate) threshold: f32,
+    pub(crate) flat_ner: bool,
+    pub(crate) dup_label: bool,
+    pub(crate) multi_label: bool,
+}
+
+/// Read-only state threaded through the per-`(c_idx, start)` candidate-collection helper, bundled
+/// so [`collect_candidates_for_start`] stays under the workspace parameter-count limit. ~keep
+struct DecodeContext<'a> {
+    text: &'a str,
+    words: &'a [Token],
+    labels: &'a [String],
+    scores: &'a Array4<f32>,
+    threshold: f32,
+}
+
 /// Decode the scorer's `[MAX_COUNT, num_words, MAX_WIDTH, num_labels]` tensor
 /// into a [`crate::SpanOutput`], applying a single global `threshold`,
 /// then greedy-merging overlaps via `crate::decode::greedy_search`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_span_scores(
     text: &str,
     words: &[Token],
     labels: &[String],
     scorer_out: &ScorerOutput,
     pred_count: usize,
-    threshold: f32,
-    flat_ner: bool,
-    dup_label: bool,
-    multi_label: bool,
+    options: SpanFilterOptions,
 ) -> crate::candle::Result<crate::SpanOutput> {
+    let SpanFilterOptions {
+        threshold,
+        flat_ner,
+        dup_label,
+        multi_label,
+    } = options;
     let scores = &scorer_out.scores;
     // Bound by the scores tensor's word dimension, not `words.len()`: when the
     // input exceeds the encoder's position-embedding limit, `run_pipeline`
     // truncates and the scores only cover the surviving words. Indexing by the
     // full word list would walk off the array. ~keep
     let num_words = words.len().min(scores.shape()[1]);
-    let num_labels = labels.len();
+    let ctx = DecodeContext {
+        text,
+        words,
+        labels,
+        scores,
+        threshold,
+    };
 
     let mut candidates: Vec<Span> = Vec::new();
     for c_idx in 0..pred_count.min(MAX_COUNT) {
         for start in 0..num_words {
-            for width_idx in 0..MAX_WIDTH {
-                let end_idx = start + width_idx;
-                if end_idx >= num_words {
-                    continue;
-                }
-                let end_word = end_idx + 1; // exclusive ~keep
-                for m in 0..num_labels {
-                    let prob = scores[[c_idx, start, width_idx, m]];
-                    if prob <= threshold {
-                        continue;
-                    }
-                    let byte_start = words[start].start();
-                    let byte_end = words[end_word - 1].end();
-                    if byte_start >= byte_end {
-                        continue;
-                    }
-                    // .get() rather than indexing: token offsets come from the
-                    // lowercased copy (see V2Splitter), and a lowercase form
-                    // that changes byte length can land these offsets out of
-                    // bounds or mid-character in the original text. Skip such
-                    // candidates instead of panicking, matching v2_decode's
-                    // defensive handling on the ONNX path. ~keep
-                    let Some(raw) = text.get(byte_start..byte_end) else {
-                        continue;
-                    };
-                    let surface = raw.trim();
-                    if surface.is_empty() {
-                        continue;
-                    }
-                    candidates.push(Span::new(
-                        0,
-                        byte_start,
-                        byte_end,
-                        surface.to_string(),
-                        labels[m].clone(),
-                        prob,
-                    )?);
-                }
-            }
+            collect_candidates_for_start(&mut candidates, &ctx, c_idx, start, num_words)?;
         }
     }
 
@@ -118,6 +107,58 @@ pub(crate) fn decode_span_scores(
         entities: labels.to_vec(),
         spans: vec![spans],
     })
+}
+
+/// One `(c_idx, start)` position's contribution to `candidates`: every `(width_idx, label)` pair
+/// whose score clears `ctx.threshold`, pushed as a [`Span`]. Split out of [`decode_span_scores`]
+/// to keep that function's loop nesting under the workspace limit. ~keep
+fn collect_candidates_for_start(
+    candidates: &mut Vec<Span>,
+    ctx: &DecodeContext,
+    c_idx: usize,
+    start: usize,
+    num_words: usize,
+) -> crate::candle::Result<()> {
+    for width_idx in 0..MAX_WIDTH {
+        let end_idx = start + width_idx;
+        if end_idx >= num_words {
+            continue;
+        }
+        let end_word = end_idx + 1; // exclusive ~keep
+        for m in 0..ctx.labels.len() {
+            let prob = ctx.scores[[c_idx, start, width_idx, m]];
+            if prob <= ctx.threshold {
+                continue;
+            }
+            let byte_start = ctx.words[start].start();
+            let byte_end = ctx.words[end_word - 1].end();
+            if byte_start >= byte_end {
+                continue;
+            }
+            // .get() rather than indexing: token offsets come from the
+            // lowercased copy (see V2Splitter), and a lowercase form
+            // that changes byte length can land these offsets out of
+            // bounds or mid-character in the original text. Skip such
+            // candidates instead of panicking, matching v2_decode's
+            // defensive handling on the ONNX path. ~keep
+            let Some(raw) = ctx.text.get(byte_start..byte_end) else {
+                continue;
+            };
+            let surface = raw.trim();
+            if surface.is_empty() {
+                continue;
+            }
+            candidates.push(Span::new(
+                0,
+                byte_start,
+                byte_end,
+                surface.to_string(),
+                ctx.labels[m].clone(),
+                prob,
+            )?);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,10 +182,12 @@ mod tests {
             &labels,
             &ScorerOutput { scores },
             1,
-            0.5,
-            true,
-            false,
-            false,
+            SpanFilterOptions {
+                threshold: 0.5,
+                flat_ner: true,
+                dup_label: false,
+                multi_label: false,
+            },
         )
         .expect("misaligned offsets must be skipped, not panic");
         assert!(out.spans[0].is_empty());
@@ -171,10 +214,12 @@ mod tests {
             &labels,
             &ScorerOutput { scores },
             1,
-            0.5,
-            true,
-            false,
-            false,
+            SpanFilterOptions {
+                threshold: 0.5,
+                flat_ner: true,
+                dup_label: false,
+                multi_label: false,
+            },
         )
         .expect("truncated scores must bound the decode loop");
         assert_eq!(out.spans[0].len(), 1);
@@ -204,10 +249,12 @@ mod tests {
             &labels,
             &ScorerOutput { scores },
             1,
-            0.5,
-            true,
-            false,
-            false,
+            SpanFilterOptions {
+                threshold: 0.5,
+                flat_ner: true,
+                dup_label: false,
+                multi_label: false,
+            },
         )
         .expect("decode must not error on all-below-threshold scores");
         assert!(out.spans[0].is_empty());

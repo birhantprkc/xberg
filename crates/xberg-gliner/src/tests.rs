@@ -165,7 +165,18 @@ fn decode_logits_returns_spans_above_threshold() {
     logits[[0, 0, 0, 0]] = 10.0;
     logits[[0, 3, 0, 1]] = 9.0;
 
-    let output = decode_logits(logits.view().into_dyn(), context, 0.5, 2, true, false, false).expect("decoded");
+    let output = decode_logits(
+        logits.view().into_dyn(),
+        context,
+        crate::decode::DecodeOptions {
+            threshold: 0.5,
+            max_width: 2,
+            flat_ner: true,
+            dup_label: false,
+            multi_label: false,
+        },
+    )
+    .expect("decoded");
 
     assert_eq!(output.spans[0].len(), 2);
     assert_eq!(output.spans[0][0].text(), "Ada");
@@ -184,8 +195,18 @@ fn decode_logits_rejects_unexpected_shape() {
         num_words: encoded.num_words,
     };
     let logits = Array4::<f32>::zeros((1, 2, 2, 1));
-    let error =
-        decode_logits(logits.view().into_dyn(), context, 0.5, 2, true, false, false).expect_err("shape mismatch");
+    let error = decode_logits(
+        logits.view().into_dyn(),
+        context,
+        crate::decode::DecodeOptions {
+            threshold: 0.5,
+            max_width: 2,
+            flat_ner: true,
+            dup_label: false,
+            multi_label: false,
+        },
+    )
+    .expect_err("shape mismatch");
 
     assert!(matches!(error, GlinerError::UnexpectedLogitsShape { .. }));
 }

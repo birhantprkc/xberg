@@ -172,18 +172,35 @@ impl EntityContext {
     }
 }
 
+/// Span-selection thresholds and NER overlap policy for one ORT V1 decode pass.
+///
+/// Grouped so [`decode_logits`] stays under the workspace parameter-count limit;
+/// [`greedy_search`] is public API and keeps its own individual-argument signature. ~keep
+#[cfg(feature = "ort-backend")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeOptions {
+    pub(crate) threshold: f32,
+    pub(crate) max_width: usize,
+    pub(crate) flat_ner: bool,
+    pub(crate) dup_label: bool,
+    pub(crate) multi_label: bool,
+}
+
 /// Only called by [`crate::engine::Gliner`] (the ORT V1 engine); dead
 /// weight without `ort-backend`.
 #[cfg(feature = "ort-backend")]
 pub(crate) fn decode_logits(
     logits: ArrayViewD<'_, f32>,
     context: EntityContext,
-    threshold: f32,
-    max_width: usize,
-    flat_ner: bool,
-    dup_label: bool,
-    multi_label: bool,
+    options: DecodeOptions,
 ) -> Result<SpanOutput> {
+    let DecodeOptions {
+        threshold,
+        max_width,
+        flat_ner,
+        dup_label,
+        multi_label,
+    } = options;
     let expected_shape = vec![
         context.texts.len(),
         context.num_words,

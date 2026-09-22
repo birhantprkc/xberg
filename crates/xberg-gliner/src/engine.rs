@@ -91,11 +91,13 @@ impl Gliner {
         decode_logits(
             logits.view(),
             context,
-            self.params.threshold,
-            self.params.max_width,
-            self.params.flat_ner,
-            self.params.dup_label,
-            self.params.multi_label,
+            crate::decode::DecodeOptions {
+                threshold: self.params.threshold,
+                max_width: self.params.max_width,
+                flat_ner: self.params.flat_ner,
+                dup_label: self.params.dup_label,
+                multi_label: self.params.multi_label,
+            },
         )
     }
 }
