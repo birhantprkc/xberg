@@ -113,7 +113,22 @@ pub(crate) fn escape_tex_structural(ch: char) -> Option<&'static str> {
 }
 
 /// Map a Unicode character to its LaTeX command (if any).
+///
+/// Delegates to one table per symbol family (Greek letters, operators, relations, arrows,
+/// calculus/logic/set notation, letter-like/delimiter forms, big operators) so no single match
+/// grows unwieldy; the families are disjoint over `char`, so lookup order does not affect the
+/// result. ~keep
 pub(crate) fn unicode_to_latex(ch: char) -> Option<&'static str> {
+    greek_letter_to_latex(ch)
+        .or_else(|| operator_and_relation_to_latex(ch))
+        .or_else(|| membership_and_arrow_to_latex(ch))
+        .or_else(|| calculus_logic_and_set_to_latex(ch))
+        .or_else(|| letter_like_and_delimiter_to_latex(ch))
+        .or_else(|| big_operator_to_latex(ch))
+}
+
+/// Greek letters (lowercase, uppercase, and the upsilon-with-hook variant `ϒ`).
+fn greek_letter_to_latex(ch: char) -> Option<&'static str> {
     match ch {
         '\u{03B1}' => Some("\\alpha "),
         '\u{03B2}' => Some("\\beta "),
@@ -151,6 +166,14 @@ pub(crate) fn unicode_to_latex(ch: char) -> Option<&'static str> {
         '\u{03A6}' => Some("\\Phi "),
         '\u{03A8}' => Some("\\Psi "),
         '\u{03A9}' => Some("\\Omega "),
+        '\u{03D2}' => Some("\\Upsilon "),
+        _ => None,
+    }
+}
+
+/// Arithmetic/comparison operators and set-inclusion relations.
+fn operator_and_relation_to_latex(ch: char) -> Option<&'static str> {
+    match ch {
         '\u{00B1}' => Some("\\pm "),
         '\u{2213}' => Some("\\mp "),
         '\u{00D7}' => Some("\\times "),
@@ -170,6 +193,13 @@ pub(crate) fn unicode_to_latex(ch: char) -> Option<&'static str> {
         '\u{2287}' => Some("\\supseteq "),
         '\u{2282}' => Some("\\subset "),
         '\u{2283}' => Some("\\supset "),
+        _ => None,
+    }
+}
+
+/// Set-membership symbols and directional arrows.
+fn membership_and_arrow_to_latex(ch: char) -> Option<&'static str> {
+    match ch {
         '\u{2208}' => Some("\\in "),
         '\u{2209}' => Some("\\notin "),
         '\u{220B}' => Some("\\ni "),
@@ -182,6 +212,13 @@ pub(crate) fn unicode_to_latex(ch: char) -> Option<&'static str> {
         '\u{21D2}' => Some("\\Rightarrow "),
         '\u{21D4}' => Some("\\Leftrightarrow "),
         '\u{21A6}' => Some("\\mapsto "),
+        _ => None,
+    }
+}
+
+/// Calculus operators, quantifiers/logic connectives, set operations, and ellipses.
+fn calculus_logic_and_set_to_latex(ch: char) -> Option<&'static str> {
+    match ch {
         '\u{221E}' => Some("\\infty "),
         '\u{2202}' => Some("\\partial "),
         '\u{2207}' => Some("\\nabla "),
@@ -197,6 +234,13 @@ pub(crate) fn unicode_to_latex(ch: char) -> Option<&'static str> {
         '\u{22EF}' => Some("\\cdots "),
         '\u{22EE}' => Some("\\vdots "),
         '\u{22F1}' => Some("\\ddots "),
+        _ => None,
+    }
+}
+
+/// Prime marks, letter-like symbols (ℏ, ℓ, ℜ, ℑ, ℘, ℵ), and paired delimiters.
+fn letter_like_and_delimiter_to_latex(ch: char) -> Option<&'static str> {
+    match ch {
         '\u{2032}' => Some("'"),
         '\u{2033}' => Some("''"),
         '\u{210F}' => Some("\\hbar "),
@@ -210,7 +254,13 @@ pub(crate) fn unicode_to_latex(ch: char) -> Option<&'static str> {
         '\u{2329}' | '\u{27E8}' => Some("\\langle "),
         '\u{232A}' | '\u{27E9}' => Some("\\rangle "),
         '\u{204E}' => Some("\\ast "),
-        '\u{03D2}' => Some("\\Upsilon "),
+        _ => None,
+    }
+}
+
+/// N-ary big operators (sums, products, integrals, and their "big" logic/set variants).
+fn big_operator_to_latex(ch: char) -> Option<&'static str> {
+    match ch {
         '\u{2211}' => Some("\\sum "),
         '\u{220F}' => Some("\\prod "),
         '\u{222B}' => Some("\\int "),

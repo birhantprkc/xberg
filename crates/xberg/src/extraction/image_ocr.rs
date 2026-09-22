@@ -27,6 +27,15 @@
 
 use crate::types::{ExtractedDocument, ExtractedImage};
 
+/// One image queued for OCR: its index into `images`, its raw bytes, and the per-image
+/// `OcrConfig` clone (output format/acceleration/security limits applied) to hand the backend.
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+type PendingOcrTask = (usize, bytes::Bytes, crate::core::config::OcrConfig);
+
+/// The image index paired with its OCR outcome, as returned by a spawned task.
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+type OcrTaskResult = (usize, crate::Result<ExtractedDocument>);
+
 /// Process extracted images with OCR if configured.
 ///
 /// For each image, spawns an async OCR task using the backend from the registry
@@ -59,26 +68,52 @@ pub(crate) async fn process_images_with_ocr(
     }
 
     let ocr_config = config.ocr.as_ref().unwrap();
+    let max_tasks = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
+    let mut pending = build_pending_ocr_tasks(&images, ocr_config, config);
+
+    let mut join_set: tokio::task::JoinSet<OcrTaskResult> = tokio::task::JoinSet::new();
+    while join_set.len() < max_tasks {
+        let Some(task) = pending.pop_front() else {
+            break;
+        };
+        spawn_ocr_task(&mut join_set, task);
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        let (idx, ocr_result) = join_result.map_err(|e| crate::XbergError::Ocr {
+            message: format!("OCR task panicked: {}", e),
+            source: None,
+        })?;
+
+        apply_ocr_result(&mut images, idx, ocr_result, ocr_config, warnings);
+
+        if let Some(task) = pending.pop_front() {
+            spawn_ocr_task(&mut join_set, task);
+        }
+    }
+
+    Ok(images)
+}
+
+/// Build one pending OCR task per image, applying the caller's output format, acceleration, and
+/// security limits onto a per-image `OcrConfig` clone.
+///
+/// GH#1554: `OcrConfig::security_limits` has no other way to reach a caller's configured
+/// limits — the `OcrBackend::process_image` trait method takes only `OcrConfig`, not
+/// `ExtractionConfig` — so it must be copied onto each per-image clone here, mirroring
+/// `acceleration`. `ExtractionConfig::security_limits` is the source of truth; a backend seeing
+/// `None` here must fall back to `SecurityLimits::default()`, never disable the check. ~keep
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn build_pending_ocr_tasks(
+    images: &[ExtractedImage],
+    ocr_config: &crate::core::config::OcrConfig,
+    config: &crate::core::config::ExtractionConfig,
+) -> std::collections::VecDeque<PendingOcrTask> {
     let output_format = config.output_format.clone();
     let acceleration = ocr_config.acceleration.clone();
-    // GH#1554: `OcrConfig::security_limits` has no other way to reach a caller's configured
-    // limits — the `OcrBackend::process_image` trait method takes only `OcrConfig`, not
-    // `ExtractionConfig` — so it must be copied onto each per-image clone here, mirroring
-    // `acceleration` immediately above. `ExtractionConfig::security_limits` is the source of
-    // truth; a backend seeing `None` here must fall back to `SecurityLimits::default()`,
-    // never disable the check. ~keep
     let security_limits = config.security_limits.clone();
 
-    use std::collections::VecDeque;
-    use tokio::task::JoinSet;
-
-    let max_tasks = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
-
-    type OcrTaskResult = (usize, crate::Result<ExtractedDocument>);
-    type PendingOcrTask = (usize, bytes::Bytes, crate::core::config::OcrConfig);
-    let mut join_set: JoinSet<OcrTaskResult> = JoinSet::new();
-    let mut pending: VecDeque<PendingOcrTask> = VecDeque::with_capacity(images.len());
-
+    let mut pending = std::collections::VecDeque::with_capacity(images.len());
     for (idx, image) in images.iter().enumerate() {
         let image_data = image.data.clone();
         let mut ocr_config_clone = ocr_config.clone();
@@ -91,74 +126,68 @@ pub(crate) async fn process_images_with_ocr(
         }
         pending.push_back((idx, image_data, ocr_config_clone));
     }
+    pending
+}
 
-    let spawn_task = |join_set: &mut JoinSet<OcrTaskResult>, (idx, image_data, ocr_config_clone): PendingOcrTask| {
-        join_set.spawn(async move {
-            let backend = {
-                let registry = crate::plugins::registry::get_ocr_backend_registry();
-                let registry = registry.read();
-                match registry.get(&ocr_config_clone.backend) {
-                    Ok(b) => b.clone(),
-                    Err(e) => {
-                        return (
-                            idx,
-                            Err(crate::XbergError::Ocr {
-                                message: format!("OCR backend '{}' not found: {}", ocr_config_clone.backend, e),
-                                source: None,
-                            }),
-                        );
-                    }
+/// Spawn one OCR task onto `join_set`, resolving the backend from the registry at spawn time.
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn spawn_ocr_task(join_set: &mut tokio::task::JoinSet<OcrTaskResult>, task: PendingOcrTask) {
+    let (idx, image_data, ocr_config_clone) = task;
+    join_set.spawn(async move {
+        let backend = {
+            let registry = crate::plugins::registry::get_ocr_backend_registry();
+            let registry = registry.read();
+            match registry.get(&ocr_config_clone.backend) {
+                Ok(b) => b.clone(),
+                Err(e) => {
+                    return (
+                        idx,
+                        Err(crate::XbergError::Ocr {
+                            message: format!("OCR backend '{}' not found: {}", ocr_config_clone.backend, e),
+                            source: None,
+                        }),
+                    );
                 }
-            };
-
-            let ocr_result = backend.process_image(&image_data, &ocr_config_clone).await;
-            (idx, ocr_result)
-        });
-    };
-
-    while join_set.len() < max_tasks {
-        let Some(task) = pending.pop_front() else {
-            break;
+            }
         };
-        spawn_task(&mut join_set, task);
-    }
 
-    while let Some(join_result) = join_set.join_next().await {
-        let (idx, ocr_result) = join_result.map_err(|e| crate::XbergError::Ocr {
-            message: format!("OCR task panicked: {}", e),
-            source: None,
-        })?;
+        let ocr_result = backend.process_image(&image_data, &ocr_config_clone).await;
+        (idx, ocr_result)
+    });
+}
 
-        match ocr_result {
-            Ok(extraction_result) => {
-                // Keep the backend's result whole. Rebuilding it field-by-field silently
-                // dropped everything the backend populated besides content/mime_type/
-                // ocr_elements — tables, metadata (OCR language, PSM, confidence),
-                // formulas, llm_usage (VLM cost accounting), detected_languages and
-                // processing_warnings. The PDF inline-image path already stores the
-                // backend result unmodified; mirror it here.
-                let mut ocr_document = extraction_result;
-                // Recursion guard: OCR output must never carry nested images, or an
-                // archive/recursive consumer would extract images out of OCR output.
-                ocr_document.images = None;
-                ocr_config.apply_public_element_policy(&mut ocr_document);
-                images[idx].ocr_result = Some(Box::new(ocr_document));
-            }
-            Err(e) => {
-                warnings.push(crate::types::ProcessingWarning {
-                    source: std::borrow::Cow::Borrowed("image_ocr"),
-                    message: std::borrow::Cow::Owned(format!("Image {} OCR failed: {}", idx, e)),
-                });
-                images[idx].ocr_result = None;
-            }
+/// Apply one completed OCR task's result onto `images[idx]`, recording a warning on failure.
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn apply_ocr_result(
+    images: &mut [ExtractedImage],
+    idx: usize,
+    ocr_result: crate::Result<ExtractedDocument>,
+    ocr_config: &crate::core::config::OcrConfig,
+    warnings: &mut Vec<crate::types::ProcessingWarning>,
+) {
+    match ocr_result {
+        Ok(extraction_result) => {
+            // Keep the backend's result whole. Rebuilding it field-by-field silently
+            // dropped everything the backend populated besides content/mime_type/
+            // ocr_elements — tables, metadata (OCR language, PSM, confidence),
+            // formulas, llm_usage (VLM cost accounting), detected_languages and
+            // processing_warnings. The PDF inline-image path already stores the
+            // backend result unmodified; mirror it here. ~keep
+            let mut ocr_document = extraction_result;
+            // Recursion guard: OCR output must never carry nested images, or an
+            // archive/recursive consumer would extract images out of OCR output. ~keep
+            ocr_document.images = None;
+            ocr_config.apply_public_element_policy(&mut ocr_document);
+            images[idx].ocr_result = Some(Box::new(ocr_document));
         }
-
-        if let Some(task) = pending.pop_front() {
-            spawn_task(&mut join_set, task);
+        Err(e) => {
+            warnings.push(crate::types::ProcessingWarning {
+                source: std::borrow::Cow::Borrowed("image_ocr"),
+                message: std::borrow::Cow::Owned(format!("Image {} OCR failed: {}", idx, e)),
+            });
+            images[idx].ocr_result = None;
         }
     }
-
-    Ok(images)
 }
 
 #[cfg(all(test, feature = "ocr", feature = "tokio-runtime"))]

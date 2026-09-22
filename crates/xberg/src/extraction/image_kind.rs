@@ -66,59 +66,85 @@ pub fn classify(
     let w = width.unwrap_or(1);
     let h = height.unwrap_or(1);
     let area = (w as u64) * (h as u64);
-
     let aspect = if h > 0 { (w as f64) / (h as f64) } else { 1.0 };
 
     if w == 0 || h == 0 {
         return (ImageKind::Unknown, 0.0);
     }
-
-    if area < SMALL_IMAGE_AREA && aspect > ICON_ASPECT_LOW && aspect < ICON_ASPECT_HIGH {
-        return (ImageKind::Icon, 0.85);
+    if let Some(result) = classify_small_image(area, aspect) {
+        return result;
+    }
+    if let Some(result) = classify_by_colorspace_and_format(format, area, colorspace, bits_per_component) {
+        return result;
+    }
+    if let Some(result) = classify_by_entropy(bytes, w, h, area) {
+        return result;
     }
 
-    if area < SMALL_IMAGE_AREA && !(ICON_ASPECT_LOW..=ICON_ASPECT_HIGH).contains(&aspect) {
+    (ImageKind::Unknown, 0.50)
+}
+
+/// Icon/Decoration rules for small images: a near-square small image is an Icon, and any other
+/// small image with an extreme aspect ratio is a Decoration.
+fn classify_small_image(area: u64, aspect: f64) -> Option<(ImageKind, f32)> {
+    if area >= SMALL_IMAGE_AREA {
+        return None;
+    }
+    if aspect > ICON_ASPECT_LOW && aspect < ICON_ASPECT_HIGH {
+        return Some((ImageKind::Icon, 0.85));
+    }
+    if !(ICON_ASPECT_LOW..=ICON_ASPECT_HIGH).contains(&aspect) {
         let confidence = if (DECORATION_ASPECT_LOW..=DECORATION_ASPECT_HIGH).contains(&aspect) {
             0.65
         } else {
             0.80
         };
-        return (ImageKind::Decoration, confidence);
+        return Some((ImageKind::Decoration, confidence));
     }
+    None
+}
 
+/// Colorspace/format rules: Gray 1-bit reads as a scanned text block, CMYK 8-bit as a
+/// photograph, a large JPEG as a photograph, indexed-color Flate as a diagram, and CCITT
+/// (fax/bilevel) as a mask.
+fn classify_by_colorspace_and_format(
+    format: &str,
+    area: u64,
+    colorspace: Option<&str>,
+    bits_per_component: Option<u32>,
+) -> Option<(ImageKind, f32)> {
     if colorspace == Some("Gray") && bits_per_component == Some(1) {
-        return (ImageKind::TextBlock, 0.75);
+        return Some((ImageKind::TextBlock, 0.75));
     }
-
     if colorspace == Some("CMYK") && bits_per_component == Some(8) {
-        return (ImageKind::Photograph, 0.70);
+        return Some((ImageKind::Photograph, 0.70));
     }
-
     if format == "jpeg" && area > LARGE_JPEG_AREA {
-        return (ImageKind::Photograph, 0.85);
+        return Some((ImageKind::Photograph, 0.85));
     }
-
     if format == "flate" && colorspace == Some("Indexed") {
-        return (ImageKind::Diagram, 0.65);
+        return Some((ImageKind::Diagram, 0.65));
     }
-
     if format == "ccitt" {
-        return (ImageKind::Mask, 0.85);
+        return Some((ImageKind::Mask, 0.85));
     }
+    None
+}
 
-    if area > 0
-        && area <= MAX_CLASSIFY_PIXELS
-        && let Ok(entropy) = compute_entropy_on_thumbnail(bytes, w, h)
-    {
-        if entropy > HIGH_ENTROPY_THRESHOLD {
-            return (ImageKind::Photograph, 0.65);
-        }
-        if entropy < LOW_ENTROPY_THRESHOLD && area < SMALL_CHART_AREA {
-            return (ImageKind::Chart, 0.60);
-        }
+/// Entropy-based fallback: a high-entropy thumbnail reads as a photograph, and a small,
+/// low-entropy one as a chart. Skips images too large to safely decode for the thumbnail.
+fn classify_by_entropy(bytes: &[u8], width: u32, height: u32, area: u64) -> Option<(ImageKind, f32)> {
+    if area == 0 || area > MAX_CLASSIFY_PIXELS {
+        return None;
     }
-
-    (ImageKind::Unknown, 0.50)
+    let entropy = compute_entropy_on_thumbnail(bytes, width, height).ok()?;
+    if entropy > HIGH_ENTROPY_THRESHOLD {
+        return Some((ImageKind::Photograph, 0.65));
+    }
+    if entropy < LOW_ENTROPY_THRESHOLD && area < SMALL_CHART_AREA {
+        return Some((ImageKind::Chart, 0.60));
+    }
+    None
 }
 
 /// Iterative path-compressing find for the cluster_tiles union-find.
@@ -229,124 +255,17 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
             continue;
         }
 
-        let mut candidates: Vec<usize> = indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                let img = &images[idx];
-                let is_drawable = matches!(
-                    img.image_kind,
-                    Some(ImageKind::Drawing | ImageKind::Diagram | ImageKind::TileFragment)
-                );
-                let is_unclassified_small = img.image_kind.is_none()
-                    && (img.width.unwrap_or(0) as u64) * (img.height.unwrap_or(0) as u64) < (300 * 300);
-                is_drawable || is_unclassified_small
-            })
-            .collect();
-
+        let candidates = select_tile_candidates(images, &indices);
         if candidates.len() < 2 {
             continue;
         }
 
-        let dims: Vec<_> = candidates
-            .iter()
-            .map(|&idx| {
-                let img = &images[idx];
-                (img.width.unwrap_or(0), img.height.unwrap_or(0))
-            })
-            .collect();
-
-        let mut widths: Vec<_> = dims.iter().map(|(w, _)| *w).collect();
-        let mut heights: Vec<_> = dims.iter().map(|(_, h)| *h).collect();
-        widths.sort();
-        heights.sort();
-
-        let median_w = widths[widths.len() / 2] as f64;
-        let median_h = heights[heights.len() / 2] as f64;
-
-        if median_w < 1.0 || median_h < 1.0 {
+        let Some(candidates) = narrow_by_median_dimensions(images, &candidates) else {
             continue;
-        }
+        };
 
-        let candidates_filtered: Vec<usize> = candidates
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                let img = &images[idx];
-                let w = img.width.unwrap_or(0) as f64;
-                let h = img.height.unwrap_or(0) as f64;
-                let w_ratio = w / median_w;
-                let h_ratio = h / median_h;
-                (0.8..=1.2).contains(&w_ratio) && (0.8..=1.2).contains(&h_ratio)
-            })
-            .collect();
-
-        if candidates_filtered.len() < 2 {
-            continue;
-        }
-
-        candidates = candidates_filtered;
-
-        let n = candidates.len();
-        let mut parent: Vec<usize> = (0..n).collect();
-
-        for (i, idx_i) in candidates.iter().enumerate() {
-            for (j, idx_j) in candidates.iter().enumerate().skip(i + 1) {
-                let idx_i = *idx_i;
-                let idx_j = *idx_j;
-                let img_i = &images[idx_i];
-                let img_j = &images[idx_j];
-
-                let should_connect = if let (Some(bbox_i), Some(bbox_j)) = (&img_i.bounding_box, &img_j.bounding_box) {
-                    let min_dim = (img_i.width.unwrap_or(0) as i32)
-                        .min(img_i.height.unwrap_or(0) as i32)
-                        .min(img_j.width.unwrap_or(0) as i32)
-                        .min(img_j.height.unwrap_or(0) as i32) as f64;
-
-                    if min_dim < 1.0 {
-                        false
-                    } else {
-                        let threshold = min_dim / 2.0;
-                        let dx = (bbox_i.x0.max(bbox_j.x0) - bbox_i.x1.min(bbox_j.x1)).max(0.0);
-                        let dy = (bbox_i.y0.max(bbox_j.y0) - bbox_i.y1.min(bbox_j.y1)).max(0.0);
-                        let dist = (dx * dx + dy * dy).sqrt();
-                        dist <= threshold
-                    }
-                } else {
-                    const NO_BBOX_INDEX_WINDOW: i32 = 3;
-                    (idx_i as i32 - idx_j as i32).abs() <= NO_BBOX_INDEX_WINDOW
-                };
-
-                if should_connect {
-                    uf_union(&mut parent, i, j);
-                }
-            }
-        }
-
-        let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (i, idx_i) in candidates.iter().enumerate() {
-            let root = uf_find(&mut parent, i);
-            clusters.entry(root).or_default().push(*idx_i);
-        }
-
-        let mut cluster_count = 0;
-        let mut max_cluster_size = 0;
-        let mut multi_clusters: Vec<Vec<usize>> = clusters.into_values().filter(|cluster| cluster.len() >= 2).collect();
-        for cluster in &mut multi_clusters {
-            cluster.sort_unstable();
-        }
-        multi_clusters.sort_by_key(|cluster| cluster[0]);
-        for cluster in multi_clusters {
-            cluster_count += 1;
-            max_cluster_size = max_cluster_size.max(cluster.len());
-            for idx in cluster {
-                images[idx].cluster_id = Some(next_cluster_id);
-                if matches!(images[idx].image_kind, Some(ImageKind::Drawing | ImageKind::Diagram)) {
-                    images[idx].image_kind = Some(ImageKind::TileFragment);
-                }
-            }
-            next_cluster_id = next_cluster_id.saturating_add(1);
-        }
+        let parent = union_find_adjacent_tiles(images, &candidates);
+        let (cluster_count, max_cluster_size) = apply_tile_clusters(images, &candidates, parent, &mut next_cluster_id);
 
         if cluster_count > 0 {
             tracing::info!(
@@ -360,687 +279,147 @@ pub fn cluster_tiles(images: &mut [ExtractedImage]) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
-    use image::{ImageBuffer, Rgba};
+/// Select candidate indices on a page for tile clustering: images already classified as
+/// Drawing/Diagram/TileFragment, plus small unclassified images that might be an unlabeled tile.
+fn select_tile_candidates(images: &[ExtractedImage], indices: &[usize]) -> Vec<usize> {
+    indices
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            let img = &images[idx];
+            let is_drawable = matches!(
+                img.image_kind,
+                Some(ImageKind::Drawing | ImageKind::Diagram | ImageKind::TileFragment)
+            );
+            let is_unclassified_small = img.image_kind.is_none()
+                && (img.width.unwrap_or(0) as u64) * (img.height.unwrap_or(0) as u64) < (300 * 300);
+            is_drawable || is_unclassified_small
+        })
+        .collect()
+}
 
-    #[test]
-    fn test_classify_returns_mask_for_is_mask_true() {
-        let (kind, conf) = classify(&[], "jpeg", Some(100), Some(100), None, None, true);
-        assert_eq!(kind, ImageKind::Mask);
-        assert_eq!(conf, 0.95);
+/// Narrow `candidates` to those within ±20% of the group's median width/height, the size
+/// signature of tiles composing one figure. Returns `None` when the median is degenerate
+/// (< 1px, meaning "not a tile cluster") or fewer than 2 candidates remain after narrowing.
+fn narrow_by_median_dimensions(images: &[ExtractedImage], candidates: &[usize]) -> Option<Vec<usize>> {
+    let dims: Vec<_> = candidates
+        .iter()
+        .map(|&idx| {
+            let img = &images[idx];
+            (img.width.unwrap_or(0), img.height.unwrap_or(0))
+        })
+        .collect();
+
+    let mut widths: Vec<_> = dims.iter().map(|(w, _)| *w).collect();
+    let mut heights: Vec<_> = dims.iter().map(|(_, h)| *h).collect();
+    widths.sort();
+    heights.sort();
+
+    let median_w = widths[widths.len() / 2] as f64;
+    let median_h = heights[heights.len() / 2] as f64;
+    if median_w < 1.0 || median_h < 1.0 {
+        return None;
     }
 
-    #[test]
-    fn test_classify_returns_icon_for_small_square() {
-        let (kind, conf) = classify(&[], "png", Some(48), Some(48), None, None, false);
-        assert_eq!(kind, ImageKind::Icon);
-        assert_eq!(conf, 0.85);
+    let filtered: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            let img = &images[idx];
+            let w = img.width.unwrap_or(0) as f64;
+            let h = img.height.unwrap_or(0) as f64;
+            let w_ratio = w / median_w;
+            let h_ratio = h / median_h;
+            (0.8..=1.2).contains(&w_ratio) && (0.8..=1.2).contains(&h_ratio)
+        })
+        .collect();
+
+    if filtered.len() < 2 {
+        return None;
     }
+    Some(filtered)
+}
 
-    #[test]
-    fn test_classify_returns_decoration_for_tiny_strip() {
-        let (kind, conf) = classify(&[], "png", Some(10), Some(100), None, None, false);
-        assert_eq!(kind, ImageKind::Decoration);
-        assert_eq!(conf, 0.80);
-    }
+/// Whether two candidate images are spatially adjacent enough to belong to the same tile
+/// cluster: within half a tile-side of each other when bounding boxes are known, or within a
+/// small index window when they are not.
+fn should_connect_tiles(img_i: &ExtractedImage, img_j: &ExtractedImage, idx_i: usize, idx_j: usize) -> bool {
+    if let (Some(bbox_i), Some(bbox_j)) = (&img_i.bounding_box, &img_j.bounding_box) {
+        let min_dim = (img_i.width.unwrap_or(0) as i32)
+            .min(img_i.height.unwrap_or(0) as i32)
+            .min(img_j.width.unwrap_or(0) as i32)
+            .min(img_j.height.unwrap_or(0) as i32) as f64;
 
-    #[test]
-    fn test_classify_returns_textblock_for_gray_1bpp() {
-        let (kind, conf) = classify(&[], "png", Some(200), Some(200), Some("Gray"), Some(1), false);
-        assert_eq!(kind, ImageKind::TextBlock);
-        assert_eq!(conf, 0.75);
-    }
-
-    #[test]
-    fn test_classify_returns_photograph_for_cmyk_8bpp() {
-        let (kind, conf) = classify(&[], "jpeg", Some(800), Some(800), Some("CMYK"), Some(8), false);
-        assert_eq!(kind, ImageKind::Photograph);
-        assert_eq!(conf, 0.70);
-    }
-
-    #[test]
-    fn test_classify_returns_photograph_for_large_jpeg() {
-        let (kind, conf) = classify(&[], "jpeg", Some(1000), Some(1000), None, None, false);
-        assert_eq!(kind, ImageKind::Photograph);
-        assert_eq!(conf, 0.85);
-    }
-
-    #[test]
-    fn test_classify_returns_diagram_for_flate_indexed() {
-        let (kind, conf) = classify(&[], "flate", Some(200), Some(200), Some("Indexed"), None, false);
-        assert_eq!(kind, ImageKind::Diagram);
-        assert_eq!(conf, 0.65);
-    }
-
-    #[test]
-    fn test_classify_returns_mask_for_ccitt() {
-        let (kind, conf) = classify(&[], "ccitt", Some(200), Some(200), None, None, false);
-        assert_eq!(kind, ImageKind::Mask);
-        assert_eq!(conf, 0.85);
-    }
-
-    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
-    #[test]
-    fn test_classify_returns_photograph_for_high_entropy_thumbnail() {
-        let mut state: u32 = 0x9E37_79B9;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            (state & 0xFF) as u8
-        };
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(100, 100, |_x, _y| Rgba([next(), next(), next(), 255]));
-
-        let mut bytes = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .unwrap();
-
-        let (kind, conf) = classify(&bytes, "png", Some(100), Some(100), None, None, false);
-        assert_eq!(kind, ImageKind::Photograph);
-        assert!(conf >= 0.6, "confidence {} should be >= 0.6", conf);
-    }
-
-    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
-    #[test]
-    fn should_reject_oversized_declared_dimensions_before_entropy_decode() {
-        let oversized = crate::extraction::image_decode::bmp_with_declared_dimensions(6_000, 6_000);
-
-        let error = compute_entropy_on_thumbnail(&oversized, 6_000, 6_000)
-            .expect_err("oversized image must fail at the decoded-image budget");
-
-        assert!(
-            error.contains("security_limits.max_content_size"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[cfg(any(feature = "ocr", feature = "ocr-wasm"))]
-    #[test]
-    fn test_classify_returns_chart_for_low_entropy_small_image() {
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(256, 256, |x, _y| {
-            if x < 128 {
-                Rgba([255, 0, 0, 255])
-            } else {
-                Rgba([0, 0, 255, 255])
-            }
-        });
-
-        let mut bytes = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .unwrap();
-
-        let (kind, conf) = classify(&bytes, "png", Some(256), Some(256), None, None, false);
-        assert_eq!(kind, ImageKind::Chart);
-        assert!(conf >= 0.55, "confidence {} should be >= 0.55", conf);
-    }
-
-    #[test]
-    fn test_classify_returns_unknown_for_truncated_bytes() {
-        let truncated = vec![0x89, 0x50, 0x4E, 0x47];
-        let (kind, conf) = classify(&truncated, "png", Some(100), Some(100), None, None, false);
-        assert_eq!(kind, ImageKind::Unknown);
-        assert_eq!(conf, 0.50);
-    }
-
-    #[test]
-    fn test_classify_never_panics_on_garbage_input() {
-        let test_cases = vec![
-            (&[][..], "unknown", Some(0u32), Some(0u32), None, None, false),
-            (
-                b"garbage",
-                "jpeg",
-                Some(1u32),
-                Some(1u32),
-                Some("RGB"),
-                Some(8u32),
-                false,
-            ),
-            (
-                b"\xFF\xD8\xFF\xFF",
-                "jpeg",
-                Some(10000u32),
-                Some(10000u32),
-                None,
-                None,
-                false,
-            ),
-            (b"\x89PNG\r\n\x1a\n", "png", Some(0u32), Some(0u32), None, None, false),
-            (
-                b"",
-                "unknown",
-                Some(65536u32),
-                Some(65536u32),
-                Some("CMYK"),
-                Some(16u32),
-                true,
-            ),
-        ];
-
-        for (bytes, fmt, w, h, cs, bpc, is_mask) in test_cases {
-            let _ = classify(bytes, fmt, w, h, cs, bpc, is_mask);
+        if min_dim < 1.0 {
+            return false;
         }
-    }
-
-    #[test]
-    fn test_cluster_tiles_groups_adjacent_similar_tiles() {
-        let mut images = vec![
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 0,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 0.0,
-                    y0: 0.0,
-                    x1: 100.0,
-                    y1: 100.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 1,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 101.0,
-                    y0: 0.0,
-                    x1: 201.0,
-                    y1: 100.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-        ];
-
-        cluster_tiles(&mut images);
-
-        assert_eq!(images[0].cluster_id, Some(1));
-        assert_eq!(images[1].cluster_id, Some(1));
-        assert_eq!(images[0].image_kind, Some(ImageKind::TileFragment));
-        assert_eq!(images[1].image_kind, Some(ImageKind::TileFragment));
-    }
-
-    #[test]
-    fn test_cluster_tiles_keeps_singletons_unclustered() {
-        let mut images = vec![ExtractedImage {
-            data: bytes::Bytes::new(),
-            format: "png".into(),
-            image_index: 0,
-            page_number: Some(1),
-            width: Some(100),
-            height: Some(100),
-            colorspace: None,
-            bits_per_component: None,
-            is_mask: false,
-            description: None,
-            ocr_result: None,
-            bounding_box: None,
-            source_path: None,
-            image_kind: Some(ImageKind::Photograph),
-            kind_confidence: Some(0.8),
-            cluster_id: None,
-            caption: None,
-            qr_codes: None,
-            data_base64: None,
-        }];
-
-        cluster_tiles(&mut images);
-
-        assert_eq!(images[0].cluster_id, None);
-        assert_eq!(images[0].image_kind, Some(ImageKind::Photograph));
-    }
-
-    #[test]
-    fn test_cluster_tiles_separates_distant_tiles() {
-        let mut images = vec![
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 0,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 0.0,
-                    y0: 0.0,
-                    x1: 100.0,
-                    y1: 100.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 1,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 500.0,
-                    y0: 500.0,
-                    x1: 600.0,
-                    y1: 600.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-        ];
-
-        cluster_tiles(&mut images);
-
-        assert_eq!(images[0].cluster_id, None);
-        assert_eq!(images[1].cluster_id, None);
-    }
-
-    #[test]
-    fn test_cluster_tiles_separates_dissimilar_kinds() {
-        let mut images = vec![
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 0,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: None,
-                source_path: None,
-                image_kind: Some(ImageKind::Photograph),
-                kind_confidence: Some(0.8),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 1,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: None,
-                source_path: None,
-                image_kind: Some(ImageKind::Photograph),
-                kind_confidence: Some(0.8),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-        ];
-
-        cluster_tiles(&mut images);
-
-        assert_eq!(images[0].cluster_id, None);
-        assert_eq!(images[1].cluster_id, None);
-    }
-
-    #[test]
-    fn test_cluster_tiles_falls_back_when_bounding_boxes_missing() {
-        let mut images = vec![
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 0,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: None,
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 1,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: None,
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-        ];
-
-        cluster_tiles(&mut images);
-
-        assert_eq!(images[0].cluster_id, Some(1));
-        assert_eq!(images[1].cluster_id, Some(1));
-    }
-
-    #[test]
-    fn test_cluster_tiles_assigns_unique_ids() {
-        let mut images = vec![
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 0,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 0.0,
-                    y0: 0.0,
-                    x1: 100.0,
-                    y1: 100.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 1,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 101.0,
-                    y0: 0.0,
-                    x1: 201.0,
-                    y1: 100.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Drawing),
-                kind_confidence: Some(0.7),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 2,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 0.0,
-                    y0: 200.0,
-                    x1: 100.0,
-                    y1: 300.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Diagram),
-                kind_confidence: Some(0.65),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-            ExtractedImage {
-                data: bytes::Bytes::new(),
-                format: "png".into(),
-                image_index: 3,
-                page_number: Some(1),
-                width: Some(100),
-                height: Some(100),
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: Some(crate::types::BoundingBox {
-                    x0: 101.0,
-                    y0: 200.0,
-                    x1: 201.0,
-                    y1: 300.0,
-                }),
-                source_path: None,
-                image_kind: Some(ImageKind::Diagram),
-                kind_confidence: Some(0.65),
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            },
-        ];
-
-        cluster_tiles(&mut images);
-
-        assert_eq!(images[0].cluster_id, Some(1));
-        assert_eq!(images[1].cluster_id, Some(1));
-        assert_eq!(images[2].cluster_id, Some(2));
-        assert_eq!(images[3].cluster_id, Some(2));
-    }
-
-    #[test]
-    fn test_cluster_tiles_is_deterministic() {
-        let make_images = || {
-            vec![
-                ExtractedImage {
-                    data: bytes::Bytes::new(),
-                    format: "png".into(),
-                    image_index: 0,
-                    page_number: Some(1),
-                    width: Some(100),
-                    height: Some(100),
-                    colorspace: None,
-                    bits_per_component: None,
-                    is_mask: false,
-                    description: None,
-                    ocr_result: None,
-                    bounding_box: None,
-                    source_path: None,
-                    image_kind: Some(ImageKind::Drawing),
-                    kind_confidence: Some(0.7),
-                    cluster_id: None,
-                    caption: None,
-                    qr_codes: None,
-                    data_base64: None,
-                },
-                ExtractedImage {
-                    data: bytes::Bytes::new(),
-                    format: "png".into(),
-                    image_index: 1,
-                    page_number: Some(1),
-                    width: Some(100),
-                    height: Some(100),
-                    colorspace: None,
-                    bits_per_component: None,
-                    is_mask: false,
-                    description: None,
-                    ocr_result: None,
-                    bounding_box: None,
-                    source_path: None,
-                    image_kind: Some(ImageKind::Drawing),
-                    kind_confidence: Some(0.7),
-                    cluster_id: None,
-                    caption: None,
-                    qr_codes: None,
-                    data_base64: None,
-                },
-            ]
-        };
-
-        let mut images1 = make_images();
-        let mut images2 = make_images();
-
-        cluster_tiles(&mut images1);
-        cluster_tiles(&mut images2);
-
-        assert_eq!(images1[0].cluster_id, images2[0].cluster_id);
-        assert_eq!(images1[1].cluster_id, images2[1].cluster_id);
-    }
-
-    #[test]
-    fn test_classify_skips_entropy_for_oversized_image() {
-        let bytes = b"\x89PNG\r\n\x1a\nbogus body".to_vec();
-        let (kind, conf) = classify(&bytes, "png", Some(20_000), Some(20_000), None, None, false);
-        assert_eq!(kind, ImageKind::Unknown);
-        assert_eq!(conf, 0.50);
-    }
-
-    #[test]
-    fn test_cluster_tiles_isolates_clusters_per_page() {
-        let mut images = vec![];
-        for page in 1..=2 {
-            for col in 0..2 {
-                images.push(ExtractedImage {
-                    data: bytes::Bytes::new(),
-                    format: "png".into(),
-                    image_index: ((page - 1) * 2 + col),
-                    page_number: Some(page),
-                    width: Some(100),
-                    height: Some(100),
-                    colorspace: None,
-                    bits_per_component: None,
-                    is_mask: false,
-                    description: None,
-                    ocr_result: None,
-                    bounding_box: Some(crate::types::BoundingBox {
-                        x0: (col as f64) * 101.0,
-                        y0: 0.0,
-                        x1: (col as f64) * 101.0 + 100.0,
-                        y1: 100.0,
-                    }),
-                    source_path: None,
-                    image_kind: Some(ImageKind::Drawing),
-                    kind_confidence: Some(0.7),
-                    cluster_id: None,
-                    caption: None,
-                    qr_codes: None,
-                    data_base64: None,
-                });
-            }
-        }
-        cluster_tiles(&mut images);
-        assert!(images[0].cluster_id.is_some());
-        assert_eq!(images[0].cluster_id, images[1].cluster_id);
-        assert_eq!(images[2].cluster_id, images[3].cluster_id);
-        assert_ne!(images[0].cluster_id, images[2].cluster_id);
-    }
-
-    #[test]
-    fn test_classify_does_not_panic_on_zero_dimensions() {
-        let bytes = b"\x89PNG\r\n\x1a\nbody".to_vec();
-        let (kind, conf) = classify(&bytes, "png", Some(0), Some(0), None, None, false);
-        assert_eq!(kind, ImageKind::Unknown);
-        assert_eq!(conf, 0.0);
-    }
-
-    #[test]
-    fn test_image_kind_serde_round_trips_all_variants() {
-        let variants = [
-            (ImageKind::Photograph, "photograph"),
-            (ImageKind::Diagram, "diagram"),
-            (ImageKind::Chart, "chart"),
-            (ImageKind::Drawing, "drawing"),
-            (ImageKind::TextBlock, "text_block"),
-            (ImageKind::Decoration, "decoration"),
-            (ImageKind::Logo, "logo"),
-            (ImageKind::Icon, "icon"),
-            (ImageKind::TileFragment, "tile_fragment"),
-            (ImageKind::Mask, "mask"),
-            (ImageKind::Unknown, "unknown"),
-        ];
-        for (kind, expected) in variants {
-            let json = serde_json::to_string(&kind).expect("serialize");
-            assert_eq!(json, format!("\"{expected}\""), "wrong wire name for {kind:?}");
-            let round_trip: ImageKind = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(round_trip, kind);
-        }
+        let threshold = min_dim / 2.0;
+        let dx = (bbox_i.x0.max(bbox_j.x0) - bbox_i.x1.min(bbox_j.x1)).max(0.0);
+        let dy = (bbox_i.y0.max(bbox_j.y0) - bbox_i.y1.min(bbox_j.y1)).max(0.0);
+        let dist = (dx * dx + dy * dy).sqrt();
+        dist <= threshold
+    } else {
+        const NO_BBOX_INDEX_WINDOW: i32 = 3;
+        (idx_i as i32 - idx_j as i32).abs() <= NO_BBOX_INDEX_WINDOW
     }
 }
+
+/// Union-find adjacent candidates (pairwise, via [`should_connect_tiles`]) and return the
+/// resulting parent array, indexed by position within `candidates` (not by `images` index).
+fn union_find_adjacent_tiles(images: &[ExtractedImage], candidates: &[usize]) -> Vec<usize> {
+    let n = candidates.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    for (i, idx_i) in candidates.iter().enumerate() {
+        for (j, idx_j) in candidates.iter().enumerate().skip(i + 1) {
+            let img_i = &images[*idx_i];
+            let img_j = &images[*idx_j];
+            if should_connect_tiles(img_i, img_j, *idx_i, *idx_j) {
+                uf_union(&mut parent, i, j);
+            }
+        }
+    }
+
+    parent
+}
+
+/// Group `candidates` into clusters by `parent`'s union-find roots, assign each multi-member
+/// cluster a shared `cluster_id`, reclassify Drawing/Diagram members as TileFragment, and return
+/// `(cluster_count, max_cluster_size)` for the caller's tracing span.
+fn apply_tile_clusters(
+    images: &mut [ExtractedImage],
+    candidates: &[usize],
+    mut parent: Vec<usize>,
+    next_cluster_id: &mut u32,
+) -> (i32, usize) {
+    let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, idx_i) in candidates.iter().enumerate() {
+        let root = uf_find(&mut parent, i);
+        clusters.entry(root).or_default().push(*idx_i);
+    }
+
+    let mut cluster_count = 0;
+    let mut max_cluster_size = 0;
+    let mut multi_clusters: Vec<Vec<usize>> = clusters.into_values().filter(|cluster| cluster.len() >= 2).collect();
+    for cluster in &mut multi_clusters {
+        cluster.sort_unstable();
+    }
+    multi_clusters.sort_by_key(|cluster| cluster[0]);
+    for cluster in multi_clusters {
+        cluster_count += 1;
+        max_cluster_size = max_cluster_size.max(cluster.len());
+        for idx in cluster {
+            images[idx].cluster_id = Some(*next_cluster_id);
+            if matches!(images[idx].image_kind, Some(ImageKind::Drawing | ImageKind::Diagram)) {
+                images[idx].image_kind = Some(ImageKind::TileFragment);
+            }
+        }
+        *next_cluster_id = next_cluster_id.saturating_add(1);
+    }
+
+    (cluster_count, max_cluster_size)
+}
+
+#[cfg(test)]
+#[path = "image_kind/tests.rs"]
+mod tests;
