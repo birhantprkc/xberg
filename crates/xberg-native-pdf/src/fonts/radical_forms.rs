@@ -12,7 +12,31 @@
 /// radical presentation form, or `None` for a codepoint outside the two
 /// radical blocks or without an equivalent (e.g. U+2E80, a repeat mark).
 pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
-    let mapped = match c as u32 {
+    let cp = c as u32;
+    let mapped = match cp {
+        0x2E81..=0x2EF3 => cjk_radicals_supplement_to_ideograph(cp)?,
+        0x2F00..=0x2FD5 => kangxi_radical_to_ideograph(cp)?,
+        _ => return None,
+    };
+    char::from_u32(mapped)
+}
+
+/// `EquivalentUnifiedIdeograph.txt` mapping for the CJK Radicals Supplement
+/// block (U+2E80..U+2EFF). ~keep
+fn cjk_radicals_supplement_to_ideograph(cp: u32) -> Option<u32> {
+    match cp {
+        0x2E81..=0x2EBD => cjk_radicals_supplement_to_ideograph_low(cp),
+        0x2EBE..=0x2EF3 => cjk_radicals_supplement_to_ideograph_high(cp),
+        _ => None,
+    }
+}
+
+/// Lower half of the CJK Radicals Supplement mapping (U+2E81..U+2EBD),
+/// split out of `cjk_radicals_supplement_to_ideograph` purely to keep that
+/// function within the repository's line-length guideline; the mapping
+/// itself is unchanged. ~keep
+fn cjk_radicals_supplement_to_ideograph_low(cp: u32) -> Option<u32> {
+    Some(match cp {
         0x2E81 => 0x5382,
         0x2E82 => 0x4E5B,
         0x2E83 => 0x4E5A,
@@ -73,6 +97,16 @@ pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
         0x2EBB => 0x807F,
         0x2EBC => 0x8089,
         0x2EBD => 0x26951,
+        _ => return None,
+    })
+}
+
+/// Upper half of the CJK Radicals Supplement mapping (U+2EBE..U+2EF3),
+/// split out of `cjk_radicals_supplement_to_ideograph` purely to keep that
+/// function within the repository's line-length guideline; the mapping
+/// itself is unchanged. ~keep
+fn cjk_radicals_supplement_to_ideograph_high(cp: u32) -> Option<u32> {
+    Some(match cp {
         0x2EBE => 0x8279,
         0x2EBF => 0x8279,
         0x2EC0 => 0x8279,
@@ -127,6 +161,27 @@ pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
         0x2EF1 => 0x9F9C,
         0x2EF2 => 0x4E80,
         0x2EF3 => 0x9F9F,
+        _ => return None,
+    })
+}
+
+/// `EquivalentUnifiedIdeograph.txt` mapping for the Kangxi Radicals block
+/// (U+2F00..U+2FDF). ~keep
+fn kangxi_radical_to_ideograph(cp: u32) -> Option<u32> {
+    match cp {
+        0x2F00..=0x2F37 => kangxi_radical_to_ideograph_q1(cp),
+        0x2F38..=0x2F6F => kangxi_radical_to_ideograph_q2(cp),
+        0x2F70..=0x2FA2 => kangxi_radical_to_ideograph_q3(cp),
+        0x2FA3..=0x2FD5 => kangxi_radical_to_ideograph_q4(cp),
+        _ => None,
+    }
+}
+
+/// 1st quarter of the Kangxi Radicals mapping (U+2F00..U+2F37), split out of
+/// `kangxi_radical_to_ideograph` purely to keep that function within the
+/// repository's line-length guideline; the mapping itself is unchanged. ~keep
+fn kangxi_radical_to_ideograph_q1(cp: u32) -> Option<u32> {
+    Some(match cp {
         0x2F00 => 0x4E00,
         0x2F01 => 0x4E28,
         0x2F02 => 0x4E36,
@@ -183,6 +238,15 @@ pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
         0x2F35 => 0x5EF4,
         0x2F36 => 0x5EFE,
         0x2F37 => 0x5F0B,
+        _ => return None,
+    })
+}
+
+/// 2nd quarter of the Kangxi Radicals mapping (U+2F38..U+2F6F), split out of
+/// `kangxi_radical_to_ideograph` purely to keep that function within the
+/// repository's line-length guideline; the mapping itself is unchanged. ~keep
+fn kangxi_radical_to_ideograph_q2(cp: u32) -> Option<u32> {
+    Some(match cp {
         0x2F38 => 0x5F13,
         0x2F39 => 0x5F50,
         0x2F3A => 0x5F61,
@@ -239,6 +303,15 @@ pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
         0x2F6D => 0x77DB,
         0x2F6E => 0x77E2,
         0x2F6F => 0x77F3,
+        _ => return None,
+    })
+}
+
+/// 3rd quarter of the Kangxi Radicals mapping (U+2F70..U+2FA2), split out of
+/// `kangxi_radical_to_ideograph` purely to keep that function within the
+/// repository's line-length guideline; the mapping itself is unchanged. ~keep
+fn kangxi_radical_to_ideograph_q3(cp: u32) -> Option<u32> {
+    Some(match cp {
         0x2F70 => 0x793A,
         0x2F71 => 0x79B8,
         0x2F72 => 0x79BE,
@@ -290,6 +363,15 @@ pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
         0x2FA0 => 0x8FB0,
         0x2FA1 => 0x8FB5,
         0x2FA2 => 0x9091,
+        _ => return None,
+    })
+}
+
+/// 4th quarter of the Kangxi Radicals mapping (U+2FA3..U+2FD5), split out of
+/// `kangxi_radical_to_ideograph` purely to keep that function within the
+/// repository's line-length guideline; the mapping itself is unchanged. ~keep
+fn kangxi_radical_to_ideograph_q4(cp: u32) -> Option<u32> {
+    Some(match cp {
         0x2FA3 => 0x9149,
         0x2FA4 => 0x91C6,
         0x2FA5 => 0x91CC,
@@ -342,6 +424,5 @@ pub(crate) fn radical_to_unified_ideograph(c: char) -> Option<char> {
         0x2FD4 => 0x9F9C,
         0x2FD5 => 0x9FA0,
         _ => return None,
-    };
-    char::from_u32(mapped)
+    })
 }

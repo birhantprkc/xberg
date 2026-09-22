@@ -619,18 +619,40 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
         }
     }
 
-    // Parse begincodespacerange sections (PDF Spec §9.7.5 / §9.10.3)
-    //
-    // The codespace range declares the valid domain of character codes and,
-    // critically, **their byte width**.  A range like `<00> <FF>` is 1-byte;
-    // `<0000> <FFFF>` is 2-byte.  We use the widest range found to set
-    // `cmap.code_width`, which the text extractor uses to decide how many
-    // bytes to consume per character from the PDF content stream.
-    //
-    // Without this, any CJK ToUnicode CMap that does not use one of the
-    // well-known encoding names (Identity-H, EUC, GBK, …) would be read
-    // one byte at a time, splitting every 2-byte CID into two wrong codes. ~keep
-    for section in extract_sections(&content, "begincodespacerange", "endcodespacerange") {
+    // Parse begincodespacerange sections (PDF Spec §9.7.5 / §9.10.3). See
+    // `apply_codespacerange_sections` for why this matters. ~keep
+    apply_codespacerange_sections(&mut cmap, &content);
+
+    // Parse bfchar and bfrange sections in document order so that later entries
+    // overwrite earlier ones for the same code (ISO 32000-1:2008 §9.10.3).
+    // pdf.js, MuPDF, and Poppler all use this last-wins, document-order semantics. ~keep
+    for (kind, section) in bf_sections_in_document_order(&content) {
+        match kind {
+            BfSectionKind::Char => apply_bfchar_section(&mut cmap, section),
+            BfSectionKind::Range => apply_bfrange_section(&mut cmap, section),
+        }
+    }
+
+    apply_notdefrange_sections(&mut cmap, &content);
+
+    cmap.compress_sequential_ranges();
+    Ok(cmap)
+}
+
+/// The codespace range declares the valid domain of character codes and,
+/// critically, **their byte width**. A range like `<00> <FF>` is 1-byte;
+/// `<0000> <FFFF>` is 2-byte. We use the widest range found to set
+/// `cmap.code_width`, which the text extractor uses to decide how many bytes
+/// to consume per character from the PDF content stream.
+///
+/// Without this, any CJK ToUnicode CMap that does not use one of the
+/// well-known encoding names (Identity-H, EUC, GBK, …) would be read one
+/// byte at a time, splitting every 2-byte CID into two wrong codes. Split
+/// out of `parse_tounicode_cmap` purely to keep that function within the
+/// repository's line-length guideline; behavior and evaluation order are
+/// unchanged. ~keep
+fn apply_codespacerange_sections(cmap: &mut CMap, content: &str) {
+    for section in extract_sections(content, "begincodespacerange", "endcodespacerange") {
         for line in section.lines() {
             let width = parse_codespacerange_line_width(line);
             if width > cmap.code_width {
@@ -639,73 +661,84 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
             }
         }
     }
+}
 
-    // Parse bfchar and bfrange sections in document order so that later entries
-    // overwrite earlier ones for the same code (ISO 32000-1:2008 §9.10.3).
-    // pdf.js, MuPDF, and Poppler all use this last-wins, document-order semantics. ~keep
-    for (kind, section) in bf_sections_in_document_order(&content) {
-        match kind {
-            BfSectionKind::Char => {
-                let mut attempted = 0usize;
-                let mut malformed = 0usize;
-                for line in significant_lines(section) {
-                    attempted += 1;
-                    let pairs = parse_bfchar_line(line);
-                    if pairs.is_empty() {
-                        malformed += 1;
-                        continue;
-                    }
-                    for (src, dst) in pairs {
-                        tracing::trace!("ToUnicode bfchar: 0x{:02X} -> {:?}", src, dst);
-                        cmap.insert(src, dst);
-                    }
-                }
-                warn_on_malformed_lines("bfchar", attempted, malformed);
-            }
-            BfSectionKind::Range => {
-                let mut attempted = 0usize;
-                let mut malformed = 0usize;
-                for line in significant_lines(section) {
-                    attempted += 1;
-                    match parse_bfrange_line(line) {
-                        Some(mappings) => {
-                            tracing::trace!("ToUnicode bfrange: {} mappings parsed", mappings.len());
-                            for (src, dst) in mappings {
-                                cmap.insert(src, dst);
-                            }
-                        }
-                        None => malformed += 1,
-                    }
-                }
-                warn_on_malformed_lines("bfrange", attempted, malformed);
+/// Apply one `beginbfchar`/`endbfchar` section's mappings to `cmap`. Split
+/// out of `parse_tounicode_cmap` purely to keep that function within the
+/// repository's line-length guideline; behavior and evaluation order are
+/// unchanged. ~keep
+fn apply_bfchar_section(cmap: &mut CMap, section: &str) {
+    let mut attempted = 0usize;
+    let mut malformed = 0usize;
+    for line in significant_lines(section) {
+        attempted += 1;
+        let pairs = parse_bfchar_line(line);
+        if pairs.is_empty() {
+            malformed += 1;
+            continue;
+        }
+        for (src, dst) in pairs {
+            tracing::trace!("ToUnicode bfchar: 0x{:02X} -> {:?}", src, dst);
+            cmap.insert(src, dst);
+        }
+    }
+    warn_on_malformed_lines("bfchar", attempted, malformed);
+}
+
+/// Apply one `beginbfrange`/`endbfrange` section's mappings to `cmap`. Split
+/// out of `parse_tounicode_cmap` purely to keep that function within the
+/// repository's line-length guideline; behavior and evaluation order are
+/// unchanged. ~keep
+fn apply_bfrange_section(cmap: &mut CMap, section: &str) {
+    let mut attempted = 0usize;
+    let mut malformed = 0usize;
+    for line in significant_lines(section) {
+        attempted += 1;
+        let Some(mappings) = parse_bfrange_line(line) else {
+            malformed += 1;
+            continue;
+        };
+        tracing::trace!("ToUnicode bfrange: {} mappings parsed", mappings.len());
+        for (src, dst) in mappings {
+            cmap.insert(src, dst);
+        }
+    }
+    warn_on_malformed_lines("bfrange", attempted, malformed);
+}
+
+/// Apply every `beginnotdefrange`/`endnotdefrange` section's fallback
+/// mappings to `cmap`. Split out of `parse_tounicode_cmap` purely to keep
+/// that function within the repository's line-length guideline; behavior
+/// and evaluation order are unchanged. ~keep
+fn apply_notdefrange_sections(cmap: &mut CMap, content: &str) {
+    for section in extract_sections(content, "beginnotdefrange", "endnotdefrange") {
+        apply_notdefrange_section(cmap, section);
+    }
+}
+
+/// Apply one `beginnotdefrange`/`endnotdefrange` section's fallback
+/// mappings to `cmap`. Split out of `apply_notdefrange_sections` purely to
+/// keep nesting within the repository's guideline; behavior and evaluation
+/// order are unchanged. ~keep
+fn apply_notdefrange_section(cmap: &mut CMap, section: &str) {
+    let mut attempted = 0usize;
+    let mut malformed = 0usize;
+    for line in significant_lines(section) {
+        attempted += 1;
+        let Some(mappings) = parse_notdefrange_line(line) else {
+            malformed += 1;
+            continue;
+        };
+        tracing::trace!("ToUnicode notdefrange: {} mappings parsed", mappings.len());
+        for (src, dst) in mappings {
+            // Only insert if not already mapped (normal mappings take precedence)
+            // For notdefrange, we need to check if source is already mapped ~keep
+            if !cmap.chars.contains_key(&src) {
+                cmap.insert(src, dst);
             }
         }
     }
-
-    for section in extract_sections(&content, "beginnotdefrange", "endnotdefrange") {
-        let mut attempted = 0usize;
-        let mut malformed = 0usize;
-        for line in significant_lines(section) {
-            attempted += 1;
-            match parse_notdefrange_line(line) {
-                Some(mappings) => {
-                    tracing::trace!("ToUnicode notdefrange: {} mappings parsed", mappings.len());
-                    for (src, dst) in mappings {
-                        // Only insert if not already mapped (normal mappings take precedence)
-                        // For notdefrange, we need to check if source is already mapped ~keep
-                        if !cmap.chars.contains_key(&src) {
-                            cmap.insert(src, dst);
-                        }
-                    }
-                }
-                None => malformed += 1,
-            }
-        }
-        warn_on_malformed_lines("notdefrange", attempted, malformed);
-    }
-
-    cmap.compress_sequential_ranges();
-    Ok(cmap)
+    warn_on_malformed_lines("notdefrange", attempted, malformed);
 }
 
 enum BfSectionKind {
@@ -1014,145 +1047,176 @@ fn parse_bfrange_line(line: &str) -> Option<Vec<(u32, String)>> {
         std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>\s*<([^>]*)>\s*\[((?:\s*<[^>]+>\s*)+)\]").unwrap());
 
     if let Some(caps) = RE_ARRAY.captures(line) {
-        let start_str = caps[1].trim().replace(char::is_whitespace, "");
-        let end_str = caps[2].trim().replace(char::is_whitespace, "");
-        let start = u32::from_str_radix(&start_str, 16).ok()?;
-        let end = u32::from_str_radix(&end_str, 16).ok()?;
-        let array_str = &caps[3];
-
-        static RE_HEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>").unwrap());
-        // Drop any array entry that is not pure ASCII hex (e.g. a lossy-decoded
-        // U+FFFD from invalid UTF-8 in the raw stream) before it can reach the
-        // byte-index slices below. See `is_ascii_hex_digits`. A dropped entry
-        // shrinks `dst_hexes` below `range_size`, which the existing
-        // size-mismatch warning already surfaces. ~keep
-        let dst_hexes: Vec<String> = RE_HEX
-            .captures_iter(array_str)
-            .filter_map(|cap| {
-                let s = cap.get(1).unwrap().as_str().trim().replace(char::is_whitespace, "");
-                if is_ascii_hex_digits(&s) { Some(s) } else { None }
-            })
-            .collect();
-
-        let mut result = Vec::new();
-
-        // `start`/`end` are attacker-controlled hex from the font's ToUnicode stream, so a
-        // reversed range (`<0100> <0000>`) or `end == u32::MAX` makes the naive
-        // `(end - start + 1)` overflow: a panic under `overflow-checks` (debug and test), a
-        // silent wrap to a bogus count in release, which this crate's profile does not
-        // enable. The sequential branch and `parse_notdefrange_line` clamp with
-        // `end.saturating_sub(start).min(10000)`; here `range_size` is an entry COUNT rather
-        // than a 0-based loop offset, hence the `saturating_add(1)`, and their `.min(10000)`
-        // is unnecessary because this value only bounds a `.take()` over `dst_hexes` (already
-        // sized by the literal array in the stream) instead of driving iteration. ~keep
-        let range_size = end.saturating_sub(start).saturating_add(1) as usize;
-
-        // SPEC VALIDATION: PDF Spec ISO 32000-1:2008, Section 9.10.3
-        // The array must have exactly (end - start + 1) entries.
-        // Current behavior (lenient): Use what's available, ignore extras/missing.
-        // Proper strict mode: Should fail if array size doesn't match range_size. ~keep
-        if dst_hexes.len() != range_size {
-            tracing::warn!(
-                "ToUnicode bfrange array size mismatch: expected {} entries for range 0x{:X}-0x{:X}, got {}",
-                range_size,
-                start,
-                end,
-                dst_hexes.len()
-            );
-        }
-
-        for (i, dst_hex) in dst_hexes.iter().take(range_size).enumerate() {
-            let src = start + i as u32;
-
-            let dst = if dst_hex.len() <= 4 {
-                let dst_code = u32::from_str_radix(dst_hex, 16).ok()?;
-                char::from_u32(dst_code)?.to_string()
-            } else if dst_hex.len() <= 6 {
-                let dst_code = u32::from_str_radix(dst_hex, 16).ok()?;
-                if let Some(ch) = char::from_u32(dst_code) {
-                    ch.to_string()
-                } else {
-                    continue;
-                }
-            } else if dst_hex.len() == 8 {
-                let dst_code = u32::from_str_radix(dst_hex, 16).ok()?;
-                if let Some(decoded) = decode_utf16_surrogate_pair(dst_code) {
-                    decoded
-                } else {
-                    let mut unicode_string = String::new();
-                    if let Ok(code) = u32::from_str_radix(&dst_hex[0..4], 16)
-                        && let Some(ch) = char::from_u32(code)
-                    {
-                        unicode_string.push(ch);
-                    }
-                    if let Ok(code) = u32::from_str_radix(&dst_hex[4..8], 16)
-                        && let Some(ch) = char::from_u32(code)
-                    {
-                        unicode_string.push(ch);
-                    }
-                    if unicode_string.is_empty() {
-                        continue;
-                    }
-                    unicode_string
-                }
-            } else {
-                let mut unicode_string = String::new();
-                for chunk_start in (0..dst_hex.len()).step_by(4) {
-                    let chunk_end = (chunk_start + 4).min(dst_hex.len());
-                    if let Ok(code) = u32::from_str_radix(&dst_hex[chunk_start..chunk_end], 16)
-                        && let Some(ch) = char::from_u32(code)
-                    {
-                        unicode_string.push(ch);
-                    }
-                }
-                if unicode_string.is_empty() {
-                    continue;
-                }
-                unicode_string
-            };
-
-            result.push((src, dst));
-        }
-        return Some(result);
+        return parse_bfrange_array_form(&caps);
     }
 
     if let Some(caps) = RE_SEQ.captures(line) {
-        let start_str = caps[1].trim().replace(char::is_whitespace, "");
-        let end_str = caps[2].trim().replace(char::is_whitespace, "");
-        let dst_start_str = caps[3].trim().replace(char::is_whitespace, "");
-        let start = u32::from_str_radix(&start_str, 16).ok()?;
-        let end = u32::from_str_radix(&end_str, 16).ok()?;
-        let dst_start = u32::from_str_radix(&dst_start_str, 16).ok()?;
-
-        let mut result = Vec::new();
-        let range_size = end.saturating_sub(start).min(10000);
-
-        // For surrogate pair destinations (8 hex digits), decode to Unicode code point
-        // first, then increment the code point. Naively incrementing the raw u32 would
-        // overflow across the low surrogate boundary (0xDFFF → 0xE000). ~keep
-        let base_codepoint = if dst_start > 0xFFFF {
-            if let Some(decoded) = decode_utf16_surrogate_pair(dst_start) {
-                decoded.chars().next().map(|c| c as u32)
-            } else {
-                Some(dst_start)
-            }
-        } else {
-            Some(dst_start)
-        };
-
-        if let Some(base_cp) = base_codepoint {
-            for i in 0..=range_size {
-                let src = start.wrapping_add(i);
-                let cp = base_cp.wrapping_add(i);
-                if let Some(ch) = char::from_u32(cp) {
-                    result.push((src, ch.to_string()));
-                }
-            }
-        }
-        return Some(result);
+        return parse_bfrange_sequential_form(&caps);
     }
 
     None
+}
+
+/// Parse the `<start> <end> [<dst1> <dst2> ...]` bfrange form: an explicit
+/// array of individual destinations, one per code in `start..=end`. Split
+/// out of `parse_bfrange_line` purely to keep that function within the
+/// repository's line-length guideline; behavior, `?`-propagated abort
+/// semantics, and per-entry `continue`-skip semantics are all unchanged. ~keep
+fn parse_bfrange_array_form(caps: &regex::Captures) -> Option<Vec<(u32, String)>> {
+    let start_str = caps[1].trim().replace(char::is_whitespace, "");
+    let end_str = caps[2].trim().replace(char::is_whitespace, "");
+    let start = u32::from_str_radix(&start_str, 16).ok()?;
+    let end = u32::from_str_radix(&end_str, 16).ok()?;
+    let array_str = &caps[3];
+
+    static RE_HEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"<([^>]*)>").unwrap());
+    // Drop any array entry that is not pure ASCII hex (e.g. a lossy-decoded
+    // U+FFFD from invalid UTF-8 in the raw stream) before it can reach the
+    // byte-index slices below. See `is_ascii_hex_digits`. A dropped entry
+    // shrinks `dst_hexes` below `range_size`, which the existing
+    // size-mismatch warning already surfaces. ~keep
+    let dst_hexes: Vec<String> = RE_HEX
+        .captures_iter(array_str)
+        .filter_map(|cap| {
+            let s = cap.get(1).unwrap().as_str().trim().replace(char::is_whitespace, "");
+            if is_ascii_hex_digits(&s) { Some(s) } else { None }
+        })
+        .collect();
+
+    let mut result = Vec::new();
+
+    // `start`/`end` are attacker-controlled hex from the font's ToUnicode stream, so a
+    // reversed range (`<0100> <0000>`) or `end == u32::MAX` makes the naive
+    // `(end - start + 1)` overflow: a panic under `overflow-checks` (debug and test), a
+    // silent wrap to a bogus count in release, which this crate's profile does not
+    // enable. The sequential branch and `parse_notdefrange_line` clamp with
+    // `end.saturating_sub(start).min(10000)`; here `range_size` is an entry COUNT rather
+    // than a 0-based loop offset, hence the `saturating_add(1)`, and their `.min(10000)`
+    // is unnecessary because this value only bounds a `.take()` over `dst_hexes` (already
+    // sized by the literal array in the stream) instead of driving iteration. ~keep
+    let range_size = end.saturating_sub(start).saturating_add(1) as usize;
+
+    // SPEC VALIDATION: PDF Spec ISO 32000-1:2008, Section 9.10.3
+    // The array must have exactly (end - start + 1) entries.
+    // Current behavior (lenient): Use what's available, ignore extras/missing.
+    // Proper strict mode: Should fail if array size doesn't match range_size. ~keep
+    if dst_hexes.len() != range_size {
+        tracing::warn!(
+            "ToUnicode bfrange array size mismatch: expected {} entries for range 0x{:X}-0x{:X}, got {}",
+            range_size,
+            start,
+            end,
+            dst_hexes.len()
+        );
+    }
+
+    for (i, dst_hex) in dst_hexes.iter().take(range_size).enumerate() {
+        let src = start + i as u32;
+
+        let Some(dst) = decode_bfrange_array_entry(dst_hex)? else {
+            continue;
+        };
+
+        result.push((src, dst));
+    }
+    Some(result)
+}
+
+/// Decode one bfrange array entry (a single `<dstN>` hex string) to its
+/// Unicode string. The outer `Option` (propagated with `?` by the caller)
+/// is this entry's *abort-the-whole-line* signal — a malformed hex digit
+/// sequence, matching the original inline `.ok()?` sites. The inner
+/// `Option` is this entry's *skip-just-this-entry* signal — a
+/// well-formed-hex but otherwise unusable value, matching the original
+/// inline `continue` sites. Split out of `parse_bfrange_array_form` purely
+/// to keep nesting within the repository's guideline; behavior is
+/// unchanged. ~keep
+fn decode_bfrange_array_entry(dst_hex: &str) -> Option<Option<String>> {
+    if dst_hex.len() <= 4 {
+        let dst_code = u32::from_str_radix(dst_hex, 16).ok()?;
+        return Some(Some(char::from_u32(dst_code)?.to_string()));
+    }
+    if dst_hex.len() <= 6 {
+        let dst_code = u32::from_str_radix(dst_hex, 16).ok()?;
+        return Some(char::from_u32(dst_code).map(|ch| ch.to_string()));
+    }
+    if dst_hex.len() == 8 {
+        let dst_code = u32::from_str_radix(dst_hex, 16).ok()?;
+        if let Some(decoded) = decode_utf16_surrogate_pair(dst_code) {
+            return Some(Some(decoded));
+        }
+        let mut unicode_string = String::new();
+        if let Ok(code) = u32::from_str_radix(&dst_hex[0..4], 16)
+            && let Some(ch) = char::from_u32(code)
+        {
+            unicode_string.push(ch);
+        }
+        if let Ok(code) = u32::from_str_radix(&dst_hex[4..8], 16)
+            && let Some(ch) = char::from_u32(code)
+        {
+            unicode_string.push(ch);
+        }
+        return Some(if unicode_string.is_empty() {
+            None
+        } else {
+            Some(unicode_string)
+        });
+    }
+
+    let mut unicode_string = String::new();
+    for chunk_start in (0..dst_hex.len()).step_by(4) {
+        let chunk_end = (chunk_start + 4).min(dst_hex.len());
+        if let Ok(code) = u32::from_str_radix(&dst_hex[chunk_start..chunk_end], 16)
+            && let Some(ch) = char::from_u32(code)
+        {
+            unicode_string.push(ch);
+        }
+    }
+    Some(if unicode_string.is_empty() {
+        None
+    } else {
+        Some(unicode_string)
+    })
+}
+
+/// Parse the `<start> <end> <dst>` bfrange form: a sequential mapping
+/// starting at `dst` and incrementing per code in `start..=end`. Split out
+/// of `parse_bfrange_line` purely to keep that function within the
+/// repository's line-length guideline; behavior is unchanged. ~keep
+fn parse_bfrange_sequential_form(caps: &regex::Captures) -> Option<Vec<(u32, String)>> {
+    let start_str = caps[1].trim().replace(char::is_whitespace, "");
+    let end_str = caps[2].trim().replace(char::is_whitespace, "");
+    let dst_start_str = caps[3].trim().replace(char::is_whitespace, "");
+    let start = u32::from_str_radix(&start_str, 16).ok()?;
+    let end = u32::from_str_radix(&end_str, 16).ok()?;
+    let dst_start = u32::from_str_radix(&dst_start_str, 16).ok()?;
+
+    let mut result = Vec::new();
+    let range_size = end.saturating_sub(start).min(10000);
+
+    // For surrogate pair destinations (8 hex digits), decode to Unicode code point
+    // first, then increment the code point. Naively incrementing the raw u32 would
+    // overflow across the low surrogate boundary (0xDFFF → 0xE000). ~keep
+    let base_codepoint = if dst_start > 0xFFFF {
+        if let Some(decoded) = decode_utf16_surrogate_pair(dst_start) {
+            decoded.chars().next().map(|c| c as u32)
+        } else {
+            Some(dst_start)
+        }
+    } else {
+        Some(dst_start)
+    };
+
+    if let Some(base_cp) = base_codepoint {
+        for i in 0..=range_size {
+            let src = start.wrapping_add(i);
+            let cp = base_cp.wrapping_add(i);
+            if let Some(ch) = char::from_u32(cp) {
+                result.push((src, ch.to_string()));
+            }
+        }
+    }
+    Some(result)
 }
 
 /// Parse a notdefrange line: `<start> <end> <dst>`
@@ -1208,599 +1272,4 @@ pub fn parse_cid_to_unicode(data: &[u8]) -> Result<CMap> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_bfchar_single() {
-        let data = b"beginbfchar\n<0041> <0041>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-    }
-
-    #[test]
-    fn test_parse_bfchar_multiple() {
-        let data = b"beginbfchar\n<0041> <0041>\n<0042> <0042>\n<0043> <0043>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0x42).as_deref(), Some("B"));
-        assert_eq!(cmap.get(&0x43).as_deref(), Some("C"));
-    }
-
-    #[test]
-    fn test_large_bfrange_compresses_and_resolves() {
-        // A 513-code contiguous range collapses into `ranges`, leaving `chars`
-        // empty, and still resolves via computed range lookup. ~keep
-        let data = b"beginbfrange\n<0100> <0300> <0500>\nendbfrange";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert!(!cmap.ranges.is_empty(), "large contiguous range should compress");
-        assert!(cmap.chars.is_empty(), "compressed codes should leave `chars`");
-        assert_eq!(cmap.get(&0x100).as_deref(), Some("\u{0500}"));
-        assert_eq!(cmap.get(&0x300).as_deref(), Some("\u{0700}"));
-        assert_eq!(cmap.get(&0x0FF), None);
-        assert_eq!(cmap.get(&0x301), None);
-    }
-
-    #[test]
-    fn test_bfchar_override_survives_range_compression() {
-        // A bfchar after a bfrange wins for that code (§9.10.3); compression must
-        // not swallow it (it breaks contiguity and stays in `chars`). ~keep
-        let data = b"beginbfrange\n<0100> <0300> <0500>\nendbfrange\n\
-                     beginbfchar\n<0200> <0041>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x200).as_deref(), Some("A"), "later bfchar must win");
-        assert_eq!(cmap.get(&0x1FF).as_deref(), Some("\u{05FF}"));
-        assert_eq!(cmap.get(&0x201).as_deref(), Some("\u{0601}"));
-    }
-
-    #[test]
-    fn test_parse_bfchar_non_ascii() {
-        let data = b"beginbfchar\n<00E9> <00E9>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0xE9).as_deref(), Some("é"));
-    }
-
-    #[test]
-    fn test_parse_bfrange_simple() {
-        let data = b"beginbfrange\n<0041> <0043> <0041>\nendbfrange";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0x42).as_deref(), Some("B"));
-        assert_eq!(cmap.get(&0x43).as_deref(), Some("C"));
-    }
-
-    #[test]
-    fn test_parse_bfrange_ascii_printable() {
-        let data = b"beginbfrange\n<0020> <007E> <0020>\nendbfrange";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-
-        assert_eq!(cmap.get(&0x20).as_deref(), Some(" "));
-        assert_eq!(cmap.get(&0x30).as_deref(), Some("0"));
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0x7A).as_deref(), Some("z"));
-        assert_eq!(cmap.get(&0x7E).as_deref(), Some("~"));
-    }
-
-    #[test]
-    fn test_parse_mixed_bfchar_bfrange() {
-        let data = b"beginbfchar\n<0041> <0058>\nendbfchar\nbeginbfrange\n<0042> <0044> <0042>\nendbfrange";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("X"));
-        assert_eq!(cmap.get(&0x42).as_deref(), Some("B"));
-        assert_eq!(cmap.get(&0x43).as_deref(), Some("C"));
-        assert_eq!(cmap.get(&0x44).as_deref(), Some("D"));
-    }
-
-    #[test]
-    fn test_parse_empty_cmap() {
-        let data = b"";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert!(cmap.is_empty());
-    }
-
-    #[test]
-    fn test_parse_cmap_with_whitespace() {
-        let data = b"beginbfchar\n  <0041>    <0041>  \n  <0042>  <0042>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0x42).as_deref(), Some("B"));
-    }
-
-    #[test]
-    fn test_parse_bfchar_line() {
-        assert_eq!(parse_bfchar_line("<0041> <0041>"), vec![(0x41, "A".to_string())]);
-        assert_eq!(parse_bfchar_line("<00E9> <00E9>"), vec![(0xE9, "é".to_string())]);
-        assert!(parse_bfchar_line("invalid line").is_empty());
-    }
-
-    #[test]
-    fn test_parse_bfchar_multiple_pairs_per_line() {
-        let result = parse_bfchar_line("<01> <0041> <02> <0042> <03> <0043>");
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], (0x01, "A".to_string()));
-        assert_eq!(result[1], (0x02, "B".to_string()));
-        assert_eq!(result[2], (0x03, "C".to_string()));
-    }
-
-    #[test]
-    fn test_parse_bfrange_line() {
-        let result = parse_bfrange_line("<0041> <0043> <0041>").unwrap();
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], (0x41, "A".to_string()));
-        assert_eq!(result[1], (0x42, "B".to_string()));
-        assert_eq!(result[2], (0x43, "C".to_string()));
-    }
-
-    #[test]
-    fn test_parse_bfrange_line_single_char() {
-        let result = parse_bfrange_line("<0041> <0041> <0041>").unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], (0x41, "A".to_string()));
-    }
-
-    #[test]
-    fn test_parse_bfrange_line_invalid() {
-        assert!(parse_bfrange_line("invalid").is_none());
-    }
-
-    #[test]
-    fn test_extract_sections() {
-        let content = "before\nbeginbfchar\ndata1\nendbfchar\nmiddle\nbeginbfchar\ndata2\nendbfchar\nafter";
-        let sections = extract_sections(content, "beginbfchar", "endbfchar");
-        assert_eq!(sections.len(), 2);
-        assert!(sections[0].contains("data1"));
-        assert!(sections[1].contains("data2"));
-    }
-
-    #[test]
-    fn test_extract_sections_none() {
-        let content = "no sections here";
-        let sections = extract_sections(content, "beginbfchar", "endbfchar");
-        assert_eq!(sections.len(), 0);
-    }
-
-    #[test]
-    fn test_parse_cid_to_unicode() {
-        let data = b"beginbfchar\n<0041> <0041>\nendbfchar";
-        let cmap = parse_cid_to_unicode(data).unwrap();
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-    }
-
-    #[test]
-    fn test_parse_hex_case_insensitive() {
-        let data = b"beginbfchar\n<00aB> <00Ab>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0xAB).as_deref(), Some("«"));
-    }
-
-    #[test]
-    fn test_parse_multiple_sections() {
-        let data = b"beginbfchar\n<0041> <0041>\nendbfchar\nbeginbfchar\n<0042> <0042>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.len(), 2);
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0x42).as_deref(), Some("B"));
-    }
-
-    #[test]
-    fn test_parse_bfchar_ligature() {
-        let data = b"beginbfchar\n<000C> <00660069>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x0C).as_deref(), Some("fi"));
-    }
-
-    #[test]
-    fn test_parse_bfchar_multiple_ligatures() {
-        let data = b"beginbfchar\n<000B> <00660066>\n<000C> <00660069>\n<000D> <0066006C>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x0B).as_deref(), Some("ff"));
-        assert_eq!(cmap.get(&0x0C).as_deref(), Some("fi"));
-        assert_eq!(cmap.get(&0x0D).as_deref(), Some("fl"));
-    }
-
-    #[test]
-    fn test_parse_bfrange_array_ligatures() {
-        let data = b"beginbfrange\n<005F> <0061> [<00660066> <00660069> <00660066006C>]\nendbfrange";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x5F).as_deref(), Some("ff"));
-        assert_eq!(cmap.get(&0x60).as_deref(), Some("fi"));
-        assert_eq!(cmap.get(&0x61).as_deref(), Some("ffl"));
-    }
-
-    #[test]
-    fn test_parse_bfrange_array_mixed() {
-        let data = b"beginbfrange\n<0010> <0012> [<0041> <00660069> <0043>]\nendbfrange";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.get(&0x10).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0x11).as_deref(), Some("fi"));
-        assert_eq!(cmap.get(&0x12).as_deref(), Some("C"));
-    }
-
-    #[test]
-    fn test_parse_zekat_cmap() {
-        let cmap_data = r#"
-/CIDInit /ProcSet findresource begin
-19 dict begin
-begincmap
-/CIDSystemInfo
-<< /Registry (Adobe)
-/Ordering (UCS)
-/Supplement 0
->> def
-/CMapName /Adobe-Identity-UCS def
-/CMapType 2 def
-1 begincodespacerange
-<0000> <FFFF>
-endcodespacerange
-1 beginbfrange
-<0003> <0004> <0020>
-endbfrange
-3 beginbfchar
-<000F> <002C>
-<0011> <002E>
-<0024> <0041>
-endbfchar
-1 beginbfrange
-<0027> <0029> <0044>
-endbfrange
-2 beginbfchar
-<002C> <0049>
-<002E> <004B>
-endbfchar
-2 beginbfrange
-<0030> <0032> <004D>
-<0035> <0037> <0052>
-endbfrange
-2 beginbfchar
-<0039> <0056>
-<003D> <005A>
-endbfchar
-5 beginbfrange
-<0044> <0048> <0061>
-<004A> <004C> <0067>
-<004E> <0053> <006B>
-<0055> <0059> <0072>
-<005C> <005D> <0079>
-endbfrange
-5 beginbfchar
-<006B> <00E2>
-<006F> <00E7>
-<007C> <00F6>
-<0081> <00FC>
-<00AB> <2026>
-endbfchar
-1 beginbfrange
-<00B3> <00B4> <201C>
-endbfrange
-4 beginbfchar
-<00C6> <00C2>
-<00D5> <0131>
-<00F7> <011F>
-<00FA> <015F>
-endbfchar
-endcmap
-CMapName currentdict /CMap defineresource pop
-end
-end
-"#
-        .as_bytes();
-
-        let cmap = parse_tounicode_cmap(cmap_data).expect("Failed to parse CMap");
-
-        assert_eq!(cmap.get(&0x3D).as_deref(), Some("Z"));
-        assert_eq!(cmap.get(&0x24).as_deref(), Some("A"));
-        assert_eq!(cmap.get(&0xC6).as_deref(), Some("\u{00C2}"));
-    }
-
-    /// `/WMode 1 def` on a CMap stream marks the font as vertical writing,
-    /// even when the CMap name does not advertise a `-V` suffix. This is the
-    /// authoritative signal per ISO 32000-1 §9.7.5.4 and is required for
-    /// embedded CMap streams used by tategaki layouts where the writer keeps
-    /// a horizontal-shaped CMap name but flips the writing mode internally.
-    #[test]
-    fn test_parse_wmode_vertical() {
-        let data = b"\
-/CIDInit /ProcSet findresource begin
-12 dict begin
-begincmap
-/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
-/CMapName /Adobe-Identity-UCS def
-/CMapType 2 def
-/WMode 1 def
-1 begincodespacerange
-<0000> <FFFF>
-endcodespacerange
-1 beginbfchar
-<0041> <0041>
-endbfchar
-endcmap
-CMapName currentdict /CMap defineresource pop
-end
-end
-";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.wmode, 1, "explicit /WMode 1 def must set vertical writing");
-        assert_eq!(cmap.get(&0x41).as_deref(), Some("A"));
-        assert_eq!(cmap.code_width, 2);
-    }
-
-    /// Default WMode is `0` (horizontal) when the directive is absent. Most
-    /// ToUnicode CMaps for horizontal text omit `/WMode` entirely; this
-    /// guards the dominant code path.
-    #[test]
-    fn test_parse_wmode_default_horizontal() {
-        let data = b"beginbfchar\n<0041> <0041>\nendbfchar";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.wmode, 0, "missing /WMode must default to horizontal");
-    }
-
-    /// `/WMode 0 def` is a no-op but must be parsed without warning.
-    #[test]
-    fn test_parse_wmode_explicit_horizontal() {
-        let data = b"\
-begincmap
-/WMode 0 def
-1 begincodespacerange
-<0000> <FFFF>
-endcodespacerange
-1 beginbfchar
-<0041> <0041>
-endbfchar
-endcmap
-";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.wmode, 0);
-    }
-
-    /// M5: a `/WMode N def` directive that lives inside a PostScript
-    /// comment (`%` to end-of-line, §3.3.1) must NOT flip the writing
-    /// mode. Without comment-stripping, this commented-out producer
-    /// debug line would silently switch a horizontal CMap to vertical.
-    #[test]
-    fn test_parse_wmode_ignored_inside_postscript_comment() {
-        let data = b"\
-begincmap
-% /WMode 1 def
-1 begincodespacerange
-<0000> <FFFF>
-endcodespacerange
-1 beginbfchar
-<0041> <0041>
-endbfchar
-endcmap
-";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(
-            cmap.wmode, 0,
-            "/WMode 1 def inside a PostScript comment must be ignored"
-        );
-    }
-
-    /// M5 corollary: a legitimate `/WMode 1 def` on a later line is
-    /// still picked up even when an earlier line carries an unrelated
-    /// comment.
-    #[test]
-    fn test_parse_wmode_after_comment_still_seen() {
-        let data = b"\
-begincmap
-% some prologue comment unrelated to wmode
-/WMode 1 def
-1 begincodespacerange
-<0000> <FFFF>
-endcodespacerange
-1 beginbfchar
-<0041> <0041>
-endbfchar
-endcmap
-";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(cmap.wmode, 1);
-    }
-
-    /// M6: a non-standard `/WMode 2 def` must NOT silently flip writing
-    /// mode; the spec only defines 0 and 1 (§9.7.5.4). Parser returns
-    /// None (callers fall back to horizontal default) and emits a warn
-    /// log so producer bugs are diagnosable.
-    #[test]
-    fn test_parse_wmode_non_standard_value_falls_back() {
-        let data = b"\
-begincmap
-/WMode 2 def
-1 begincodespacerange
-<0000> <FFFF>
-endcodespacerange
-1 beginbfchar
-<0041> <0041>
-endbfchar
-endcmap
-";
-        let cmap = parse_tounicode_cmap(data).unwrap();
-        assert_eq!(
-            cmap.wmode, 0,
-            "/WMode 2 def is non-standard; parser must fall back to horizontal"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Malformed-input regression tests (fail-loudly / degraded / empty
-    // classification for `parse_tounicode_cmap`).
-    //
-    // `capture_warnings` installs a minimal in-process `tracing::Subscriber`
-    // that records event messages, scoped only to the closure passed to it.
-    // It is test-only code living entirely in this module — no production
-    // type is touched to make these assertions possible. ~keep
-    // ------------------------------------------------------------------
-
-    #[derive(Clone, Default)]
-    struct RecordingSubscriber {
-        messages: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[derive(Default)]
-    struct MessageVisitor(Vec<String>);
-
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.push(format!("{}={value:?}", field.name()));
-        }
-    }
-
-    impl tracing::Subscriber for RecordingSubscriber {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut visitor = MessageVisitor::default();
-            event.record(&mut visitor);
-            self.messages.lock_or_recover().push(visitor.0.join(" "));
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// Run `f` under a subscriber that records every tracing event message,
-    /// returning them in emission order.
-    fn capture_warnings<F: FnOnce()>(f: F) -> Vec<String> {
-        let subscriber = RecordingSubscriber::default();
-        let messages = Arc::clone(&subscriber.messages);
-        tracing::subscriber::with_default(subscriber, f);
-        messages.lock_or_recover().clone()
-    }
-
-    /// FATAL: a non-empty stream with none of the CMap structural keywords is
-    /// not a CMap at all — any mapping derived from it would be arbitrary, so
-    /// the parser must fail loudly instead of returning a silently empty
-    /// CMap indistinguishable from a font that legitimately maps nothing.
-    #[test]
-    fn garbage_stream_without_cmap_syntax_is_rejected() {
-        let data = b"RANDOM BINARY GARBAGE, NOT A CMAP STREAM AT ALL 0xDEADBEEF 1234567890";
-        let err = parse_tounicode_cmap(data)
-            .expect_err("a stream with no CMap keywords at all must be rejected, not silently empty");
-        let message = err.to_string();
-        assert!(
-            message.to_lowercase().contains("cmap"),
-            "error message should name the defect: {message}"
-        );
-    }
-
-    /// LEGITIMATELY EMPTY: a zero-length stream is not evidence of
-    /// corruption — some producers emit an empty ToUnicode stream for a font
-    /// that genuinely maps nothing. No warning should fire.
-    #[test]
-    fn zero_length_stream_is_legitimately_empty_without_warning() {
-        let logs = capture_warnings(|| {
-            let cmap = parse_tounicode_cmap(b"").unwrap();
-            assert!(cmap.is_empty());
-        });
-        assert!(
-            logs.is_empty(),
-            "a zero-length stream must not warn, it is a legitimate empty CMap: {logs:?}"
-        );
-    }
-
-    /// DEGRADED (truncation): a `beginbfchar` block with no matching
-    /// `endbfchar` before EOF is dropped, not guessed at, and the defect is
-    /// surfaced via `tracing::warn!` rather than silently disappearing.
-    #[test]
-    fn truncated_bfchar_block_is_dropped_with_warning() {
-        let data = b"beginbfchar\n<0041> <0041>\n";
-        let logs = capture_warnings(|| {
-            let cmap = parse_tounicode_cmap(data).expect("truncation is degraded, not fatal");
-            assert!(
-                cmap.is_empty(),
-                "a block with no closing endbfchar must be dropped entirely, not partially guessed"
-            );
-        });
-        assert!(
-            logs.iter()
-                .any(|m| m.contains("beginbfchar") && m.contains("endbfchar")),
-            "expected a WARN naming the truncated beginbfchar block, got: {logs:?}"
-        );
-    }
-
-    /// DEGRADED (truncation): the same defect class for `begincodespacerange`,
-    /// verifying that dropping one section type does not lose unrelated
-    /// sections (`beginbfchar` is scanned independently) and that the
-    /// dropped section's effect (2-byte `code_width`) is correctly absent.
-    #[test]
-    fn truncated_codespacerange_block_is_dropped_with_warning() {
-        let data = b"begincodespacerange\n<0000> <FFFF>\nbeginbfchar\n<0041> <0041>\nendbfchar";
-        let logs = capture_warnings(|| {
-            let cmap = parse_tounicode_cmap(data).unwrap();
-            assert_eq!(
-                cmap.code_width, 1,
-                "an unterminated codespacerange section must not set code_width"
-            );
-            assert_eq!(
-                cmap.get(&0x41).as_deref(),
-                Some("A"),
-                "the unrelated, well-formed bfchar block must still parse"
-            );
-        });
-        assert!(
-            logs.iter()
-                .any(|m| m.contains("begincodespacerange") && m.contains("endcodespacerange")),
-            "expected a WARN naming the truncated codespacerange block, got: {logs:?}"
-        );
-    }
-
-    /// DEGRADED (malformed hex): a line with an unparseable src code is
-    /// dropped, its well-formed neighbor still parses, and the defect is
-    /// surfaced via `tracing::warn!`.
-    #[test]
-    fn malformed_bfchar_hex_operand_is_skipped_with_warning() {
-        let data = b"beginbfchar\n<0041> <0041>\n<ZZZZ> <0042>\nendbfchar";
-        let logs = capture_warnings(|| {
-            let cmap = parse_tounicode_cmap(data).unwrap();
-            assert_eq!(cmap.get(&0x41).as_deref(), Some("A"), "well-formed entry still parses");
-            assert_eq!(cmap.len(), 1, "the malformed entry must not appear in the map");
-        });
-        assert!(
-            logs.iter()
-                .any(|m| m.contains("bfchar") && m.contains("failed to parse")),
-            "expected a WARN about the malformed bfchar line, got: {logs:?}"
-        );
-    }
-
-    /// A parse failure now reaching `LazyCMap::get()` must be memoized: the
-    /// `Err` arm's `tracing::warn!` fires at most once per `LazyCMap`, not
-    /// once per character, since `get()` sits on the per-character decode
-    /// path (`FontInfo::char_to_unicode`).
-    #[test]
-    fn lazy_cmap_memoizes_a_parse_failure_and_warns_once() {
-        const CONFIDENTIAL_MARKER: &str = "CONFIDENTIAL_CMAP_NAME_9c12";
-        let data = format!("RANDOM BINARY GARBAGE {CONFIDENTIAL_MARKER}").into_bytes();
-        let lazy = LazyCMap::new(data);
-        let logs = capture_warnings(|| {
-            assert!(lazy.get().is_none(), "a garbage stream must fail to parse");
-            assert!(lazy.get().is_none(), "second call must reuse the memoized failure");
-            assert!(lazy.get().is_none(), "third call must reuse the memoized failure");
-        });
-        let failure_warnings = logs
-            .iter()
-            .filter(|message| {
-                message.contains("operation=\"parse_tounicode_cmap\"")
-                    && message.contains("error_code=\"font_error\"")
-                    && message.contains("message=PDF operation degraded")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            failure_warnings.len(),
-            1,
-            "LazyCMap::get() must warn on a parse failure exactly once, not per call: {logs:?}"
-        );
-        assert!(!format!("{logs:?}").contains(CONFIDENTIAL_MARKER));
-    }
-}
+mod tests;

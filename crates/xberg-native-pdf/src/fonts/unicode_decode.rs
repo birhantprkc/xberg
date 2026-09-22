@@ -128,124 +128,161 @@ impl GlyphDropTally {
 /// # Returns
 /// Best-effort Unicode string representation, or "?" if no mapping possible
 pub(crate) fn fallback_char_to_unicode(char_code: u32) -> String {
-    match char_code {
-        0x2014 => "—".to_string(),
-        0x2013 => "–".to_string(),
-        0x2018 => "\u{2018}".to_string(),
-        0x2019 => "\u{2019}".to_string(),
-        0x201C => "\u{201C}".to_string(),
-        0x201D => "\u{201D}".to_string(),
-        0x2022 => "•".to_string(),
-        0x2026 => "…".to_string(),
-        0x00B0 => "°".to_string(),
-
-        0x00B1 => "±".to_string(),
-        0x00D7 => "×".to_string(),
-        0x00F7 => "÷".to_string(),
-        0x2202 => "∂".to_string(),
-        0x2207 => "∇".to_string(),
-        0x220F => "∏".to_string(),
-        0x2211 => "∑".to_string(),
-        0x221A => "√".to_string(),
-        0x221E => "∞".to_string(),
-        0x2260 => "≠".to_string(),
-        0x2261 => "≡".to_string(),
-        0x2264 => "≤".to_string(),
-        0x2265 => "≥".to_string(),
-        0x222B => "∫".to_string(),
-        0x2248 => "≈".to_string(),
-        0x2282 => "⊂".to_string(),
-        0x2283 => "⊃".to_string(),
-        0x2286 => "⊆".to_string(),
-        0x2287 => "⊇".to_string(),
-        0x2208 => "∈".to_string(),
-        0x2209 => "∉".to_string(),
-        0x2200 => "∀".to_string(),
-        0x2203 => "∃".to_string(),
-        0x2205 => "∅".to_string(),
-        0x2227 => "∧".to_string(),
-        0x2228 => "∨".to_string(),
-        0x00AC => "¬".to_string(),
-        0x2192 => "→".to_string(),
-        0x2190 => "←".to_string(),
-        0x2194 => "↔".to_string(),
-        0x21D2 => "⇒".to_string(),
-        0x21D4 => "⇔".to_string(),
-
-        0x03B1 => "α".to_string(),
-        0x03B2 => "β".to_string(),
-        0x03B3 => "γ".to_string(),
-        0x03B4 => "δ".to_string(),
-        0x03B5 => "ε".to_string(),
-        0x03B6 => "ζ".to_string(),
-        0x03B7 => "η".to_string(),
-        0x03B8 => "θ".to_string(),
-        0x03B9 => "ι".to_string(),
-        0x03BA => "κ".to_string(),
-        0x03BB => "λ".to_string(),
-        0x03BC => "μ".to_string(),
-        0x03BD => "ν".to_string(),
-        0x03BE => "ξ".to_string(),
-        0x03BF => "ο".to_string(),
-        0x03C0 => "π".to_string(),
-        0x03C1 => "ρ".to_string(),
-        0x03C2 => "ς".to_string(),
-        0x03C3 => "σ".to_string(),
-        0x03C4 => "τ".to_string(),
-        0x03C5 => "υ".to_string(),
-        0x03C6 => "φ".to_string(),
-        0x03C7 => "χ".to_string(),
-        0x03C8 => "ψ".to_string(),
-        0x03C9 => "ω".to_string(),
-
-        0x0391 => "Α".to_string(),
-        0x0392 => "Β".to_string(),
-        0x0393 => "Γ".to_string(),
-        0x0394 => "Δ".to_string(),
-        0x0395 => "Ε".to_string(),
-        0x0396 => "Ζ".to_string(),
-        0x0397 => "Η".to_string(),
-        0x0398 => "Θ".to_string(),
-        0x0399 => "Ι".to_string(),
-        0x039A => "Κ".to_string(),
-        0x039B => "Λ".to_string(),
-        0x039C => "Μ".to_string(),
-        0x039D => "Ν".to_string(),
-        0x039E => "Ξ".to_string(),
-        0x039F => "Ο".to_string(),
-        0x03A0 => "Π".to_string(),
-        0x03A1 => "Ρ".to_string(),
-        0x03A3 => "Σ".to_string(),
-        0x03A4 => "Τ".to_string(),
-        0x03A5 => "Υ".to_string(),
-        0x03A6 => "Φ".to_string(),
-        0x03A7 => "Χ".to_string(),
-        0x03A8 => "Ψ".to_string(),
-        0x03A9 => "Ω".to_string(),
-
-        0x20AC => "€".to_string(),
-        0x00A3 => "£".to_string(),
-        0x00A5 => "¥".to_string(),
-        0x00A2 => "¢".to_string(),
-        0x20A3 => "₣".to_string(),
-        0x20A4 => "₤".to_string(),
-        0x20A9 => "₩".to_string(),
-        0x20AA => "₪".to_string(),
-        0x20AB => "₫".to_string(),
-        0x20B9 => "₹".to_string(),
-
-        code => {
-            if let Some(ch) = char::from_u32(code) {
-                if (0xE000..=0xF8FF).contains(&code) {
-                    tracing::trace!("Private Use Area character: U+{:04X}", code);
-                }
-                ch.to_string()
-            } else {
-                tracing::trace!("Character code 0x{:04X} is not a valid Unicode code point", code);
-                "?".to_string()
-            }
-        }
+    if let Some(s) = fallback_typography_symbol(char_code)
+        .or_else(|| fallback_math_symbol(char_code))
+        .or_else(|| fallback_greek_letter(char_code))
+        .or_else(|| fallback_currency_symbol(char_code))
+    {
+        return s.to_string();
     }
+
+    if let Some(ch) = char::from_u32(char_code) {
+        if (0xE000..=0xF8FF).contains(&char_code) {
+            tracing::trace!("Private Use Area character: U+{:04X}", char_code);
+        }
+        ch.to_string()
+    } else {
+        tracing::trace!("Character code 0x{:04X} is not a valid Unicode code point", char_code);
+        "?".to_string()
+    }
+}
+
+/// Typographic punctuation fallbacks (dashes, quotes, bullet, ellipsis,
+/// degree sign). Split out of `fallback_char_to_unicode` purely to keep that
+/// function within the repository's line-length guideline; the mapping
+/// itself is unchanged. ~keep
+fn fallback_typography_symbol(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0x2014 => "—",
+        0x2013 => "–",
+        0x2018 => "\u{2018}",
+        0x2019 => "\u{2019}",
+        0x201C => "\u{201C}",
+        0x201D => "\u{201D}",
+        0x2022 => "•",
+        0x2026 => "…",
+        0x00B0 => "°",
+        _ => return None,
+    })
+}
+
+/// Mathematical operator / set-theory / logic symbol fallbacks. Split out of
+/// `fallback_char_to_unicode` purely to keep that function within the
+/// repository's line-length guideline; the mapping itself is unchanged. ~keep
+fn fallback_math_symbol(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0x00B1 => "±",
+        0x00D7 => "×",
+        0x00F7 => "÷",
+        0x2202 => "∂",
+        0x2207 => "∇",
+        0x220F => "∏",
+        0x2211 => "∑",
+        0x221A => "√",
+        0x221E => "∞",
+        0x2260 => "≠",
+        0x2261 => "≡",
+        0x2264 => "≤",
+        0x2265 => "≥",
+        0x222B => "∫",
+        0x2248 => "≈",
+        0x2282 => "⊂",
+        0x2283 => "⊃",
+        0x2286 => "⊆",
+        0x2287 => "⊇",
+        0x2208 => "∈",
+        0x2209 => "∉",
+        0x2200 => "∀",
+        0x2203 => "∃",
+        0x2205 => "∅",
+        0x2227 => "∧",
+        0x2228 => "∨",
+        0x00AC => "¬",
+        0x2192 => "→",
+        0x2190 => "←",
+        0x2194 => "↔",
+        0x21D2 => "⇒",
+        0x21D4 => "⇔",
+        _ => return None,
+    })
+}
+
+/// Greek lower- and upper-case letter fallbacks. Split out of
+/// `fallback_char_to_unicode` purely to keep that function within the
+/// repository's line-length guideline; the mapping itself is unchanged. ~keep
+fn fallback_greek_letter(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0x03B1 => "α",
+        0x03B2 => "β",
+        0x03B3 => "γ",
+        0x03B4 => "δ",
+        0x03B5 => "ε",
+        0x03B6 => "ζ",
+        0x03B7 => "η",
+        0x03B8 => "θ",
+        0x03B9 => "ι",
+        0x03BA => "κ",
+        0x03BB => "λ",
+        0x03BC => "μ",
+        0x03BD => "ν",
+        0x03BE => "ξ",
+        0x03BF => "ο",
+        0x03C0 => "π",
+        0x03C1 => "ρ",
+        0x03C2 => "ς",
+        0x03C3 => "σ",
+        0x03C4 => "τ",
+        0x03C5 => "υ",
+        0x03C6 => "φ",
+        0x03C7 => "χ",
+        0x03C8 => "ψ",
+        0x03C9 => "ω",
+
+        0x0391 => "Α",
+        0x0392 => "Β",
+        0x0393 => "Γ",
+        0x0394 => "Δ",
+        0x0395 => "Ε",
+        0x0396 => "Ζ",
+        0x0397 => "Η",
+        0x0398 => "Θ",
+        0x0399 => "Ι",
+        0x039A => "Κ",
+        0x039B => "Λ",
+        0x039C => "Μ",
+        0x039D => "Ν",
+        0x039E => "Ξ",
+        0x039F => "Ο",
+        0x03A0 => "Π",
+        0x03A1 => "Ρ",
+        0x03A3 => "Σ",
+        0x03A4 => "Τ",
+        0x03A5 => "Υ",
+        0x03A6 => "Φ",
+        0x03A7 => "Χ",
+        0x03A8 => "Ψ",
+        0x03A9 => "Ω",
+        _ => return None,
+    })
+}
+
+/// Currency symbol fallbacks. Split out of `fallback_char_to_unicode` purely
+/// to keep that function within the repository's line-length guideline; the
+/// mapping itself is unchanged. ~keep
+fn fallback_currency_symbol(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0x20AC => "€",
+        0x00A3 => "£",
+        0x00A5 => "¥",
+        0x00A2 => "¢",
+        0x20A3 => "₣",
+        0x20A4 => "₤",
+        0x20A9 => "₩",
+        0x20AA => "₪",
+        0x20AB => "₫",
+        0x20B9 => "₹",
+        _ => return None,
+    })
 }
 
 /// Byte grouping mode for CID font character code decoding.
@@ -286,72 +323,88 @@ pub(crate) fn font_has_utf8_cmap(font: &FontInfo) -> bool {
 
 /// Get byte grouping mode for a font.
 pub(crate) fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
-    if let Some(font) = font {
-        if font.subtype == "Type0" {
-            // An embedded `/Encoding` CMap stream's own `begincodespacerange`
-            // is the most authoritative segmentation signal there is (ISO
-            // 32000-1 §9.7.6.2) — it is the actual PDF-authored declaration
-            // of how many bytes each code occupies, not a name heuristic or
-            // a proxy from the (conceptually separate) `/ToUnicode` stream.
-            // A genuinely mixed-width codespace gets its own per-position
-            // mode (GH #1631); a single declared width is just that fixed
-            // mode. No codespace declared (or no embedded CMap at all) falls
-            // through to the existing heuristics below unchanged. ~keep
-            if let Some(cid_map) = &font.embedded_cid_map {
-                match cid_map.codespace_widths().as_slice() {
-                    [1] => return ByteMode::OneByte,
-                    [2] => return ByteMode::TwoByte,
-                    [] => {}
-                    _ => return ByteMode::Codespace(std::sync::Arc::clone(cid_map)),
-                }
-            }
+    let Some(font) = font else {
+        return ByteMode::OneByte;
+    };
+    if font.subtype != "Type0" {
+        return ByteMode::OneByte;
+    }
 
-            // If the ToUnicode CMap declares a 2-byte codespace range, always use
-            // TwoByte mode regardless of the encoding name. This handles CJK fonts
-            // whose /Encoding name is a custom CMap stream that doesn't match the
-            // well-known keyword patterns below (e.g. "H", "V", "UniCNS-H", …).
-            // See PDF Spec §9.7.5 — `begincodespacerange` is authoritative. ~keep
-            if let Some(ref lazy_cmap) = font.to_unicode
-                && lazy_cmap.code_width() == 2
-            {
-                return ByteMode::TwoByte;
-            }
+    if let Some(mode) = byte_mode_from_embedded_codespace(font) {
+        return mode;
+    }
 
-            match &font.encoding {
-                crate::fonts::Encoding::Identity => ByteMode::TwoByte,
-                crate::fonts::Encoding::Standard(name) => {
-                    if (name.contains("Identity") && !name.contains("OneByteIdentity"))
-                        || name.contains("UCS2")
-                        || name.contains("UTF16")
-                        // CORPUS-3: bare Adobe predefined horizontal/vertical CMaps
-                        // ("H"/"V", e.g. Adobe-Japan1-H) are 2-byte by definition;
-                        // without this they were read single-byte → CJK garbage
-                        // ("あいうえお" → "CACCCECGCI" on noembed-jis7). ~keep
-                        || name == "H"
-                        || name == "V"
-                    {
-                        ByteMode::TwoByte
-                    } else if name.contains("RKSJ") {
-                        ByteMode::ShiftJIS
-                    } else if name.contains("EUC")
-                        || name.contains("GBK")
-                        || name.contains("GBpc")
-                        || name.contains("GB-")
-                        || name.contains("CNS")
-                        || name.contains("B5")
-                        || name.contains("KSC")
-                        || name.contains("KSCms")
-                    {
-                        ByteMode::TwoByte
-                    } else {
-                        ByteMode::OneByte
-                    }
-                }
-                _ => ByteMode::OneByte,
-            }
-        } else {
-            ByteMode::OneByte
-        }
+    // If the ToUnicode CMap declares a 2-byte codespace range, always use
+    // TwoByte mode regardless of the encoding name. This handles CJK fonts
+    // whose /Encoding name is a custom CMap stream that doesn't match the
+    // well-known keyword patterns below (e.g. "H", "V", "UniCNS-H", …).
+    // See PDF Spec §9.7.5 — `begincodespacerange` is authoritative. ~keep
+    if let Some(ref lazy_cmap) = font.to_unicode
+        && lazy_cmap.code_width() == 2
+    {
+        return ByteMode::TwoByte;
+    }
+
+    byte_mode_from_encoding(&font.encoding)
+}
+
+/// An embedded `/Encoding` CMap stream's own `begincodespacerange` is the
+/// most authoritative segmentation signal there is (ISO 32000-1 §9.7.6.2) —
+/// it is the actual PDF-authored declaration of how many bytes each code
+/// occupies, not a name heuristic or a proxy from the (conceptually
+/// separate) `/ToUnicode` stream. A genuinely mixed-width codespace gets its
+/// own per-position mode (GH #1631); a single declared width is just that
+/// fixed mode. Returns `None` when no codespace is declared (or there is no
+/// embedded CMap at all), so the caller falls through to its other
+/// heuristics unchanged. Split out of `get_byte_mode` purely to keep that
+/// function within the repository's line-length guideline; behavior is
+/// unchanged. ~keep
+fn byte_mode_from_embedded_codespace(font: &FontInfo) -> Option<ByteMode> {
+    let cid_map = font.embedded_cid_map.as_ref()?;
+    match cid_map.codespace_widths().as_slice() {
+        [1] => Some(ByteMode::OneByte),
+        [2] => Some(ByteMode::TwoByte),
+        [] => None,
+        _ => Some(ByteMode::Codespace(std::sync::Arc::clone(cid_map))),
+    }
+}
+
+/// Split out of `get_byte_mode` purely to keep that function within the
+/// repository's line-length guideline; behavior is unchanged. ~keep
+fn byte_mode_from_encoding(encoding: &crate::fonts::Encoding) -> ByteMode {
+    match encoding {
+        crate::fonts::Encoding::Identity => ByteMode::TwoByte,
+        crate::fonts::Encoding::Standard(name) => byte_mode_from_standard_encoding_name(name),
+        _ => ByteMode::OneByte,
+    }
+}
+
+/// Split out of `get_byte_mode` purely to keep that function within the
+/// repository's line-length guideline; behavior is unchanged. ~keep
+fn byte_mode_from_standard_encoding_name(name: &str) -> ByteMode {
+    if (name.contains("Identity") && !name.contains("OneByteIdentity"))
+        || name.contains("UCS2")
+        || name.contains("UTF16")
+        // CORPUS-3: bare Adobe predefined horizontal/vertical CMaps
+        // ("H"/"V", e.g. Adobe-Japan1-H) are 2-byte by definition;
+        // without this they were read single-byte → CJK garbage
+        // ("あいうえお" → "CACCCECGCI" on noembed-jis7). ~keep
+        || name == "H"
+        || name == "V"
+    {
+        ByteMode::TwoByte
+    } else if name.contains("RKSJ") {
+        ByteMode::ShiftJIS
+    } else if name.contains("EUC")
+        || name.contains("GBK")
+        || name.contains("GBpc")
+        || name.contains("GB-")
+        || name.contains("CNS")
+        || name.contains("B5")
+        || name.contains("KSC")
+        || name.contains("KSCms")
+    {
+        ByteMode::TwoByte
     } else {
         ByteMode::OneByte
     }
@@ -491,73 +544,128 @@ pub(crate) fn decode_text_to_unicode(
     bytes: &[u8],
     font: Option<&FontInfo>,
     policy: DecodePolicy,
-    mut drops: Option<&mut GlyphDropTally>,
+    drops: Option<&mut GlyphDropTally>,
 ) -> String {
     let raw_result = if let Some(font) = font {
-        let mut result = String::new();
         if font.subtype != "Type0" {
-            let table = font.get_byte_to_char_table();
-            for &byte in bytes {
-                let c = table[byte as usize];
-                if c != '\0' {
-                    result.push(c);
-                } else {
-                    let char_str = resolve_char(font, byte as u32, policy);
-                    if char_str != "\u{FFFD}" || policy.preserve_unmapped {
-                        result.push_str(&char_str);
-                    } else if let Some(tally) = drops.as_deref_mut() {
-                        tally.record("no Unicode mapping", byte as u32, 0);
-                    }
-                }
-            }
+            decode_simple_font_bytes(font, bytes, policy, drops)
         } else if font_has_utf8_cmap(font) {
-            // Type0 font whose /Encoding is an embedded CMap with a UTF-8
-            // (variable-width) codespace — e.g. `Uni-Utf8-H` (pdf.js
-            // issue18117) and the Adobe predefined `Uni*-UTF8-H` family.
-            // Codes are 1–4 bytes segmented by UTF-8 lead-byte rules, which
-            // exceed the u16 of `TextCharIter`. Segment into u32 codes and
-            // resolve via the (present) ToUnicode CMap, which is keyed by
-            // the same multi-byte codes. Isolated to UTF-8-CMap fonts: every
-            // other font keeps the path below unchanged. ~keep
-            for code in utf8_codes(bytes) {
-                let char_str = resolve_char(font, code, policy);
-                if char_str != "\u{FFFD}" || policy.preserve_unmapped {
-                    result.push_str(&char_str);
-                } else if let Some(tally) = drops.as_deref_mut() {
-                    tally.record("no Unicode mapping", code, 0);
-                }
-            }
+            decode_utf8_cmap_bytes(font, bytes, policy, drops)
         } else {
-            for (char_code, _) in TextCharIter::new(bytes, Some(font)) {
-                let char_str = resolve_char(font, char_code as u32, policy);
-
-                if char_str != "\u{FFFD}" || policy.preserve_unmapped {
-                    result.push_str(&char_str);
-                } else if let Some(tally) = drops.as_deref_mut() {
-                    tally.record("no Unicode mapping", char_code as u32, 0);
-                }
-            }
+            decode_generic_type0_bytes(font, bytes, policy, drops)
         }
-        result
     } else {
-        // No font - fallback to Latin-1 (ISO 8859-1) encoding
-        // Per PDF Spec ISO 32000-1:2008, Section 9.6.6, Latin-1 maps bytes 0x00-0xFF
-        // directly to Unicode code points U+0000-U+00FF ~keep
-        crate::extractors::recovery_tally::record(|counts| {
-            counts
-                .missing_font_decodes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            counts
-                .missing_font_bytes
-                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        });
-        tracing::trace!(
-            "No font provided for {} bytes, using Latin-1 fallback (PDF spec compliant)",
-            bytes.len()
-        );
-        bytes.iter().map(|&b| char::from(b)).collect()
+        decode_latin1_fallback(bytes)
     };
 
+    filter_decoded_text(&raw_result, policy)
+}
+
+/// Decode `bytes` for a simple (non-Type0) font via its precomputed
+/// byte→char table, falling back to `resolve_char` for unmapped bytes. Split
+/// out of `decode_text_to_unicode` purely to keep that function within the
+/// repository's line-length guideline; behavior is unchanged. ~keep
+fn decode_simple_font_bytes(
+    font: &FontInfo,
+    bytes: &[u8],
+    policy: DecodePolicy,
+    mut drops: Option<&mut GlyphDropTally>,
+) -> String {
+    let mut result = String::new();
+    let table = font.get_byte_to_char_table();
+    for &byte in bytes {
+        let c = table[byte as usize];
+        if c != '\0' {
+            result.push(c);
+        } else {
+            let char_str = resolve_char(font, byte as u32, policy);
+            if char_str != "\u{FFFD}" || policy.preserve_unmapped {
+                result.push_str(&char_str);
+            } else if let Some(tally) = drops.as_deref_mut() {
+                tally.record("no Unicode mapping", byte as u32, 0);
+            }
+        }
+    }
+    result
+}
+
+/// Decode `bytes` for a Type0 font whose /Encoding is an embedded CMap with
+/// a UTF-8 (variable-width) codespace — e.g. `Uni-Utf8-H` (pdf.js
+/// issue18117) and the Adobe predefined `Uni*-UTF8-H` family. Codes are 1–4
+/// bytes segmented by UTF-8 lead-byte rules, which exceed the u16 of
+/// `TextCharIter`. Segment into u32 codes and resolve via the (present)
+/// ToUnicode CMap, which is keyed by the same multi-byte codes. Isolated to
+/// UTF-8-CMap fonts: every other font keeps `decode_generic_type0_bytes`
+/// unchanged. Split out of `decode_text_to_unicode` purely to keep that
+/// function within the repository's line-length guideline; behavior is
+/// unchanged. ~keep
+fn decode_utf8_cmap_bytes(
+    font: &FontInfo,
+    bytes: &[u8],
+    policy: DecodePolicy,
+    mut drops: Option<&mut GlyphDropTally>,
+) -> String {
+    let mut result = String::new();
+    for code in utf8_codes(bytes) {
+        let char_str = resolve_char(font, code, policy);
+        if char_str != "\u{FFFD}" || policy.preserve_unmapped {
+            result.push_str(&char_str);
+        } else if let Some(tally) = drops.as_deref_mut() {
+            tally.record("no Unicode mapping", code, 0);
+        }
+    }
+    result
+}
+
+/// Decode `bytes` for any other Type0 font via `TextCharIter`'s fixed/mixed
+/// byte-mode segmentation. Split out of `decode_text_to_unicode` purely to
+/// keep that function within the repository's line-length guideline;
+/// behavior is unchanged. ~keep
+fn decode_generic_type0_bytes(
+    font: &FontInfo,
+    bytes: &[u8],
+    policy: DecodePolicy,
+    mut drops: Option<&mut GlyphDropTally>,
+) -> String {
+    let mut result = String::new();
+    for (char_code, _) in TextCharIter::new(bytes, Some(font)) {
+        let char_str = resolve_char(font, char_code as u32, policy);
+
+        if char_str != "\u{FFFD}" || policy.preserve_unmapped {
+            result.push_str(&char_str);
+        } else if let Some(tally) = drops.as_deref_mut() {
+            tally.record("no Unicode mapping", char_code as u32, 0);
+        }
+    }
+    result
+}
+
+/// No font - fallback to Latin-1 (ISO 8859-1) encoding. Per PDF Spec ISO
+/// 32000-1:2008, Section 9.6.6, Latin-1 maps bytes 0x00-0xFF directly to
+/// Unicode code points U+0000-U+00FF. Split out of `decode_text_to_unicode`
+/// purely to keep that function within the repository's line-length
+/// guideline; behavior is unchanged. ~keep
+fn decode_latin1_fallback(bytes: &[u8]) -> String {
+    crate::extractors::recovery_tally::record(|counts| {
+        counts
+            .missing_font_decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counts
+            .missing_font_bytes
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    });
+    tracing::trace!(
+        "No font provided for {} bytes, using Latin-1 fallback (PDF spec compliant)",
+        bytes.len()
+    );
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// Strip control characters (except tab/newline/CR) and optionally
+/// decompose ligatures. Split out of `decode_text_to_unicode` purely to keep
+/// that function within the repository's line-length guideline; behavior is
+/// unchanged. ~keep
+fn filter_decoded_text(raw_result: &str, policy: DecodePolicy) -> String {
     let mut filtered = String::with_capacity(raw_result.len());
     for c in raw_result.chars() {
         if c < '\x20' && c != '\t' && c != '\n' && c != '\r' {

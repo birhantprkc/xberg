@@ -36,15 +36,23 @@ const TAG_HHEA: u32 = 0x6868_6561;
 const TAG_HMTX: u32 = 0x686D_7478;
 const TAG_MAXP: u32 = 0x6D61_7870;
 
-/// Patch the OTF/TTF byte stream to carry a format-4 `cmap` subtable
-/// encoding the supplied Unicode→GID mapping. Returns `None` if the
-/// input is not a recognisable SFNT or the patch fails. On success,
-/// returns a fresh byte stream identical in every other respect (all
-/// other tables byte-preserved with new offsets).
-pub fn inject_unicode_cmap(font_bytes: &[u8], unicode_to_gid: &HashMap<u32, u16>) -> Option<Vec<u8>> {
-    if font_bytes.len() < 12 || unicode_to_gid.is_empty() {
-        return None;
-    }
+/// One record from an SFNT table directory, with its table bytes already
+/// sliced out of the source font. Shared by every function in this module
+/// that reads or rewrites a font's table directory. ~keep
+#[derive(Clone)]
+struct TableEntry {
+    tag: u32,
+    checksum: u32,
+    offset: u32,
+    length: u32,
+    data: Vec<u8>,
+}
+
+/// Parse an SFNT table directory: validate the version tag, read the table
+/// count, and slice out each table's bytes. Returns `None` if the header is
+/// malformed, the version tag is unrecognised, or a table's bounds fall
+/// outside `font_bytes`.
+fn parse_sfnt_tables(font_bytes: &[u8]) -> Option<(u32, Vec<TableEntry>)> {
     let sfnt_version = read_u32(font_bytes, 0)?;
     if sfnt_version != SFNT_TRUETYPE && sfnt_version != SFNT_OTTO {
         return None;
@@ -53,15 +61,6 @@ pub fn inject_unicode_cmap(font_bytes: &[u8], unicode_to_gid: &HashMap<u32, u16>
     let num_tables = read_u16(font_bytes, 4)? as usize;
     if font_bytes.len() < 12 + num_tables * 16 {
         return None;
-    }
-
-    #[derive(Clone)]
-    struct TableEntry {
-        tag: u32,
-        checksum: u32,
-        offset: u32,
-        length: u32,
-        data: Vec<u8>,
     }
 
     let mut tables: Vec<TableEntry> = Vec::with_capacity(num_tables + 1);
@@ -85,24 +84,14 @@ pub fn inject_unicode_cmap(font_bytes: &[u8], unicode_to_gid: &HashMap<u32, u16>
         });
     }
 
-    let new_cmap_bytes = build_format4_cmap(unicode_to_gid)?;
+    Some((sfnt_version, tables))
+}
 
-    let new_cmap_checksum = checksum_table(&new_cmap_bytes);
-    let cmap_idx = tables.iter().position(|t| t.tag == TAG_CMAP);
-    if let Some(idx) = cmap_idx {
-        tables[idx].length = new_cmap_bytes.len() as u32;
-        tables[idx].checksum = new_cmap_checksum;
-        tables[idx].data = new_cmap_bytes;
-    } else {
-        tables.push(TableEntry {
-            tag: TAG_CMAP,
-            checksum: new_cmap_checksum,
-            offset: 0,
-            length: new_cmap_bytes.len() as u32,
-            data: new_cmap_bytes,
-        });
-    }
-
+/// Sort `tables` by tag, recompute offsets, serialize the SFNT header and
+/// table directory, and patch `head.checkSumAdjustment` per the OpenType
+/// spec. Shared by every function in this module that rewrites a font's
+/// table directory. ~keep
+fn finalize_sfnt(sfnt_version: u32, mut tables: Vec<TableEntry>) -> Vec<u8> {
     // Tables in the directory are sorted by tag (per OpenType spec).
     // Sort by tag so the writer emits them in canonical order. ~keep
     tables.sort_by_key(|t| t.tag);
@@ -151,7 +140,39 @@ pub fn inject_unicode_cmap(font_bytes: &[u8], unicode_to_gid: &HashMap<u32, u16>
         }
     }
 
-    Some(out)
+    out
+}
+
+/// Patch the OTF/TTF byte stream to carry a format-4 `cmap` subtable
+/// encoding the supplied Unicode→GID mapping. Returns `None` if the
+/// input is not a recognisable SFNT or the patch fails. On success,
+/// returns a fresh byte stream identical in every other respect (all
+/// other tables byte-preserved with new offsets).
+pub fn inject_unicode_cmap(font_bytes: &[u8], unicode_to_gid: &HashMap<u32, u16>) -> Option<Vec<u8>> {
+    if font_bytes.len() < 12 || unicode_to_gid.is_empty() {
+        return None;
+    }
+    let (sfnt_version, mut tables) = parse_sfnt_tables(font_bytes)?;
+
+    let new_cmap_bytes = build_format4_cmap(unicode_to_gid)?;
+
+    let new_cmap_checksum = checksum_table(&new_cmap_bytes);
+    let cmap_idx = tables.iter().position(|t| t.tag == TAG_CMAP);
+    if let Some(idx) = cmap_idx {
+        tables[idx].length = new_cmap_bytes.len() as u32;
+        tables[idx].checksum = new_cmap_checksum;
+        tables[idx].data = new_cmap_bytes;
+    } else {
+        tables.push(TableEntry {
+            tag: TAG_CMAP,
+            checksum: new_cmap_checksum,
+            offset: 0,
+            length: new_cmap_bytes.len() as u32,
+            data: new_cmap_bytes,
+        });
+    }
+
+    Some(finalize_sfnt(sfnt_version, tables))
 }
 
 /// Patch the OTF/TTF byte stream to carry an `hmtx` table whose
@@ -177,45 +198,7 @@ pub fn inject_hmtx(font_bytes: &[u8], widths_by_gid: &HashMap<u16, u16>) -> Opti
     if font_bytes.len() < 12 {
         return None;
     }
-    let sfnt_version = read_u32(font_bytes, 0)?;
-    if sfnt_version != SFNT_TRUETYPE && sfnt_version != SFNT_OTTO {
-        return None;
-    }
-
-    let num_tables = read_u16(font_bytes, 4)? as usize;
-    if font_bytes.len() < 12 + num_tables * 16 {
-        return None;
-    }
-
-    #[derive(Clone)]
-    struct TableEntry {
-        tag: u32,
-        checksum: u32,
-        offset: u32,
-        length: u32,
-        data: Vec<u8>,
-    }
-
-    let mut tables: Vec<TableEntry> = Vec::with_capacity(num_tables + 1);
-    for i in 0..num_tables {
-        let rec_off = 12 + i * 16;
-        let tag = read_u32(font_bytes, rec_off)?;
-        let checksum = read_u32(font_bytes, rec_off + 4)?;
-        let offset = read_u32(font_bytes, rec_off + 8)?;
-        let length = read_u32(font_bytes, rec_off + 12)?;
-        let end = (offset as usize).checked_add(length as usize)?;
-        if end > font_bytes.len() {
-            return None;
-        }
-        let data = font_bytes[offset as usize..end].to_vec();
-        tables.push(TableEntry {
-            tag,
-            checksum,
-            offset,
-            length,
-            data,
-        });
-    }
+    let (sfnt_version, mut tables) = parse_sfnt_tables(font_bytes)?;
 
     let maxp = tables.iter().find(|t| t.tag == TAG_MAXP)?.data.clone();
     if maxp.len() < 6 {
@@ -272,49 +255,7 @@ pub fn inject_hmtx(font_bytes: &[u8], widths_by_gid: &HashMap<u16, u16>) -> Opti
     tables[hhea_idx].length = new_hhea.len() as u32;
     tables[hhea_idx].data = new_hhea;
 
-    tables.sort_by_key(|t| t.tag);
-
-    let new_num_tables = tables.len();
-    let header_size = 12 + new_num_tables * 16;
-    let mut cur_offset = header_size as u32;
-    for t in tables.iter_mut() {
-        t.offset = cur_offset;
-        let pad = (4 - (t.length as usize & 3)) & 3;
-        cur_offset += t.length + pad as u32;
-    }
-
-    let entry_selector = (new_num_tables as f64).log2().floor() as u16;
-    let search_range = (1u16 << entry_selector) * 16;
-    let range_shift = (new_num_tables as u16) * 16 - search_range;
-
-    let total_size = cur_offset as usize;
-    let mut out = vec![0u8; total_size];
-    write_u32(&mut out, 0, sfnt_version);
-    write_u16(&mut out, 4, new_num_tables as u16);
-    write_u16(&mut out, 6, search_range);
-    write_u16(&mut out, 8, entry_selector);
-    write_u16(&mut out, 10, range_shift);
-    for (i, t) in tables.iter().enumerate() {
-        let rec_off = 12 + i * 16;
-        write_u32(&mut out, rec_off, t.tag);
-        write_u32(&mut out, rec_off + 4, t.checksum);
-        write_u32(&mut out, rec_off + 8, t.offset);
-        write_u32(&mut out, rec_off + 12, t.length);
-        let off = t.offset as usize;
-        out[off..off + t.data.len()].copy_from_slice(&t.data);
-    }
-
-    if let Some(head) = tables.iter().find(|t| t.tag == TAG_HEAD) {
-        let head_off = head.offset as usize;
-        if head.length >= 12 && head_off + 12 <= out.len() {
-            write_u32(&mut out, head_off + 8, 0);
-            let sum_total = sum_u32_padded(&out);
-            let adjustment = 0xB1B0_AFBA_u32.wrapping_sub(sum_total);
-            write_u32(&mut out, head_off + 8, adjustment);
-        }
-    }
-
-    Some(out)
+    Some(finalize_sfnt(sfnt_version, tables))
 }
 
 /// Build the bytes of an OpenType `cmap` table containing exactly one
@@ -331,13 +272,23 @@ fn build_format4_cmap(unicode_to_gid: &HashMap<u32, u16>) -> Option<Vec<u8>> {
     pairs.sort_by_key(|(cp, _)| *cp);
     pairs.dedup_by_key(|(cp, _)| *cp);
 
-    // Coalesce consecutive (cp, gid) pairs into segments where
-    // gid - cp is constant (the format-4 idDelta encoding). ~keep
-    struct Segment {
-        start: u16,
-        end: u16,
-        delta: i32,
-    }
+    let segs = coalesce_cmap_segments(&pairs);
+    Some(write_format4_subtable(&segs))
+}
+
+/// One format-4 cmap segment: a contiguous codepoint range sharing a single
+/// `idDelta` (constant `gid - cp` across the range).
+struct Segment {
+    start: u16,
+    end: u16,
+    delta: i32,
+}
+
+/// Coalesce consecutive (cp, gid) pairs into segments where
+/// gid - cp is constant (the format-4 idDelta encoding), then append the
+/// mandatory final sentinel segment. `pairs` must already be sorted and
+/// deduplicated by codepoint. ~keep
+fn coalesce_cmap_segments(pairs: &[(u16, u16)]) -> Vec<Segment> {
     let mut segs: Vec<Segment> = Vec::new();
     for &(cp, gid) in pairs.iter() {
         let want_delta = gid as i32 - cp as i32;
@@ -366,7 +317,12 @@ fn build_format4_cmap(unicode_to_gid: &HashMap<u32, u16>) -> Option<Vec<u8>> {
             delta: 1,
         });
     }
+    segs
+}
 
+/// Serialize `segs` as the bytes of a complete OpenType `cmap` table
+/// containing exactly one format-4 subtable (Unicode BMP).
+fn write_format4_subtable(segs: &[Segment]) -> Vec<u8> {
     let seg_count = segs.len();
     let seg_count_x2 = (seg_count as u16) * 2;
     let entry_selector = (seg_count as f64).log2().floor() as u16;
@@ -404,26 +360,26 @@ fn build_format4_cmap(unicode_to_gid: &HashMap<u32, u16>) -> Option<Vec<u8>> {
     write_be_u16(&mut buf, entry_selector);
     write_be_u16(&mut buf, range_shift);
 
-    for s in &segs {
+    for s in segs {
         write_be_u16(&mut buf, s.end);
     }
     write_be_u16(&mut buf, 0);
 
-    for s in &segs {
+    for s in segs {
         write_be_u16(&mut buf, s.start);
     }
 
-    for s in &segs {
+    for s in segs {
         let d16 = s.delta.rem_euclid(0x1_0000) as u16;
         write_be_u16(&mut buf, d16);
     }
 
     // idRangeOffset array (all zero → use idDelta directly) ~keep
-    for _ in &segs {
+    for _ in segs {
         write_be_u16(&mut buf, 0);
     }
 
-    Some(buf)
+    buf
 }
 
 fn read_u16(buf: &[u8], off: usize) -> Option<u16> {

@@ -247,8 +247,24 @@ fn strip_cmap_suffix(name: &str) -> &str {
 /// when the source PDF doesn't ship outlines.
 fn collection_for_bare_name(name: &str) -> Option<CharacterCollection> {
     use CharacterCollection::*;
-    // Adobe-Japan1 — Mincho / Gothic family + Heisei + Kozuka ~keep
-    if matches!(
+    if is_adobe_japan1_bare_name(name) {
+        return Some(AdobeJapan1);
+    }
+    if is_adobe_gb1_bare_name(name) {
+        return Some(AdobeGB1);
+    }
+    if is_adobe_cns1_bare_name(name) {
+        return Some(AdobeCNS1);
+    }
+    if is_adobe_korea1_bare_name(name) {
+        return Some(AdobeKorea1);
+    }
+    None
+}
+
+/// Adobe-Japan1 — Mincho / Gothic family + Heisei + Kozuka ~keep
+fn is_adobe_japan1_bare_name(name: &str) -> bool {
+    matches!(
         name,
         "Ryumin-Light"
             | "Ryumin-Medium"
@@ -294,11 +310,12 @@ fn collection_for_bare_name(name: &str) -> Option<CharacterCollection> {
             | "KozGoProVI-Heavy"
             | "Kozuka-Mincho-Pro-VI-R"
             | "Kozuka-Gothic-Pro-VI-M"
-    ) {
-        return Some(AdobeJapan1);
-    }
-    // Adobe-GB1 — STSong / STHeiti / SimSun / SimHei ~keep
-    if matches!(
+    )
+}
+
+/// Adobe-GB1 — STSong / STHeiti / SimSun / SimHei ~keep
+fn is_adobe_gb1_bare_name(name: &str) -> bool {
+    matches!(
         name,
         "STSong-Light"
             | "STSongStd-Light"
@@ -319,11 +336,12 @@ fn collection_for_bare_name(name: &str) -> Option<CharacterCollection> {
             | "AdobeHeitiStd-Regular"
             | "AdobeKaitiStd-Regular"
             | "AdobeFangsongStd-Regular"
-    ) {
-        return Some(AdobeGB1);
-    }
-    // Adobe-CNS1 — Traditional Chinese (MHei / MSung / MingLiU / DFKai) ~keep
-    if matches!(
+    )
+}
+
+/// Adobe-CNS1 — Traditional Chinese (MHei / MSung / MingLiU / DFKai) ~keep
+fn is_adobe_cns1_bare_name(name: &str) -> bool {
+    matches!(
         name,
         "MHei-Medium"
             | "MSung-Light"
@@ -341,11 +359,12 @@ fn collection_for_bare_name(name: &str) -> Option<CharacterCollection> {
             | "AdobeMingStd-Light"
             | "AdobeFanHeitiStd-Bold"
             | "AdobeSongStd-Bold"
-    ) {
-        return Some(AdobeCNS1);
-    }
-    // Adobe-Korea1 — Korean (HYSMyeongJo / HYGoThic / Adobe-Myungjo) ~keep
-    if matches!(
+    )
+}
+
+/// Adobe-Korea1 — Korean (HYSMyeongJo / HYGoThic / Adobe-Myungjo) ~keep
+fn is_adobe_korea1_bare_name(name: &str) -> bool {
+    matches!(
         name,
         "HYSMyeongJo-Medium"
             | "HYSMyeongJoStd-Medium"
@@ -366,10 +385,7 @@ fn collection_for_bare_name(name: &str) -> Option<CharacterCollection> {
             | "GulimChe"
             | "Gungsuh"
             | "GungsuhChe"
-    ) {
-        return Some(AdobeKorea1);
-    }
-    None
+    )
 }
 
 /// Decide whether `base_font` names a predefined Adobe CIDFont this renderer

@@ -173,8 +173,15 @@ pub fn math_alphanumeric_base(codepoint: u32) -> Option<u32> {
     if !(0x1D400..=0x1D7FF).contains(&codepoint) {
         return None;
     }
-    // Reserved holes: codepoints already encoded elsewhere in Unicode.
-    // (BMP italic h, planar holes for h-related letters, etc.) ~keep
+    math_alphanumeric_reserved_hole(codepoint)
+        .or_else(|| math_alphanumeric_latin(codepoint))
+        .or_else(|| math_alphanumeric_greek(codepoint))
+        .or_else(|| math_alphanumeric_digit(codepoint))
+}
+
+/// Reserved holes: codepoints already encoded elsewhere in Unicode.
+/// (BMP italic h, planar holes for h-related letters, etc.) ~keep
+fn math_alphanumeric_reserved_hole(codepoint: u32) -> Option<u32> {
     let canonical = match codepoint {
         0x1D455 => 0x0068,
         0x1D49D => 0x0042,
@@ -202,13 +209,13 @@ pub fn math_alphanumeric_base(codepoint: u32) -> Option<u32> {
         0x1D551 => 0x005A,
         _ => 0,
     };
-    if canonical != 0 {
-        return Some(canonical);
-    }
+    if canonical != 0 { Some(canonical) } else { None }
+}
 
-    // Bold / Italic / Bold-Italic / Script / Bold-Script / Fraktur /
-    // Double-Struck / Bold-Fraktur / Sans / Sans-Bold / Sans-Italic /
-    // Sans-Bold-Italic / Mono Latin (each 52 chars: A-Z then a-z). ~keep
+/// Bold / Italic / Bold-Italic / Script / Bold-Script / Fraktur /
+/// Double-Struck / Bold-Fraktur / Sans / Sans-Bold / Sans-Italic /
+/// Sans-Bold-Italic / Mono Latin (each 52 chars: A-Z then a-z). ~keep
+fn math_alphanumeric_latin(codepoint: u32) -> Option<u32> {
     const LATIN_RANGES: &[(u32, u32)] = &[
         (0x1D400, 0x41),
         (0x1D41A, 0x61),
@@ -242,13 +249,16 @@ pub fn math_alphanumeric_base(codepoint: u32) -> Option<u32> {
             return Some(base + (codepoint - start));
         }
     }
+    None
+}
 
-    // Greek bold / italic / bold-italic / sans-bold / sans-bold-italic.
-    // Each block is 58 chars: 25 capitals (Α-Ω inc. capital Theta variant
-    // at offset 17), nabla at +25, then 25 lowercase α-ω at +26, partial-
-    // differential at +51, then 6 alt forms (epsilon/theta/kappa/phi/rho/pi).
-    // We map the 25 capitals (best-effort — the Theta-variant slot lands on
-    // unassigned U+03A2 but is rare) and the 25 lowercases. ~keep
+/// Greek bold / italic / bold-italic / sans-bold / sans-bold-italic.
+/// Each block is 58 chars: 25 capitals (Α-Ω inc. capital Theta variant
+/// at offset 17), nabla at +25, then 25 lowercase α-ω at +26, partial-
+/// differential at +51, then 6 alt forms (epsilon/theta/kappa/phi/rho/pi).
+/// We map the 25 capitals (best-effort — the Theta-variant slot lands on
+/// unassigned U+03A2 but is rare) and the 25 lowercases. ~keep
+fn math_alphanumeric_greek(codepoint: u32) -> Option<u32> {
     const GREEK_RANGES: &[u32] = &[0x1D6A8, 0x1D6E2, 0x1D71C, 0x1D756, 0x1D790];
     for &start in GREEK_RANGES {
         if codepoint >= start && codepoint < start + 25 {
@@ -259,14 +269,16 @@ pub fn math_alphanumeric_base(codepoint: u32) -> Option<u32> {
             return Some(0x03B1 + (codepoint - lower_start));
         }
     }
+    None
+}
 
+fn math_alphanumeric_digit(codepoint: u32) -> Option<u32> {
     const DIGIT_STARTS: &[u32] = &[0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6];
     for &start in DIGIT_STARTS {
         if codepoint >= start && codepoint < start + 10 {
             return Some(0x30 + (codepoint - start));
         }
     }
-
     None
 }
 

@@ -388,6 +388,18 @@ impl CharacterMapper {
     /// Per PDF Spec ISO 32000-1:2008 Section 9.6.6.1.
     pub fn code_to_glyph_name_extended(&self, code: u32) -> Option<String> {
         match code {
+            0x80..=0xBF => Self::glyph_name_windows1252_c1_controls(code),
+            0xC0..=0xFF => Self::glyph_name_windows1252_latin_supplement(code),
+            _ => None,
+        }
+    }
+
+    /// Map the Windows-1252 C1-control replacement range (0x80-0xBF) to glyph names.
+    ///
+    /// Split out of `code_to_glyph_name_extended` purely to keep that function within
+    /// the repository's line-length guideline; the mapping itself is unchanged. ~keep
+    fn glyph_name_windows1252_c1_controls(code: u32) -> Option<String> {
+        match code {
             0x80 => Some("Euro".to_string()),
             0x81 => None,
             0x82 => Some("quotesinglbase".to_string()),
@@ -455,6 +467,16 @@ impl CharacterMapper {
             0xBE => Some("threequarters".to_string()),
             0xBF => Some("questiondown".to_string()),
 
+            _ => None,
+        }
+    }
+
+    /// Map the Windows-1252 Latin-1-supplement range (0xC0-0xFF) to glyph names.
+    ///
+    /// Split out of `code_to_glyph_name_extended` purely to keep that function within
+    /// the repository's line-length guideline; the mapping itself is unchanged. ~keep
+    fn glyph_name_windows1252_latin_supplement(code: u32) -> Option<String> {
+        match code {
             0xC0 => Some("Agrave".to_string()),
             0xC1 => Some("Aacute".to_string()),
             0xC2 => Some("Acircumflex".to_string()),
