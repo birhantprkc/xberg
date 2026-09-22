@@ -575,6 +575,7 @@ traineddata = "traineddata"
 # Alef-generated config files. Both grow with the size of the surface alef manages and
 # with the quality-debt baseline below; a line count on generated config is not a
 # maintainability signal. ~keep
+"crates/xberg-paddle-ocr/src/ocr_lite.rs" = ["too-many-parameters"]
 "poly.toml" = ["file-too-long"]
 ".alef-toml-merge-provenance.toml" = ["file-too-long"]
 # --- quality-debt baseline (generated) ---
@@ -589,25 +590,15 @@ traineddata = "traineddata"
 ".github/workflows/publish.yaml" = ["file-too-long"]
 "CHANGELOG.md" = ["file-too-long"]
 "alef.toml" = ["file-too-long"]
-"crates/xberg-candle-ocr/src/models/deepseek_ocr/engine.rs" = ["function-too-long"]
 "crates/xberg-candle-ocr/src/models/deepseek_ocr/model.rs" = [
   "file-too-long",
   "function-too-long",
   "too-many-parameters",
 ]
-"crates/xberg-candle-ocr/src/models/glm_ocr/mod.rs" = ["function-too-long"]
-"crates/xberg-candle-ocr/src/models/glm_ocr/mtp.rs" = ["too-many-parameters"]
-"crates/xberg-candle-ocr/src/models/paddleocr_vl/engine.rs" = ["function-too-long"]
 "crates/xberg-candle-ocr/src/models/paddleocr_vl/model.rs" = ["file-too-long", "function-too-long", "nesting-too-deep"]
-"crates/xberg-candle-ocr/src/models/trocr.rs" = ["function-too-long"]
 "crates/xberg-cli/src/commands/overrides/mod.rs" = ["type-too-long"]
 "crates/xberg-cli/src/main.rs" = ["file-too-long", "function-too-long", "type-too-long"]
 "crates/xberg-cli/tests/commands_test.rs" = ["file-too-long"]
-"crates/xberg-gliner/src/candle/decode.rs" = ["nesting-too-deep", "too-many-parameters"]
-"crates/xberg-gliner/src/candle/pipeline.rs" = ["function-too-long", "too-many-parameters"]
-"crates/xberg-gliner/src/decode.rs" = ["too-many-parameters"]
-"crates/xberg-gliner/src/v2/decode.rs" = ["too-many-parameters"]
-"crates/xberg-libwpd/build.rs" = ["function-too-long"]
 "crates/xberg-libwpd/src/shim.cpp" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/annotation_types.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/src/annotations.rs" = ["function-too-long", "nesting-too-deep"]
@@ -849,9 +840,6 @@ traineddata = "traineddata"
 "crates/xberg-native-pdf/tests/test_transparency_flattening_qa_round2.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/tests/test_vertical_writing_mode_qa_probes.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/tests/test_word_boundary_detection.rs" = ["file-too-long"]
-"crates/xberg-paddle-ocr/src/crnn_net.rs" = ["function-too-long", "nesting-too-deep"]
-"crates/xberg-paddle-ocr/src/db_net.rs" = ["function-too-long", "too-many-parameters"]
-"crates/xberg-paddle-ocr/src/ocr_lite.rs" = ["file-too-long", "function-too-long", "too-many-parameters"]
 "crates/xberg-pdfium-render/src/bindgen/pdfium_7678.rs" = ["file-too-long"]
 "crates/xberg-pdfium-render/src/bindings.rs" = ["file-too-long", "too-many-parameters", "type-too-long"]
 "crates/xberg-pdfium-render/src/bindings/dynamic_bindings.rs" = [
@@ -881,8 +869,6 @@ traineddata = "traineddata"
 "crates/xberg-pdfium-render/src/pdf/quad_points.rs" = ["too-many-parameters"]
 "crates/xberg-tesseract/build.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long", "nesting-too-deep"]
 "crates/xberg-tesseract/src/api.rs" = ["file-too-long"]
-"crates/xberg-tesseract/src/leptonica.rs" = ["file-too-long"]
-"crates/xberg-tesseract/src/result_iterator.rs" = ["function-too-long"]
 "crates/xberg/src/api/handlers.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg/src/api/openapi.rs" = ["function-too-long"]
 "crates/xberg/src/api/openweb.rs" = ["function-too-long"]
