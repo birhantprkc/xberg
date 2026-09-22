@@ -236,6 +236,13 @@ impl PdfDocument {
             font_set_cache: Mutex::new(BoundedEntryCache::new(256)),
             font_fingerprint_cache: Mutex::new(BoundedEntryCache::new(256)),
             font_name_set_cache: Mutex::new(BoundedEntryCache::new(256)),
+            font_set_donated_cache: Mutex::new(BoundedEntryCache::new(256)),
+            font_fingerprint_donated_cache: Mutex::new(BoundedEntryCache::new(256)),
+            font_name_set_donated_cache: Mutex::new(BoundedEntryCache::new(256)),
+            #[cfg(test)]
+            donation_call_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            donation_apply_count: AtomicUsize::new(0),
             font_identity_cache: Mutex::new(BoundedEntryCache::new(512)),
             font_id_hash_cache: Mutex::new(HashMap::new()),
             font_reference_hash_cache: Mutex::new(BoundedEntryCache::new(FONT_IDENTITY_MAX_RESOLVED_REFERENCES)),

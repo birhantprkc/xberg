@@ -447,13 +447,20 @@ impl<'doc> TextExtractor<'doc> {
     /// Share TrueType cmap tables between fonts with matching base font names.
     /// When a CIDFontType2 Identity-H font has no truetype_cmap, borrow from
     /// another font on the same page with the same base font name (ignoring subset prefix).
-    pub fn share_truetype_cmaps(&mut self) {
+    ///
+    /// Returns the number of fonts actually mutated (donations applied). A font
+    /// that already carries a cmap — e.g. one served from `PdfDocument`'s
+    /// donated-set cache (#1746) — is skipped and does not count, so callers
+    /// can use the return value to observe when a cache hit made this call a
+    /// no-op instead of redoing the `Arc::make_mut` clone. ~keep
+    pub fn share_truetype_cmaps(&mut self) -> usize {
         let best_cmaps = crate::fonts::unicode_decode::best_truetype_cmaps(self.fonts.values().map(|f| &**f));
 
         if best_cmaps.is_empty() {
-            return;
+            return 0;
         }
 
+        let mut applied = 0;
         for font_arc in self.fonts.values_mut() {
             if font_arc.truetype_cmap().is_some() {
                 continue;
@@ -476,7 +483,9 @@ impl<'doc> TextExtractor<'doc> {
                 );
                 // Use Arc::make_mut + set_truetype_cmap for copy-on-write sharing ~keep
                 Arc::make_mut(font_arc).set_truetype_cmap(Some(donor_cmap.clone()));
+                applied += 1;
             }
         }
+        applied
     }
 }

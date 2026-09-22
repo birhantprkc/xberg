@@ -8179,3 +8179,184 @@ fn test_get_page_rotation_still_folds_absent_and_malformed_to_zero() {
     let malformed = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("135"), false)).unwrap();
     assert_eq!(malformed.get_page_rotation(0).unwrap(), 0);
 }
+
+/// Build a minimal TrueType font with a cmap format 4 table mapping each
+/// `(char_code, glyph_id)` pair.
+///
+/// Mirrors the builder in `fonts::truetype_cmap`'s own test module;
+/// duplicated here on purpose — that copy pins cmap TABLE PARSING, this one
+/// exists only to give `donate_truetype_cmaps_within_set` a font with a real,
+/// lazily-parseable `truetype_cmap()` to donate. ~keep
+fn build_truetype_with_cmap_format4(mappings: &[(u16, u16)]) -> Vec<u8> {
+    use byteorder::{BigEndian, WriteBytesExt};
+
+    let mut data = Vec::new();
+
+    data.write_u32::<BigEndian>(0x00010000).unwrap();
+    data.write_u16::<BigEndian>(1).unwrap();
+    data.write_u16::<BigEndian>(16).unwrap();
+    data.write_u16::<BigEndian>(0).unwrap();
+    data.write_u16::<BigEndian>(0).unwrap();
+
+    let cmap_offset: u32 = 12 + 16;
+    data.write_u32::<BigEndian>(0x636D_6170).unwrap();
+    data.write_u32::<BigEndian>(0).unwrap();
+    data.write_u32::<BigEndian>(cmap_offset).unwrap();
+    data.write_u32::<BigEndian>(0).unwrap();
+
+    data.write_u16::<BigEndian>(0).unwrap();
+    data.write_u16::<BigEndian>(1).unwrap();
+
+    let subtable_offset: u32 = 4 + 8;
+    data.write_u16::<BigEndian>(3).unwrap();
+    data.write_u16::<BigEndian>(1).unwrap();
+    data.write_u32::<BigEndian>(subtable_offset).unwrap();
+
+    let mut segments: Vec<(u16, u16, i16)> = Vec::new();
+    for &(char_code, gid) in mappings {
+        let delta = gid as i16 - char_code as i16;
+        segments.push((char_code, char_code, delta));
+    }
+    segments.push((0xFFFF, 0xFFFF, 1));
+
+    let seg_count = segments.len();
+    let seg_count_x2 = (seg_count * 2) as u16;
+
+    data.write_u16::<BigEndian>(4).unwrap();
+    let length_pos = data.len();
+    data.write_u16::<BigEndian>(0).unwrap();
+    data.write_u16::<BigEndian>(0).unwrap();
+
+    data.write_u16::<BigEndian>(seg_count_x2).unwrap();
+    data.write_u16::<BigEndian>(0).unwrap();
+    data.write_u16::<BigEndian>(0).unwrap();
+    data.write_u16::<BigEndian>(0).unwrap();
+
+    for seg in &segments {
+        data.write_u16::<BigEndian>(seg.1).unwrap();
+    }
+    data.write_u16::<BigEndian>(0).unwrap();
+    for seg in &segments {
+        data.write_u16::<BigEndian>(seg.0).unwrap();
+    }
+    for seg in &segments {
+        data.write_i16::<BigEndian>(seg.2).unwrap();
+    }
+    for _ in &segments {
+        data.write_u16::<BigEndian>(0).unwrap();
+    }
+
+    let fmt4_start = length_pos - 2;
+    let fmt4_len = data.len() - fmt4_start;
+    let len_bytes = (fmt4_len as u16).to_be_bytes();
+    data[length_pos] = len_bytes[0];
+    data[length_pos + 1] = len_bytes[1];
+
+    data
+}
+
+/// Build the object graph for a `/Font` dictionary holding a donor
+/// (embedded TrueType with a real cmap) and a recipient (Type0, Identity-H,
+/// same stripped base name, no cmap of its own) directly in `doc`'s object
+/// cache, and return the `/Font` dict's own `ObjectRef` plus a `Resources`
+/// object pointing at it.
+fn donor_and_recipient_font_resources(doc: &PdfDocument) -> (ObjectRef, Object) {
+    let donor_ref = ObjectRef::new(11, 0);
+    let descriptor_ref = ObjectRef::new(12, 0);
+    let font_file_ref = ObjectRef::new(13, 0);
+    let recipient_ref = ObjectRef::new(14, 0);
+    let font_dict_ref = ObjectRef::new(15, 0);
+
+    let font_program = build_truetype_with_cmap_format4(&[(0x41, 3)]);
+
+    doc.object_cache.lock_or_recover().insert(
+        font_file_ref,
+        Object::Stream {
+            dict: HashMap::new(),
+            data: bytes::Bytes::from(font_program),
+        },
+    );
+    doc.object_cache.lock_or_recover().insert(
+        descriptor_ref,
+        Object::Dictionary(HashMap::from([
+            ("Flags".to_string(), Object::Integer(32)),
+            ("FontFile2".to_string(), Object::Reference(font_file_ref)),
+        ])),
+    );
+    doc.object_cache.lock_or_recover().insert(
+        donor_ref,
+        Object::Dictionary(HashMap::from([
+            ("Type".to_string(), Object::Name("Font".to_string())),
+            ("Subtype".to_string(), Object::Name("TrueType".to_string())),
+            (
+                "BaseFont".to_string(),
+                Object::Name("ABCDEF+DonationTest1746".to_string()),
+            ),
+            ("FontDescriptor".to_string(), Object::Reference(descriptor_ref)),
+        ])),
+    );
+    doc.object_cache.lock_or_recover().insert(
+        recipient_ref,
+        Object::Dictionary(HashMap::from([
+            ("Type".to_string(), Object::Name("Font".to_string())),
+            ("Subtype".to_string(), Object::Name("Type0".to_string())),
+            (
+                "BaseFont".to_string(),
+                Object::Name("GHIJKL+DonationTest1746".to_string()),
+            ),
+            ("Encoding".to_string(), Object::Name("Identity-H".to_string())),
+        ])),
+    );
+    doc.object_cache.lock_or_recover().insert(
+        font_dict_ref,
+        Object::Dictionary(HashMap::from([
+            ("F1".to_string(), Object::Reference(donor_ref)),
+            ("F2".to_string(), Object::Reference(recipient_ref)),
+        ])),
+    );
+
+    let resources = Object::Dictionary(HashMap::from([("Font".to_string(), Object::Reference(font_dict_ref))]));
+    (font_dict_ref, resources)
+}
+
+/// #1746: a `/Font` dictionary shared across pages must donate TrueType
+/// cmaps between its own fonts only ONCE, not on every page that touches it.
+/// Every simulated page must still see the donated cmap (the cache must not
+/// merely go quiet while serving stale, undonated fonts), but the donation
+/// work itself — `donate_truetype_cmaps_within_set` — must not re-run past
+/// the first page.
+#[test]
+fn donated_truetype_cmap_is_reused_not_recomputed_per_page() {
+    let doc = PdfDocument::from_bytes(build_minimal_pdf(b"")).unwrap();
+    let (_font_dict_ref, resources) = donor_and_recipient_font_resources(&doc);
+
+    const PAGES: usize = 5;
+    for page in 0..PAGES {
+        let mut extractor = crate::extractors::TextExtractor::new();
+        doc.load_fonts(&resources, &mut extractor).expect("load_fonts");
+
+        let recipient = extractor
+            .get_font_set()
+            .into_iter()
+            .find(|(name, _)| name == "F2")
+            .map(|(_, font)| font)
+            .unwrap_or_else(|| panic!("page {page}: recipient font F2 missing from extractor"));
+        assert!(
+            recipient.truetype_cmap().is_some(),
+            "page {page}: recipient must carry the donor's cmap"
+        );
+    }
+
+    assert_eq!(
+        doc.donation_call_count(),
+        1,
+        "donation must run once for a font set reused across {PAGES} pages, not once per page"
+    );
+    assert_eq!(
+        doc.donation_apply_count(),
+        1,
+        "share_truetype_cmaps must apply the donation once (page 0) and find the recipient \
+         already carrying a cmap on every later page, not redo the Arc::make_mut mutation \
+         {PAGES} times"
+    );
+}

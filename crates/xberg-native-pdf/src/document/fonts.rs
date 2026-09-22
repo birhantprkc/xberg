@@ -469,6 +469,17 @@ impl PdfDocument {
         bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(|b| b.is_ascii_uppercase())
     }
 
+    /// Run `TextExtractor::share_truetype_cmaps` and, in test builds, add the
+    /// number of fonts it actually mutated to `donation_apply_count`. Kept as
+    /// one call site so every `load_fonts` branch reports through it. ~keep
+    fn share_truetype_cmaps_counted(&self, extractor: &mut crate::extractors::TextExtractor<'_>) {
+        let applied = extractor.share_truetype_cmaps();
+        #[cfg(test)]
+        self.donation_apply_count.fetch_add(applied, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = applied;
+    }
+
     /// Load fonts from a Resources dictionary into the extractor.
     pub(crate) fn load_fonts(
         &self,
@@ -507,10 +518,16 @@ impl PdfDocument {
             if let Some(font_dict_ref) = font_dict_ref {
                 let cached_set_opt = self.font_set_cache.lock_or_recover().get(&font_dict_ref).cloned();
                 if let Some(cached_set) = cached_set_opt {
-                    for (name, font_arc) in &cached_set {
+                    let to_add = self
+                        .font_set_donated_cache
+                        .lock_or_recover()
+                        .get(&font_dict_ref)
+                        .cloned()
+                        .unwrap_or(cached_set);
+                    for (name, font_arc) in &to_add {
                         extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
                     }
-                    extractor.share_truetype_cmaps();
+                    self.share_truetype_cmaps_counted(extractor);
                     return Ok(());
                 }
             }
@@ -553,10 +570,13 @@ impl PdfDocument {
                 let cached_fingerprint_opt =
                     fingerprint.and_then(|key| self.font_fingerprint_cache.lock_or_recover().get(&key).cloned());
                 if let Some(cached_set) = cached_fingerprint_opt {
-                    for (name, font_arc) in &cached_set {
+                    let to_add = fingerprint
+                        .and_then(|key| self.font_fingerprint_donated_cache.lock_or_recover().get(&key).cloned())
+                        .unwrap_or(cached_set);
+                    for (name, font_arc) in &to_add {
                         extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
                     }
-                    extractor.share_truetype_cmaps();
+                    self.share_truetype_cmaps_counted(extractor);
                     return Ok(());
                 }
 
@@ -592,10 +612,24 @@ impl PdfDocument {
                     // lets differing sibling fonts (F2, F3 …) slip through unchecked.
                     // Fixes the regression described above. ~keep
                     if self.font_set_identity_hash(&sorted_font_entries) == Some(check_hash) {
-                        for (name, font_arc) in cached_set.iter() {
-                            extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
+                        let donated_opt = self
+                            .font_name_set_donated_cache
+                            .lock_or_recover()
+                            .get(&name_hash)
+                            .cloned();
+                        match &donated_opt {
+                            Some(donated) => {
+                                for (name, font_arc) in donated.iter() {
+                                    extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
+                                }
+                            }
+                            None => {
+                                for (name, font_arc) in cached_set.iter() {
+                                    extractor.add_font_shared(name.clone(), Arc::clone(font_arc));
+                                }
+                            }
                         }
-                        extractor.share_truetype_cmaps();
+                        self.share_truetype_cmaps_counted(extractor);
                         return Ok(());
                     }
                 }
@@ -729,15 +763,29 @@ impl PdfDocument {
                 // in a later load_fonts call (e.g. an XObject font donating to a
                 // page-level font already in the extractor) requires sharing to run
                 // again even when all fonts came from cache. ~keep
-                extractor.share_truetype_cmaps();
+                self.share_truetype_cmaps_counted(extractor);
+
+                // Donate within THIS dictionary's own set and cache that alongside
+                // the pre-donation set, under the same keys. See
+                // `donate_truetype_cmaps_within_set` for why this is safe to cache
+                // (it never reads any font outside `resolved`). ~keep
+                let donated = Self::donate_truetype_cmaps_within_set(&resolved);
+                #[cfg(test)]
+                self.donation_call_count.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(fdr) = font_dict_ref {
                     self.font_set_cache.lock_or_recover().insert(fdr, resolved.clone());
+                    self.font_set_donated_cache
+                        .lock_or_recover()
+                        .insert(fdr, donated.clone());
                 }
                 if let Some(key) = fingerprint {
                     self.font_fingerprint_cache
                         .lock_or_recover()
                         .insert(key, resolved.clone());
+                    self.font_fingerprint_donated_cache
+                        .lock_or_recover()
+                        .insert(key, donated.clone());
                 }
 
                 // Layer 4 is keyed by font NAMES alone, so it carries a combined
@@ -750,6 +798,9 @@ impl PdfDocument {
                     self.font_name_set_cache
                         .lock_or_recover()
                         .insert(name_hash, (Arc::new(resolved), combined_check_hash));
+                    self.font_name_set_donated_cache
+                        .lock_or_recover()
+                        .insert(name_hash, Arc::new(donated));
                 }
 
                 return Ok(());
@@ -757,6 +808,69 @@ impl PdfDocument {
         }
 
         Ok(())
+    }
+
+    /// Donate TrueType cmaps among the fonts THIS dictionary resolves, and only
+    /// those — never against fonts a sibling dictionary (another page's own
+    /// `/Font` dict, or a Form XObject's) happens to have already added to the
+    /// extractor. That makes the result a pure function of `resolved`, so it is
+    /// safe to cache under the same key the pre-donation caches use: a cache hit
+    /// still depends only on this dictionary's own resources, never on which
+    /// page or XObject was read before it.
+    ///
+    /// Donation whose donor lives outside `resolved` is intentionally left out
+    /// here. `TextExtractor::share_truetype_cmaps` still runs after every
+    /// `load_fonts` call to cover that case; it is a no-op for any font this
+    /// function already gave a cmap, so caching the self-contained part removes
+    /// the redundant `Arc::make_mut` clone for the common case without changing
+    /// cross-dictionary behavior. ~keep
+    fn donate_truetype_cmaps_within_set(
+        resolved: &[(String, Arc<crate::fonts::FontInfo>)],
+    ) -> Vec<(String, Arc<crate::fonts::FontInfo>)> {
+        let mut donated: Vec<(String, Arc<crate::fonts::FontInfo>)> = resolved.to_vec();
+        let best_cmaps =
+            crate::fonts::unicode_decode::best_truetype_cmaps(donated.iter().map(|(_, font)| font.as_ref()));
+        if best_cmaps.is_empty() {
+            return donated;
+        }
+
+        for (_, font_arc) in donated.iter_mut() {
+            if font_arc.truetype_cmap().is_some() {
+                continue;
+            }
+            if font_arc.subtype != "Type0" {
+                continue;
+            }
+            let is_identity = matches!(&font_arc.encoding, crate::fonts::Encoding::Identity)
+                || matches!(&font_arc.encoding, crate::fonts::Encoding::Standard(n) if n.contains("Identity"));
+            if !is_identity {
+                continue;
+            }
+            let stripped = crate::fonts::unicode_decode::strip_subset_prefix(&font_arc.base_font);
+            if let Some((donor_cmap, _)) = best_cmaps.get(stripped) {
+                Arc::make_mut(font_arc).set_truetype_cmap(Some(donor_cmap.clone()));
+            }
+        }
+
+        donated
+    }
+
+    /// Number of times `donate_truetype_cmaps_within_set` actually ran, i.e. a
+    /// cache miss did real donation work rather than reusing a cached result.
+    /// Test-only: proves donation runs once per font set across repeated page
+    /// reads instead of once per page.
+    #[cfg(test)]
+    pub(super) fn donation_call_count(&self) -> usize {
+        self.donation_call_count.load(Ordering::Relaxed)
+    }
+
+    /// Sum of `TextExtractor::share_truetype_cmaps`'s return value across every
+    /// `load_fonts` call on this document. Test-only: proves a `/Font`
+    /// dictionary already served from the donated-set cache does not redo the
+    /// `Arc::make_mut` mutation `share_truetype_cmaps` applies on a real donation.
+    #[cfg(test)]
+    pub(super) fn donation_apply_count(&self) -> usize {
+        self.donation_apply_count.load(Ordering::Relaxed)
     }
 
     /// Public wrapper for `load_fonts` (normally pub(crate)).

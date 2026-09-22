@@ -593,6 +593,31 @@ pub struct PdfDocument {
     /// Stores the resolved font set (Arc-wrapped to avoid cloning) plus a combined
     /// identity hash over ALL fonts for verification before reuse. Bounded at 256 entries.
     font_name_set_cache: Mutex<BoundedEntryCache<u64, (Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>, u64)>>,
+    /// Donated companions to `font_set_cache`/`font_fingerprint_cache`/`font_name_set_cache`,
+    /// keyed identically. Holds the SAME dictionary's font set after TrueType cmap donation
+    /// has run only among fonts that dictionary itself resolves — never against fonts a
+    /// sibling dictionary (a different page, or a Form XObject) happens to have contributed
+    /// to the extractor first. That keeps a cache hit's donated value a function of this
+    /// dictionary's own resources alone, so it cannot vary with which page or XObject was
+    /// read before it. Donation that depends on a donor OUTSIDE this dictionary is not
+    /// cached here; `TextExtractor::share_truetype_cmaps` still runs on every `load_fonts`
+    /// call to cover that case, and is cheap when these fonts already carry a cmap. ~keep
+    font_set_donated_cache: Mutex<BoundedEntryCache<ObjectRef, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
+    /// Donated companion to `font_fingerprint_cache`. See `font_set_donated_cache`.
+    font_fingerprint_donated_cache: Mutex<BoundedEntryCache<u64, Vec<(String, Arc<crate::fonts::FontInfo>)>>>,
+    /// Donated companion to `font_name_set_cache`. See `font_set_donated_cache`.
+    font_name_set_donated_cache: Mutex<BoundedEntryCache<u64, Arc<Vec<(String, Arc<crate::fonts::FontInfo>)>>>>,
+    /// Counts calls to `donate_truetype_cmaps_within_set`, i.e. actual donation
+    /// work rather than a cache hit. Test-only: proves donation runs once per
+    /// font set across repeated page reads instead of once per page. ~keep
+    #[cfg(test)]
+    donation_call_count: AtomicUsize,
+    /// Sum of `TextExtractor::share_truetype_cmaps`'s return value across every
+    /// `load_fonts` call on this document, i.e. the number of fonts actually
+    /// mutated by cmap donation. Test-only: proves a cache hit that already
+    /// carries a donated cmap does not redo that mutation. ~keep
+    #[cfg(test)]
+    donation_apply_count: AtomicUsize,
     /// Per-font identity cache keyed by the resolved semantic content consumed by
     /// `FontInfo::from_dict`. Skips expensive parsing when a structurally identical
     /// font was already parsed.
