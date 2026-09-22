@@ -146,7 +146,7 @@ Fixtures are JSON files organized by format directory under `fixtures/`:
 | PPT         | 1        | 1                |
 
 Format is determined by each fixture's JSON `file_type` field (see
-[`Fixture::file_type`](src/fixture.rs)), not by its directory — most fixtures
+[`Fixture::file_type`](src/fixture/mod.rs)), not by its directory — most fixtures
 live in a directory matching their `file_type`, but several do not (for
 example `fixtures/ordinance_2197_scanned.json` sits at the top level and
 `fixtures/pdf_medium.json` has no format subdirectory at all). "With Markdown
