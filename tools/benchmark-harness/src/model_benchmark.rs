@@ -5,8 +5,8 @@
 
 use crate::Result;
 use crate::corpus::{self, CorpusFilter};
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use xberg::core::config::layout::TableModel;
 
 fn parse_table_model(s: &str) -> TableModel {
@@ -50,6 +50,44 @@ pub struct ModelDocResult {
     pub model_b_regions: usize,
 }
 
+/// Wall-clock ceiling for one document under one table model.
+const MODEL_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Extract `document_path` under `table_model` and report the elapsed milliseconds.
+///
+/// A timeout or extraction error yields `None` alongside the elapsed time, so a document that
+/// one model cannot handle still contributes its timing to the comparison.
+async fn time_table_model(
+    document_path: &Path,
+    document_name: &str,
+    table_model: &str,
+) -> (Option<xberg::ExtractedDocument>, f64) {
+    let extraction_config = xberg::ExtractionConfig {
+        output_format: xberg::core::config::OutputFormat::Markdown,
+        layout: Some(xberg::core::config::layout::LayoutDetectionConfig {
+            table_model: parse_table_model(table_model),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let started = Instant::now();
+    let result = match tokio::time::timeout(
+        MODEL_EXTRACTION_TIMEOUT,
+        crate::extract_xberg_file(document_path, &extraction_config),
+    )
+    .await
+    {
+        Ok(r) => r.ok(),
+        Err(_) => {
+            eprintln!("  TIMEOUT {}/{}", document_name, table_model);
+            None
+        }
+    };
+
+    (result, started.elapsed().as_secs_f64() * 1000.0)
+}
+
 /// Run model benchmark (stub — full implementation requires layout model API).
 ///
 /// This currently extracts using the two table model configurations and measures timing.
@@ -74,53 +112,8 @@ pub async fn run_model_benchmark(config: &ModelBenchmarkConfig) -> Result<Vec<Mo
     let mut results = Vec::new();
 
     for doc in &docs {
-        let config_a = xberg::ExtractionConfig {
-            output_format: xberg::core::config::OutputFormat::Markdown,
-            layout: Some(xberg::core::config::layout::LayoutDetectionConfig {
-                table_model: parse_table_model(&config.model_a),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let t = Instant::now();
-        let result_a = match tokio::time::timeout(
-            std::time::Duration::from_secs(180),
-            crate::extract_xberg_file(&doc.document_path, &config_a),
-        )
-        .await
-        {
-            Ok(r) => r.ok(),
-            Err(_) => {
-                eprintln!("  TIMEOUT {}/{}", doc.name, config.model_a);
-                None
-            }
-        };
-        let model_a_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-        let config_b = xberg::ExtractionConfig {
-            output_format: xberg::core::config::OutputFormat::Markdown,
-            layout: Some(xberg::core::config::layout::LayoutDetectionConfig {
-                table_model: parse_table_model(&config.model_b),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let t = Instant::now();
-        let result_b = match tokio::time::timeout(
-            std::time::Duration::from_secs(180),
-            crate::extract_xberg_file(&doc.document_path, &config_b),
-        )
-        .await
-        {
-            Ok(r) => r.ok(),
-            Err(_) => {
-                eprintln!("  TIMEOUT {}/{}", doc.name, config.model_b);
-                None
-            }
-        };
-        let model_b_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let (result_a, model_a_ms) = time_table_model(&doc.document_path, &doc.name, &config.model_a).await;
+        let (result_b, model_b_ms) = time_table_model(&doc.document_path, &doc.name, &config.model_b).await;
 
         let count_headings = |content: &str| content.lines().filter(|l| l.starts_with('#')).count();
 

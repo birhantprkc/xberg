@@ -181,9 +181,37 @@ fn fmt_delta(value: Option<f64>) -> String {
     }
 }
 
+/// How far TF1 and SF1 deficits must diverge before the loss is attributed to one of them
+/// rather than to both.
+const LOSING_SIDE_MARGIN: f64 = 0.02;
+
+/// Number of worst-losing documents the token-loss section itemises.
+const TOKEN_DIAGNOSTIC_ROWS: usize = 10;
+
 /// Render the gap report markdown from the per-document rows.
 pub fn render_markdown(rows: &[DocumentRow], config: &GapConfig) -> String {
     let mut out = String::new();
+    push_header(&mut out, config);
+
+    let mut losses: Vec<&DocumentRow> = rows
+        .iter()
+        .filter(|r| r.combined_deficit.map(|d| d > 0.0).unwrap_or(false))
+        .collect();
+    losses.sort_by(|a, b| {
+        b.combined_deficit
+            .partial_cmp(&a.combined_deficit)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    push_summary(&mut out, rows, &losses);
+    push_loss_table(&mut out, &losses);
+    push_token_diagnostics(&mut out, &losses, config);
+    push_layout_vs_docling(&mut out, rows, config);
+
+    out
+}
+
+fn push_header(out: &mut String, config: &GapConfig) {
     out.push_str("# PDF quality gap report\n\n");
     out.push_str(&format!(
         "Heuristics path: `{}` — Layout path: `{}` — Competitors: {}\n\n",
@@ -196,17 +224,9 @@ pub fn render_markdown(rows: &[DocumentRow], config: &GapConfig) -> String {
             .collect::<Vec<_>>()
             .join(", "),
     ));
+}
 
-    let mut losses: Vec<&DocumentRow> = rows
-        .iter()
-        .filter(|r| r.combined_deficit.map(|d| d > 0.0).unwrap_or(false))
-        .collect();
-    losses.sort_by(|a, b| {
-        b.combined_deficit
-            .partial_cmp(&a.combined_deficit)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
+fn push_summary(out: &mut String, rows: &[DocumentRow], losses: &[&DocumentRow]) {
     let comparable = rows.iter().filter(|r| r.combined_deficit.is_some()).count();
     let wins = comparable - losses.len();
     out.push_str("## Summary\n\n");
@@ -225,16 +245,18 @@ pub fn render_markdown(rows: &[DocumentRow], config: &GapConfig) -> String {
         ));
     }
     out.push('\n');
+}
 
+fn push_loss_table(out: &mut String, losses: &[&DocumentRow]) {
     out.push_str("## Where competitors beat our heuristics path (worst first)\n\n");
     out.push_str(
         "| Document | Best competitor | Δcombined | Δtext (TF1) | Δstruct (SF1) | us combined | comp combined | likely losing |\n",
     );
     out.push_str("|---|---|--:|--:|--:|--:|--:|---|\n");
-    for row in &losses {
+    for row in losses {
         let losing = match (row.tf1_deficit, row.sf1_deficit) {
-            (Some(t), Some(s)) if t > s + 0.02 => "text",
-            (Some(t), Some(s)) if s > t + 0.02 => "structure",
+            (Some(t), Some(s)) if t > s + LOSING_SIDE_MARGIN => "text",
+            (Some(t), Some(s)) if s > t + LOSING_SIDE_MARGIN => "structure",
             (Some(_), Some(_)) => "both",
             _ => "—",
         };
@@ -251,9 +273,13 @@ pub fn render_markdown(rows: &[DocumentRow], config: &GapConfig) -> String {
         ));
     }
     out.push('\n');
+}
 
-    out.push_str("## Token-loss diagnostics (worst 10 lost docs)\n\n");
-    for row in losses.iter().take(10) {
+fn push_token_diagnostics(out: &mut String, losses: &[&DocumentRow], config: &GapConfig) {
+    out.push_str(&format!(
+        "## Token-loss diagnostics (worst {TOKEN_DIAGNOSTIC_ROWS} lost docs)\n\n"
+    ));
+    for row in losses.iter().take(TOKEN_DIAGNOSTIC_ROWS) {
         if let Some(us) = row.scores.iter().find(|s| s.framework == config.baseline)
             && !us.top_missing_tokens.is_empty()
         {
@@ -265,7 +291,9 @@ pub fn render_markdown(rows: &[DocumentRow], config: &GapConfig) -> String {
         }
     }
     out.push('\n');
+}
 
+fn push_layout_vs_docling(out: &mut String, rows: &[DocumentRow], config: &GapConfig) {
     out.push_str("## Where `xberg-layout` trails Docling\n\n");
     out.push_str("| Document | xberg-layout combined | docling combined | Δcombined |\n");
     out.push_str("|---|--:|--:|--:|\n");
@@ -291,8 +319,6 @@ pub fn render_markdown(rows: &[DocumentRow], config: &GapConfig) -> String {
         out.push_str("| _(none — layout matches or beats Docling everywhere it ran)_ |  |  |  |\n");
     }
     out.push('\n');
-
-    out
 }
 
 /// Load-per-core mean spread above which two frameworks are considered to have

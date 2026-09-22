@@ -181,6 +181,99 @@ pub struct ProvenanceInputs<'a> {
     pub models: &'a [ModelProvenance],
 }
 
+fn model_identifiers_by_framework(models: &[ModelProvenance]) -> HashMap<&str, Vec<String>> {
+    models
+        .iter()
+        .fold(HashMap::<&str, Vec<String>>::new(), |mut map, model| {
+            map.entry(&model.framework).or_default().push(model.identifier.clone());
+            map
+        })
+}
+
+/// # Errors
+///
+/// Returns [`Error::Config`] if a model identity names a framework that is not in the run.
+fn reject_models_for_unselected_frameworks(inputs: &ProvenanceInputs<'_>) -> Result<()> {
+    for model in inputs.models {
+        if !inputs
+            .frameworks
+            .iter()
+            .any(|adapter| adapter.name() == model.framework)
+        {
+            return Err(Error::Config(format!(
+                "model identity names unselected framework '{}'",
+                model.framework
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn capture_framework(
+    adapter: &Arc<dyn FrameworkAdapter>,
+    inputs: &ProvenanceInputs<'_>,
+    models: &HashMap<&str, Vec<String>>,
+) -> FrameworkProvenance {
+    let capability = matches!(inputs.config.benchmark_mode, BenchmarkMode::Batch)
+        .then(|| adapter.batch_capability())
+        .flatten();
+    let eligible_languages: Vec<Option<String>> = inputs
+        .fixtures
+        .fixtures()
+        .iter()
+        .filter(|(_, fixture)| {
+            adapter.supports_fixture(
+                &fixture.file_type,
+                fixture.document.file_name().and_then(|name| name.to_str()),
+                fixture.ocr_language(),
+            )
+        })
+        .map(|(_, fixture)| fixture.ocr_language().map(str::to_string))
+        .collect();
+    let eligible_documents = eligible_languages.len();
+    // A framework only benchmarks the formats it declares support for, so its eligible-doc
+    // count need not be a multiple of the cohort's fixed batch size. Partition into batches
+    // of at most `size` with a smaller final batch when the count isn't an exact multiple
+    // (0 eligible -> 0 partitions), mirroring `fixed_batch_ranges` in the runner. This
+    // previously aborted the whole invocation, silently dropping e.g. docling batch on the
+    // family cohorts where it supports only a subset of the member formats. ~keep
+    let language_policy = adapter.ocr_language_policy();
+    let batch_partitions = inputs
+        .fixed_batch_size
+        .filter(|_| capability.is_some())
+        .map(|size| language_policy.batch_partition_count(&eligible_languages, size));
+    let batch_workers = capability.map(|_| adapter.worker_provenance(inputs.config.max_concurrent));
+    let (requested_workers, effective_workers) = worker_counts(
+        inputs.config.benchmark_mode,
+        inputs.config.max_concurrent,
+        batch_workers,
+    );
+    let configured_thread_budget =
+        configured_thread_budget(inputs.config.benchmark_mode, capability, adapter.as_ref());
+
+    FrameworkProvenance {
+        name: adapter.name().to_string(),
+        version: adapter.version(),
+        executable: adapter.executable_provenance_for_mode(inputs.config.benchmark_mode),
+        models: models.get(adapter.name()).cloned().unwrap_or_default(),
+        batch_capability: capability,
+        requested_workers,
+        effective_workers,
+        configured_thread_budget,
+        worker_semantics: worker_semantics(inputs.config.benchmark_mode, capability).to_string(),
+        effective_warmup_iterations: capability.map_or(inputs.config.warmup_iterations, |value| {
+            if value.timing_scope == crate::types::BatchTimingScope::ColdEndToEndSubprocess {
+                0
+            } else {
+                inputs.config.warmup_iterations
+            }
+        }),
+        eligible_documents,
+        batch_partitions,
+        ocr_language_policy: language_policy,
+    }
+}
+
 impl RunProvenance {
     pub fn capture(inputs: ProvenanceInputs<'_>) -> Result<Self> {
         let corpus = capture_corpus(
@@ -189,84 +282,12 @@ impl RunProvenance {
             inputs.cohort,
             inputs.cohort_manifest_path,
         )?;
-        let models = inputs
-            .models
-            .iter()
-            .fold(HashMap::<&str, Vec<String>>::new(), |mut map, model| {
-                map.entry(&model.framework).or_default().push(model.identifier.clone());
-                map
-            });
-        for model in inputs.models {
-            if !inputs
-                .frameworks
-                .iter()
-                .any(|adapter| adapter.name() == model.framework)
-            {
-                return Err(Error::Config(format!(
-                    "model identity names unselected framework '{}'",
-                    model.framework
-                )));
-            }
-        }
+        let models = model_identifiers_by_framework(inputs.models);
+        reject_models_for_unselected_frameworks(&inputs)?;
+
         let mut frameworks = Vec::with_capacity(inputs.frameworks.len());
         for adapter in inputs.frameworks {
-            let capability = matches!(inputs.config.benchmark_mode, BenchmarkMode::Batch)
-                .then(|| adapter.batch_capability())
-                .flatten();
-            let eligible_languages: Vec<Option<String>> = inputs
-                .fixtures
-                .fixtures()
-                .iter()
-                .filter(|(_, fixture)| {
-                    adapter.supports_fixture(
-                        &fixture.file_type,
-                        fixture.document.file_name().and_then(|name| name.to_str()),
-                        fixture.ocr_language(),
-                    )
-                })
-                .map(|(_, fixture)| fixture.ocr_language().map(str::to_string))
-                .collect();
-            let eligible_documents = eligible_languages.len();
-            // A framework only benchmarks the formats it declares support for, so its eligible-doc
-            // count need not be a multiple of the cohort's fixed batch size. Partition into batches
-            // of at most `size` with a smaller final batch when the count isn't an exact multiple
-            // (0 eligible -> 0 partitions), mirroring `fixed_batch_ranges` in the runner. This
-            // previously aborted the whole invocation, silently dropping e.g. docling batch on the
-            // family cohorts where it supports only a subset of the member formats. ~keep
-            let language_policy = adapter.ocr_language_policy();
-            let batch_partitions = inputs
-                .fixed_batch_size
-                .filter(|_| capability.is_some())
-                .map(|size| language_policy.batch_partition_count(&eligible_languages, size));
-            let batch_workers = capability.map(|_| adapter.worker_provenance(inputs.config.max_concurrent));
-            let (requested_workers, effective_workers) = worker_counts(
-                inputs.config.benchmark_mode,
-                inputs.config.max_concurrent,
-                batch_workers,
-            );
-            let configured_thread_budget =
-                configured_thread_budget(inputs.config.benchmark_mode, capability, adapter.as_ref());
-            frameworks.push(FrameworkProvenance {
-                name: adapter.name().to_string(),
-                version: adapter.version(),
-                executable: adapter.executable_provenance_for_mode(inputs.config.benchmark_mode),
-                models: models.get(adapter.name()).cloned().unwrap_or_default(),
-                batch_capability: capability,
-                requested_workers,
-                effective_workers,
-                configured_thread_budget,
-                worker_semantics: worker_semantics(inputs.config.benchmark_mode, capability).to_string(),
-                effective_warmup_iterations: capability.map_or(inputs.config.warmup_iterations, |value| {
-                    if value.timing_scope == crate::types::BatchTimingScope::ColdEndToEndSubprocess {
-                        0
-                    } else {
-                        inputs.config.warmup_iterations
-                    }
-                }),
-                eligible_documents,
-                batch_partitions,
-                ocr_language_policy: language_policy,
-            });
+            frameworks.push(capture_framework(adapter, &inputs, &models));
         }
 
         Ok(Self {

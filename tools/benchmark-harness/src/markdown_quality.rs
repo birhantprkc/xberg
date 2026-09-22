@@ -82,214 +82,248 @@ pub(crate) fn md_parser_options() -> pulldown_cmark::Options {
 /// variants: fenced and indented code blocks, ATX and setext headings, different
 /// list markers (-, *, +, 1.), tables with any separator style, etc.
 pub fn parse_markdown_blocks(md: &str) -> Vec<MdBlock> {
-    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    use pulldown_cmark::Parser;
 
-    let parser = Parser::new_ext(md, md_parser_options());
-    let mut blocks: Vec<MdBlock> = Vec::new();
-    let mut index = 0;
-    let mut current_text = String::new();
-    let mut in_heading: Option<u8> = None;
-    let mut in_code_block = false;
-    let mut in_table = false;
-    let mut in_list_item = false;
-    let mut table_content = String::new();
+    let mut state = BlockAccumulator::default();
+    for event in Parser::new_ext(md, md_parser_options()) {
+        if state.handle_block_tag(&event) || state.handle_table_tag(&event) || state.handle_inline_tag(&event) {
+            continue;
+        }
+        state.handle_content(event);
+    }
+    state.finish()
+}
 
-    for event in parser {
+/// Running state of the [`parse_markdown_blocks`] event walk.
+///
+/// The `in_*` flags are the parser context the handlers branch on: pulldown-cmark reports text
+/// inside a table cell, a code block or a list item with the same `Event::Text`, so the block a
+/// run of text belongs to is only knowable from the enclosing tags seen so far.
+#[derive(Default)]
+struct BlockAccumulator {
+    blocks: Vec<MdBlock>,
+    index: usize,
+    current_text: String,
+    table_content: String,
+    in_heading: Option<u8>,
+    in_code_block: bool,
+    in_table: bool,
+    in_list_item: bool,
+}
+
+impl BlockAccumulator {
+    fn flush_paragraph(&mut self) {
+        flush_text(
+            &mut self.current_text,
+            &mut self.blocks,
+            &mut self.index,
+            MdBlockType::Paragraph,
+        );
+    }
+
+    fn push_block(&mut self, block_type: MdBlockType, content: String) {
+        self.blocks.push(MdBlock {
+            block_type,
+            content,
+            index: self.index,
+        });
+        self.index += 1;
+    }
+
+    fn finish(mut self) -> Vec<MdBlock> {
+        self.flush_paragraph();
+        self.blocks
+    }
+
+    /// Handle heading, code-block, list and image tags. Returns whether the event was consumed.
+    fn handle_block_tag(&mut self, event: &pulldown_cmark::Event<'_>) -> bool {
+        use pulldown_cmark::{Event, Tag, TagEnd};
+
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-                in_heading = Some(level as u8);
+                self.flush_paragraph();
+                self.in_heading = Some(*level as u8);
             }
-            Event::End(TagEnd::Heading(_)) => {
-                if let Some(level) = in_heading.take() {
-                    let block_type = match level {
-                        1 => MdBlockType::Heading1,
-                        2 => MdBlockType::Heading2,
-                        3 => MdBlockType::Heading3,
-                        4 => MdBlockType::Heading4,
-                        5 => MdBlockType::Heading5,
-                        _ => MdBlockType::Heading6,
-                    };
-                    let content = std::mem::take(&mut current_text);
-                    if !content.trim().is_empty() {
-                        blocks.push(MdBlock {
-                            block_type,
-                            content: content.trim().to_string(),
-                            index,
-                        });
-                        index += 1;
-                    }
-                }
-            }
+            Event::End(TagEnd::Heading(_)) => self.end_heading(),
             Event::Start(Tag::CodeBlock(_)) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-                in_code_block = true;
+                self.flush_paragraph();
+                self.in_code_block = true;
             }
-            Event::End(TagEnd::CodeBlock) => {
-                in_code_block = false;
-                let content = std::mem::take(&mut current_text);
-                if !content.trim().is_empty() {
-                    let block_type = if content.trim().starts_with("\\")
-                        || content.contains("\\frac")
-                        || content.contains("\\sum")
-                        || content.contains("\\int")
-                    {
-                        MdBlockType::Formula
-                    } else {
-                        MdBlockType::CodeBlock
-                    };
-                    blocks.push(MdBlock {
-                        block_type,
-                        content: content.trim_end().to_string(),
-                        index,
-                    });
-                    index += 1;
-                }
-            }
-            Event::Start(Tag::Table(_)) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-                in_table = true;
-                table_content.clear();
-            }
-            Event::End(TagEnd::Table) => {
-                in_table = false;
-                let content = std::mem::take(&mut table_content);
-                if !content.trim().is_empty() {
-                    blocks.push(MdBlock {
-                        block_type: MdBlockType::Table,
-                        content: content.trim().to_string(),
-                        index,
-                    });
-                    index += 1;
-                }
-            }
-            Event::Start(Tag::TableHead) => {}
-            Event::End(TagEnd::TableHead) => {}
-            Event::Start(Tag::TableRow) => {
-                if !table_content.is_empty() {
-                    table_content.push('\n');
-                }
-                table_content.push('|');
-            }
-            Event::End(TagEnd::TableRow) => {}
-            Event::Start(Tag::TableCell) => {}
-            Event::End(TagEnd::TableCell) => {
-                let cell_text = std::mem::take(&mut current_text);
-                table_content.push(' ');
-                table_content.push_str(cell_text.trim());
-                table_content.push_str(" |");
-            }
-            Event::Start(Tag::List(_)) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-            }
+            Event::End(TagEnd::CodeBlock) => self.end_code_block(),
+            Event::Start(Tag::List(_)) => self.flush_paragraph(),
             Event::End(TagEnd::List(_)) => {}
             Event::Start(Tag::Item) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-                in_list_item = true;
+                self.flush_paragraph();
+                self.in_list_item = true;
             }
             Event::End(TagEnd::Item) => {
-                in_list_item = false;
-                let content = std::mem::take(&mut current_text);
+                self.in_list_item = false;
+                let content = std::mem::take(&mut self.current_text);
                 if !content.trim().is_empty() {
-                    blocks.push(MdBlock {
-                        block_type: MdBlockType::ListItem,
-                        content: content.trim().to_string(),
-                        index,
-                    });
-                    index += 1;
+                    self.push_block(MdBlockType::ListItem, content.trim().to_string());
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-                current_text.push_str("![");
+                self.flush_paragraph();
+                self.current_text.push_str("![");
                 let _ = dest_url;
             }
-            Event::End(TagEnd::Image) if current_text.starts_with("![") => {
-                current_text.push(']');
-                blocks.push(MdBlock {
-                    block_type: MdBlockType::Image,
-                    content: std::mem::take(&mut current_text),
-                    index,
-                });
-                index += 1;
+            Event::End(TagEnd::Image) if self.current_text.starts_with("![") => {
+                self.current_text.push(']');
+                let content = std::mem::take(&mut self.current_text);
+                self.push_block(MdBlockType::Image, content);
             }
-            Event::Start(Tag::Paragraph) if !in_list_item && !in_table => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
+            _ => return false,
+        }
+        true
+    }
+
+    fn end_heading(&mut self) {
+        let Some(level) = self.in_heading.take() else {
+            return;
+        };
+        let block_type = match level {
+            1 => MdBlockType::Heading1,
+            2 => MdBlockType::Heading2,
+            3 => MdBlockType::Heading3,
+            4 => MdBlockType::Heading4,
+            5 => MdBlockType::Heading5,
+            _ => MdBlockType::Heading6,
+        };
+        let content = std::mem::take(&mut self.current_text);
+        if !content.trim().is_empty() {
+            self.push_block(block_type, content.trim().to_string());
+        }
+    }
+
+    fn end_code_block(&mut self) {
+        self.in_code_block = false;
+        let content = std::mem::take(&mut self.current_text);
+        if content.trim().is_empty() {
+            return;
+        }
+        let block_type = if content.trim().starts_with("\\")
+            || content.contains("\\frac")
+            || content.contains("\\sum")
+            || content.contains("\\int")
+        {
+            MdBlockType::Formula
+        } else {
+            MdBlockType::CodeBlock
+        };
+        self.push_block(block_type, content.trim_end().to_string());
+    }
+
+    /// Handle table tags. Returns whether the event was consumed.
+    fn handle_table_tag(&mut self, event: &pulldown_cmark::Event<'_>) -> bool {
+        use pulldown_cmark::{Event, Tag, TagEnd};
+
+        match event {
+            Event::Start(Tag::Table(_)) => {
+                self.flush_paragraph();
+                self.in_table = true;
+                self.table_content.clear();
             }
-            Event::End(TagEnd::Paragraph) if !in_list_item && !in_table => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-            }
-            Event::Start(Tag::Strong) if !in_table && !in_code_block => {
-                current_text.push_str("**");
-            }
-            Event::End(TagEnd::Strong) if !in_table && !in_code_block => {
-                current_text.push_str("**");
-            }
-            Event::Text(text) | Event::Code(text) => {
-                if in_table {
-                    current_text.push_str(&text);
-                } else {
-                    if !current_text.is_empty()
-                        && !current_text.ends_with(' ')
-                        && !current_text.ends_with('\n')
-                        && !current_text.ends_with("**")
-                    {
-                        current_text.push(' ');
-                    }
-                    current_text.push_str(&text);
+            Event::End(TagEnd::Table) => {
+                self.in_table = false;
+                let content = std::mem::take(&mut self.table_content);
+                if !content.trim().is_empty() {
+                    self.push_block(MdBlockType::Table, content.trim().to_string());
                 }
             }
+            Event::Start(Tag::TableHead) | Event::End(TagEnd::TableHead) => {}
+            Event::Start(Tag::TableRow) => {
+                if !self.table_content.is_empty() {
+                    self.table_content.push('\n');
+                }
+                self.table_content.push('|');
+            }
+            Event::End(TagEnd::TableRow) | Event::Start(Tag::TableCell) => {}
+            Event::End(TagEnd::TableCell) => {
+                let cell_text = std::mem::take(&mut self.current_text);
+                self.table_content.push(' ');
+                self.table_content.push_str(cell_text.trim());
+                self.table_content.push_str(" |");
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Handle paragraph and strong-emphasis tags, which are context-sensitive. Returns whether
+    /// the event was consumed; a guard that does not hold leaves the event unhandled, as the
+    /// original single-match walk did.
+    fn handle_inline_tag(&mut self, event: &pulldown_cmark::Event<'_>) -> bool {
+        use pulldown_cmark::{Event, Tag, TagEnd};
+
+        match event {
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph)
+                if !self.in_list_item && !self.in_table =>
+            {
+                self.flush_paragraph();
+            }
+            Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) if !self.in_table && !self.in_code_block => {
+                self.current_text.push_str("**");
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Handle text, breaks, math and raw HTML.
+    fn handle_content(&mut self, event: pulldown_cmark::Event<'_>) {
+        use pulldown_cmark::Event;
+
+        match event {
+            Event::Text(text) | Event::Code(text) => self.push_text(&text),
             Event::SoftBreak => {
-                if in_code_block {
-                    current_text.push('\n');
+                if self.in_code_block {
+                    self.current_text.push('\n');
                 } else {
-                    current_text.push(' ');
+                    self.current_text.push(' ');
                 }
             }
-            Event::HardBreak => {
-                current_text.push('\n');
-            }
-            Event::InlineMath(text) => {
-                current_text.push_str(&text);
-            }
+            Event::HardBreak => self.current_text.push('\n'),
+            Event::InlineMath(text) => self.current_text.push_str(&text),
             Event::DisplayMath(text) => {
-                flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
+                self.flush_paragraph();
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    blocks.push(MdBlock {
-                        block_type: MdBlockType::Formula,
-                        content: trimmed.to_string(),
-                        index,
-                    });
-                    index += 1;
+                    self.push_block(MdBlockType::Formula, trimmed.to_string());
                 }
             }
             Event::Html(html) => {
                 let text = strip_html_tags(&html);
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
-                    flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-                    blocks.push(MdBlock {
-                        block_type: MdBlockType::Paragraph,
-                        content: trimmed.to_string(),
-                        index,
-                    });
-                    index += 1;
+                    self.flush_paragraph();
+                    self.push_block(MdBlockType::Paragraph, trimmed.to_string());
                 }
             }
             Event::InlineHtml(html) => {
                 let text = strip_html_tags(&html);
                 if !text.is_empty() {
-                    current_text.push_str(&text);
+                    self.current_text.push_str(&text);
                 }
             }
             _ => {}
         }
     }
 
-    flush_text(&mut current_text, &mut blocks, &mut index, MdBlockType::Paragraph);
-
-    blocks
+    fn push_text(&mut self, text: &str) {
+        if self.in_table {
+            self.current_text.push_str(text);
+            return;
+        }
+        if !self.current_text.is_empty()
+            && !self.current_text.ends_with(' ')
+            && !self.current_text.ends_with('\n')
+            && !self.current_text.ends_with("**")
+        {
+            self.current_text.push(' ');
+        }
+        self.current_text.push_str(text);
+    }
 }
 
 /// Flush accumulated text into a block if non-empty.

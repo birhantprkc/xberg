@@ -251,6 +251,92 @@ async fn extract_whole(bytes: &[u8]) -> Result<ExtractedDocument> {
         .ok_or_else(|| Error::Benchmark("extraction produced no document".to_string()))
 }
 
+/// Score one fixture: detected boundaries against ground truth, reconstruction fidelity, and
+/// split-vs-naive timings.
+///
+/// Returns `Ok(None)` for a fixture that cannot participate — unreadable, unextractable, or not
+/// page-addressable — so one bad document does not abort the run.
+///
+/// # Errors
+///
+/// Returns [`Error::Benchmark`] if splitting at the ground-truth page ranges fails, or the
+/// extraction error if a naive-baseline re-extraction fails.
+async fn benchmark_split_fixture(fixture: &SplitFixture) -> Result<Option<SplitDocResult>> {
+    let bytes = match std::fs::read(&fixture.document_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("  SKIP {} (read failed: {e})", fixture.name);
+            return Ok(None);
+        }
+    };
+
+    let doc = match extract_whole(&bytes).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("  SKIP {} ({e})", fixture.name);
+            return Ok(None);
+        }
+    };
+    let total_pages = doc.pages.as_ref().map_or(0, Vec::len) as u32;
+    if total_pages == 0 {
+        eprintln!("  SKIP {} (not page-addressable)", fixture.name);
+        return Ok(None);
+    }
+
+    let gt_starts: BTreeSet<u32> = fixture.boundaries.iter().map(|b| b.start_page).collect();
+    let boundaries = boundaries_from_extraction_result(&doc, &MultidocThresholds::default());
+    let predicted = segment_starts(&boundaries, total_pages);
+    let (precision, recall, f1) = boundary_prf1(&predicted, &gt_starts);
+
+    let gt_ranges: Vec<std::ops::RangeInclusive<u32>> =
+        fixture.boundaries.iter().map(|b| b.start_page..=b.end_page).collect();
+    let split_cfg = SplitConfig {
+        strategy: SplitStrategy::PageRanges(gt_ranges.clone()),
+        ..Default::default()
+    };
+
+    let t = Instant::now();
+    let segments = split_and_extract(&bytes, &split_cfg)
+        .await
+        .map_err(|e| Error::Benchmark(format!("split_and_extract failed on {}: {e}", fixture.name)))?;
+    let split_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let reconstructed = segments
+        .iter()
+        .map(|s| s.document.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let reconstruction_tf1 = compute_quality(&reconstructed, &doc.content).f1_score_text;
+
+    let counts_ok = segments.iter().all(|s| {
+        let d = &s.document;
+        d.counts.pages == d.pages.as_ref().map_or(0, Vec::len)
+            && d.counts.tables == d.tables.len()
+            && d.counts.images == d.images.as_ref().map_or(0, Vec::len)
+    });
+
+    let t = Instant::now();
+    for _ in 0..gt_ranges.len() {
+        let _ = extract_whole(&bytes).await?;
+    }
+    let naive_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(Some(SplitDocResult {
+        name: fixture.name.clone(),
+        pages: total_pages,
+        gt_internal: gt_starts.iter().filter(|&&p| p != 1).count(),
+        detected_internal: predicted.iter().filter(|&&p| p != 1).count(),
+        precision,
+        recall,
+        f1,
+        reconstruction_tf1,
+        counts_ok,
+        split_ms,
+        naive_ms,
+        segments: segments.len(),
+    }))
+}
+
 /// Run the split-boundary benchmark under default thresholds.
 pub async fn run_split_benchmark(config: &SplitBenchmarkConfig) -> Result<Vec<SplitDocResult>> {
     let fixtures = load_split_fixtures(&config.fixtures_dir)?;
@@ -262,79 +348,9 @@ pub async fn run_split_benchmark(config: &SplitBenchmarkConfig) -> Result<Vec<Sp
 
     let mut results = Vec::new();
     for fixture in &fixtures {
-        let bytes = match std::fs::read(&fixture.document_path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("  SKIP {} (read failed: {e})", fixture.name);
-                continue;
-            }
-        };
-
-        let doc = match extract_whole(&bytes).await {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("  SKIP {} ({e})", fixture.name);
-                continue;
-            }
-        };
-        let total_pages = doc.pages.as_ref().map_or(0, Vec::len) as u32;
-        if total_pages == 0 {
-            eprintln!("  SKIP {} (not page-addressable)", fixture.name);
-            continue;
+        if let Some(result) = benchmark_split_fixture(fixture).await? {
+            results.push(result);
         }
-
-        let gt_starts: BTreeSet<u32> = fixture.boundaries.iter().map(|b| b.start_page).collect();
-        let boundaries = boundaries_from_extraction_result(&doc, &MultidocThresholds::default());
-        let predicted = segment_starts(&boundaries, total_pages);
-        let (precision, recall, f1) = boundary_prf1(&predicted, &gt_starts);
-
-        let gt_ranges: Vec<std::ops::RangeInclusive<u32>> =
-            fixture.boundaries.iter().map(|b| b.start_page..=b.end_page).collect();
-        let split_cfg = SplitConfig {
-            strategy: SplitStrategy::PageRanges(gt_ranges.clone()),
-            ..Default::default()
-        };
-
-        let t = Instant::now();
-        let segments = split_and_extract(&bytes, &split_cfg)
-            .await
-            .map_err(|e| Error::Benchmark(format!("split_and_extract failed on {}: {e}", fixture.name)))?;
-        let split_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-        let reconstructed = segments
-            .iter()
-            .map(|s| s.document.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let reconstruction_tf1 = compute_quality(&reconstructed, &doc.content).f1_score_text;
-
-        let counts_ok = segments.iter().all(|s| {
-            let d = &s.document;
-            d.counts.pages == d.pages.as_ref().map_or(0, Vec::len)
-                && d.counts.tables == d.tables.len()
-                && d.counts.images == d.images.as_ref().map_or(0, Vec::len)
-        });
-
-        let t = Instant::now();
-        for _ in 0..gt_ranges.len() {
-            let _ = extract_whole(&bytes).await?;
-        }
-        let naive_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-        results.push(SplitDocResult {
-            name: fixture.name.clone(),
-            pages: total_pages,
-            gt_internal: gt_starts.iter().filter(|&&p| p != 1).count(),
-            detected_internal: predicted.iter().filter(|&&p| p != 1).count(),
-            precision,
-            recall,
-            f1,
-            reconstruction_tf1,
-            counts_ok,
-            split_ms,
-            naive_ms,
-            segments: segments.len(),
-        });
     }
 
     if let Some(path) = &config.guardrails_out {

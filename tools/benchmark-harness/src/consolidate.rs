@@ -47,33 +47,41 @@ pub fn load_run_results(dir: &Path) -> Result<Vec<BenchmarkResult>> {
     let mut results = Vec::new();
     for path in sorted_dir_entries(dir)? {
         if path.is_file() && path.file_name().is_some_and(|n| n == "results.json") {
-            eprintln!("Loading results from {}", path.display());
-            let json_content = fs::read_to_string(&path).map_err(Error::Io)?;
-            let mut run_results: Vec<BenchmarkResult> = serde_json::from_str(&json_content)
-                .map_err(|e| Error::Benchmark(format!("Failed to parse {}: {}", path.display(), e)))?;
-
-            let is_batch = is_batch_results_dir(dir);
-
-            if is_batch {
-                for result in &mut run_results {
-                    if !result.framework.ends_with("-batch") {
-                        result.framework = format!("{}-batch", result.framework);
-                    }
-                }
-            }
-
-            for result in &run_results {
-                crate::output::validate_result(result)
-                    .map_err(|e| Error::Benchmark(format!("Invalid result in {}: {}", path.display(), e)))?;
-            }
-
-            results.extend(run_results);
+            results.extend(load_results_file(&path, is_batch_results_dir(dir))?);
         } else if path.is_dir() {
             let mut run_results = load_run_results(&path)?;
             results.append(&mut run_results);
         }
     }
     Ok(results)
+}
+
+/// Parse one `results.json`, re-tag its frameworks for batch mode, and validate every entry.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the file cannot be read, or [`Error::Benchmark`] if it contains
+/// invalid JSON or fails validation.
+fn load_results_file(path: &Path, is_batch: bool) -> Result<Vec<BenchmarkResult>> {
+    eprintln!("Loading results from {}", path.display());
+    let json_content = fs::read_to_string(path).map_err(Error::Io)?;
+    let mut run_results: Vec<BenchmarkResult> = serde_json::from_str(&json_content)
+        .map_err(|e| Error::Benchmark(format!("Failed to parse {}: {}", path.display(), e)))?;
+
+    if is_batch {
+        for result in &mut run_results {
+            if !result.framework.ends_with("-batch") {
+                result.framework = format!("{}-batch", result.framework);
+            }
+        }
+    }
+
+    for result in &run_results {
+        crate::output::validate_result(result)
+            .map_err(|e| Error::Benchmark(format!("Invalid result in {}: {}", path.display(), e)))?;
+    }
+
+    Ok(run_results)
 }
 
 /// List `dir`'s immediate entries, sorted by path.
