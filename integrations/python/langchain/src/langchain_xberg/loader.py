@@ -39,6 +39,196 @@ _METADATA_FIELDS: tuple[str, ...] = (
 )
 
 
+class _ConfigView:
+    """Read a loader's ``ExtractionConfig`` (or dict) without caching, for dynamic flags.
+
+    ``ExtractionConfig`` is a frozen dataclass, so its fields are attributes and mapping
+    access raises. ``extract()`` also accepts a plain ``dict``, which reaches the loader
+    unchanged, so both shapes are read here. Split out of ``XbergLoader`` to keep that
+    class within the repo's type-length budget. ~keep
+    """
+
+    def __init__(self, config: ExtractionConfig | dict[str, Any] | None) -> None:
+        self._config = config
+
+    def field(self, name: str) -> Any:
+        """Read a top-level config field regardless of how the config was supplied."""
+        config = self._config
+        if config is None:
+            return None
+        if isinstance(config, dict):
+            return config.get(name)
+        return getattr(config, name, None)
+
+    @property
+    def per_page(self) -> bool:
+        """Whether per-page splitting is enabled in the config."""
+        pages = self.field("pages")
+        if pages is None:
+            return False
+        if isinstance(pages, dict):
+            return bool(pages.get("extract_pages"))
+        return bool(getattr(pages, "extract_pages", None))
+
+    @property
+    def chunking(self) -> bool:
+        """Whether chunking is enabled in the config."""
+        return self.field("chunking") is not None
+
+
+class _DocumentAssembler:
+    """Convert Xberg extraction results into LangChain ``Document`` objects.
+
+    Holds no state beyond a ``_ConfigView`` onto the owning loader's config; split out of
+    ``XbergLoader`` to keep that class within the repo's type-length budget. ~keep
+    """
+
+    def __init__(self, config: _ConfigView) -> None:
+        self._config = config
+
+    def result_to_documents(self, result: ExtractionResult, sources: list[str]) -> Iterator[Document]:
+        """Map an ExtractionResult envelope to LangChain Documents.
+
+        Raises XbergError on the first per-input error, mirroring the fail-fast
+        behaviour of single extraction. On success, ``result.results`` is aligned
+        positionally with ``sources``.
+        """
+        if result.errors:
+            error = result.errors[0]
+            msg = f"Failed to extract '{error.source}': {error.message}"
+            raise XbergError(msg)
+
+        for index, document in enumerate(result.results):
+            source = sources[index] if index < len(sources) else (sources[-1] if sources else "")
+            yield from self.document_to_documents(document, source)
+
+    def document_to_documents(self, document: ExtractedDocument, source: str) -> Iterator[Document]:
+        """Convert a single ExtractedDocument into one or more Documents.
+
+        When chunking is enabled and the document was chunked, one Document is
+        emitted per chunk. Otherwise, when per-page splitting is enabled, one
+        Document is emitted per page. Failing both, the whole document becomes a
+        single Document.
+        """
+        if self._config.chunking and document.chunks:
+            yield from self.chunks_to_documents(document, source)
+        elif self._config.per_page and document.pages:
+            yield from self.pages_to_documents(document, source)
+        else:
+            metadata = self.build_metadata(document, source)
+            page_content = self.assemble_content(document.content, document.tables)
+            yield Document(page_content=page_content, metadata=metadata)
+
+    def chunks_to_documents(self, document: ExtractedDocument, source: str) -> Iterator[Document]:
+        """Yield one Document per chunk from an ExtractedDocument.
+
+        Chunk content is already segmented by Xberg, so it is used verbatim.
+        Each Document carries the document-level metadata plus chunk-specific
+        keys (index, heading path, page span, token count, chunk type).
+        """
+        base_metadata = self.build_metadata(document, source)
+
+        for chunk in document.chunks or []:
+            chunk_metadata = dict(base_metadata)
+            meta = chunk.metadata
+            chunk_metadata["chunk_index"] = meta.chunk_index
+            chunk_metadata["total_chunks"] = meta.total_chunks
+            chunk_metadata["chunk_type"] = str(chunk.chunk_type)
+            if meta.heading_path:
+                chunk_metadata["heading_path"] = list(meta.heading_path)
+            if meta.token_count is not None:
+                chunk_metadata["token_count"] = meta.token_count
+            if meta.first_page is not None:
+                # Xberg uses 1-indexed pages; LangChain convention is 0-indexed. ~keep
+                chunk_metadata["page"] = meta.first_page - 1
+                chunk_metadata["first_page"] = meta.first_page
+            if meta.last_page is not None:
+                chunk_metadata["last_page"] = meta.last_page
+
+            yield Document(page_content=chunk.content, metadata=chunk_metadata)
+
+    def pages_to_documents(self, document: ExtractedDocument, source: str) -> Iterator[Document]:
+        """Yield one Document per page from an ExtractedDocument."""
+        base_metadata = self.build_metadata(document, source)
+
+        for page in document.pages or []:
+            page_metadata = dict(base_metadata)
+            # Xberg uses 1-indexed pages; LangChain convention is 0-indexed. ~keep
+            page_metadata["page"] = page.page_number - 1
+            if page.is_blank is not None:
+                page_metadata["is_blank"] = page.is_blank
+
+            page_content = self.assemble_content(page.content, page.tables)
+            yield Document(page_content=page_content, metadata=page_metadata)
+
+    def build_metadata(self, document: ExtractedDocument, source: str) -> dict[str, Any]:
+        """Build a flat metadata dict from an ExtractedDocument."""
+        metadata: dict[str, Any] = self.flatten_metadata(document.metadata)
+
+        metadata["mime_type"] = document.mime_type
+        if document.quality_score is not None:
+            metadata["quality_score"] = document.quality_score
+        if document.detected_languages:
+            metadata["detected_languages"] = document.detected_languages
+        if document.counts is not None:
+            metadata["page_count"] = document.counts.pages
+
+        if document.extracted_keywords:
+            metadata["extracted_keywords"] = [
+                {"text": keyword.text, "score": keyword.score, "algorithm": str(keyword.algorithm)}
+                for keyword in document.extracted_keywords
+            ]
+
+        metadata["table_count"] = len(document.tables)
+        if document.tables:
+            metadata["tables"] = [
+                {"cells": table.cells, "markdown": table.markdown, "page_number": table.page_number}
+                for table in document.tables
+            ]
+
+        if document.processing_warnings:
+            metadata["processing_warnings"] = [
+                {"source": warning.source, "message": warning.message} for warning in document.processing_warnings
+            ]
+
+        metadata["source"] = source
+        return metadata
+
+    @staticmethod
+    def flatten_metadata(document_metadata: Any) -> dict[str, Any]:
+        """Flatten the Xberg Metadata object into a dict of non-null scalar values.
+
+        Works whether Metadata is exposed as a native object (attribute access) or a
+        dataclass. Only JSON-friendly fields are copied; opaque nested objects are
+        skipped. The free-form ``additional`` map is merged when present.
+        """
+        if document_metadata is None:
+            return {}
+
+        flat: dict[str, Any] = {}
+        for name in _METADATA_FIELDS:
+            value = getattr(document_metadata, name, None)
+            if value is not None:
+                flat[name] = value
+
+        additional = getattr(document_metadata, "additional", None)
+        if additional:
+            flat["additional"] = dict(additional)
+
+        return flat
+
+    @staticmethod
+    def assemble_content(content: str, tables: Any) -> str:
+        """Combine text content with table markdown."""
+        if not tables:
+            return content
+        table_parts = [getattr(table, "markdown", "") for table in tables]
+        parts = [part for part in table_parts if part]
+        if not parts:
+            return content
+        return "\n\n".join([content, *parts])
+
+
 class XbergLoader(BaseLoader):
     """Load documents using Xberg, supporting 88+ file formats with true async.
 
@@ -143,35 +333,18 @@ class XbergLoader(BaseLoader):
         self._mime_type = mime_type
         self._glob = glob
         self._config = config
-
-    def _config_field(self, name: str) -> Any:
-        """Read a top-level config field regardless of how the config was supplied.
-
-        ``ExtractionConfig`` is a frozen dataclass, so its fields are attributes and
-        mapping access raises. ``extract()`` also accepts a plain ``dict``, which
-        reaches the loader unchanged, so both shapes are read here.
-        """
-        config = self._config
-        if config is None:
-            return None
-        if isinstance(config, dict):
-            return config.get(name)
-        return getattr(config, name, None)
+        self._config_view = _ConfigView(config)
+        self._assembler = _DocumentAssembler(self._config_view)
 
     @property
     def _per_page(self) -> bool:
         """Whether per-page splitting is enabled in the config."""
-        pages = self._config_field("pages")
-        if pages is None:
-            return False
-        if isinstance(pages, dict):
-            return bool(pages.get("extract_pages"))
-        return bool(getattr(pages, "extract_pages", None))
+        return self._config_view.per_page
 
     @property
     def _chunking(self) -> bool:
         """Whether chunking is enabled in the config."""
-        return self._config_field("chunking") is not None
+        return self._config_view.chunking
 
     def _resolve_paths(self) -> Iterator[Path]:
         """Yield concrete file paths for the configured source."""
@@ -206,148 +379,6 @@ class XbergLoader(BaseLoader):
         sources = [str(path) for path in paths]
         return inputs, sources
 
-    def _result_to_documents(self, result: ExtractionResult, sources: list[str]) -> Iterator[Document]:
-        """Map an ExtractionResult envelope to LangChain Documents.
-
-        Raises XbergError on the first per-input error, mirroring the fail-fast
-        behaviour of single extraction. On success, ``result.results`` is aligned
-        positionally with ``sources``.
-        """
-        if result.errors:
-            error = result.errors[0]
-            msg = f"Failed to extract '{error.source}': {error.message}"
-            raise XbergError(msg)
-
-        for index, document in enumerate(result.results):
-            source = sources[index] if index < len(sources) else (sources[-1] if sources else "")
-            yield from self._document_to_documents(document, source)
-
-    def _document_to_documents(self, document: ExtractedDocument, source: str) -> Iterator[Document]:
-        """Convert a single ExtractedDocument into one or more Documents.
-
-        When chunking is enabled and the document was chunked, one Document is
-        emitted per chunk. Otherwise, when per-page splitting is enabled, one
-        Document is emitted per page. Failing both, the whole document becomes a
-        single Document.
-        """
-        if self._chunking and document.chunks:
-            yield from self._chunks_to_documents(document, source)
-        elif self._per_page and document.pages:
-            yield from self._pages_to_documents(document, source)
-        else:
-            metadata = self._build_metadata(document, source)
-            page_content = self._assemble_content(document.content, document.tables)
-            yield Document(page_content=page_content, metadata=metadata)
-
-    def _chunks_to_documents(self, document: ExtractedDocument, source: str) -> Iterator[Document]:
-        """Yield one Document per chunk from an ExtractedDocument.
-
-        Chunk content is already segmented by Xberg, so it is used verbatim.
-        Each Document carries the document-level metadata plus chunk-specific
-        keys (index, heading path, page span, token count, chunk type).
-        """
-        base_metadata = self._build_metadata(document, source)
-
-        for chunk in document.chunks or []:
-            chunk_metadata = dict(base_metadata)
-            meta = chunk.metadata
-            chunk_metadata["chunk_index"] = meta.chunk_index
-            chunk_metadata["total_chunks"] = meta.total_chunks
-            chunk_metadata["chunk_type"] = str(chunk.chunk_type)
-            if meta.heading_path:
-                chunk_metadata["heading_path"] = list(meta.heading_path)
-            if meta.token_count is not None:
-                chunk_metadata["token_count"] = meta.token_count
-            if meta.first_page is not None:
-                # Xberg uses 1-indexed pages; LangChain convention is 0-indexed. ~keep
-                chunk_metadata["page"] = meta.first_page - 1
-                chunk_metadata["first_page"] = meta.first_page
-            if meta.last_page is not None:
-                chunk_metadata["last_page"] = meta.last_page
-
-            yield Document(page_content=chunk.content, metadata=chunk_metadata)
-
-    def _pages_to_documents(self, document: ExtractedDocument, source: str) -> Iterator[Document]:
-        """Yield one Document per page from an ExtractedDocument."""
-        base_metadata = self._build_metadata(document, source)
-
-        for page in document.pages or []:
-            page_metadata = dict(base_metadata)
-            # Xberg uses 1-indexed pages; LangChain convention is 0-indexed. ~keep
-            page_metadata["page"] = page.page_number - 1
-            if page.is_blank is not None:
-                page_metadata["is_blank"] = page.is_blank
-
-            page_content = self._assemble_content(page.content, page.tables)
-            yield Document(page_content=page_content, metadata=page_metadata)
-
-    def _build_metadata(self, document: ExtractedDocument, source: str) -> dict[str, Any]:
-        """Build a flat metadata dict from an ExtractedDocument."""
-        metadata: dict[str, Any] = self._flatten_metadata(document.metadata)
-
-        metadata["mime_type"] = document.mime_type
-        if document.quality_score is not None:
-            metadata["quality_score"] = document.quality_score
-        if document.detected_languages:
-            metadata["detected_languages"] = document.detected_languages
-        if document.counts is not None:
-            metadata["page_count"] = document.counts.pages
-
-        if document.extracted_keywords:
-            metadata["extracted_keywords"] = [
-                {"text": keyword.text, "score": keyword.score, "algorithm": str(keyword.algorithm)}
-                for keyword in document.extracted_keywords
-            ]
-
-        metadata["table_count"] = len(document.tables)
-        if document.tables:
-            metadata["tables"] = [
-                {"cells": table.cells, "markdown": table.markdown, "page_number": table.page_number}
-                for table in document.tables
-            ]
-
-        if document.processing_warnings:
-            metadata["processing_warnings"] = [
-                {"source": warning.source, "message": warning.message} for warning in document.processing_warnings
-            ]
-
-        metadata["source"] = source
-        return metadata
-
-    @staticmethod
-    def _flatten_metadata(document_metadata: Any) -> dict[str, Any]:
-        """Flatten the Xberg Metadata object into a dict of non-null scalar values.
-
-        Works whether Metadata is exposed as a native object (attribute access) or a
-        dataclass. Only JSON-friendly fields are copied; opaque nested objects are
-        skipped. The free-form ``additional`` map is merged when present.
-        """
-        if document_metadata is None:
-            return {}
-
-        flat: dict[str, Any] = {}
-        for name in _METADATA_FIELDS:
-            value = getattr(document_metadata, name, None)
-            if value is not None:
-                flat[name] = value
-
-        additional = getattr(document_metadata, "additional", None)
-        if additional:
-            flat["additional"] = dict(additional)
-
-        return flat
-
-    @staticmethod
-    def _assemble_content(content: str, tables: Any) -> str:
-        """Combine text content with table markdown."""
-        if not tables:
-            return content
-        table_parts = [getattr(table, "markdown", "") for table in tables]
-        parts = [part for part in table_parts if part]
-        if not parts:
-            return content
-        return "\n\n".join([content, *parts])
-
     async def alazy_load(self) -> AsyncIterator[Document]:
         """Load documents asynchronously, yielding one Document at a time.
 
@@ -373,7 +404,7 @@ class XbergLoader(BaseLoader):
             msg = f"Failed to extract '{source}': {exc}"
             raise XbergError(msg) from exc
 
-        for document in self._result_to_documents(result, sources):
+        for document in self._assembler.result_to_documents(result, sources):
             yield document
 
     async def _collect(self) -> list[Document]:
