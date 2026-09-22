@@ -545,332 +545,13 @@ impl<'doc> TextExtractor<'doc> {
                 state.stroke_color_rgb = (0.0, 0.0, 0.0);
                 state.stroke_color_cmyk = None;
             }
-            Operator::SetFillColor { components } => {
-                let state = self.state_stack.current_mut();
-                match state.fill_color_space.as_str() {
-                    "DeviceGray" | "CalGray" if components.len() == 1 => {
-                        let gray = components[0];
-                        state.fill_color_rgb = (gray, gray, gray);
-                    }
-                    "DeviceRGB" | "CalRGB" if components.len() == 3 => {
-                        state.fill_color_rgb = (components[0], components[1], components[2]);
-                    }
-                    "Lab" if components.len() == 3 => {
-                        // CIE L*a*b* color space
-                        // For now, treat as RGB (proper conversion requires whitepoint)
-                        // L* is lightness (0-100), a* and b* are color opponents
-                        // Simplified conversion: normalize and treat as RGB ~keep
-                        let l = components[0] / 100.0;
-                        state.fill_color_rgb = (l, l, l);
-                        tracing::trace!(target: LOG_TARGET,
-                            "Lab color space simplified to grayscale (full conversion not yet implemented)"
-                        );
-                    }
-                    "DeviceCMYK" if components.len() == 4 => {
-                        state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
-                        state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                    }
-                    "ICCBased" => {
-                        // ICC profile-based color space
-                        // For now, assume RGB and use components directly ~keep
-                        if components.len() == 3 {
-                            state.fill_color_rgb = (components[0], components[1], components[2]);
-                        } else if components.len() == 1 {
-                            let gray = components[0];
-                            state.fill_color_rgb = (gray, gray, gray);
-                        } else if components.len() == 4 {
-                            state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
-                            state.fill_color_rgb =
-                                cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                        }
-                        tracing::trace!(target: LOG_TARGET, "ICCBased color space using simplified conversion (ICC profile not processed)");
-                    }
-                    "Separation" if components.len() == 1 => {
-                        // Separation color space (spot color)
-                        // Component is tint value (0.0 = no ink, 1.0 = full ink)
-                        // For now, treat as grayscale ~keep
-                        let tint = components[0];
-                        let gray = 1.0 - tint; // Inverted (0 tint = white, 1 tint = black) ~keep
-                        state.fill_color_rgb = (gray, gray, gray);
-                        tracing::trace!(target: LOG_TARGET, "Separation color space simplified to grayscale");
-                    }
-                    "DeviceN" if !components.is_empty() => {
-                        // DeviceN color space (multiple colorants)
-                        // For now, use simplified conversion ~keep
-                        if components.len() == 4 {
-                            state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
-                            state.fill_color_rgb =
-                                cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                        } else {
-                            let gray = 1.0 - components[0];
-                            state.fill_color_rgb = (gray, gray, gray);
-                        }
-                        tracing::trace!(target: LOG_TARGET, "DeviceN color space using simplified conversion");
-                    }
-                    _ => {
-                        // Named color space reference (e.g. "Cs1") or unknown —
-                        // fall back by component count to avoid warn spam. ~keep
-                        match components.len() {
-                            1 => {
-                                let gray = components[0];
-                                state.fill_color_rgb = (gray, gray, gray);
-                            }
-                            3 => {
-                                state.fill_color_rgb = (components[0], components[1], components[2]);
-                            }
-                            4 => {
-                                state.fill_color_cmyk =
-                                    Some((components[0], components[1], components[2], components[3]));
-                                state.fill_color_rgb =
-                                    cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                            }
-                            _ => {}
-                        }
-                        tracing::trace!(target: LOG_TARGET,
-                            "Unknown fill color space {:?} with {} components; \
-                             applied component-count fallback",
-                            state.fill_color_space,
-                            components.len()
-                        );
-                    }
-                }
-            }
-            Operator::SetStrokeColor { components } => {
-                let state = self.state_stack.current_mut();
-                match state.stroke_color_space.as_str() {
-                    "DeviceGray" | "CalGray" if components.len() == 1 => {
-                        let gray = components[0];
-                        state.stroke_color_rgb = (gray, gray, gray);
-                    }
-                    "DeviceRGB" | "CalRGB" if components.len() == 3 => {
-                        state.stroke_color_rgb = (components[0], components[1], components[2]);
-                    }
-                    "Lab" if components.len() == 3 => {
-                        let l = components[0] / 100.0;
-                        state.stroke_color_rgb = (l, l, l);
-                        tracing::trace!(target: LOG_TARGET, "Lab stroke color space simplified to grayscale");
-                    }
-                    "DeviceCMYK" if components.len() == 4 => {
-                        state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
-                        state.stroke_color_rgb =
-                            cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                    }
-                    "ICCBased" => {
-                        if components.len() == 3 {
-                            state.stroke_color_rgb = (components[0], components[1], components[2]);
-                        } else if components.len() == 1 {
-                            let gray = components[0];
-                            state.stroke_color_rgb = (gray, gray, gray);
-                        } else if components.len() == 4 {
-                            state.stroke_color_cmyk =
-                                Some((components[0], components[1], components[2], components[3]));
-                            state.stroke_color_rgb =
-                                cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                        }
-                        tracing::trace!(target: LOG_TARGET, "ICCBased stroke color using simplified conversion");
-                    }
-                    "Separation" if components.len() == 1 => {
-                        let tint = components[0];
-                        let gray = 1.0 - tint;
-                        state.stroke_color_rgb = (gray, gray, gray);
-                        tracing::trace!(target: LOG_TARGET, "Separation stroke color simplified to grayscale");
-                    }
-                    "DeviceN" if !components.is_empty() => {
-                        if components.len() == 4 {
-                            state.stroke_color_cmyk =
-                                Some((components[0], components[1], components[2], components[3]));
-                            state.stroke_color_rgb =
-                                cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                        } else {
-                            let gray = 1.0 - components[0];
-                            state.stroke_color_rgb = (gray, gray, gray);
-                        }
-                        tracing::trace!(target: LOG_TARGET, "DeviceN stroke color using simplified conversion");
-                    }
-                    _ => {
-                        match components.len() {
-                            1 => {
-                                let gray = components[0];
-                                state.stroke_color_rgb = (gray, gray, gray);
-                            }
-                            3 => {
-                                state.stroke_color_rgb = (components[0], components[1], components[2]);
-                            }
-                            4 => {
-                                state.stroke_color_cmyk =
-                                    Some((components[0], components[1], components[2], components[3]));
-                                state.stroke_color_rgb =
-                                    cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                            }
-                            _ => {}
-                        }
-                        tracing::trace!(target: LOG_TARGET,
-                            "Unknown stroke color space {:?} with {} components; \
-                             applied component-count fallback",
-                            state.stroke_color_space,
-                            components.len()
-                        );
-                    }
-                }
-            }
+            Operator::SetFillColor { components } => self.apply_set_fill_color(&components),
+            Operator::SetStrokeColor { components } => self.apply_set_stroke_color(&components),
             Operator::SetFillColorN { components, name } => {
-                if name.is_some() {
-                    // Pattern color space - for now, just log and ignore ~keep
-                    tracing::trace!(target: LOG_TARGET, "Pattern fill color not yet supported: {:?}", name);
-                } else {
-                    let state = self.state_stack.current_mut();
-                    match state.fill_color_space.as_str() {
-                        "DeviceGray" | "CalGray" if components.len() == 1 => {
-                            let gray = components[0];
-                            state.fill_color_rgb = (gray, gray, gray);
-                        }
-                        "DeviceRGB" | "CalRGB" if components.len() == 3 => {
-                            state.fill_color_rgb = (components[0], components[1], components[2]);
-                        }
-                        "Lab" if components.len() == 3 => {
-                            let l = components[0] / 100.0;
-                            state.fill_color_rgb = (l, l, l);
-                        }
-                        "DeviceCMYK" if components.len() == 4 => {
-                            state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
-                            state.fill_color_rgb =
-                                cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                        }
-                        "ICCBased" => {
-                            if components.len() == 3 {
-                                state.fill_color_rgb = (components[0], components[1], components[2]);
-                            } else if components.len() == 1 {
-                                let gray = components[0];
-                                state.fill_color_rgb = (gray, gray, gray);
-                            } else if components.len() == 4 {
-                                state.fill_color_cmyk =
-                                    Some((components[0], components[1], components[2], components[3]));
-                                state.fill_color_rgb =
-                                    cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                            }
-                        }
-                        "Separation" if components.len() == 1 => {
-                            let tint = components[0];
-                            let gray = 1.0 - tint;
-                            state.fill_color_rgb = (gray, gray, gray);
-                        }
-                        "DeviceN" if !components.is_empty() => {
-                            if components.len() == 4 {
-                                state.fill_color_cmyk =
-                                    Some((components[0], components[1], components[2], components[3]));
-                                state.fill_color_rgb =
-                                    cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                            } else {
-                                let gray = 1.0 - components[0];
-                                state.fill_color_rgb = (gray, gray, gray);
-                            }
-                        }
-                        _ => {
-                            match components.len() {
-                                1 => {
-                                    let gray = components[0];
-                                    state.fill_color_rgb = (gray, gray, gray);
-                                }
-                                3 => {
-                                    state.fill_color_rgb = (components[0], components[1], components[2]);
-                                }
-                                4 => {
-                                    state.fill_color_cmyk =
-                                        Some((components[0], components[1], components[2], components[3]));
-                                    state.fill_color_rgb =
-                                        cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                                }
-                                _ => {}
-                            }
-                            tracing::trace!(target: LOG_TARGET,
-                                "Unknown fill color space {:?} with {} components; \
-                                 applied component-count fallback",
-                                state.fill_color_space,
-                                components.len()
-                            );
-                        }
-                    }
-                }
+                self.apply_set_fill_color_n(&components, name.as_deref().map(String::as_str))
             }
             Operator::SetStrokeColorN { components, name } => {
-                if name.is_some() {
-                    // Pattern color space - for now, just log and ignore ~keep
-                    tracing::trace!(target: LOG_TARGET, "Pattern stroke color not yet supported: {:?}", name);
-                } else {
-                    let state = self.state_stack.current_mut();
-                    match state.stroke_color_space.as_str() {
-                        "DeviceGray" | "CalGray" if components.len() == 1 => {
-                            let gray = components[0];
-                            state.stroke_color_rgb = (gray, gray, gray);
-                        }
-                        "DeviceRGB" | "CalRGB" if components.len() == 3 => {
-                            state.stroke_color_rgb = (components[0], components[1], components[2]);
-                        }
-                        "Lab" if components.len() == 3 => {
-                            let l = components[0] / 100.0;
-                            state.stroke_color_rgb = (l, l, l);
-                        }
-                        "DeviceCMYK" if components.len() == 4 => {
-                            state.stroke_color_cmyk =
-                                Some((components[0], components[1], components[2], components[3]));
-                            state.stroke_color_rgb =
-                                cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                        }
-                        "ICCBased" => {
-                            if components.len() == 3 {
-                                state.stroke_color_rgb = (components[0], components[1], components[2]);
-                            } else if components.len() == 1 {
-                                let gray = components[0];
-                                state.stroke_color_rgb = (gray, gray, gray);
-                            } else if components.len() == 4 {
-                                state.stroke_color_cmyk =
-                                    Some((components[0], components[1], components[2], components[3]));
-                                state.stroke_color_rgb =
-                                    cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                            }
-                        }
-                        "Separation" if components.len() == 1 => {
-                            let tint = components[0];
-                            let gray = 1.0 - tint;
-                            state.stroke_color_rgb = (gray, gray, gray);
-                        }
-                        "DeviceN" if !components.is_empty() => {
-                            if components.len() == 4 {
-                                state.stroke_color_cmyk =
-                                    Some((components[0], components[1], components[2], components[3]));
-                                state.stroke_color_rgb =
-                                    cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                            } else {
-                                let gray = 1.0 - components[0];
-                                state.stroke_color_rgb = (gray, gray, gray);
-                            }
-                        }
-                        _ => {
-                            match components.len() {
-                                1 => {
-                                    let gray = components[0];
-                                    state.stroke_color_rgb = (gray, gray, gray);
-                                }
-                                3 => {
-                                    state.stroke_color_rgb = (components[0], components[1], components[2]);
-                                }
-                                4 => {
-                                    state.stroke_color_cmyk =
-                                        Some((components[0], components[1], components[2], components[3]));
-                                    state.stroke_color_rgb =
-                                        cmyk_to_rgb(components[0], components[1], components[2], components[3]);
-                                }
-                                _ => {}
-                            }
-                            tracing::trace!(target: LOG_TARGET,
-                                "Unknown stroke color space {:?} with {} components; \
-                                 applied component-count fallback",
-                                state.stroke_color_space,
-                                components.len()
-                            );
-                        }
-                    }
-                }
+                self.apply_set_stroke_color_n(&components, name.as_deref().map(String::as_str))
             }
 
             Operator::SetLineCap { cap_style } => {
@@ -1162,5 +843,323 @@ impl<'doc> TextExtractor<'doc> {
         }
 
         Ok(())
+    }
+
+    /// `sc`/`SC` fill color. Split out of `execute_operator` unchanged, for
+    /// file size — see the `Operator::SetFillColor` doc comment for the
+    /// component-count-per-space rules. ~keep
+    fn apply_set_fill_color(&mut self, components: &[f32]) {
+        let state = self.state_stack.current_mut();
+        match state.fill_color_space.as_str() {
+            "DeviceGray" | "CalGray" if components.len() == 1 => {
+                let gray = components[0];
+                state.fill_color_rgb = (gray, gray, gray);
+            }
+            "DeviceRGB" | "CalRGB" if components.len() == 3 => {
+                state.fill_color_rgb = (components[0], components[1], components[2]);
+            }
+            "Lab" if components.len() == 3 => {
+                // CIE L*a*b* color space
+                // For now, treat as RGB (proper conversion requires whitepoint)
+                // L* is lightness (0-100), a* and b* are color opponents
+                // Simplified conversion: normalize and treat as RGB ~keep
+                let l = components[0] / 100.0;
+                state.fill_color_rgb = (l, l, l);
+                tracing::trace!(target: LOG_TARGET,
+                    "Lab color space simplified to grayscale (full conversion not yet implemented)"
+                );
+            }
+            "DeviceCMYK" if components.len() == 4 => {
+                state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+            }
+            "ICCBased" => {
+                // ICC profile-based color space
+                // For now, assume RGB and use components directly ~keep
+                if components.len() == 3 {
+                    state.fill_color_rgb = (components[0], components[1], components[2]);
+                } else if components.len() == 1 {
+                    let gray = components[0];
+                    state.fill_color_rgb = (gray, gray, gray);
+                } else if components.len() == 4 {
+                    state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                }
+                tracing::trace!(target: LOG_TARGET, "ICCBased color space using simplified conversion (ICC profile not processed)");
+            }
+            "Separation" if components.len() == 1 => {
+                // Separation color space (spot color)
+                // Component is tint value (0.0 = no ink, 1.0 = full ink)
+                // For now, treat as grayscale ~keep
+                let tint = components[0];
+                let gray = 1.0 - tint; // Inverted (0 tint = white, 1 tint = black) ~keep
+                state.fill_color_rgb = (gray, gray, gray);
+                tracing::trace!(target: LOG_TARGET, "Separation color space simplified to grayscale");
+            }
+            "DeviceN" if !components.is_empty() => {
+                // DeviceN color space (multiple colorants)
+                // For now, use simplified conversion ~keep
+                if components.len() == 4 {
+                    state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                } else {
+                    let gray = 1.0 - components[0];
+                    state.fill_color_rgb = (gray, gray, gray);
+                }
+                tracing::trace!(target: LOG_TARGET, "DeviceN color space using simplified conversion");
+            }
+            _ => {
+                // Named color space reference (e.g. "Cs1") or unknown —
+                // fall back by component count to avoid warn spam. ~keep
+                match components.len() {
+                    1 => {
+                        let gray = components[0];
+                        state.fill_color_rgb = (gray, gray, gray);
+                    }
+                    3 => {
+                        state.fill_color_rgb = (components[0], components[1], components[2]);
+                    }
+                    4 => {
+                        state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                        state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                    }
+                    _ => {}
+                }
+                tracing::trace!(target: LOG_TARGET,
+                    "Unknown fill color space {:?} with {} components; \
+                     applied component-count fallback",
+                    state.fill_color_space,
+                    components.len()
+                );
+            }
+        }
+    }
+
+    /// `SC` stroke color — mirrors [`Self::apply_set_fill_color`] on the
+    /// stroke fields. Split out of `execute_operator` unchanged, for file
+    /// size. ~keep
+    fn apply_set_stroke_color(&mut self, components: &[f32]) {
+        let state = self.state_stack.current_mut();
+        match state.stroke_color_space.as_str() {
+            "DeviceGray" | "CalGray" if components.len() == 1 => {
+                let gray = components[0];
+                state.stroke_color_rgb = (gray, gray, gray);
+            }
+            "DeviceRGB" | "CalRGB" if components.len() == 3 => {
+                state.stroke_color_rgb = (components[0], components[1], components[2]);
+            }
+            "Lab" if components.len() == 3 => {
+                let l = components[0] / 100.0;
+                state.stroke_color_rgb = (l, l, l);
+                tracing::trace!(target: LOG_TARGET, "Lab stroke color space simplified to grayscale");
+            }
+            "DeviceCMYK" if components.len() == 4 => {
+                state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                state.stroke_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+            }
+            "ICCBased" => {
+                if components.len() == 3 {
+                    state.stroke_color_rgb = (components[0], components[1], components[2]);
+                } else if components.len() == 1 {
+                    let gray = components[0];
+                    state.stroke_color_rgb = (gray, gray, gray);
+                } else if components.len() == 4 {
+                    state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.stroke_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                }
+                tracing::trace!(target: LOG_TARGET, "ICCBased stroke color using simplified conversion");
+            }
+            "Separation" if components.len() == 1 => {
+                let tint = components[0];
+                let gray = 1.0 - tint;
+                state.stroke_color_rgb = (gray, gray, gray);
+                tracing::trace!(target: LOG_TARGET, "Separation stroke color simplified to grayscale");
+            }
+            "DeviceN" if !components.is_empty() => {
+                if components.len() == 4 {
+                    state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.stroke_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                } else {
+                    let gray = 1.0 - components[0];
+                    state.stroke_color_rgb = (gray, gray, gray);
+                }
+                tracing::trace!(target: LOG_TARGET, "DeviceN stroke color using simplified conversion");
+            }
+            _ => {
+                match components.len() {
+                    1 => {
+                        let gray = components[0];
+                        state.stroke_color_rgb = (gray, gray, gray);
+                    }
+                    3 => {
+                        state.stroke_color_rgb = (components[0], components[1], components[2]);
+                    }
+                    4 => {
+                        state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                        state.stroke_color_rgb =
+                            cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                    }
+                    _ => {}
+                }
+                tracing::trace!(target: LOG_TARGET,
+                    "Unknown stroke color space {:?} with {} components; \
+                     applied component-count fallback",
+                    state.stroke_color_space,
+                    components.len()
+                );
+            }
+        }
+    }
+
+    /// `scn` fill color, with optional pattern name. Split out of
+    /// `execute_operator` unchanged, for file size. ~keep
+    fn apply_set_fill_color_n(&mut self, components: &[f32], name: Option<&str>) {
+        if name.is_some() {
+            // Pattern color space - for now, just log and ignore ~keep
+            tracing::trace!(target: LOG_TARGET, "Pattern fill color not yet supported: {:?}", name);
+            return;
+        }
+        let state = self.state_stack.current_mut();
+        match state.fill_color_space.as_str() {
+            "DeviceGray" | "CalGray" if components.len() == 1 => {
+                let gray = components[0];
+                state.fill_color_rgb = (gray, gray, gray);
+            }
+            "DeviceRGB" | "CalRGB" if components.len() == 3 => {
+                state.fill_color_rgb = (components[0], components[1], components[2]);
+            }
+            "Lab" if components.len() == 3 => {
+                let l = components[0] / 100.0;
+                state.fill_color_rgb = (l, l, l);
+            }
+            "DeviceCMYK" if components.len() == 4 => {
+                state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+            }
+            "ICCBased" => {
+                if components.len() == 3 {
+                    state.fill_color_rgb = (components[0], components[1], components[2]);
+                } else if components.len() == 1 {
+                    let gray = components[0];
+                    state.fill_color_rgb = (gray, gray, gray);
+                } else if components.len() == 4 {
+                    state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                }
+            }
+            "Separation" if components.len() == 1 => {
+                let tint = components[0];
+                let gray = 1.0 - tint;
+                state.fill_color_rgb = (gray, gray, gray);
+            }
+            "DeviceN" if !components.is_empty() => {
+                if components.len() == 4 {
+                    state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                } else {
+                    let gray = 1.0 - components[0];
+                    state.fill_color_rgb = (gray, gray, gray);
+                }
+            }
+            _ => {
+                match components.len() {
+                    1 => {
+                        let gray = components[0];
+                        state.fill_color_rgb = (gray, gray, gray);
+                    }
+                    3 => {
+                        state.fill_color_rgb = (components[0], components[1], components[2]);
+                    }
+                    4 => {
+                        state.fill_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                        state.fill_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                    }
+                    _ => {}
+                }
+                tracing::trace!(target: LOG_TARGET,
+                    "Unknown fill color space {:?} with {} components; \
+                     applied component-count fallback",
+                    state.fill_color_space,
+                    components.len()
+                );
+            }
+        }
+    }
+
+    /// `SCN` stroke color, with optional pattern name — mirrors
+    /// [`Self::apply_set_fill_color_n`] on the stroke fields. Split out of
+    /// `execute_operator` unchanged, for file size. ~keep
+    fn apply_set_stroke_color_n(&mut self, components: &[f32], name: Option<&str>) {
+        if name.is_some() {
+            // Pattern color space - for now, just log and ignore ~keep
+            tracing::trace!(target: LOG_TARGET, "Pattern stroke color not yet supported: {:?}", name);
+            return;
+        }
+        let state = self.state_stack.current_mut();
+        match state.stroke_color_space.as_str() {
+            "DeviceGray" | "CalGray" if components.len() == 1 => {
+                let gray = components[0];
+                state.stroke_color_rgb = (gray, gray, gray);
+            }
+            "DeviceRGB" | "CalRGB" if components.len() == 3 => {
+                state.stroke_color_rgb = (components[0], components[1], components[2]);
+            }
+            "Lab" if components.len() == 3 => {
+                let l = components[0] / 100.0;
+                state.stroke_color_rgb = (l, l, l);
+            }
+            "DeviceCMYK" if components.len() == 4 => {
+                state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                state.stroke_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+            }
+            "ICCBased" => {
+                if components.len() == 3 {
+                    state.stroke_color_rgb = (components[0], components[1], components[2]);
+                } else if components.len() == 1 {
+                    let gray = components[0];
+                    state.stroke_color_rgb = (gray, gray, gray);
+                } else if components.len() == 4 {
+                    state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.stroke_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                }
+            }
+            "Separation" if components.len() == 1 => {
+                let tint = components[0];
+                let gray = 1.0 - tint;
+                state.stroke_color_rgb = (gray, gray, gray);
+            }
+            "DeviceN" if !components.is_empty() => {
+                if components.len() == 4 {
+                    state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                    state.stroke_color_rgb = cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                } else {
+                    let gray = 1.0 - components[0];
+                    state.stroke_color_rgb = (gray, gray, gray);
+                }
+            }
+            _ => {
+                match components.len() {
+                    1 => {
+                        let gray = components[0];
+                        state.stroke_color_rgb = (gray, gray, gray);
+                    }
+                    3 => {
+                        state.stroke_color_rgb = (components[0], components[1], components[2]);
+                    }
+                    4 => {
+                        state.stroke_color_cmyk = Some((components[0], components[1], components[2], components[3]));
+                        state.stroke_color_rgb =
+                            cmyk_to_rgb(components[0], components[1], components[2], components[3]);
+                    }
+                    _ => {}
+                }
+                tracing::trace!(target: LOG_TARGET,
+                    "Unknown stroke color space {:?} with {} components; \
+                     applied component-count fallback",
+                    state.stroke_color_space,
+                    components.len()
+                );
+            }
+        }
     }
 }

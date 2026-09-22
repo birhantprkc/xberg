@@ -59,6 +59,84 @@ impl<'doc> TextExtractor<'doc> {
         Ok(self.cached_xobject_refs.get(name).copied().flatten())
     }
 
+    /// Quantize a CTM to 6 millipoint-rounded i64 values so it can be used as
+    /// a HashSet/HashMap key without floating-point equality hazards.
+    /// Rounds to nearest millipoint instead of truncating with `as i64`, so
+    /// floating-point noise in the same logical CTM produces a stable key
+    /// (truncation alone could send 0.99999... / 1.00001... to different
+    /// buckets). Split out of `process_xobject` unchanged, for file size. ~keep
+    fn quantize_ctm(ctm: Matrix) -> [i64; 6] {
+        [
+            (ctm.a * 1000.0).round() as i64,
+            (ctm.b * 1000.0).round() as i64,
+            (ctm.c * 1000.0).round() as i64,
+            (ctm.d * 1000.0).round() as i64,
+            (ctm.e * 1000.0).round() as i64,
+            (ctm.f * 1000.0).round() as i64,
+        ]
+    }
+
+    /// Parse /Matrix from a Form XObject dict. Defaults to identity per ISO
+    /// 32000-1 §8.10.1 when absent or malformed. Split out of
+    /// `process_xobject` unchanged, for file size. ~keep
+    fn parse_form_matrix(xobject_dict: &std::collections::HashMap<String, Object>) -> Matrix {
+        let Some(Object::Array(arr)) = xobject_dict.get("Matrix") else {
+            return Matrix::identity();
+        };
+        let get_f32 = |i: usize| -> f32 {
+            match arr.get(i) {
+                Some(Object::Real(v)) => *v as f32,
+                Some(Object::Integer(v)) => *v as f32,
+                _ => {
+                    if i == 0 || i == 3 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+            }
+        };
+        Matrix {
+            a: get_f32(0),
+            b: get_f32(1),
+            c: get_f32(2),
+            d: get_f32(3),
+            e: get_f32(4),
+            f: get_f32(5),
+        }
+    }
+
+    /// Parse /BBox (form coordinate space) from a Form XObject dict, for the
+    /// §8.10.1 form clip. A form XObject's painting is clipped to its /BBox;
+    /// text the form draws outside the BBox is invisible in a conformant
+    /// renderer and must not be extracted. Returns `[x0,y0,x1,y1]` with
+    /// `[x0,y0]` normalized to the min corner; `None` disables the clip
+    /// (defensive — /BBox is required, but malformed dicts exist). Split out
+    /// of `process_xobject` unchanged, for file size. ~keep
+    fn parse_form_bbox(xobject_dict: &std::collections::HashMap<String, Object>) -> Option<[f32; 4]> {
+        let Some(Object::Array(arr)) = xobject_dict.get("BBox") else {
+            return None;
+        };
+        if arr.len() < 4 {
+            return None;
+        }
+        let f = |i: usize| -> Option<f32> {
+            match arr.get(i) {
+                Some(Object::Real(v)) => Some(*v as f32),
+                Some(Object::Integer(v)) => Some(*v as f32),
+                _ => None,
+            }
+        };
+        match (f(0), f(1), f(2), f(3)) {
+            (Some(a), Some(b), Some(c), Some(d))
+                if a.is_finite() && b.is_finite() && c.is_finite() && d.is_finite() =>
+            {
+                Some([a.min(c), b.min(d), a.max(c), b.max(d)])
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn process_xobject(&mut self, name: &str) -> Result<()> {
         if self.xobject_depth >= Self::MAX_XOBJECT_DEPTH {
             return Ok(());
@@ -89,18 +167,7 @@ impl<'doc> TextExtractor<'doc> {
         // nesting depth; the depth limiter (MAX_XOBJECT_DEPTH) provides a
         // second backstop. ~keep
         let current_ctm = self.state_stack.current().ctm;
-        // Round to nearest millipoint instead of truncating with `as i64`,
-        // so floating-point noise in the same logical CTM produces a
-        // stable hash key (truncation alone could send 0.99999...
-        // 1.00001... to different buckets). ~keep
-        let ctm_key = [
-            (current_ctm.a * 1000.0).round() as i64,
-            (current_ctm.b * 1000.0).round() as i64,
-            (current_ctm.c * 1000.0).round() as i64,
-            (current_ctm.d * 1000.0).round() as i64,
-            (current_ctm.e * 1000.0).round() as i64,
-            (current_ctm.f * 1000.0).round() as i64,
-        ];
+        let ctm_key = Self::quantize_ctm(current_ctm);
         let xobj_key = (xobject_ref, ctm_key);
 
         // Skip already-processed (XObject, CTM) pairs — each unique combination
@@ -238,60 +305,12 @@ impl<'doc> TextExtractor<'doc> {
                     return Ok(());
                 }
 
-                // Parse /Matrix from Form XObject dict (default: identity per ISO 32000-1 §8.10.1)
-                // ~keep
-                let form_matrix = if let Some(Object::Array(arr)) = xobject_dict.get("Matrix") {
-                    let get_f32 = |i: usize| -> f32 {
-                        match arr.get(i) {
-                            Some(Object::Real(v)) => *v as f32,
-                            Some(Object::Integer(v)) => *v as f32,
-                            _ => {
-                                if i == 0 || i == 3 {
-                                    1.0
-                                } else {
-                                    0.0
-                                }
-                            }
-                        }
-                    };
-                    Matrix {
-                        a: get_f32(0),
-                        b: get_f32(1),
-                        c: get_f32(2),
-                        d: get_f32(3),
-                        e: get_f32(4),
-                        f: get_f32(5),
-                    }
-                } else {
-                    Matrix::identity()
-                };
-
-                // Parse /BBox (form coordinate space) for the §8.10.1 form clip.
-                // A form XObject's painting is clipped to its /BBox; text the form
-                // draws outside the BBox is invisible in a conformant renderer and
-                // must not be extracted. Stored as [x0,y0,x1,y1]; None disables the
-                // clip (defensive — /BBox is required, but malformed dicts exist). ~keep
-                let form_bbox: Option<[f32; 4]> = match xobject_dict.get("BBox") {
-                    Some(Object::Array(arr)) if arr.len() >= 4 => {
-                        let f = |i: usize| -> Option<f32> {
-                            match arr.get(i) {
-                                Some(Object::Real(v)) => Some(*v as f32),
-                                Some(Object::Integer(v)) => Some(*v as f32),
-                                _ => None,
-                            }
-                        };
-                        match (f(0), f(1), f(2), f(3)) {
-                            (Some(a), Some(b), Some(c), Some(d))
-                                if a.is_finite() && b.is_finite() && c.is_finite() && d.is_finite() =>
-                            {
-                                // Normalize so [x0,y0] is the min corner. ~keep
-                                Some([a.min(c), b.min(d), a.max(c), b.max(d)])
-                            }
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
+                // Parse /Matrix (default: identity per ISO 32000-1 §8.10.1) and
+                // /BBox (the §8.10.1 form clip) from the Form XObject dict. See
+                // `parse_form_matrix`/`parse_form_bbox` for the per-field
+                // parsing rules (unchanged, just split out for file size). ~keep
+                let form_matrix = Self::parse_form_matrix(xobject_dict);
+                let form_bbox = Self::parse_form_bbox(xobject_dict);
 
                 // Only save/restore fonts+resources when XObject has its own Resources.
                 // Avoids expensive HashMap clone for XObjects that inherit page fonts. ~keep

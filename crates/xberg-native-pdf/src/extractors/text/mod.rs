@@ -1951,6 +1951,20 @@ impl TjBuffer {
         self.unicode.is_empty()
     }
 
+    /// Push a decoded glyph's Unicode text onto `unicode`, dropping control
+    /// characters other than tab/LF/CR. Takes the target buffer explicitly
+    /// (not `&mut self`) so callers can hold an outstanding borrow of another
+    /// `self` field (`cached_font`) across the call. Split out of `append`
+    /// (same filter, unchanged) — it was inlined at two call sites and both
+    /// nested four levels deep. ~keep
+    fn push_filtered_unicode(unicode: &mut String, s: &str) {
+        for ch in s.chars() {
+            if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
+                unicode.push(ch);
+            }
+        }
+    }
+
     /// Append a text string to the buffer.
     fn append(&mut self, bytes: &[u8]) -> Result<()> {
         // PDF spec Section 7.3.4.2: implementation limit of 32,767 bytes per string.
@@ -1990,24 +2004,14 @@ impl TjBuffer {
                 let c = table[byte as usize];
                 if c != '\0' {
                     self.unicode.push(c);
+                } else if let Some(s) = font.char_to_unicode(byte as u32) {
+                    if s != "\u{FFFD}" || preserve_unmapped_glyphs() {
+                        Self::push_filtered_unicode(&mut self.unicode, &s);
+                    }
                 } else {
-                    if let Some(s) = font.char_to_unicode(byte as u32) {
-                        if s != "\u{FFFD}" || preserve_unmapped_glyphs() {
-                            for ch in s.chars() {
-                                if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                    self.unicode.push(ch);
-                                }
-                            }
-                        }
-                    } else {
-                        let fb = fallback_char_to_unicode(byte as u32);
-                        if fb != "\u{FFFD}" || preserve_unmapped_glyphs() {
-                            for ch in fb.chars() {
-                                if ch >= '\x20' || ch == '\t' || ch == '\n' || ch == '\r' {
-                                    self.unicode.push(ch);
-                                }
-                            }
-                        }
+                    let fb = fallback_char_to_unicode(byte as u32);
+                    if fb != "\u{FFFD}" || preserve_unmapped_glyphs() {
+                        Self::push_filtered_unicode(&mut self.unicode, &fb);
                     }
                 }
             }

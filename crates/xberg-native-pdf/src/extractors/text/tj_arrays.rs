@@ -36,41 +36,10 @@ impl<'doc> TextExtractor<'doc> {
         // Move owned strings out of buffer (avoids clone) ~keep
         let font_name_span = buffer.font_name.take().unwrap_or_else(|| "Unknown".to_string());
 
-        // RTL text correction: use the confidence-gated geometric
-        // detector when `char_widths` gives us per-character user-space
-        // x-positions, falling back to the coarse "buffer's net horizontal
-        // advance is positive" heuristic only for genuinely ambiguous/short
-        // runs. Mirrors `flush_tj_span_buffer`'s handling — this used to be
-        // the one flush site still on the older `accumulated_width > 0.0`
-        // check, which (since `accumulated_width` only ever sums *positive*
-        // glyph widths — TJ kerning offsets never subtract from it) is true
-        // for nearly every non-empty RTL buffer and so was unconditionally
-        // reversing every RTL run regardless of its actual source order. ~keep
-        let mut text = std::mem::take(&mut buffer.unicode);
-        if text.len() > 1 {
-            let has_rtl = text.chars().any(|c| crate::text::rtl_detector::is_rtl_text(c as u32));
-            if has_rtl {
-                let chars: Vec<char> = text.chars().collect();
-                let verdict = if chars.len() == buffer.char_widths.len() && !buffer.char_widths.is_empty() {
-                    let mut chars_with_x: Vec<(char, f32)> = Vec::with_capacity(chars.len());
-                    let mut cursor_text_space = 0.0_f32;
-                    for (i, c) in chars.iter().enumerate() {
-                        let user_x = buffer.user_pos_x + cursor_text_space * buffer.user_h_scale;
-                        chars_with_x.push((*c, user_x));
-                        cursor_text_space += buffer.char_widths[i];
-                    }
-                    crate::text::bidi::detect_visual_order_run(&chars_with_x)
-                } else {
-                    crate::text::bidi::RunOrder::Ambiguous
-                };
-                text = crate::text::bidi::apply_rtl_verdict(
-                    &text,
-                    verdict,
-                    buffer.accumulated_width > 0.0,
-                    matches!(buffer.render_mode, 3 | 7),
-                );
-            }
-        }
+        // RTL text correction. See `correct_tj_buffer_rtl_order` for the full
+        // rationale (unchanged, just split out for file size). ~keep
+        let text = std::mem::take(&mut buffer.unicode);
+        let text = Self::correct_tj_buffer_rtl_order(text, &buffer);
 
         let span = TextSpan {
             provenance: None,
@@ -125,6 +94,46 @@ impl<'doc> TextExtractor<'doc> {
             self.spans.push(span);
         }
         Ok(())
+    }
+
+    /// RTL text correction for a flushed TJ buffer: use the confidence-gated
+    /// geometric detector when `char_widths` gives us per-character
+    /// user-space x-positions, falling back to the coarse "buffer's net
+    /// horizontal advance is positive" heuristic only for genuinely
+    /// ambiguous/short runs. Mirrors `flush_tj_span_buffer`'s handling — this
+    /// used to be the one flush site still on the older
+    /// `accumulated_width > 0.0` check, which (since `accumulated_width`
+    /// only ever sums *positive* glyph widths — TJ kerning offsets never
+    /// subtract from it) is true for nearly every non-empty RTL buffer and
+    /// so was unconditionally reversing every RTL run regardless of its
+    /// actual source order. ~keep
+    fn correct_tj_buffer_rtl_order(text: String, buffer: &TjBuffer) -> String {
+        if text.len() <= 1 {
+            return text;
+        }
+        let has_rtl = text.chars().any(|c| crate::text::rtl_detector::is_rtl_text(c as u32));
+        if !has_rtl {
+            return text;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let verdict = if chars.len() == buffer.char_widths.len() && !buffer.char_widths.is_empty() {
+            let mut chars_with_x: Vec<(char, f32)> = Vec::with_capacity(chars.len());
+            let mut cursor_text_space = 0.0_f32;
+            for (i, c) in chars.iter().enumerate() {
+                let user_x = buffer.user_pos_x + cursor_text_space * buffer.user_h_scale;
+                chars_with_x.push((*c, user_x));
+                cursor_text_space += buffer.char_widths[i];
+            }
+            crate::text::bidi::detect_visual_order_run(&chars_with_x)
+        } else {
+            crate::text::bidi::RunOrder::Ambiguous
+        };
+        crate::text::bidi::apply_rtl_verdict(
+            &text,
+            verdict,
+            buffer.accumulated_width > 0.0,
+            matches!(buffer.render_mode, 3 | 7),
+        )
     }
 
     /// Calculate total width of TJ buffer using PDF spec formula.

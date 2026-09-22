@@ -134,6 +134,16 @@ impl<'doc> TextExtractor<'doc> {
         // is effectively every real font — silently dropping the provenance
         // fact issue #1254 exists to carry (issue #1667). `None` when the font
         // is unresolvable. ~keep
+        self.resolve_span_font_provenance();
+
+        Ok(std::mem::take(&mut self.spans))
+    }
+
+    /// Resolve each span's font resource alias to its `/BaseFont` name and
+    /// §9.10.2 mapping provenance, in place. Split out of
+    /// `extract_text_spans_impl` for readability only — same single pass over
+    /// `self.spans`, same lookup keyed by the raw resource alias. ~keep
+    fn resolve_span_font_provenance(&mut self) {
         let resolved: Vec<(Option<String>, Option<crate::fonts::MappingProvenance>)> = self
             .spans
             .iter()
@@ -152,8 +162,6 @@ impl<'doc> TextExtractor<'doc> {
             }
             span.provenance = provenance;
         }
-
-        Ok(std::mem::take(&mut self.spans))
     }
 
     /// Feed a content stream's operators to `execute_operator`.

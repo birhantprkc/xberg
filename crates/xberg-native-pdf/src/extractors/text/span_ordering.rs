@@ -397,6 +397,49 @@ impl<'doc> TextExtractor<'doc> {
     /// collapse legitimate single-glyph spans of adjacent narrow glyphs
     /// (`ll`, `rr`, `II`, `ii` at small font sizes) in PDFs that emit text
     /// glyph-by-glyph with kerning.
+    ///
+    /// Geometric check — require BOTH position AND text to match. Split out
+    /// of `deduplicate_overlapping_spans` unchanged, for file size. ~keep
+    fn is_geometric_duplicate_span(
+        span: &TextSpan,
+        y_rounded: i32,
+        x: f32,
+        prev_y_rounded: Option<i32>,
+        prev_x: Option<f32>,
+        prev_text: Option<&str>,
+    ) -> bool {
+        let (Some(prev_y), Some(prev_x_val), Some(prev_txt)) = (prev_y_rounded, prev_x, prev_text) else {
+            return false;
+        };
+        let char_count = span.text.chars().count().max(1) as f32;
+        let per_glyph_width = (span.bbox.width / char_count).max(0.1);
+        let threshold = (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
+        y_rounded == prev_y && (x - prev_x_val).abs() < threshold && span.text == prev_txt
+    }
+
+    /// Content-based deduplication — require positions to OVERLAP. Split out
+    /// of `deduplicate_overlapping_spans` unchanged, for file size. ~keep
+    fn is_content_duplicate_span(
+        span: &TextSpan,
+        seen_content: &std::collections::HashMap<String, (f32, f32)>,
+    ) -> bool {
+        if span.text.len() < 5 {
+            return false;
+        }
+        let Some((prev_x_val, prev_y_val)) = seen_content.get(&span.text) else {
+            return false;
+        };
+        let y_diff = (span.bbox.y - prev_y_val).abs();
+        let x_diff = (span.bbox.x - prev_x_val).abs();
+
+        // Only dedup when spans overlap geometrically (X within 5pt)
+        // NOT when they're at different positions on the same line ~keep
+        let same_line = y_diff < 2.0;
+        let overlapping_position = x_diff < 5.0;
+
+        same_line && overlapping_position
+    }
+
     pub(super) fn deduplicate_overlapping_spans(&mut self) {
         if self.spans.is_empty() {
             return;
@@ -427,35 +470,9 @@ impl<'doc> TextExtractor<'doc> {
             let y_rounded = span.bbox.y.round() as i32;
             let x = span.bbox.x;
 
-            // Geometric deduplication — require BOTH position AND text match ~keep
             let geometric_duplicate =
-                if let (Some(prev_y), Some(prev_x_val), Some(prev_txt)) = (prev_y_rounded, prev_x, &prev_text) {
-                    let char_count = span.text.chars().count().max(1) as f32;
-                    let per_glyph_width = (span.bbox.width / char_count).max(0.1);
-                    let threshold = (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT);
-                    y_rounded == prev_y && (x - prev_x_val).abs() < threshold && span.text == *prev_txt
-                } else {
-                    false
-                };
-
-            // Content-based deduplication — require positions to OVERLAP ~keep
-            let content_duplicate = if span.text.len() >= 5 {
-                if let Some((prev_x_val, prev_y_val)) = seen_content.get(&span.text) {
-                    let y_diff = (span.bbox.y - prev_y_val).abs();
-                    let x_diff = (span.bbox.x - prev_x_val).abs();
-
-                    // Only dedup when spans overlap geometrically (X within 5pt)
-                    // NOT when they're at different positions on the same line ~keep
-                    let same_line = y_diff < 2.0;
-                    let overlapping_position = x_diff < 5.0;
-
-                    same_line && overlapping_position
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+                Self::is_geometric_duplicate_span(&span, y_rounded, x, prev_y_rounded, prev_x, prev_text.as_deref());
+            let content_duplicate = Self::is_content_duplicate_span(&span, &seen_content);
 
             if geometric_duplicate {
                 geometric_skips += 1;
@@ -495,6 +512,52 @@ impl<'doc> TextExtractor<'doc> {
     /// Keyed by lowercased text + rounded (x, y) bucket to make the
     /// lookup O(1) without quadratic bbox comparisons on large pages.
     /// The actual overlap check falls through to a real IoU on collision.
+    ///
+    /// Intersection-over-union of two bounding boxes. Split out of
+    /// `dedup_stroke_fill_overlap` unchanged, for file size. ~keep
+    fn bbox_iou(a: &crate::geometry::Rect, b: &crate::geometry::Rect) -> f32 {
+        let ix1 = a.x.max(b.x);
+        let iy1 = a.y.max(b.y);
+        let ix2 = (a.x + a.width).min(b.x + b.width);
+        let iy2 = (a.y + a.height).min(b.y + b.height);
+        if ix2 <= ix1 || iy2 <= iy1 {
+            return 0.0;
+        }
+        let inter = (ix2 - ix1) * (iy2 - iy1);
+        let area_a = a.width * a.height;
+        let area_b = b.width * b.height;
+        let union = area_a + area_b - inter;
+        if union > 0.0 { inter / union } else { 0.0 }
+    }
+
+    /// True if `b` has an IoU-duplicate (>= `threshold`) among the bboxes
+    /// stored in `grid`'s 3x3 cell neighbourhood around `(cx, cy)`. A
+    /// partner with IoU >= 0.7 is within ≈0.176·width, so it always falls in
+    /// this neighbourhood — querying it finds every match a full scan would.
+    /// Saturating bounds: a span with an extreme/out-of-page bbox can push
+    /// cx/cy to the i32 limits, where `cx + 1` would overflow in an
+    /// overflow-checked build (observed on 1008.3918v2.pdf). Split out of
+    /// `dedup_stroke_fill_overlap` unchanged, for file size. ~keep
+    fn grid_has_iou_duplicate(
+        grid: &std::collections::HashMap<(i32, i32), Vec<crate::geometry::Rect>>,
+        cx: i32,
+        cy: i32,
+        b: &crate::geometry::Rect,
+        threshold: f32,
+    ) -> bool {
+        for gx in cx.saturating_sub(1)..=cx.saturating_add(1) {
+            for gy in cy.saturating_sub(1)..=cy.saturating_add(1) {
+                let Some(others) = grid.get(&(gx, gy)) else {
+                    continue;
+                };
+                if others.iter().any(|other| Self::bbox_iou(b, other) >= threshold) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn dedup_stroke_fill_overlap(&mut self) {
         use std::collections::HashMap;
 
@@ -524,39 +587,9 @@ impl<'doc> TextExtractor<'doc> {
             let b = span.bbox;
             let cx = ((b.x + b.width * 0.5) / CELL).floor() as i32;
             let cy = ((b.y + b.height * 0.5) / CELL).floor() as i32;
-            let mut is_dup = false;
-            if let Some(grid) = seen.get(&key) {
-                // Saturating bounds: a span with an extreme/out-of-page bbox can
-                // push cx/cy to the i32 limits, where `cx + 1` would overflow in
-                // an overflow-checked build (observed on 1008.3918v2.pdf). ~keep
-                'outer: for gx in cx.saturating_sub(1)..=cx.saturating_add(1) {
-                    for gy in cy.saturating_sub(1)..=cy.saturating_add(1) {
-                        let Some(others) = grid.get(&(gx, gy)) else {
-                            continue;
-                        };
-                        for other in others {
-                            // IoU — intersection over union. >= 0.7 means the
-                            // two bboxes are almost the same rectangle, which is
-                            // what stroke+fill produces. ~keep
-                            let ix1 = b.x.max(other.x);
-                            let iy1 = b.y.max(other.y);
-                            let ix2 = (b.x + b.width).min(other.x + other.width);
-                            let iy2 = (b.y + b.height).min(other.y + other.height);
-                            if ix2 <= ix1 || iy2 <= iy1 {
-                                continue;
-                            }
-                            let inter = (ix2 - ix1) * (iy2 - iy1);
-                            let area_a = b.width * b.height;
-                            let area_b = other.width * other.height;
-                            let union = area_a + area_b - inter;
-                            if union > 0.0 && inter / union >= 0.7 {
-                                is_dup = true;
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-            }
+            let is_dup = seen
+                .get(&key)
+                .is_some_and(|grid| Self::grid_has_iou_duplicate(grid, cx, cy, &b, 0.7));
             if is_dup {
                 skipped += 1;
             } else {
