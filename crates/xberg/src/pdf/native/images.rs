@@ -4,6 +4,9 @@
 //! actual image data and metadata.
 
 #[cfg(test)]
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+mod decode_skip_tests;
+#[cfg(test)]
 mod parallel_tests;
 
 use super::NativeDocument;
@@ -314,6 +317,148 @@ pub(crate) fn page_ocr_fallback_image_bytes(
     out
 }
 
+/// Page numbers (1-based) whose PDF-space dimensions are known and whose native text layer is
+/// non-blank -- the two preconditions `should_skip_pdf_image_ocr` (`core/pipeline/mod.rs`)
+/// checks before excluding a full-page image from OCR, computed here so
+/// [`extract_page_images`] can skip that image's decode (and therefore its PNG re-encode)
+/// entirely instead of throwing the result away later (GH#1732). Keyed to `(width, height)` in
+/// PDF points.
+///
+/// Built from the `PageStructure` already computed alongside native text extraction
+/// (`pdf::native::metadata::build_page_structure`), so this costs nothing beyond a small map
+/// build -- no extra document access. Empty when `page_structure` is `None` (no page boundary
+/// tracking) or carries no per-page info, which simply means no page qualifies and every image
+/// goes through the ordinary decode path, exactly as before this fix.
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+pub(crate) fn ocr_skip_candidate_pages(
+    page_structure: Option<&crate::types::PageStructure>,
+) -> std::collections::HashMap<u32, (f64, f64)> {
+    let mut pages = std::collections::HashMap::new();
+    let Some(page_infos) = page_structure.and_then(|structure| structure.pages.as_ref()) else {
+        return pages;
+    };
+    for page in page_infos {
+        if page.is_blank == Some(false)
+            && let Some(dimensions) = page.dimensions
+        {
+            pages.insert(page.number, (dimensions.width, dimensions.height));
+        }
+    }
+    pages
+}
+
+/// Whether a handle's pre-decode bounding box covers enough of its page to be the "full-page
+/// image" `should_skip_pdf_image_ocr` (`core/pipeline/mod.rs`) would exclude from OCR (GH#1732).
+/// Mirrors that function's own area-ratio test exactly, sharing its
+/// [`crate::core::pipeline::FULL_PAGE_IMAGE_AREA_RATIO`] constant so the two decisions cannot
+/// drift apart.
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn covers_full_page(bbox: &xberg_native_pdf::geometry::Rect, page_width: f64, page_height: f64) -> bool {
+    if page_width <= 0.0 || page_height <= 0.0 {
+        return false;
+    }
+    let image_area = f64::from(bbox.width) * f64::from(bbox.height);
+    image_area / (page_width * page_height) >= crate::core::pipeline::FULL_PAGE_IMAGE_AREA_RATIO
+}
+
+/// Without OCR compiled in, nothing ever drops an OCR-skipped image, so it is never safe to
+/// treat one as unreadable -- always decode. Keeps [`outcomes_from_uncapped_page`] free of its
+/// own `#[cfg]` branch. ~keep
+#[cfg(not(all(feature = "ocr", feature = "tokio-runtime")))]
+fn covers_full_page(_bbox: &xberg_native_pdf::geometry::Rect, _page_width: f64, _page_height: f64) -> bool {
+    false
+}
+
+/// Build the metadata-only [`crate::types::ExtractedImage`] for a handle whose decode is being
+/// skipped entirely (GH#1732): dimensions, bounding box, page number and alt text come from the
+/// handle's cheap Phase-1 fields, `data` stays empty, and `format` is tagged `"skipped"` so a
+/// consumer inspecting `format` cannot mistake it for real, decoded image bytes.
+fn skipped_image_outcome(
+    handle: &xberg_native_pdf::PdfImageHandle<'_>,
+    page_number: u32,
+    alt_text: Option<String>,
+) -> PageImageOutcome {
+    Ok(crate::types::ExtractedImage {
+        data: Bytes::new(),
+        format: Cow::Borrowed("skipped"),
+        // Replaced with the document-global index by `extract_images_with_data`. ~keep
+        image_index: 0,
+        page_number: Some(page_number),
+        width: Some(handle.width),
+        height: Some(handle.height),
+        colorspace: Some(format!("{:?}", handle.color_space)),
+        bits_per_component: Some(handle.bits_per_component as u32),
+        is_mask: false,
+        description: alt_text,
+        ocr_result: None,
+        bounding_box: Some(crate::types::BoundingBox {
+            x0: handle.bbox.x as f64,
+            y0: handle.bbox.y as f64,
+            x1: (handle.bbox.x + handle.bbox.width) as f64,
+            y1: (handle.bbox.y + handle.bbox.height) as f64,
+        }),
+        source_path: None,
+        image_kind: None,
+        kind_confidence: None,
+        cluster_id: None,
+        caption: None,
+        qr_codes: None,
+        data_base64: None,
+    })
+}
+
+/// Convert one already-decoded [`xberg_native_pdf::extractors::PdfImage`] into its
+/// [`PageImageOutcome`]: `Ok` on a successful (or pass-through JPEG) encode, `Err` when a raw
+/// pixel buffer could not be re-encoded to PNG (issue #71). Shared by both the capped and
+/// uncapped extraction paths so the conversion logic exists once.
+fn image_outcome_from_decoded(
+    native_img: &xberg_native_pdf::extractors::PdfImage,
+    page_number: u32,
+    alt_text: Option<String>,
+) -> PageImageOutcome {
+    let (data, format) = match native_img.data() {
+        xberg_native_pdf::extractors::ImageData::Jpeg(jpeg_bytes) => {
+            let data_bytes = Bytes::copy_from_slice(jpeg_bytes);
+            let actual_format = detect_image_format_from_bytes(data_bytes.as_ref());
+            (data_bytes, Cow::Borrowed(actual_format))
+        }
+        xberg_native_pdf::extractors::ImageData::Raw { pixels, format } => {
+            match raw_pixels_to_png(native_img.width(), native_img.height(), format, pixels) {
+                Ok(bytes) => (bytes, Cow::Borrowed("png")),
+                Err(e) => return Err(e),
+            }
+        }
+    };
+
+    Ok(crate::types::ExtractedImage {
+        data,
+        format,
+        // Replaced with the document-global index by `extract_images_with_data`. ~keep
+        image_index: 0,
+        page_number: Some(page_number),
+        width: Some(native_img.width()),
+        height: Some(native_img.height()),
+        colorspace: Some(format!("{:?}", native_img.color_space())),
+        bits_per_component: Some(native_img.bits_per_component() as u32),
+        is_mask: false,
+        description: alt_text,
+        ocr_result: None,
+        bounding_box: native_img.bbox().map(|r| crate::types::BoundingBox {
+            x0: r.x as f64,
+            y0: r.y as f64,
+            x1: (r.x + r.width) as f64,
+            y1: (r.y + r.height) as f64,
+        }),
+        source_path: None,
+        image_kind: None,
+        kind_confidence: None,
+        cluster_id: None,
+        caption: None,
+        qr_codes: None,
+        data_base64: None,
+    })
+}
+
 /// Extract full image data from all pages of a PDF.
 ///
 /// Returns a `Vec<ExtractedImage>` with complete image data and metadata, plus any
@@ -335,6 +480,7 @@ pub(crate) fn extract_images_with_data(
     doc: &mut NativeDocument,
     max_images_per_page: Option<u32>,
     cancel_token: Option<&CancellationToken>,
+    ocr_skip_candidate_pages: &std::collections::HashMap<u32, (f64, f64)>,
 ) -> Result<(Vec<crate::types::ExtractedImage>, Vec<crate::types::ProcessingWarning>)> {
     if max_images_per_page == Some(0) {
         return Ok((Vec::new(), Vec::new()));
@@ -357,7 +503,14 @@ pub(crate) fn extract_images_with_data(
     let alt_text_by_page = super::hierarchy::extract_figure_alt_text_by_page(doc);
     let doc: &NativeDocument = doc;
 
-    let per_page = extract_all_page_images(doc, page_count, max_images_per_page, &alt_text_by_page, cancel_token);
+    let per_page = extract_all_page_images(
+        doc,
+        page_count,
+        max_images_per_page,
+        &alt_text_by_page,
+        cancel_token,
+        ocr_skip_candidate_pages,
+    );
 
     // The document-global `image_index` and the skipped-image warnings are assigned here,
     // in page order, so they do not depend on which thread ran which page. A skipped image
@@ -411,6 +564,7 @@ fn extract_all_page_images(
     max_images_per_page: Option<u32>,
     alt_text_by_page: &std::collections::HashMap<u32, Vec<Option<String>>>,
     cancel_token: Option<&CancellationToken>,
+    ocr_skip_candidate_pages: &std::collections::HashMap<u32, (f64, f64)>,
 ) -> Vec<Vec<PageImageOutcome>> {
     // rayon's work-stealing pool needs OS threads; wasm32 has none, so it falls back to a
     // sequential iterator there, matching the gate on the paragraph pass in
@@ -420,13 +574,31 @@ fn extract_all_page_images(
         use rayon::prelude::*;
         (0..page_count)
             .into_par_iter()
-            .map(|page_idx| extract_page_images(doc, page_idx, max_images_per_page, alt_text_by_page, cancel_token))
+            .map(|page_idx| {
+                extract_page_images(
+                    doc,
+                    page_idx,
+                    max_images_per_page,
+                    alt_text_by_page,
+                    cancel_token,
+                    ocr_skip_candidate_pages,
+                )
+            })
             .collect()
     }
     #[cfg(target_arch = "wasm32")]
     {
         (0..page_count)
-            .map(|page_idx| extract_page_images(doc, page_idx, max_images_per_page, alt_text_by_page, cancel_token))
+            .map(|page_idx| {
+                extract_page_images(
+                    doc,
+                    page_idx,
+                    max_images_per_page,
+                    alt_text_by_page,
+                    cancel_token,
+                    ocr_skip_candidate_pages,
+                )
+            })
             .collect()
     }
 }
@@ -435,12 +607,19 @@ fn extract_all_page_images(
 ///
 /// Returns an empty vec when the page yields no images, when the page could not be read, or
 /// when `cancel_token` has already fired.
+///
+/// `ocr_skip_candidate_pages` names pages where a full-page image can skip its decode entirely
+/// (GH#1732) -- non-empty only when the caller already determined OCR is the sole reason images
+/// were requested for this document at all. Applied only to the uncapped path
+/// (`max_images_per_page == None`), the common/default case and the one issue #1732 measured;
+/// the capped path is left unchanged to keep this change narrow.
 fn extract_page_images(
     doc: &NativeDocument,
     page_idx: usize,
     max_images_per_page: Option<u32>,
     alt_text_by_page: &std::collections::HashMap<u32, Vec<Option<String>>>,
     cancel_token: Option<&CancellationToken>,
+    ocr_skip_candidate_pages: &std::collections::HashMap<u32, (f64, f64)>,
 ) -> Vec<PageImageOutcome> {
     #[cfg(test)]
     record_page_thread();
@@ -449,95 +628,118 @@ fn extract_page_images(
         return Vec::new();
     }
 
-    let native_images = match max_images_per_page.map(|n| n as usize) {
-        Some(limit) => {
-            let handle_images = match extract_n_images_from_page_handles(doc, page_idx, limit) {
-                Ok(images) => images,
-                Err(error) => {
-                    tracing::debug!(
-                        page = page_idx,
-                        "capped image-handle extraction failed; falling back to eager extraction: {error}"
-                    );
-                    Vec::new()
-                }
-            };
-            if !handle_images.is_empty() {
-                handle_images
-            } else {
-                match doc.doc.extract_images(page_idx) {
-                    Ok(imgs) => imgs.into_iter().take(limit).collect(),
-                    Err(e) => {
-                        tracing::debug!(
-                            page = page_idx,
-                            "xberg_native_pdf: failed to extract images (fallback): {e}"
-                        );
-                        return Vec::new();
-                    }
-                }
-            }
-        }
-        None => match doc.doc.extract_images(page_idx) {
-            Ok(imgs) => imgs,
-            Err(e) => {
-                tracing::debug!(page = page_idx, "xberg_native_pdf: failed to extract images: {e}");
-                return Vec::new();
-            }
-        },
-    };
-
     let page_number = (page_idx + 1) as u32;
     let page_alt_texts = alt_text_by_page.get(&(page_idx as u32));
+
+    match max_images_per_page.map(|n| n as usize) {
+        Some(limit) => outcomes_from_capped_page(doc, page_idx, limit, page_number, page_alt_texts),
+        None => outcomes_from_uncapped_page(doc, page_idx, page_number, page_alt_texts, ocr_skip_candidate_pages),
+    }
+}
+
+/// The existing eager/capped path: decode every handle up to `limit`, falling back to the eager
+/// extractor when the handle-based pass comes back empty. Unchanged behavior from before
+/// GH#1732's decode-skip fast path, which applies only to [`outcomes_from_uncapped_page`].
+fn outcomes_from_capped_page(
+    doc: &NativeDocument,
+    page_idx: usize,
+    limit: usize,
+    page_number: u32,
+    page_alt_texts: Option<&Vec<Option<String>>>,
+) -> Vec<PageImageOutcome> {
+    let handle_images = match extract_n_images_from_page_handles(doc, page_idx, limit) {
+        Ok(images) => images,
+        Err(error) => {
+            tracing::debug!(
+                page = page_idx,
+                "capped image-handle extraction failed; falling back to eager extraction: {error}"
+            );
+            Vec::new()
+        }
+    };
+    let native_images = if !handle_images.is_empty() {
+        handle_images
+    } else {
+        match doc.doc.extract_images(page_idx) {
+            Ok(imgs) => imgs.into_iter().take(limit).collect(),
+            Err(e) => {
+                tracing::debug!(
+                    page = page_idx,
+                    "xberg_native_pdf: failed to extract images (fallback): {e}"
+                );
+                return Vec::new();
+            }
+        }
+    };
+    decoded_images_to_outcomes(native_images, page_number, page_alt_texts)
+}
+
+/// The uncapped path (the common/default case, and the one issue #1732 measured): enumerate
+/// this page's images via the cheap Phase-1 handle walk, decoding only the handles that are
+/// not both full-page and OCR-skip-eligible. Falls back to the eager extractor only when handle
+/// enumeration itself fails, mirroring the capped path's existing fallback-on-failure behavior.
+fn outcomes_from_uncapped_page(
+    doc: &NativeDocument,
+    page_idx: usize,
+    page_number: u32,
+    page_alt_texts: Option<&Vec<Option<String>>>,
+    ocr_skip_candidate_pages: &std::collections::HashMap<u32, (f64, f64)>,
+) -> Vec<PageImageOutcome> {
+    let handles = match doc.doc.page_image_handles(page_idx) {
+        Ok(h) => h,
+        Err(error) => {
+            tracing::debug!(
+                page = page_idx,
+                "failed to enumerate image handles; falling back to eager extraction: {error}"
+            );
+            Vec::new()
+        }
+    };
+    if handles.is_empty() {
+        return match doc.doc.extract_images(page_idx) {
+            Ok(imgs) => decoded_images_to_outcomes(imgs, page_number, page_alt_texts),
+            Err(e) => {
+                tracing::debug!(page = page_idx, "xberg_native_pdf: failed to extract images: {e}");
+                Vec::new()
+            }
+        };
+    }
+
+    let page_dimensions = ocr_skip_candidate_pages.get(&page_number).copied();
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for (page_image_position, handle) in handles.iter().enumerate() {
+        let alt_text = page_alt_texts
+            .and_then(|alts| alts.get(page_image_position))
+            .and_then(|alt| alt.clone());
+        if page_dimensions.is_some_and(|(width, height)| covers_full_page(&handle.bbox, width, height)) {
+            outcomes.push(skipped_image_outcome(handle, page_number, alt_text));
+            continue;
+        }
+        match handle.decode() {
+            Ok(native_img) => outcomes.push(image_outcome_from_decoded(&native_img, page_number, alt_text)),
+            Err(error) => {
+                tracing::debug!(page = page_idx, "image decompression failed: {error}");
+            }
+        }
+    }
+    outcomes
+}
+
+/// Convert a page's already-decoded images into outcomes, looking up each one's alt text by its
+/// content-stream paint position. Shared by the capped path and the uncapped path's
+/// handle-enumeration-failed fallback.
+fn decoded_images_to_outcomes(
+    native_images: Vec<xberg_native_pdf::extractors::PdfImage>,
+    page_number: u32,
+    page_alt_texts: Option<&Vec<Option<String>>>,
+) -> Vec<PageImageOutcome> {
     let mut outcomes = Vec::with_capacity(native_images.len());
     for (page_image_position, native_img) in native_images.iter().enumerate() {
         let alt_text = page_alt_texts
             .and_then(|alts| alts.get(page_image_position))
             .and_then(|alt| alt.clone());
-        let (data, format) = match native_img.data() {
-            xberg_native_pdf::extractors::ImageData::Jpeg(jpeg_bytes) => {
-                let data_bytes = Bytes::copy_from_slice(jpeg_bytes);
-                let actual_format = detect_image_format_from_bytes(data_bytes.as_ref());
-                (data_bytes, Cow::Borrowed(actual_format))
-            }
-            xberg_native_pdf::extractors::ImageData::Raw { pixels, format } => {
-                match raw_pixels_to_png(native_img.width(), native_img.height(), format, pixels) {
-                    Ok(bytes) => (bytes, Cow::Borrowed("png")),
-                    Err(e) => {
-                        outcomes.push(Err(e));
-                        continue;
-                    }
-                }
-            }
-        };
-
-        outcomes.push(Ok(crate::types::ExtractedImage {
-            data,
-            format,
-            // Replaced with the document-global index by `extract_images_with_data`. ~keep
-            image_index: 0,
-            page_number: Some(page_number),
-            width: Some(native_img.width()),
-            height: Some(native_img.height()),
-            colorspace: Some(format!("{:?}", native_img.color_space())),
-            bits_per_component: Some(native_img.bits_per_component() as u32),
-            is_mask: false,
-            description: alt_text,
-            ocr_result: None,
-            bounding_box: native_img.bbox().map(|r| crate::types::BoundingBox {
-                x0: r.x as f64,
-                y0: r.y as f64,
-                x1: (r.x + r.width) as f64,
-                y1: (r.y + r.height) as f64,
-            }),
-            source_path: None,
-            image_kind: None,
-            kind_confidence: None,
-            cluster_id: None,
-            caption: None,
-            qr_codes: None,
-            data_base64: None,
-        }));
+        outcomes.push(image_outcome_from_decoded(native_img, page_number, alt_text));
     }
-
     outcomes
 }
 
@@ -752,7 +954,8 @@ mod tests {
         let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
         let mut doc = crate::pdf::native::NativeDocument::open_bytes(&bytes).expect("failed to open PDF");
 
-        let (result, _warnings) = extract_images_with_data(&mut doc, Some(0), None).expect("cap=0 must not error");
+        let (result, _warnings) = extract_images_with_data(&mut doc, Some(0), None, &std::collections::HashMap::new())
+            .expect("cap=0 must not error");
 
         assert!(
             result.is_empty(),
@@ -788,7 +991,8 @@ mod tests {
 
         let mut doc_full = crate::pdf::native::NativeDocument::open_bytes(&bytes).expect("failed to open PDF");
         let (full_result, _warnings) =
-            extract_images_with_data(&mut doc_full, None, None).expect("uncancelled extraction must not error");
+            extract_images_with_data(&mut doc_full, None, None, &std::collections::HashMap::new())
+                .expect("uncancelled extraction must not error");
         let full_count = full_result.len();
         let page_count = doc_full
             .doc
@@ -814,7 +1018,8 @@ mod tests {
         });
 
         let (result, _warnings) =
-            extract_images_with_data(&mut doc_cancel, None, Some(&token)).expect("cancellation must not error");
+            extract_images_with_data(&mut doc_cancel, None, Some(&token), &std::collections::HashMap::new())
+                .expect("cancellation must not error");
 
         handle.join().expect("background thread must not panic");
 
@@ -851,7 +1056,8 @@ mod tests {
         token.cancel();
 
         let (result, _warnings) =
-            extract_images_with_data(&mut doc, None, Some(&token)).expect("extract must not error");
+            extract_images_with_data(&mut doc, None, Some(&token), &std::collections::HashMap::new())
+                .expect("extract must not error");
 
         assert!(
             result.is_empty(),
@@ -876,7 +1082,8 @@ mod tests {
         let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
         let mut doc = crate::pdf::native::NativeDocument::open_bytes(&bytes).expect("failed to open PDF");
 
-        let (result, _warnings) = extract_images_with_data(&mut doc, None, None).expect("extraction must not error");
+        let (result, _warnings) = extract_images_with_data(&mut doc, None, None, &std::collections::HashMap::new())
+            .expect("extraction must not error");
 
         assert!(!result.is_empty(), "fixture must contain at least one image");
         assert!(
@@ -899,8 +1106,8 @@ mod tests {
         let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
         let mut doc = crate::pdf::native::NativeDocument::open_bytes(&bytes).expect("failed to open PDF");
 
-        let (result, _warnings) =
-            extract_images_with_data(&mut doc, Some(50), None).expect("extraction must not error");
+        let (result, _warnings) = extract_images_with_data(&mut doc, Some(50), None, &std::collections::HashMap::new())
+            .expect("extraction must not error");
 
         assert!(!result.is_empty(), "fixture must contain at least one image");
         assert!(
@@ -1058,7 +1265,8 @@ mod tests {
         let bytes = std::fs::read(&pdf_path).expect("failed to read test PDF");
         let mut doc = crate::pdf::native::NativeDocument::open_bytes(&bytes).expect("failed to open PDF");
 
-        let (result, _warnings) = extract_images_with_data(&mut doc, None, None).expect("extraction must not error");
+        let (result, _warnings) = extract_images_with_data(&mut doc, None, None, &std::collections::HashMap::new())
+            .expect("extraction must not error");
 
         let page_one_images: Vec<_> = result.iter().filter(|img| img.page_number == Some(1)).collect();
         assert!(

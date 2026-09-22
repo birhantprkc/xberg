@@ -109,7 +109,8 @@ fn extract_in_pool(pdf: &[u8], threads: usize, tag: &str) -> Vec<crate::types::E
     pool.broadcast(|_| ());
     pool.install(|| {
         let mut doc = crate::pdf::native::NativeDocument::open_bytes(pdf).expect("the fixture must open");
-        let (images, warnings) = extract_images_with_data(&mut doc, None, None).expect("extraction must not error");
+        let (images, warnings) = extract_images_with_data(&mut doc, None, None, &std::collections::HashMap::new())
+            .expect("extraction must not error");
         assert!(
             warnings.is_empty(),
             "the fixture's images must all re-encode; got {:?}",

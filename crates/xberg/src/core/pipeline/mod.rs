@@ -43,8 +43,11 @@ use initialization::{builtin_registration_error, initialize_processor_cache_for_
 
 const CAPTIONING_PROCESSOR_NAME: &str = "captioning";
 const BUILTIN_REGISTRATION_SOURCE: &str = "builtin_registration";
+// `pub(crate)` so `pdf::native::images` can reference this SAME constant when deciding, before
+// any per-image decode, whether a full-page image will end up excluded here anyway (GH#1732) --
+// the two checks must use one number, never two independently-maintained literals. ~keep
 #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
-const FULL_PAGE_IMAGE_AREA_RATIO: f64 = 0.85;
+pub(crate) const FULL_PAGE_IMAGE_AREA_RATIO: f64 = 0.85;
 
 type PostProcessorHandle = std::sync::Arc<dyn crate::plugins::PostProcessor>;
 

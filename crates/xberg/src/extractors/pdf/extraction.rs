@@ -100,6 +100,34 @@ fn hierarchy_cluster_count(config: &ExtractionConfig) -> usize {
         )
 }
 
+/// Whether OCR is the ONLY reason image bytes were requested for this document at all (GH#1732).
+///
+/// When true, a full-page image on a page that already has native text can skip its decode
+/// entirely: `should_skip_pdf_image_ocr` (`core/pipeline/mod.rs`) will exclude it from OCR, and
+/// `drop_ocr_only_images` (same file) will then drop it from the result, unread. Mirrors
+/// `should_retain_images_after_ocr` (same file) -- `wants_own_bytes_in_result`,
+/// `ocr_inline_images`, and `images.include_page_rasters` are exactly the ways that function's
+/// WRITE gate can keep an image alive after OCR -- plus two more consumers that read
+/// `ExtractedImage.data` unconditionally, before OCR or `drop_ocr_only_images` ever run:
+/// `pdf_options.extract_images` gates `images_extraction_enabled` independently of
+/// `wants_own_bytes_in_result`, and `StyledHtmlRenderer::render_image`
+/// (`rendering/html_styled.rs`) base64-encodes `image.data` unconditionally whenever HTML output
+/// uses `html_output`, as part of a pre-render pass that runs before OCR and before
+/// `drop_ocr_only_images`. Both must also block this fast path. ~keep
+#[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+fn only_reason_images_were_requested_is_ocr(config: &ExtractionConfig, ocr_inline_images: bool) -> bool {
+    let html_reads_image_data = config.output_format == OutputFormat::Html && config.html_output.is_some();
+    config.runs_ocr_on_embedded_images()
+        && !config.wants_own_bytes_in_result()
+        && !ocr_inline_images
+        && !config.images.as_ref().is_some_and(|images| images.include_page_rasters)
+        && !config
+            .pdf_options
+            .as_ref()
+            .is_some_and(|options| options.extract_images)
+        && !html_reads_image_data
+}
+
 /// Report a table-extraction failure that took out a whole detector pass, not just one page.
 ///
 /// The per-page warnings in `pdf::native::table` cannot cover these: a stage that fails or
@@ -557,14 +585,31 @@ pub(crate) fn extract_all_from_native_document(
     let images_extraction_enabled =
         config.needs_image_data() || config.pdf_options.as_ref().map(|p| p.extract_images).unwrap_or(false);
 
+    // Non-empty only when OCR is the SOLE reason `images_extraction_enabled` is true, so a
+    // full-page image on an already-text-bearing page can skip its decode entirely instead of
+    // being decoded, PNG re-encoded, and thrown away by `drop_ocr_only_images` (GH#1732). Any
+    // other consumer of image bytes leaves this empty and every image decodes as before. ~keep
+    #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+    let ocr_skip_candidate_pages = if only_reason_images_were_requested_is_ocr(config, ocr_inline_images) {
+        crate::pdf::native::images::ocr_skip_candidate_pages(pdf_metadata.page_structure.as_ref())
+    } else {
+        std::collections::HashMap::new()
+    };
+    #[cfg(not(all(feature = "ocr", feature = "tokio-runtime")))]
+    let ocr_skip_candidate_pages: std::collections::HashMap<u32, (f64, f64)> = std::collections::HashMap::new();
+
     let (images, image_positions) = if images_extraction_enabled || ocr_inline_images {
         let max_images = config.images.as_ref().and_then(|i| i.max_images_per_page);
-        let (extracted, image_warnings) =
-            crate::pdf::native::images::extract_images_with_data(&mut doc, max_images, config.cancel_token.as_ref())
-                .map_err(|e| crate::error::XbergError::Parsing {
-                    message: format!("xberg_native_pdf image extraction failed: {e}"),
-                    source: None,
-                })?;
+        let (extracted, image_warnings) = crate::pdf::native::images::extract_images_with_data(
+            &mut doc,
+            max_images,
+            config.cancel_token.as_ref(),
+            &ocr_skip_candidate_pages,
+        )
+        .map_err(|e| crate::error::XbergError::Parsing {
+            message: format!("xberg_native_pdf image extraction failed: {e}"),
+            source: None,
+        })?;
         extraction_warnings.extend(image_warnings);
 
         let positions: Vec<(u32, u32)> = extracted
@@ -923,6 +968,123 @@ mod tests {
         retain_segments_inside_page_margins, table_stage_failure_warning,
     };
     use crate::core::config::OutputFormat;
+
+    // GH#1732: `only_reason_images_were_requested_is_ocr` must return `true` only when no
+    // other consumer -- extract_images, captioning, QR codes, inline-image OCR, page rasters,
+    // `pdf_options.extract_images`, or styled-HTML rendering -- would ever read image bytes.
+    #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
+    mod only_reason_is_ocr {
+        use super::super::only_reason_images_were_requested_is_ocr;
+        use crate::core::config::{
+            ExtractionConfig, HtmlOutputConfig, ImageExtractionConfig, OcrConfig, OutputFormat, PdfConfig,
+        };
+
+        fn ocr_only_config() -> ExtractionConfig {
+            ExtractionConfig {
+                ocr: Some(OcrConfig::default()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn true_when_ocr_is_the_sole_consumer() {
+            assert!(only_reason_images_were_requested_is_ocr(&ocr_only_config(), false));
+        }
+
+        #[test]
+        fn false_when_ocr_is_not_configured() {
+            assert!(!only_reason_images_were_requested_is_ocr(
+                &ExtractionConfig::default(),
+                false
+            ));
+        }
+
+        #[test]
+        fn false_when_extract_images_is_requested() {
+            let config = ExtractionConfig {
+                images: Some(ImageExtractionConfig {
+                    extract_images: true,
+                    ..Default::default()
+                }),
+                ..ocr_only_config()
+            };
+            assert!(!only_reason_images_were_requested_is_ocr(&config, false));
+        }
+
+        #[test]
+        fn false_when_captioning_is_configured() {
+            let config = ExtractionConfig {
+                captioning: Some(crate::core::config::CaptioningConfig {
+                    llm: crate::core::config::LlmConfig::default(),
+                    prompt: None,
+                    min_image_area: 1,
+                }),
+                ..ocr_only_config()
+            };
+            assert!(!only_reason_images_were_requested_is_ocr(&config, false));
+        }
+
+        #[test]
+        fn false_when_qr_codes_is_enabled() {
+            let config = ExtractionConfig {
+                qr_codes: Some(true),
+                ..ocr_only_config()
+            };
+            assert!(!only_reason_images_were_requested_is_ocr(&config, false));
+        }
+
+        #[test]
+        fn false_when_ocr_inline_images_is_requested() {
+            assert!(!only_reason_images_were_requested_is_ocr(&ocr_only_config(), true));
+        }
+
+        #[test]
+        fn false_when_page_rasters_are_included() {
+            let config = ExtractionConfig {
+                images: Some(ImageExtractionConfig {
+                    extract_images: false,
+                    include_page_rasters: true,
+                    ..Default::default()
+                }),
+                ..ocr_only_config()
+            };
+            assert!(!only_reason_images_were_requested_is_ocr(&config, false));
+        }
+
+        #[test]
+        fn false_when_pdf_options_extract_images_is_set() {
+            let config = ExtractionConfig {
+                pdf_options: Some(PdfConfig {
+                    extract_images: true,
+                    ..Default::default()
+                }),
+                ..ocr_only_config()
+            };
+            assert!(!only_reason_images_were_requested_is_ocr(&config, false));
+        }
+
+        #[test]
+        fn false_when_styled_html_output_is_configured() {
+            let config = ExtractionConfig {
+                output_format: OutputFormat::Html,
+                html_output: Some(HtmlOutputConfig::default()),
+                ..ocr_only_config()
+            };
+            assert!(!only_reason_images_were_requested_is_ocr(&config, false));
+        }
+
+        #[test]
+        fn true_when_html_format_without_html_output_config() {
+            // `StyledHtmlRenderer` only runs when `html_output` is also configured
+            // (`core/pipeline/mod.rs`'s `styled_html_prerender`); plain HTML rendering goes
+            // through `comrak_bridge`, which already checks `!img.data.is_empty()`.
+            let config = ExtractionConfig {
+                output_format: OutputFormat::Html,
+                ..ocr_only_config()
+            };
+            assert!(only_reason_images_were_requested_is_ocr(&config, false));
+        }
+    }
 
     #[test]
     fn should_match_multiline_annotation_as_contiguous_lines_inside_page_text() {
