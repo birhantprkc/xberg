@@ -390,6 +390,11 @@ tasks:
     cmds:
       - python3 scripts/ci/check-ffi-format-features.py alef.toml
 
+  alef:verify:fields:
+    desc: "Check every tracked config field is named in every generated binding surface (GH#1745)"
+    cmds:
+      - python3 scripts/ci/check-binding-field-coverage.py
+
   supported-counts:sync:
     desc: "Synchronize published format counts with the MIME registry"
     cmds:

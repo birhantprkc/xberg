@@ -290,6 +290,17 @@ jobs:
       # goes red on a stale tree, which is the point. ~keep
       - name: Verify alef-generated bindings are current
         run: task alef:verify
+      # `alef verify` above compares each generated file's hash to a hash of its own
+      # generation inputs, so it is green whenever a regen would reproduce the tree --
+      # including when a field was never wired into the generator's field list at all,
+      # because then a regen changes nothing and no hash moves (GH#1745: a field added
+      # to ExtractionConfig shipped absent from every binding while this job stayed
+      # green throughout). This asserts the cheaper structural property instead: every
+      # tracked config field's name appears somewhere in each language's own generated
+      # surface. It does not require a full `alef all --clean` regen or the sibling
+      # polyrepo checkouts above. ~keep
+      - name: Verify tracked config fields reach every binding surface
+        run: task alef:verify:fields
       # `alef verify` above already reports schema drift, but only as an informational
       # log line buried in its full-surface output -- it never fails, by upstream design:
       # a version-stamp-only difference still describes the same alef.toml config surface,
