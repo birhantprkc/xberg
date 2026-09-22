@@ -48,6 +48,17 @@ const FULL_PAGE_IMAGE_AREA_RATIO: f64 = 0.85;
 
 type PostProcessorHandle = std::sync::Arc<dyn crate::plugins::PostProcessor>;
 
+/// Where [`run_pipeline_impl`] reads its post-processor registry, cache and registration gate
+/// from. Production code always uses `Global`; `Isolated` exists only so a test that mutates a
+/// registry and asserts on the outcome of that mutation can give itself a private
+/// `initialization::ProcessorRegistryState` instead of racing every other extraction in the
+/// binary against the process-wide statics (#1749). ~keep
+enum ProcessorSource {
+    Global,
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    Isolated(std::sync::Arc<initialization::ProcessorRegistryState>),
+}
+
 #[cfg(all(feature = "ocr", feature = "tokio-runtime"))]
 fn image_ocr_positions(doc: &InternalDocument) -> Vec<usize> {
     doc.images
@@ -370,7 +381,27 @@ async fn run_captioning_prepass(
     )
 ))]
 #[cfg_attr(alef, alef(skip))]
-pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) -> Result<ExtractedDocument> {
+pub async fn run_pipeline(doc: InternalDocument, config: &ExtractionConfig) -> Result<ExtractedDocument> {
+    run_pipeline_impl(doc, config, ProcessorSource::Global).await
+}
+
+/// Isolated-registry counterpart of [`run_pipeline`] for the #1749 tests described on
+/// [`ProcessorSource`]: identical behavior, except the post-processing stage reads `state`
+/// instead of the process-wide registry, cache and registration gate.
+#[cfg(all(test, feature = "tokio-runtime"))]
+async fn run_pipeline_with_isolated_registry(
+    doc: InternalDocument,
+    config: &ExtractionConfig,
+    state: std::sync::Arc<initialization::ProcessorRegistryState>,
+) -> Result<ExtractedDocument> {
+    run_pipeline_impl(doc, config, ProcessorSource::Isolated(state)).await
+}
+
+async fn run_pipeline_impl(
+    mut doc: InternalDocument,
+    config: &ExtractionConfig,
+    processor_source: ProcessorSource,
+) -> Result<ExtractedDocument> {
     doc.ocr_text_only = config.images.as_ref().map(|i| i.ocr_text_only).unwrap_or(false);
     doc.append_ocr_text = config.images.as_ref().map(|i| i.append_ocr_text).unwrap_or(false);
     doc.escape_markdown = config.escape_markdown;
@@ -428,8 +459,15 @@ pub async fn run_pipeline(mut doc: InternalDocument, config: &ExtractionConfig) 
     let pp_config = config.postprocessor.as_ref();
     let postprocessing_enabled = pp_config.is_none_or(|processor_config| processor_config.enabled);
     let processor_stages = if postprocessing_enabled {
-        let processor_stages = initialize_processor_cache_for_async_pipeline().await?;
-        push_builtin_registration_warning(&mut doc, builtin_registration_error());
+        let processor_stages = match &processor_source {
+            ProcessorSource::Global => {
+                let snapshot = initialize_processor_cache_for_async_pipeline().await?;
+                push_builtin_registration_warning(&mut doc, builtin_registration_error());
+                snapshot
+            }
+            #[cfg(all(test, feature = "tokio-runtime"))]
+            ProcessorSource::Isolated(state) => initialization::processor_snapshot_from_state(state).await?,
+        };
         Some(processor_stages)
     } else {
         None

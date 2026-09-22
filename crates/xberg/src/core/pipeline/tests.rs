@@ -20,6 +20,11 @@ struct HandoffRaceProcessor {
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     executed_after_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mutation_error: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    // #1749: the reentrant mutation attempted from inside `process` below must land on the
+    // *same* isolated registry `run_pipeline_with_isolated_registry` is snapshotting from, not
+    // the process-wide global -- so the processor carries a handle to it instead of reaching
+    // for `crate::plugins::unregister_post_processor`. ~keep
+    state: std::sync::Arc<initialization::ProcessorRegistryState>,
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -43,7 +48,9 @@ impl crate::plugins::Plugin for HandoffRaceProcessor {
 impl crate::plugins::PostProcessor for HandoffRaceProcessor {
     async fn process(&self, _: &mut crate::types::ExtractedDocument, _: &ExtractionConfig) -> Result<()> {
         if let Some(error_slot) = &self.mutation_error {
-            let error = crate::plugins::unregister_post_processor("handoff-race")
+            let error = self
+                .state
+                .unregister("handoff-race")
                 .expect_err("lifecycle mutation during processing must be rejected");
             *error_slot.lock().unwrap() = Some(error.to_string());
         }
@@ -124,12 +131,25 @@ fn restore_builtin_summarization() {
 ///
 /// Carries `retry_while_registry_in_use`'s own cfg: without it the constants outlive the only
 /// function that reads them on any feature set that compiles it out, and `-D warnings` turns
-/// that into a hard error on the narrow no-ORT legs while every wide-feature leg stays green. ~keep
-#[cfg(any(feature = "summarization", feature = "tokio-runtime"))]
+/// that into a hard error on the narrow no-ORT legs while every wide-feature leg stays green.
+/// #1749 narrowed this from `any(summarization, tokio-runtime)`: the `tokio-runtime`-only
+/// callers (the pipeline lifecycle-gate tests) now use an isolated `ProcessorRegistryState`
+/// instead, so `tokio-runtime` alone no longer has a caller left -- this must track exactly the
+/// feature combinations the remaining call sites below require, or a `pdf,ocr`-only leg (which
+/// enables `tokio-runtime` via `ocr` but none of these) is dead code again under `-D warnings`. ~keep
+#[cfg(any(
+    feature = "summarization",
+    all(feature = "captioning", feature = "redaction", feature = "chunking"),
+    all(feature = "captioning", feature = "tree-sitter")
+))]
 const REGISTRY_MUTATION_ATTEMPTS: usize = 100;
 
 /// Delay between attempts, long enough for a concurrent extraction to drop its snapshot lease.
-#[cfg(any(feature = "summarization", feature = "tokio-runtime"))]
+#[cfg(any(
+    feature = "summarization",
+    all(feature = "captioning", feature = "redaction", feature = "chunking"),
+    all(feature = "captioning", feature = "tree-sitter")
+))]
 const REGISTRY_MUTATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Retry a post-processor lifecycle mutation while the registry reports it is in use.
@@ -139,7 +159,11 @@ const REGISTRY_MUTATION_RETRY_DELAY: std::time::Duration = std::time::Duration::
 /// `.unwrap()`ing it asserts an exclusivity this binary cannot provide. `#[serial]` only orders a
 /// test against the crate's other `#[serial]` tests, while dozens of non-serial tests here run
 /// real extractions and hold that lease. Honour the contract instead of racing it. ~keep
-#[cfg(any(feature = "summarization", feature = "tokio-runtime"))]
+#[cfg(any(
+    feature = "summarization",
+    all(feature = "captioning", feature = "redaction", feature = "chunking"),
+    all(feature = "captioning", feature = "tree-sitter")
+))]
 fn retry_while_registry_in_use<T>(mut mutation: impl FnMut() -> crate::Result<T>) -> T {
     for _ in 0..REGISTRY_MUTATION_ATTEMPTS {
         match mutation() {
@@ -427,18 +451,29 @@ async fn unregister_remains_effective_during_pending_builtin_recovery() {
     assert!(processed.summary.is_none());
 }
 
+// #1749: this test races the module's registration gate against a real pipeline run
+// deliberately, so it needs its own isolated `ProcessorRegistryState` rather than the
+// process-wide registry -- `#[serial]` only ordered it against the crate's other `#[serial]`
+// tests, never against the dozens of non-serial tests elsewhere in this binary that hold a
+// `ProcessorSnapshotLease` on the global state while running a real extraction. When one of
+// those happened to be active at the instant this test's `with_gate` call sampled the lease
+// count, the call was rejected before its closure ever ran, and `started_sender` was dropped
+// unsent -- `started_receiver.recv().unwrap()` then panicked on a disconnected channel. An
+// isolated registry has no such unrelated activity to race. ~keep
 #[tokio::test(flavor = "current_thread")]
-#[serial]
 #[cfg(feature = "tokio-runtime")]
 async fn lifecycle_wait_keeps_async_runtime_schedulable() {
+    use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
 
-    initialization::initialize_processor_cache().unwrap();
+    let state = Arc::new(initialization::ProcessorRegistryState::new_isolated());
+    state.ensure_cache_current().unwrap();
     let (started_sender, started_receiver) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
+    let update_state = Arc::clone(&state);
     let update_thread = std::thread::spawn(move || {
-        with_post_processor_suppressed("async-runtime-test", || {
+        update_state.with_gate(|| {
             started_sender.send(()).unwrap();
             Ok::<_, crate::XbergError>(release_receiver.recv().unwrap())
         })
@@ -456,7 +491,7 @@ async fn lifecycle_wait_keeps_async_runtime_schedulable() {
     };
     let config = ExtractionConfig::default();
     let (pipeline_result, ()) = tokio::join!(
-        run_pipeline(make_doc("test", "text/plain"), &config),
+        run_pipeline_with_isolated_registry(make_doc("test", "text/plain"), &config, Arc::clone(&state)),
         release_from_async
     );
 
@@ -466,29 +501,32 @@ async fn lifecycle_wait_keeps_async_runtime_schedulable() {
     assert_eq!(release_source, "async");
 }
 
+// #1749: isolated for the same reason as `lifecycle_wait_keeps_async_runtime_schedulable` --
+// the `unregister` below deliberately runs while this test's own pipeline is parked mid-snapshot
+// and must succeed unconditionally (not merely "eventually"), which only an isolated registry
+// with no unrelated concurrent activity can guarantee. ~keep
 #[test]
-#[serial]
 #[cfg(feature = "tokio-runtime")]
 fn processor_handoff_rejects_a_snapshot_after_concurrent_shutdown() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
+    let state = Arc::new(initialization::ProcessorRegistryState::new_isolated());
     let shutdown = Arc::new(AtomicBool::new(false));
     let executed_after_shutdown = Arc::new(AtomicBool::new(false));
-    // Setup, before this test holds any lease of its own, so retrying is safe here — unlike the
-    // later `unregister`, which runs while this test's pipeline is deliberately parked and must
-    // NOT be retried. ~keep
-    retry_while_registry_in_use(|| {
-        crate::plugins::register_post_processor(Arc::new(HandoffRaceProcessor {
+    state
+        .register(Arc::new(HandoffRaceProcessor {
             shutdown: Arc::clone(&shutdown),
             executed_after_shutdown: Arc::clone(&executed_after_shutdown),
             mutation_error: None,
+            state: Arc::clone(&state),
         }))
-    });
-    initialization::initialize_processor_cache().unwrap();
+        .unwrap();
+    state.ensure_cache_current().unwrap();
 
     let (snapshot_sender, snapshot_receiver) = mpsc::channel();
     let (resume_sender, resume_receiver) = mpsc::channel();
+    let pipeline_state = Arc::clone(&state);
     let pipeline_thread = std::thread::spawn(move || {
         initialization::test_support::set_before_processor_snapshot_hook(Box::new(move || {
             snapshot_sender.send(()).unwrap();
@@ -498,13 +536,14 @@ fn processor_handoff_rejects_a_snapshot_after_concurrent_shutdown() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_pipeline(
+            .block_on(run_pipeline_with_isolated_registry(
                 make_doc("test", "text/plain"),
                 &ExtractionConfig::default(),
+                pipeline_state,
             ))
     });
     snapshot_receiver.recv().unwrap();
-    crate::plugins::unregister_post_processor("handoff-race").unwrap();
+    state.unregister("handoff-race").unwrap();
     assert!(shutdown.load(Ordering::SeqCst));
     resume_sender.send(()).unwrap();
     pipeline_thread.join().unwrap().unwrap();
@@ -512,29 +551,31 @@ fn processor_handoff_rejects_a_snapshot_after_concurrent_shutdown() {
     assert!(!executed_after_shutdown.load(Ordering::SeqCst));
 }
 
+// #1749: isolated for the same reason as the two tests above -- `concurrent_unregister` must be
+// driven by this test's own synchronization (the "after registration update began" hook), not by
+// an accident of unrelated concurrent activity on a shared registry. ~keep
 #[test]
-#[serial]
 #[cfg(feature = "tokio-runtime")]
 fn processor_handoff_lease_rejects_shutdown_until_pipeline_finishes() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
+    let state = Arc::new(initialization::ProcessorRegistryState::new_isolated());
     let shutdown = Arc::new(AtomicBool::new(false));
     let executed_after_shutdown = Arc::new(AtomicBool::new(false));
-    // Setup, before this test holds any lease of its own, so retrying is safe here — unlike the
-    // later `unregister`, which runs while this test's pipeline is deliberately parked and must
-    // NOT be retried. ~keep
-    retry_while_registry_in_use(|| {
-        crate::plugins::register_post_processor(Arc::new(HandoffRaceProcessor {
+    state
+        .register(Arc::new(HandoffRaceProcessor {
             shutdown: Arc::clone(&shutdown),
             executed_after_shutdown: Arc::clone(&executed_after_shutdown),
             mutation_error: None,
+            state: Arc::clone(&state),
         }))
-    });
-    initialization::initialize_processor_cache().unwrap();
+        .unwrap();
+    state.ensure_cache_current().unwrap();
 
     let (handoff_sender, handoff_receiver) = mpsc::channel();
     let (pipeline_resume_sender, pipeline_resume_receiver) = mpsc::channel();
+    let pipeline_state = Arc::clone(&state);
     let pipeline_thread = std::thread::spawn(move || {
         initialization::test_support::set_after_processor_snapshot_validated_hook(Box::new(move || {
             handoff_sender.send(()).unwrap();
@@ -544,66 +585,67 @@ fn processor_handoff_lease_rejects_shutdown_until_pipeline_finishes() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_pipeline(
+            .block_on(run_pipeline_with_isolated_registry(
                 make_doc("test", "text/plain"),
                 &ExtractionConfig::default(),
+                pipeline_state,
             ))
     });
     handoff_receiver.recv().unwrap();
 
     let (mutation_sender, mutation_receiver) = mpsc::channel();
+    let unregister_state = Arc::clone(&state);
     let unregister_thread = std::thread::spawn(move || {
         initialization::test_support::set_after_registration_update_began_hook(Box::new(move || {
             mutation_sender.send(()).unwrap();
         }));
-        crate::plugins::unregister_post_processor("handoff-race")
+        unregister_state.unregister("handoff-race")
     });
     mutation_receiver.recv().unwrap();
     assert!(!shutdown.load(Ordering::SeqCst));
     pipeline_resume_sender.send(()).unwrap();
     pipeline_thread.join().unwrap().unwrap();
     let concurrent_unregister = unregister_thread.join().unwrap();
-    retry_while_registry_in_use(|| crate::plugins::unregister_post_processor("handoff-race"));
+    state.unregister("handoff-race").unwrap();
 
     assert!(concurrent_unregister.is_err());
     assert!(shutdown.load(Ordering::SeqCst));
     assert!(!executed_after_shutdown.load(Ordering::SeqCst));
 }
 
+// #1749: isolated for the same reason as the three tests above. This test used to need the
+// `retry_while_registry_in_use` dance documented below just to get its own setup registered
+// without racing an unrelated concurrent extraction's lease; an isolated registry has no such
+// lease to race, so the registration below always succeeds on the first try.
 #[test]
-#[serial]
 #[cfg(feature = "tokio-runtime")]
 fn reentrant_lifecycle_mutation_returns_in_use_error_without_deadlock() {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
+    let state = Arc::new(initialization::ProcessorRegistryState::new_isolated());
     let mutation_error = Arc::new(Mutex::new(None));
     let thread_error = Arc::clone(&mutation_error);
-    // Registered BEFORE the thread is spawned, and so before `recv_timeout` starts counting.
-    // This is setup, not the behaviour under test: it races the lease held by every non-serial
-    // extraction test and the contract for that failure is to retry. Doing it inside the thread
-    // charges the retry against the 250ms deadlock window, which turns a slow-but-correct retry
-    // on a loaded runner into a spurious "must not deadlock: Timeout"; unwrapping it instead
-    // panics the thread, drops the sender, and reports the same assertion as "Disconnected".
-    // Both disguise a retryable setup error as a deadlock. The assertion that matters is on
-    // `mutation_error`, captured mid-pipeline and untouched by this. ~keep
-    retry_while_registry_in_use(|| {
-        crate::plugins::register_post_processor(Arc::new(HandoffRaceProcessor {
+    state
+        .register(Arc::new(HandoffRaceProcessor {
             shutdown: Arc::new(AtomicBool::new(false)),
             executed_after_shutdown: Arc::new(AtomicBool::new(false)),
             mutation_error: Some(Arc::clone(&thread_error)),
+            state: Arc::clone(&state),
         }))
-    });
+        .unwrap();
     let (result_sender, result_receiver) = mpsc::channel();
+    let pipeline_state = Arc::clone(&state);
     let pipeline_thread = std::thread::spawn(move || {
         let pipeline_result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_pipeline(
+            .block_on(run_pipeline_with_isolated_registry(
                 make_doc("test", "text/plain"),
                 &ExtractionConfig::default(),
+                pipeline_state,
             ));
         result_sender.send(pipeline_result).unwrap();
     });
@@ -612,7 +654,6 @@ fn reentrant_lifecycle_mutation_returns_in_use_error_without_deadlock() {
         .recv_timeout(Duration::from_millis(250))
         .expect("reentrant lifecycle mutation must not deadlock the pipeline");
     pipeline_thread.join().unwrap();
-    retry_while_registry_in_use(|| crate::plugins::unregister_post_processor("handoff-race"));
 
     pipeline_result.unwrap();
     let error = mutation_error.lock().unwrap().clone().unwrap();

@@ -4,6 +4,7 @@
 //! eliminating repeated registry lock acquisitions.
 
 use crate::Result;
+use crate::plugins::registry::PostProcessorRegistry;
 use crate::plugins::{PostProcessor, ProcessingStage};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -27,9 +28,21 @@ pub(super) struct ProcessorCache {
 }
 
 impl ProcessorCache {
-    /// Create a new processor cache by fetching from the registry.
+    /// Create a new processor cache by fetching from the global post-processor registry.
     pub(super) fn new(registration_epoch: u64) -> Result<Self> {
         let processor_registry = crate::plugins::registry::get_post_processor_registry();
+        Self::from_registry(&processor_registry, registration_epoch)
+    }
+
+    /// Create a new processor cache from an arbitrary registry.
+    ///
+    /// Split out of [`ProcessorCache::new`] so an isolated, per-test
+    /// [`super::initialization::ProcessorRegistryState`] can build its own snapshot without
+    /// touching the process-wide global registry. ~keep
+    pub(super) fn from_registry(
+        processor_registry: &Arc<RwLock<PostProcessorRegistry>>,
+        registration_epoch: u64,
+    ) -> Result<Self> {
         let registry = processor_registry.read();
 
         Ok(Self {

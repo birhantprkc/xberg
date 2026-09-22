@@ -22,7 +22,12 @@ static BUILTIN_REGISTRATION_EPOCH: AtomicU64 = AtomicU64::new(0);
 static BUILTIN_REGISTRATION_LOCK: Mutex<()> = Mutex::new(());
 /// ~keep A validated snapshot holds a lease through processor execution; lifecycle mutations
 /// fail as retryable while a lease is active, so shutdown never overlaps processing or blocks an async worker.
-static ACTIVE_PROCESSOR_SNAPSHOTS: AtomicUsize = AtomicUsize::new(0);
+/// Wrapped in an `Arc` (rather than a bare `AtomicUsize`) so [`ProcessorSnapshotLease`] can hold
+/// the same counter type whether it is leasing the global registry or an isolated, per-test
+/// [`ProcessorRegistryState`] (`#[cfg(test)]`), instead of every snapshot path being hard-wired to
+/// this one static. ~keep
+static ACTIVE_PROCESSOR_SNAPSHOTS: LazyLock<std::sync::Arc<AtomicUsize>> =
+    LazyLock::new(|| std::sync::Arc::new(AtomicUsize::new(0)));
 static AUTOMATIC_REGISTRATION_SUPPRESSIONS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -63,7 +68,7 @@ const AUTOMATIC_POST_PROCESSOR_NAMES: &[&str] = &[
 ];
 
 struct RegistrationUpdate;
-struct ProcessorSnapshotLease;
+struct ProcessorSnapshotLease(std::sync::Arc<AtomicUsize>);
 
 pub(super) struct ProcessorSnapshot {
     pub(super) early: std::sync::Arc<Vec<std::sync::Arc<dyn crate::plugins::PostProcessor>>>,
@@ -86,15 +91,15 @@ impl Drop for RegistrationUpdate {
 }
 
 impl ProcessorSnapshotLease {
-    fn acquire() -> Self {
-        ACTIVE_PROCESSOR_SNAPSHOTS.fetch_add(1, Ordering::SeqCst);
-        Self
+    fn acquire(active_snapshots: &std::sync::Arc<AtomicUsize>) -> Self {
+        active_snapshots.fetch_add(1, Ordering::SeqCst);
+        Self(std::sync::Arc::clone(active_snapshots))
     }
 }
 
 impl Drop for ProcessorSnapshotLease {
     fn drop(&mut self) {
-        ACTIVE_PROCESSOR_SNAPSHOTS.fetch_sub(1, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -492,7 +497,7 @@ fn try_get_processor_snapshot(require_complete_registration: bool) -> Option<Pro
     }
     #[cfg(test)]
     run_before_processor_snapshot_hook();
-    let lease = ProcessorSnapshotLease::acquire();
+    let lease = ProcessorSnapshotLease::acquire(&ACTIVE_PROCESSOR_SNAPSHOTS);
     let stages = PROCESSOR_CACHE
         .try_read()?
         .as_ref()
@@ -527,6 +532,11 @@ pub(super) fn get_processors_from_cache() -> Result<ProcessorStages> {
         .ok_or_else(|| crate::XbergError::Other("Processor cache not initialized".to_string()))?;
     Ok(cached_processor_stages(cache))
 }
+
+#[cfg(all(test, feature = "tokio-runtime"))]
+mod registry_state;
+#[cfg(all(test, feature = "tokio-runtime"))]
+pub(super) use registry_state::{ProcessorRegistryState, processor_snapshot_from_state};
 
 #[cfg(test)]
 mod tests {
