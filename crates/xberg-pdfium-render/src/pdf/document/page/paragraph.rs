@@ -9,9 +9,14 @@ use crate::pdf::document::page::object::text::PdfPageTextObject;
 use crate::pdf::document::page::object::{PdfPageObject, PdfPageObjectCommon};
 use crate::pdf::font::{PdfFont, PdfFontWeight};
 use crate::pdf::points::PdfPoints;
+use crate::pdf::quad_points::PdfQuadPoints;
 use itertools::Itertools;
 use maybe_owned::MaybeOwned;
 use std::cmp::Ordering;
+
+/// A page object annotated with the bounds (bottom, top, left, right) used to lay it out
+/// within a [PdfParagraph]. ~keep
+type PositionedObject<'a> = (PdfPoints, PdfPoints, PdfPoints, PdfPoints, &'a PdfPageObject<'a>);
 
 /// Update an `Option<PdfPoints>` to track the minimum value seen.
 fn update_min(slot: &mut Option<PdfPoints>, value: PdfPoints) {
@@ -317,10 +322,21 @@ impl<'a> PdfParagraph<'a> {
 
     /// Creates a set of one or more [PdfParagraph] objects from the given slice of page objects.
     pub fn from_objects(objects: &'a [PdfPageObject<'a>]) -> Vec<PdfParagraph<'a>> {
-        let mut lines = Vec::new();
+        let (positioned_objects, paragraph_left, paragraph_right) =
+            Self::positioned_objects_sorted_and_filtered(objects);
 
-        let mut current_line_fragments = Vec::new();
+        let lines = Self::assemble_lines(&positioned_objects, paragraph_left, paragraph_right);
 
+        Self::group_lines_into_paragraphs(lines)
+    }
+
+    /// Computes the bounds of each of the given page objects, sorts them into reading order
+    /// (top to bottom, then left to right), and filters out significantly-rotated non-text
+    /// objects. Also returns the leftmost and rightmost extents of the given objects, used as
+    /// the paragraph's overall bounds. ~keep
+    fn positioned_objects_sorted_and_filtered(
+        objects: &'a [PdfPageObject<'a>],
+    ) -> (Vec<PositionedObject<'a>>, PdfPoints, PdfPoints) {
         let mut objects_bottom = None;
 
         let mut objects_top = None;
@@ -365,103 +381,67 @@ impl<'a> PdfParagraph<'a> {
         let paragraph_left = objects_left.unwrap_or(PdfPoints::ZERO);
         let paragraph_right = objects_right.unwrap_or(paragraph_left);
 
-        let mut current_line_bottom = PdfPoints::ZERO;
-        let mut current_line_left = PdfPoints::ZERO;
-        let mut current_line_right = PdfPoints::ZERO;
-        let mut current_line_alignment = PdfLineAlignment::None;
+        (positioned_objects, paragraph_left, paragraph_right)
+    }
 
-        let mut last_object_bottom = None;
-        let mut last_object_height = None;
-        let mut last_object_left = None;
-        let mut last_object_right = None;
+    /// Assembles the given reading-order-sorted page objects into a sequence of [PdfLine]s,
+    /// starting a new line whenever the alignment changes or a vertical gap is detected. ~keep
+    fn assemble_lines(
+        positioned_objects: &[PositionedObject<'a>],
+        paragraph_left: PdfPoints,
+        paragraph_right: PdfPoints,
+    ) -> Vec<PdfLine<'a>> {
+        let mut lines = Vec::new();
+        let mut current = CurrentLine::new();
+        let mut last_object = LastObjectInfo::default();
 
         for (bottom, top, left, right, object) in positioned_objects.iter() {
-            let top = *top;
+            let bounds = ObjectBounds {
+                bottom: *bottom,
+                top: *top,
+                left: *left,
+                right: *right,
+            };
 
-            let bottom = *bottom;
+            maybe_start_new_line(
+                &mut lines,
+                &mut current,
+                &last_object,
+                bounds,
+                paragraph_left,
+                paragraph_right,
+            );
 
-            let left = *left;
+            last_object = LastObjectInfo {
+                left: Some(bounds.left),
+                right: Some(bounds.right),
+                bottom: Some(bounds.bottom),
+                height: Some(bounds.top - bounds.bottom),
+            };
 
-            let right = *right;
-
-            if last_object_left.is_none() || left < last_object_left.unwrap() {
-                let next_line_alignment = Self::guess_line_alignment(
-                    last_object_left,
-                    last_object_right,
-                    left,
-                    right,
-                    paragraph_left,
-                    paragraph_right,
-                );
-
-                if next_line_alignment != current_line_alignment
-                    || last_object_bottom.unwrap_or(PdfPoints::ZERO) - last_object_height.unwrap_or(PdfPoints::ZERO)
-                        > top
-                {
-                    lines.push(PdfLine::new(
-                        current_line_alignment,
-                        current_line_bottom,
-                        current_line_left,
-                        right - current_line_left,
-                        current_line_fragments,
-                    ));
-
-                    current_line_fragments = vec![PdfParagraphFragment::LineBreak {
-                        alignment: current_line_alignment,
-                        bottom,
-                        left,
-                    }];
-                    current_line_left = left;
-                    current_line_right = PdfPoints::ZERO;
-                    current_line_bottom = bottom;
-                    current_line_alignment = next_line_alignment;
-                }
-            }
-
-            last_object_left = Some(left);
-            last_object_right = Some(right);
-            last_object_bottom = Some(bottom);
-            last_object_height = Some(top - bottom);
-
-            if let Some(object) = object.as_text_object() {
-                current_line_right = right;
-
-                if let Some(PdfParagraphFragment::StyledString(last_string)) = current_line_fragments.last_mut() {
-                    if last_string.does_match_object_styling(object) {
-                        let separator = if let Ok(bounds) = object.bounds() {
-                            if let Some(last_object_right) = last_object_right {
-                                if last_object_right > bounds.left() { "" } else { " " }
-                            } else {
-                                ""
-                            }
-                        } else {
-                            " "
-                        };
-
-                        last_string.push(object.text(), separator);
-                    } else {
-                        current_line_fragments.push(PdfParagraphFragment::StyledString(
-                            PdfStyledString::from_text_object(object),
-                        ));
-                    }
-                } else {
-                    current_line_fragments.push(PdfParagraphFragment::StyledString(PdfStyledString::from_text_object(
-                        object,
-                    )));
-                }
-            } else {
-                current_line_fragments.push(PdfParagraphFragment::NonTextObject(object.object_handle()));
-            }
+            current.right = append_object_to_line(
+                &mut current.fragments,
+                object,
+                bounds.right,
+                last_object.right,
+                current.right,
+            );
         }
 
         lines.push(PdfLine::new(
-            current_line_alignment,
-            current_line_bottom,
-            current_line_left,
-            current_line_right - current_line_left,
-            current_line_fragments,
+            current.alignment,
+            current.bottom,
+            current.left,
+            current.right - current.left,
+            current.fragments,
         ));
 
+        lines
+    }
+
+    /// Groups the given sequence of [PdfLine]s into one or more [PdfParagraph]s, starting a new
+    /// paragraph whenever the line alignment changes. ~keep
+    fn group_lines_into_paragraphs(mut lines: Vec<PdfLine<'a>>) -> Vec<PdfParagraph<'a>> {
         let mut paragraphs = Vec::new();
 
         let mut current_paragraph_fragments = Vec::new();
@@ -754,6 +734,152 @@ impl<'a> PdfParagraph<'a> {
 
         lines
     }
+}
+
+/// The bounds of a single positioned page object, used while assembling lines. ~keep
+#[derive(Copy, Clone)]
+struct ObjectBounds {
+    bottom: PdfPoints,
+    top: PdfPoints,
+    left: PdfPoints,
+    right: PdfPoints,
+}
+
+/// Tracks the previous object's position while assembling lines, used to detect line breaks
+/// and to choose separators between adjacent text runs. ~keep
+#[derive(Default)]
+struct LastObjectInfo {
+    left: Option<PdfPoints>,
+    right: Option<PdfPoints>,
+    bottom: Option<PdfPoints>,
+    height: Option<PdfPoints>,
+}
+
+/// The fragments and position of the line currently being assembled. ~keep
+struct CurrentLine<'a> {
+    fragments: Vec<PdfParagraphFragment<'a>>,
+    bottom: PdfPoints,
+    left: PdfPoints,
+    right: PdfPoints,
+    alignment: PdfLineAlignment,
+}
+
+impl<'a> CurrentLine<'a> {
+    fn new() -> Self {
+        CurrentLine {
+            fragments: Vec::new(),
+            bottom: PdfPoints::ZERO,
+            left: PdfPoints::ZERO,
+            right: PdfPoints::ZERO,
+            alignment: PdfLineAlignment::None,
+        }
+    }
+}
+
+/// Starts a new line when the given object begins a new visual row: either its alignment
+/// differs from the current line's, or a vertical gap since the last object was detected.
+/// Otherwise leaves `current` unchanged, ready for the object to be appended to it. ~keep
+fn maybe_start_new_line<'a>(
+    lines: &mut Vec<PdfLine<'a>>,
+    current: &mut CurrentLine<'a>,
+    last_object: &LastObjectInfo,
+    bounds: ObjectBounds,
+    paragraph_left: PdfPoints,
+    paragraph_right: PdfPoints,
+) {
+    if last_object.left.is_some_and(|last_left| bounds.left >= last_left) {
+        return;
+    }
+
+    let next_line_alignment = PdfParagraph::guess_line_alignment(
+        last_object.left,
+        last_object.right,
+        bounds.left,
+        bounds.right,
+        paragraph_left,
+        paragraph_right,
+    );
+
+    let last_gap_exceeds_line =
+        last_object.bottom.unwrap_or(PdfPoints::ZERO) - last_object.height.unwrap_or(PdfPoints::ZERO) > bounds.top;
+
+    if next_line_alignment == current.alignment && !last_gap_exceeds_line {
+        return;
+    }
+
+    let finished_fragments = std::mem::take(&mut current.fragments);
+
+    lines.push(PdfLine::new(
+        current.alignment,
+        current.bottom,
+        current.left,
+        bounds.right - current.left,
+        finished_fragments,
+    ));
+
+    current.fragments = vec![PdfParagraphFragment::LineBreak {
+        alignment: current.alignment,
+        bottom: bounds.bottom,
+        left: bounds.left,
+    }];
+    current.left = bounds.left;
+    current.right = PdfPoints::ZERO;
+    current.bottom = bounds.bottom;
+    current.alignment = next_line_alignment;
+}
+
+/// Appends the given page object to the current line's fragments: text objects are merged into
+/// the trailing [PdfStyledString] fragment when its styling matches, otherwise a new fragment is
+/// pushed. Returns the updated right-hand extent of the current line. ~keep
+fn append_object_to_line<'a>(
+    current_line_fragments: &mut Vec<PdfParagraphFragment<'a>>,
+    object: &'a PdfPageObject<'a>,
+    right: PdfPoints,
+    last_object_right: Option<PdfPoints>,
+    current_line_right: PdfPoints,
+) -> PdfPoints {
+    let Some(text_object) = object.as_text_object() else {
+        current_line_fragments.push(PdfParagraphFragment::NonTextObject(object.object_handle()));
+
+        return current_line_right;
+    };
+
+    let can_merge_with_last = matches!(
+        current_line_fragments.last(),
+        Some(PdfParagraphFragment::StyledString(last_string)) if last_string.does_match_object_styling(text_object)
+    );
+
+    if can_merge_with_last {
+        if let Some(PdfParagraphFragment::StyledString(last_string)) = current_line_fragments.last_mut() {
+            let separator = separator_for_adjacent_text(text_object.bounds(), last_object_right);
+
+            last_string.push(text_object.text(), separator);
+        }
+    } else {
+        current_line_fragments.push(PdfParagraphFragment::StyledString(PdfStyledString::from_text_object(
+            text_object,
+        )));
+    }
+
+    right
+}
+
+/// Chooses the separator to use when merging adjacent text into a single [PdfStyledString]:
+/// no separator when the new text starts where the previous object's right edge ended, a
+/// single space otherwise (or when bounds could not be determined). ~keep
+fn separator_for_adjacent_text(
+    bounds: Result<PdfQuadPoints, PdfiumError>,
+    last_object_right: Option<PdfPoints>,
+) -> &'static str {
+    let Ok(bounds) = bounds else {
+        return " ";
+    };
+
+    let Some(last_object_right) = last_object_right else {
+        return "";
+    };
+
+    if last_object_right > bounds.left() { "" } else { " " }
 }
 
 /// Returns true if a page object is rotated more than 10 degrees from horizontal.

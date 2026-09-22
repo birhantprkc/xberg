@@ -77,92 +77,18 @@ pub(crate) mod internal {
         }
 
         /// Adds this [PdfPageObject] to the given [PdfPageAnnotationObjects] collection.
+        #[inline]
         fn add_object_to_annotation(
             &mut self,
             annotation_objects: &PdfPageAnnotationObjects,
         ) -> Result<(), PdfiumError> {
-            match annotation_objects.ownership() {
-                PdfPageObjectOwnership::AttachedAnnotation(ownership) => {
-                    if self.bindings().is_true(
-                        self.bindings()
-                            .FPDFAnnot_AppendObject(ownership.annotation_handle(), self.object_handle()),
-                    ) {
-                        self.set_ownership(PdfPageObjectOwnership::owned_by_attached_annotation(
-                            ownership.document_handle(),
-                            ownership.page_handle(),
-                            ownership.annotation_handle(),
-                        ));
-                        self.regenerate_content_after_mutation()
-                    } else {
-                        Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
-                    }
-                }
-                PdfPageObjectOwnership::UnattachedAnnotation(ownership) => {
-                    if self.bindings().is_true(
-                        self.bindings()
-                            .FPDFAnnot_AppendObject(ownership.annotation_handle(), self.object_handle()),
-                    ) {
-                        self.set_ownership(PdfPageObjectOwnership::owned_by_unattached_annotation(
-                            ownership.document_handle(),
-                            ownership.annotation_handle(),
-                        ));
-                        self.regenerate_content_after_mutation()
-                    } else {
-                        Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
-                    }
-                }
-                _ => Err(PdfiumError::OwnershipNotAttachedToAnnotation),
-            }
+            add_object_to_annotation_impl(self, annotation_objects)
         }
 
         /// Removes this [PdfPageObject] from the [PdfPageAnnotationsObjects] collection that contains it.
+        #[inline]
         fn remove_object_from_annotation(&mut self) -> Result<(), PdfiumError> {
-            match self.ownership() {
-                PdfPageObjectOwnership::AttachedAnnotation(ownership) => {
-                    if let Some(index) = self.get_index_for_annotation(ownership.annotation_handle()) {
-                        if self.bindings().is_true(
-                            self.bindings()
-                                .FPDFAnnot_RemoveObject(ownership.annotation_handle(), index),
-                        ) {
-                            match PdfPageIndexCache::get_content_regeneration_strategy_for_page(
-                                ownership.document_handle(),
-                                ownership.page_handle(),
-                            ) {
-                                Some(PdfPageContentRegenerationStrategy::AutomaticOnEveryChange) | None => {
-                                    PdfPage::regenerate_content_immut_for_handle(
-                                        ownership.page_handle(),
-                                        self.bindings(),
-                                    )?;
-                                }
-                                _ => {}
-                            }
-
-                            self.set_ownership(PdfPageObjectOwnership::unowned());
-                            self.regenerate_content_after_mutation()
-                        } else {
-                            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
-                        }
-                    } else {
-                        Err(PdfiumError::OwnershipNotAttachedToAnnotation)
-                    }
-                }
-                PdfPageObjectOwnership::UnattachedAnnotation(ownership) => {
-                    if let Some(index) = self.get_index_for_annotation(ownership.annotation_handle()) {
-                        if self.bindings().is_true(
-                            self.bindings()
-                                .FPDFAnnot_RemoveObject(ownership.annotation_handle(), index),
-                        ) {
-                            self.set_ownership(PdfPageObjectOwnership::unowned());
-                            self.regenerate_content_after_mutation()
-                        } else {
-                            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
-                        }
-                    } else {
-                        Err(PdfiumError::OwnershipNotAttachedToAnnotation)
-                    }
-                }
-                _ => Err(PdfiumError::OwnershipNotAttachedToAnnotation),
-            }
+            remove_object_from_annotation_impl(self)
         }
 
         fn get_index_for_annotation(&self, annotation_handle: FPDF_ANNOTATION) -> Option<i32> {
@@ -366,6 +292,103 @@ pub(crate) mod internal {
             if !self.ownership().is_owned() {
                 self.bindings().FPDFPageObj_Destroy(self.object_handle());
             }
+        }
+    }
+
+    fn add_object_to_annotation_impl<'a, T>(
+        object: &mut T,
+        annotation_objects: &PdfPageAnnotationObjects,
+    ) -> Result<(), PdfiumError>
+    where
+        T: PdfPageObjectPrivate<'a> + ?Sized,
+    {
+        match annotation_objects.ownership() {
+            PdfPageObjectOwnership::AttachedAnnotation(ownership) => {
+                if object.bindings().is_true(
+                    object
+                        .bindings()
+                        .FPDFAnnot_AppendObject(ownership.annotation_handle(), object.object_handle()),
+                ) {
+                    object.set_ownership(PdfPageObjectOwnership::owned_by_attached_annotation(
+                        ownership.document_handle(),
+                        ownership.page_handle(),
+                        ownership.annotation_handle(),
+                    ));
+                    object.regenerate_content_after_mutation()
+                } else {
+                    Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
+                }
+            }
+            PdfPageObjectOwnership::UnattachedAnnotation(ownership) => {
+                if object.bindings().is_true(
+                    object
+                        .bindings()
+                        .FPDFAnnot_AppendObject(ownership.annotation_handle(), object.object_handle()),
+                ) {
+                    object.set_ownership(PdfPageObjectOwnership::owned_by_unattached_annotation(
+                        ownership.document_handle(),
+                        ownership.annotation_handle(),
+                    ));
+                    object.regenerate_content_after_mutation()
+                } else {
+                    Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
+                }
+            }
+            _ => Err(PdfiumError::OwnershipNotAttachedToAnnotation),
+        }
+    }
+
+    fn remove_object_from_annotation_impl<'a, T>(object: &mut T) -> Result<(), PdfiumError>
+    where
+        T: PdfPageObjectPrivate<'a> + ?Sized,
+    {
+        match object.ownership() {
+            PdfPageObjectOwnership::AttachedAnnotation(ownership) => {
+                if let Some(index) = object.get_index_for_annotation(ownership.annotation_handle()) {
+                    if object.bindings().is_true(
+                        object
+                            .bindings()
+                            .FPDFAnnot_RemoveObject(ownership.annotation_handle(), index),
+                    ) {
+                        match PdfPageIndexCache::get_content_regeneration_strategy_for_page(
+                            ownership.document_handle(),
+                            ownership.page_handle(),
+                        ) {
+                            Some(PdfPageContentRegenerationStrategy::AutomaticOnEveryChange) | None => {
+                                PdfPage::regenerate_content_immut_for_handle(
+                                    ownership.page_handle(),
+                                    object.bindings(),
+                                )?;
+                            }
+                            _ => {}
+                        }
+
+                        object.set_ownership(PdfPageObjectOwnership::unowned());
+                        object.regenerate_content_after_mutation()
+                    } else {
+                        Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
+                    }
+                } else {
+                    Err(PdfiumError::OwnershipNotAttachedToAnnotation)
+                }
+            }
+            PdfPageObjectOwnership::UnattachedAnnotation(ownership) => {
+                if let Some(index) = object.get_index_for_annotation(ownership.annotation_handle()) {
+                    if object.bindings().is_true(
+                        object
+                            .bindings()
+                            .FPDFAnnot_RemoveObject(ownership.annotation_handle(), index),
+                    ) {
+                        object.set_ownership(PdfPageObjectOwnership::unowned());
+                        object.regenerate_content_after_mutation()
+                    } else {
+                        Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
+                    }
+                } else {
+                    Err(PdfiumError::OwnershipNotAttachedToAnnotation)
+                }
+            }
+            _ => Err(PdfiumError::OwnershipNotAttachedToAnnotation),
         }
     }
 }

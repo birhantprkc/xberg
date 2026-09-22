@@ -6,7 +6,7 @@ use crate::pdf::color::PdfColor;
 use crate::pdf::document::fonts::ToPdfFontToken;
 use crate::pdf::document::page::PdfPageObjectOwnership;
 use crate::pdf::document::page::object::image::PdfPageImageObject;
-use crate::pdf::document::page::object::path::PdfPagePathObject;
+use crate::pdf::document::page::object::path::{BezierPoints, PathFillStroke, PathStroke, PdfPagePathObject};
 use crate::pdf::document::page::object::text::PdfPageTextObject;
 use crate::pdf::document::page::object::x_object_form::PdfPageXObjectFormObject;
 use crate::pdf::document::page::object::{PdfPageObject, PdfPageObjectCommon};
@@ -57,21 +57,13 @@ pub trait PdfPageObjectsCommon<'a> {
     /// Returns the first [PdfPageObject] in this page objects collection.
     #[inline]
     fn first(&self) -> Result<PdfPageObject<'a>, PdfiumError> {
-        if !self.is_empty() {
-            self.get(0)
-        } else {
-            Err(PdfiumError::NoPageObjectsInCollection)
-        }
+        first_of(self)
     }
 
     /// Returns the last [PdfPageObject] in this page objects collection.
     #[inline]
     fn last(&self) -> Result<PdfPageObject<'a>, PdfiumError> {
-        if !self.is_empty() {
-            self.get(self.len() - 1)
-        } else {
-            Err(PdfiumError::NoPageObjectsInCollection)
-        }
+        last_of(self)
     }
 
     /// Returns an iterator over all the [PdfPageObject] objects in this page objects collection.
@@ -80,21 +72,7 @@ pub trait PdfPageObjectsCommon<'a> {
     /// Returns the smallest bounding box that contains all the [PdfPageObject] objects in this
     /// page objects collection.
     fn bounds(&'a self) -> PdfRect {
-        let mut bottom: f32 = 0.0;
-        let mut top: f32 = 0.0;
-        let mut left: f32 = 0.0;
-        let mut right: f32 = 0.0;
-
-        for object in self.iter() {
-            if let Ok(bounds) = object.bounds() {
-                bottom = bottom.min(bounds.bottom().value);
-                top = top.max(bounds.top().value);
-                left = left.min(bounds.left().value);
-                right = right.max(bounds.right().value);
-            }
-        }
-
-        PdfRect::new_from_values(bottom, left, top, right)
+        bounds_of(self)
     }
 
     /// Adds the given [PdfPageObject] to this page objects collection. The object's
@@ -412,8 +390,17 @@ where
         stroke_color: PdfColor,
         stroke_width: PdfPoints,
     ) -> Result<PdfPageObject<'a>, PdfiumError> {
-        let object =
-            PdfPagePathObject::new_line_from_bindings(self.bindings(), x1, y1, x2, y2, stroke_color, stroke_width)?;
+        let object = PdfPagePathObject::new_line_from_bindings(
+            self.bindings(),
+            x1,
+            y1,
+            x2,
+            y2,
+            PathStroke {
+                color: stroke_color,
+                width: stroke_width,
+            },
+        )?;
 
         self.add_path_object(object)
     }
@@ -434,16 +421,16 @@ where
     ) -> Result<PdfPageObject<'a>, PdfiumError> {
         let object = PdfPagePathObject::new_bezier_from_bindings(
             self.bindings(),
-            x1,
-            y1,
-            x2,
-            y2,
-            control1_x,
-            control1_y,
-            control2_x,
-            control2_y,
-            stroke_color,
-            stroke_width,
+            BezierPoints {
+                start: (x1, y1),
+                end: (x2, y2),
+                control1: (control1_x, control1_y),
+                control2: (control2_x, control2_y),
+            },
+            PathStroke {
+                color: stroke_color,
+                width: stroke_width,
+            },
         )?;
 
         self.add_path_object(object)
@@ -492,9 +479,11 @@ where
             center_x,
             center_y,
             radius,
-            stroke_color,
-            stroke_width,
-            fill_color,
+            PathFillStroke {
+                stroke_color,
+                stroke_width,
+                fill_color,
+            },
         )?;
 
         self.add_path_object(object)
@@ -536,9 +525,11 @@ where
             center_y,
             x_radius,
             y_radius,
-            stroke_color,
-            stroke_width,
-            fill_color,
+            PathFillStroke {
+                stroke_color,
+                stroke_width,
+                fill_color,
+            },
         )?;
 
         self.add_path_object(object)
@@ -614,6 +605,49 @@ where
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::Unknown))
         }
     }
+}
+
+fn first_of<'a, T>(objects: &T) -> Result<PdfPageObject<'a>, PdfiumError>
+where
+    T: PdfPageObjectsCommon<'a> + ?Sized,
+{
+    if !objects.is_empty() {
+        objects.get(0)
+    } else {
+        Err(PdfiumError::NoPageObjectsInCollection)
+    }
+}
+
+fn last_of<'a, T>(objects: &T) -> Result<PdfPageObject<'a>, PdfiumError>
+where
+    T: PdfPageObjectsCommon<'a> + ?Sized,
+{
+    if !objects.is_empty() {
+        objects.get(objects.len() - 1)
+    } else {
+        Err(PdfiumError::NoPageObjectsInCollection)
+    }
+}
+
+fn bounds_of<'a, T>(objects: &'a T) -> PdfRect
+where
+    T: PdfPageObjectsCommon<'a> + ?Sized,
+{
+    let mut bottom: f32 = 0.0;
+    let mut top: f32 = 0.0;
+    let mut left: f32 = 0.0;
+    let mut right: f32 = 0.0;
+
+    for object in objects.iter() {
+        if let Ok(bounds) = object.bounds() {
+            bottom = bottom.min(bounds.bottom().value);
+            top = top.max(bounds.top().value);
+            left = left.min(bounds.left().value);
+            right = right.max(bounds.right().value);
+        }
+    }
+
+    PdfRect::new_from_values(bottom, left, top, right)
 }
 
 /// An iterator over all the [PdfPageObject] objects in a page objects collection.

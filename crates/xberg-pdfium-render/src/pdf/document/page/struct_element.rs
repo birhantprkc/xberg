@@ -390,157 +390,52 @@ mod tests {
 
     #[test]
     fn test_from_pdf_type_string_all_standard_types() {
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Document"),
-            PdfStructElementType::Document
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Part"),
-            PdfStructElementType::Part
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Div"),
-            PdfStructElementType::Div
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Span"),
-            PdfStructElementType::Span
-        );
-        assert_eq!(PdfStructElementType::from_pdf_type_string("P"), PdfStructElementType::P);
-        assert_eq!(PdfStructElementType::from_pdf_type_string("H"), PdfStructElementType::H);
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("H1"),
-            PdfStructElementType::H1
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("H2"),
-            PdfStructElementType::H2
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("H3"),
-            PdfStructElementType::H3
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("H4"),
-            PdfStructElementType::H4
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("H5"),
-            PdfStructElementType::H5
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("H6"),
-            PdfStructElementType::H6
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Table"),
-            PdfStructElementType::Table
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TR"),
-            PdfStructElementType::TR
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TH"),
-            PdfStructElementType::TH
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TD"),
-            PdfStructElementType::TD
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("THead"),
-            PdfStructElementType::THead
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TBody"),
-            PdfStructElementType::TBody
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TFoot"),
-            PdfStructElementType::TFoot
-        );
-        assert_eq!(PdfStructElementType::from_pdf_type_string("L"), PdfStructElementType::L);
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("LI"),
-            PdfStructElementType::LI
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Lbl"),
-            PdfStructElementType::Lbl
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("LBody"),
-            PdfStructElementType::LBody
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Figure"),
-            PdfStructElementType::Figure
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Formula"),
-            PdfStructElementType::Formula
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Form"),
-            PdfStructElementType::Form
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Code"),
-            PdfStructElementType::Code
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("BlockQuote"),
-            PdfStructElementType::BlockQuote
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Caption"),
-            PdfStructElementType::Caption
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Link"),
-            PdfStructElementType::Link
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Note"),
-            PdfStructElementType::Note
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TOC"),
-            PdfStructElementType::TOC
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("TOCI"),
-            PdfStructElementType::TOCI
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Sect"),
-            PdfStructElementType::Sect
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Art"),
-            PdfStructElementType::Art
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Reference"),
-            PdfStructElementType::Reference
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("BibEntry"),
-            PdfStructElementType::BibEntry
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Quote"),
-            PdfStructElementType::Quote
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("Index"),
-            PdfStructElementType::Index
-        );
-        assert_eq!(
-            PdfStructElementType::from_pdf_type_string("NonStruct"),
-            PdfStructElementType::NonStruct
-        );
+        let cases = [
+            ("Document", PdfStructElementType::Document),
+            ("Part", PdfStructElementType::Part),
+            ("Div", PdfStructElementType::Div),
+            ("Span", PdfStructElementType::Span),
+            ("P", PdfStructElementType::P),
+            ("H", PdfStructElementType::H),
+            ("H1", PdfStructElementType::H1),
+            ("H2", PdfStructElementType::H2),
+            ("H3", PdfStructElementType::H3),
+            ("H4", PdfStructElementType::H4),
+            ("H5", PdfStructElementType::H5),
+            ("H6", PdfStructElementType::H6),
+            ("Table", PdfStructElementType::Table),
+            ("TR", PdfStructElementType::TR),
+            ("TH", PdfStructElementType::TH),
+            ("TD", PdfStructElementType::TD),
+            ("THead", PdfStructElementType::THead),
+            ("TBody", PdfStructElementType::TBody),
+            ("TFoot", PdfStructElementType::TFoot),
+            ("L", PdfStructElementType::L),
+            ("LI", PdfStructElementType::LI),
+            ("Lbl", PdfStructElementType::Lbl),
+            ("LBody", PdfStructElementType::LBody),
+            ("Figure", PdfStructElementType::Figure),
+            ("Formula", PdfStructElementType::Formula),
+            ("Form", PdfStructElementType::Form),
+            ("Code", PdfStructElementType::Code),
+            ("BlockQuote", PdfStructElementType::BlockQuote),
+            ("Caption", PdfStructElementType::Caption),
+            ("Link", PdfStructElementType::Link),
+            ("Note", PdfStructElementType::Note),
+            ("TOC", PdfStructElementType::TOC),
+            ("TOCI", PdfStructElementType::TOCI),
+            ("Sect", PdfStructElementType::Sect),
+            ("Art", PdfStructElementType::Art),
+            ("Reference", PdfStructElementType::Reference),
+            ("BibEntry", PdfStructElementType::BibEntry),
+            ("Quote", PdfStructElementType::Quote),
+            ("Index", PdfStructElementType::Index),
+            ("NonStruct", PdfStructElementType::NonStruct),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(PdfStructElementType::from_pdf_type_string(input), expected);
+        }
     }
 
     #[test]

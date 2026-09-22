@@ -619,80 +619,123 @@ impl PdfRenderConfig {
 
         let source_orientation = PdfPageOrientation::from_width_and_height(source_width, source_height);
 
-        let (target_rotation, do_rotate_constraints) =
-            if source_orientation == Portrait && self.portrait_rotation != PdfPageRenderRotation::None {
-                (self.portrait_rotation, self.portrait_rotation_do_rotate_constraints)
-            } else if source_orientation == Landscape && self.landscape_rotation != PdfPageRenderRotation::None {
-                (self.landscape_rotation, self.landscape_rotation_do_rotate_constraints)
-            } else {
-                (PdfPageRenderRotation::None, false)
-            };
+        let (target_rotation, do_rotate_constraints) = self.compute_target_rotation(source_orientation);
 
-        let (output_width, output_height, width_scale, height_scale) = if self.use_auto_scaling {
-            let width_scale = if let Some(scale) = self.scale_width_factor {
-                Some(scale)
-            } else {
-                self.target_width.map(|target| (target as f32) / source_width.value)
-            };
+        let (output_width, output_height, width_scale, height_scale) =
+            self.compute_output_dimensions(source_width, source_height, do_rotate_constraints);
 
-            let height_scale = if let Some(scale) = self.scale_height_factor {
-                Some(scale)
-            } else {
-                self.target_height.map(|target| (target as f32) / source_height.value)
-            };
+        let render_flags = self.compute_render_flags();
 
-            let (do_maintain_aspect_ratio, mut width_scale, mut height_scale) = match (width_scale, height_scale) {
-                (Some(width_scale), Some(height_scale)) => (width_scale == height_scale, width_scale, height_scale),
-                (Some(width_scale), None) => (true, width_scale, width_scale),
-                (None, Some(height_scale)) => (true, height_scale, height_scale),
-                (None, None) => (false, 1.0, 1.0),
-            };
+        let transformation_matrix =
+            self.compute_transformation_matrix(target_rotation, source_width, source_height, width_scale, height_scale);
 
-            let (source_width, source_height, width_constraint, height_constraint) = if do_rotate_constraints {
-                (source_height, source_width, self.maximum_height, self.maximum_width)
-            } else {
-                (source_width, source_height, self.maximum_width, self.maximum_height)
-            };
+        PdfPageRenderSettings {
+            width: output_width,
+            height: output_height,
+            format: self.format.as_pdfium() as c_int,
+            rotate: target_rotation.as_pdfium(),
+            do_clear_bitmap_before_rendering: self.do_clear_bitmap_before_rendering,
+            clear_color: self.clear_color.as_pdfium_color(),
+            do_render_form_data: self.do_render_form_data,
+            form_field_highlight: None,
+            matrix: transformation_matrix.unwrap_or(PdfMatrix::IDENTITY).as_pdfium(),
+            clipping: self.compute_clipping_rect(output_width, output_height),
+            render_flags: render_flags as c_int,
+            is_reversed_byte_order_flag_set: self.do_set_flag_reverse_byte_order,
+        }
+    }
 
-            if let Some(maximum) = width_constraint {
-                let maximum = maximum as f32;
-
-                if source_width.value * width_scale > maximum {
-                    width_scale = maximum / source_width.value;
-
-                    if do_maintain_aspect_ratio {
-                        height_scale = width_scale;
-                    }
-                }
-            }
-
-            if let Some(maximum) = height_constraint {
-                let maximum = maximum as f32;
-
-                if source_height.value * height_scale > maximum {
-                    height_scale = maximum / source_height.value;
-
-                    if do_maintain_aspect_ratio {
-                        width_scale = height_scale;
-                    }
-                }
-            }
-
-            (
-                (source_width.value * width_scale).round() as c_int,
-                (source_height.value * height_scale).round() as c_int,
-                width_scale,
-                height_scale,
-            )
+    /// Determines the clockwise rotation that should be applied during rendering, and whether
+    /// any maximum width/height constraints should be swapped to account for that rotation,
+    /// based on the source page's orientation. ~keep
+    fn compute_target_rotation(&self, source_orientation: PdfPageOrientation) -> (PdfPageRenderRotation, bool) {
+        if source_orientation == Portrait && self.portrait_rotation != PdfPageRenderRotation::None {
+            (self.portrait_rotation, self.portrait_rotation_do_rotate_constraints)
+        } else if source_orientation == Landscape && self.landscape_rotation != PdfPageRenderRotation::None {
+            (self.landscape_rotation, self.landscape_rotation_do_rotate_constraints)
         } else {
-            (
+            (PdfPageRenderRotation::None, false)
+        }
+    }
+
+    /// Computes the output pixel width and height and the width/height scale factors used to
+    /// reach them, taking fixed sizing, target sizing, explicit scale factors, and maximum
+    /// width/height constraints into account. ~keep
+    fn compute_output_dimensions(
+        &self,
+        source_width: PdfPoints,
+        source_height: PdfPoints,
+        do_rotate_constraints: bool,
+    ) -> (c_int, c_int, f32, f32) {
+        if !self.use_auto_scaling {
+            return (
                 self.fixed_width.unwrap_or(0) as c_int,
                 self.fixed_height.unwrap_or(0) as c_int,
                 self.scale_width_factor.unwrap_or(1.0),
                 self.scale_height_factor.unwrap_or(1.0),
-            )
+            );
+        }
+
+        let width_scale = if let Some(scale) = self.scale_width_factor {
+            Some(scale)
+        } else {
+            self.target_width.map(|target| (target as f32) / source_width.value)
         };
 
+        let height_scale = if let Some(scale) = self.scale_height_factor {
+            Some(scale)
+        } else {
+            self.target_height.map(|target| (target as f32) / source_height.value)
+        };
+
+        let (do_maintain_aspect_ratio, mut width_scale, mut height_scale) = match (width_scale, height_scale) {
+            (Some(width_scale), Some(height_scale)) => (width_scale == height_scale, width_scale, height_scale),
+            (Some(width_scale), None) => (true, width_scale, width_scale),
+            (None, Some(height_scale)) => (true, height_scale, height_scale),
+            (None, None) => (false, 1.0, 1.0),
+        };
+
+        let (source_width, source_height, width_constraint, height_constraint) = if do_rotate_constraints {
+            (source_height, source_width, self.maximum_height, self.maximum_width)
+        } else {
+            (source_width, source_height, self.maximum_width, self.maximum_height)
+        };
+
+        if let Some(maximum) = width_constraint {
+            let maximum = maximum as f32;
+
+            if source_width.value * width_scale > maximum {
+                width_scale = maximum / source_width.value;
+
+                if do_maintain_aspect_ratio {
+                    height_scale = width_scale;
+                }
+            }
+        }
+
+        if let Some(maximum) = height_constraint {
+            let maximum = maximum as f32;
+
+            if source_height.value * height_scale > maximum {
+                height_scale = maximum / source_height.value;
+
+                if do_maintain_aspect_ratio {
+                    width_scale = height_scale;
+                }
+            }
+        }
+
+        (
+            (source_width.value * width_scale).round() as c_int,
+            (source_height.value * height_scale).round() as c_int,
+            width_scale,
+            height_scale,
+        )
+    }
+
+    /// Combines this configuration's boolean rendering flags into a single Pdfium render
+    /// flags bitmask. ~keep
+    fn compute_render_flags(&self) -> u32 {
         let mut render_flags = 0;
 
         if self.do_set_flag_render_annotations {
@@ -743,54 +786,59 @@ impl PdfRenderConfig {
             render_flags |= FPDF_CONVERT_FILL_TO_STROKE;
         }
 
-        let transformation_matrix = if !self.do_render_form_data {
-            let result = if target_rotation != PdfPageRenderRotation::None {
-                let (delta_x, delta_y) = match target_rotation {
-                    PdfPageRenderRotation::None => unreachable!(),
-                    PdfPageRenderRotation::Degrees90 => (PdfPoints::ZERO, -source_width),
-                    PdfPageRenderRotation::Degrees180 => (-source_width, -source_height),
-                    PdfPageRenderRotation::Degrees270 => (-source_height, PdfPoints::ZERO),
-                };
+        render_flags
+    }
 
-                self.transformation_matrix
-                    .translate(delta_x, delta_y)
-                    .and_then(|result| result.rotate_clockwise_degrees(target_rotation.as_degrees()))
-            } else {
-                Ok(self.transformation_matrix)
+    /// Computes the transformation matrix that should be applied during rendering: identity
+    /// when form data rendering is enabled (Pdfium does not support both at once), otherwise
+    /// this configuration's transformation matrix combined with any rotation and scaling. ~keep
+    fn compute_transformation_matrix(
+        &self,
+        target_rotation: PdfPageRenderRotation,
+        source_width: PdfPoints,
+        source_height: PdfPoints,
+        width_scale: f32,
+        height_scale: f32,
+    ) -> Result<PdfMatrix, PdfiumError> {
+        if self.do_render_form_data {
+            return Ok(PdfMatrix::identity());
+        }
+
+        let result = if target_rotation != PdfPageRenderRotation::None {
+            let (delta_x, delta_y) = match target_rotation {
+                PdfPageRenderRotation::None => unreachable!(),
+                PdfPageRenderRotation::Degrees90 => (PdfPoints::ZERO, -source_width),
+                PdfPageRenderRotation::Degrees180 => (-source_width, -source_height),
+                PdfPageRenderRotation::Degrees270 => (-source_height, PdfPoints::ZERO),
             };
 
-            result.and_then(|result| result.scale(width_scale, height_scale))
+            self.transformation_matrix
+                .translate(delta_x, delta_y)
+                .and_then(|result| result.rotate_clockwise_degrees(target_rotation.as_degrees()))
         } else {
-            Ok(PdfMatrix::identity())
+            Ok(self.transformation_matrix)
         };
 
-        PdfPageRenderSettings {
-            width: output_width,
-            height: output_height,
-            format: self.format.as_pdfium() as c_int,
-            rotate: target_rotation.as_pdfium(),
-            do_clear_bitmap_before_rendering: self.do_clear_bitmap_before_rendering,
-            clear_color: self.clear_color.as_pdfium_color(),
-            do_render_form_data: self.do_render_form_data,
-            form_field_highlight: None,
-            matrix: transformation_matrix.unwrap_or(PdfMatrix::IDENTITY).as_pdfium(),
-            clipping: if let Some((left, top, right, bottom)) = self.clip_rect {
-                FS_RECTF {
-                    left: left as f32,
-                    top: top as f32,
-                    right: right as f32,
-                    bottom: bottom as f32,
-                }
-            } else {
-                FS_RECTF {
-                    left: 0.0,
-                    top: 0.0,
-                    right: output_width as f32,
-                    bottom: output_height as f32,
-                }
-            },
-            render_flags: render_flags as c_int,
-            is_reversed_byte_order_flag_set: self.do_set_flag_reverse_byte_order,
+        result.and_then(|result| result.scale(width_scale, height_scale))
+    }
+
+    /// Computes the pixel clipping rectangle to apply during rendering: the explicit clip
+    /// region set via [PdfRenderConfig::clip()], or the full output bounds otherwise. ~keep
+    fn compute_clipping_rect(&self, output_width: c_int, output_height: c_int) -> FS_RECTF {
+        if let Some((left, top, right, bottom)) = self.clip_rect {
+            FS_RECTF {
+                left: left as f32,
+                top: top as f32,
+                right: right as f32,
+                bottom: bottom as f32,
+            }
+        } else {
+            FS_RECTF {
+                left: 0.0,
+                top: 0.0,
+                right: output_width as f32,
+                bottom: output_height as f32,
+            }
         }
     }
 }

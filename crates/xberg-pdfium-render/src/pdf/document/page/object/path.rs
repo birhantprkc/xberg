@@ -98,6 +98,32 @@ impl Default for PdfPathFillMode {
     }
 }
 
+/// Groups the stroke color and width parameters shared by the path constructors that always
+/// stroke their path (as opposed to the constructors that accept optional fill and stroke
+/// settings). Internal to this crate; reduces the parameter count of the `_from_bindings`
+/// constructor helpers below. ~keep
+pub(crate) struct PathStroke {
+    pub(crate) color: PdfColor,
+    pub(crate) width: PdfPoints,
+}
+
+/// Groups the optional fill and stroke settings shared by several path constructors. Internal
+/// to this crate; reduces the parameter count of the `_from_bindings` constructor helpers below. ~keep
+pub(crate) struct PathFillStroke {
+    pub(crate) stroke_color: Option<PdfColor>,
+    pub(crate) stroke_width: Option<PdfPoints>,
+    pub(crate) fill_color: Option<PdfColor>,
+}
+
+/// Groups the four coordinate pairs needed to construct a cubic Bézier curve. Internal to this
+/// crate; reduces the parameter count of the `_from_bindings` constructor helpers below. ~keep
+pub(crate) struct BezierPoints {
+    pub(crate) start: (PdfPoints, PdfPoints),
+    pub(crate) end: (PdfPoints, PdfPoints),
+    pub(crate) control1: (PdfPoints, PdfPoints),
+    pub(crate) control2: (PdfPoints, PdfPoints),
+}
+
 /// A single [PdfPageObject] of type [PdfPageObjectType::Path]. The page object defines a path.
 ///
 /// Paths define shapes, trajectories, and regions of all sorts. They are used to draw
@@ -254,10 +280,9 @@ impl<'a> PdfPagePathObject<'a> {
         y1: PdfPoints,
         x2: PdfPoints,
         y2: PdfPoints,
-        stroke_color: PdfColor,
-        stroke_width: PdfPoints,
+        stroke: PathStroke,
     ) -> Result<Self, PdfiumError> {
-        let mut result = Self::new_from_bindings(bindings, x1, y1, Some(stroke_color), Some(stroke_width), None)?;
+        let mut result = Self::new_from_bindings(bindings, x1, y1, Some(stroke.color), Some(stroke.width), None)?;
 
         result.line_to(x2, y2)?;
 
@@ -280,25 +305,31 @@ impl<'a> PdfPagePathObject<'a> {
         stroke_color: PdfColor,
         stroke_width: PdfPoints,
     ) -> Result<Self, PdfiumError> {
-        Self::new_line_from_bindings(document.bindings(), x1, y1, x2, y2, stroke_color, stroke_width)
+        Self::new_line_from_bindings(
+            document.bindings(),
+            x1,
+            y1,
+            x2,
+            y2,
+            PathStroke {
+                color: stroke_color,
+                width: stroke_width,
+            },
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(crate) fn new_bezier_from_bindings(
         bindings: &'a dyn PdfiumLibraryBindings,
-        x1: PdfPoints,
-        y1: PdfPoints,
-        x2: PdfPoints,
-        y2: PdfPoints,
-        control1_x: PdfPoints,
-        control1_y: PdfPoints,
-        control2_x: PdfPoints,
-        control2_y: PdfPoints,
-        stroke_color: PdfColor,
-        stroke_width: PdfPoints,
+        points: BezierPoints,
+        stroke: PathStroke,
     ) -> Result<Self, PdfiumError> {
-        let mut result = Self::new_from_bindings(bindings, x1, y1, Some(stroke_color), Some(stroke_width), None)?;
+        let (x1, y1) = points.start;
+        let (x2, y2) = points.end;
+        let (control1_x, control1_y) = points.control1;
+        let (control2_x, control2_y) = points.control2;
+
+        let mut result = Self::new_from_bindings(bindings, x1, y1, Some(stroke.color), Some(stroke.width), None)?;
 
         result.bezier_to(x2, y2, control1_x, control1_y, control2_x, control2_y)?;
 
@@ -328,16 +359,16 @@ impl<'a> PdfPagePathObject<'a> {
     ) -> Result<Self, PdfiumError> {
         Self::new_bezier_from_bindings(
             document.bindings(),
-            x1,
-            y1,
-            x2,
-            y2,
-            control1_x,
-            control1_y,
-            control2_x,
-            control2_y,
-            stroke_color,
-            stroke_width,
+            BezierPoints {
+                start: (x1, y1),
+                end: (x2, y2),
+                control1: (control1_x, control1_y),
+                control2: (control2_x, control2_y),
+            },
+            PathStroke {
+                color: stroke_color,
+                width: stroke_width,
+            },
         )
     }
 
@@ -427,9 +458,7 @@ impl<'a> PdfPagePathObject<'a> {
         center_x: PdfPoints,
         center_y: PdfPoints,
         radius: PdfPoints,
-        stroke_color: Option<PdfColor>,
-        stroke_width: Option<PdfPoints>,
-        fill_color: Option<PdfColor>,
+        style: PathFillStroke,
     ) -> Result<Self, PdfiumError> {
         Self::new_circle_from_bindings(
             bindings,
@@ -439,9 +468,9 @@ impl<'a> PdfPagePathObject<'a> {
                 center_y + radius,
                 center_x + radius,
             ),
-            stroke_color,
-            stroke_width,
-            fill_color,
+            style.stroke_color,
+            style.stroke_width,
+            style.fill_color,
         )
     }
 
@@ -467,9 +496,11 @@ impl<'a> PdfPagePathObject<'a> {
             center_x,
             center_y,
             radius,
-            stroke_color,
-            stroke_width,
-            fill_color,
+            PathFillStroke {
+                stroke_color,
+                stroke_width,
+                fill_color,
+            },
         )
     }
 
@@ -513,7 +544,6 @@ impl<'a> PdfPagePathObject<'a> {
         Self::new_ellipse_from_bindings(document.bindings(), rect, stroke_color, stroke_width, fill_color)
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     pub(crate) fn new_ellipse_at_from_bindings(
         bindings: &'a dyn PdfiumLibraryBindings,
@@ -521,9 +551,7 @@ impl<'a> PdfPagePathObject<'a> {
         center_y: PdfPoints,
         x_radius: PdfPoints,
         y_radius: PdfPoints,
-        stroke_color: Option<PdfColor>,
-        stroke_width: Option<PdfPoints>,
-        fill_color: Option<PdfColor>,
+        style: PathFillStroke,
     ) -> Result<Self, PdfiumError> {
         Self::new_ellipse_from_bindings(
             bindings,
@@ -533,9 +561,9 @@ impl<'a> PdfPagePathObject<'a> {
                 center_y + y_radius,
                 center_x + x_radius,
             ),
-            stroke_color,
-            stroke_width,
-            fill_color,
+            style.stroke_color,
+            style.stroke_width,
+            style.fill_color,
         )
     }
 
@@ -564,9 +592,11 @@ impl<'a> PdfPagePathObject<'a> {
             center_y,
             x_radius,
             y_radius,
-            stroke_color,
-            stroke_width,
-            fill_color,
+            PathFillStroke {
+                stroke_color,
+                stroke_width,
+                fill_color,
+            },
         )
     }
 
