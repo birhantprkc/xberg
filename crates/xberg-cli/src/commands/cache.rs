@@ -5,6 +5,14 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
+#[cfg(any(
+    feature = "embeddings",
+    feature = "layout-detection",
+    feature = "paddle-ocr",
+    feature = "tree-sitter",
+    feature = "ner-onnx"
+))]
+use std::path::Path;
 use std::path::PathBuf;
 use xberg::cache;
 
@@ -202,17 +210,14 @@ pub fn manifest_command(format: WireFormat) -> Result<()> {
     }
 }
 
+/// Gather the manifest entries for every model source compiled into this binary.
 #[cfg(any(
     feature = "paddle-ocr",
     feature = "layout-detection",
     feature = "ner-onnx",
     feature = "formula-recognition"
 ))]
-#[expect(
-    clippy::print_stdout,
-    reason = "model manifest is the command's stdout result output"
-)]
-fn manifest_command_inner(format: WireFormat) -> Result<()> {
+fn collect_manifest_entries() -> Vec<CacheManifestEntry> {
     let mut entries: Vec<CacheManifestEntry> = Vec::new();
 
     #[cfg(feature = "paddle-ocr")]
@@ -250,52 +255,80 @@ fn manifest_command_inner(format: WireFormat) -> Result<()> {
         }));
     }
 
+    entries
+}
+
+/// Print the model manifest as a human-readable table.
+#[cfg(any(
+    feature = "paddle-ocr",
+    feature = "layout-detection",
+    feature = "ner-onnx",
+    feature = "formula-recognition"
+))]
+#[expect(
+    clippy::print_stdout,
+    reason = "model manifest is the command's stdout result output"
+)]
+fn print_manifest_text(entries: &[CacheManifestEntry], version: &str, total_size_bytes: u64) {
+    println!(
+        "{} {}",
+        style::header("Model Manifest"),
+        style::dim(&format!("(xberg {version})"))
+    );
+    println!("{}", style::dim("===================================="));
+    println!(
+        "{:<50} {:>12} {}",
+        style::label("PATH"),
+        style::label("SIZE"),
+        style::label("SHA256")
+    );
+    println!("{}", style::dim(&format!("{:<50} {:>12} ------", "----", "----")));
+    for entry in entries {
+        let size_str = if entry.size_bytes > 0 {
+            format!("{:.1} MB", entry.size_bytes as f64 / 1_048_576.0)
+        } else {
+            "unknown".to_string()
+        };
+        let sha_display = if entry.sha256.len() >= 12 {
+            &entry.sha256[..12]
+        } else if entry.sha256.is_empty() {
+            "-"
+        } else {
+            &entry.sha256
+        };
+        println!(
+            "{:<50} {:>12} {}",
+            entry.relative_path,
+            size_str,
+            style::dim(sha_display)
+        );
+    }
+    println!();
+    println!(
+        "{} {} files, {:.1} MB",
+        style::label("Total:"),
+        entries.len(),
+        total_size_bytes as f64 / 1_048_576.0
+    );
+}
+
+#[cfg(any(
+    feature = "paddle-ocr",
+    feature = "layout-detection",
+    feature = "ner-onnx",
+    feature = "formula-recognition"
+))]
+#[expect(
+    clippy::print_stdout,
+    reason = "model manifest is the command's stdout result output"
+)]
+fn manifest_command_inner(format: WireFormat) -> Result<()> {
+    let entries = collect_manifest_entries();
     let total_size_bytes: u64 = entries.iter().map(|e| e.size_bytes).sum();
     let version = env!("CARGO_PKG_VERSION");
 
     match format {
-        WireFormat::Text => {
-            println!(
-                "{} {}",
-                style::header("Model Manifest"),
-                style::dim(&format!("(xberg {})", version))
-            );
-            println!("{}", style::dim("===================================="));
-            println!(
-                "{:<50} {:>12} {}",
-                style::label("PATH"),
-                style::label("SIZE"),
-                style::label("SHA256")
-            );
-            println!("{}", style::dim(&format!("{:<50} {:>12} ------", "----", "----")));
-            for entry in &entries {
-                let size_str = if entry.size_bytes > 0 {
-                    format!("{:.1} MB", entry.size_bytes as f64 / 1_048_576.0)
-                } else {
-                    "unknown".to_string()
-                };
-                let sha_display = if entry.sha256.len() >= 12 {
-                    &entry.sha256[..12]
-                } else if entry.sha256.is_empty() {
-                    "-"
-                } else {
-                    &entry.sha256
-                };
-                println!(
-                    "{:<50} {:>12} {}",
-                    entry.relative_path,
-                    size_str,
-                    style::dim(sha_display)
-                );
-            }
-            println!();
-            println!(
-                "{} {} files, {:.1} MB",
-                style::label("Total:"),
-                entries.len(),
-                total_size_bytes as f64 / 1_048_576.0
-            );
-        }
+        WireFormat::Text => print_manifest_text(&entries, version, total_size_bytes),
         WireFormat::Json => {
             let output = json!({
                 "xberg_version": version,
@@ -325,7 +358,9 @@ fn manifest_command_inner(format: WireFormat) -> Result<()> {
     Ok(())
 }
 
-/// Execute cache warm command - eagerly downloads all models.
+/// Feature-gated options for [`warm_command`], bundled so the command function itself
+/// stays within the CLI's parameter-count limit. Each field only exists when its owning
+/// feature is enabled, mirroring the `warm` subcommand's own `#[cfg]`-gated CLI flags. ~keep
 #[cfg(any(
     feature = "embeddings",
     feature = "layout-detection",
@@ -333,32 +368,41 @@ fn manifest_command_inner(format: WireFormat) -> Result<()> {
     feature = "tree-sitter",
     feature = "ner-onnx"
 ))]
-#[allow(clippy::too_many_arguments)]
-#[expect(
-    clippy::print_stdout,
-    reason = "cache warm download summary is the command's stdout result output"
-)]
-pub fn warm_command(
-    cache_dir: Option<PathBuf>,
-    format: WireFormat,
-    #[cfg(feature = "embeddings")] all_embeddings: bool,
-    #[cfg(feature = "embeddings")] embedding_model: Option<String>,
-    #[cfg(feature = "layout-detection")] all_table_models: bool,
-    #[cfg(feature = "tree-sitter")] all_grammars: bool,
-    #[cfg(feature = "tree-sitter")] grammar_groups: Option<Vec<String>>,
-    #[cfg(feature = "tree-sitter")] grammars: Option<Vec<String>>,
-    #[cfg(feature = "ner-onnx")] ner: bool,
-    #[cfg(feature = "ner-onnx")] ner_model: Option<String>,
-    #[cfg(feature = "ner-onnx")] all_ner_models: bool,
-) -> Result<()> {
-    #[cfg(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr"))]
-    let hf_cache_dir = cache_dir.clone();
-    #[cfg(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr"))]
+#[derive(Debug, Default)]
+pub struct WarmOptions {
+    #[cfg(feature = "embeddings")]
+    pub all_embeddings: bool,
+    #[cfg(feature = "embeddings")]
+    pub embedding_model: Option<String>,
+    #[cfg(feature = "layout-detection")]
+    pub all_table_models: bool,
+    #[cfg(feature = "tree-sitter")]
+    pub all_grammars: bool,
+    #[cfg(feature = "tree-sitter")]
+    pub grammar_groups: Option<Vec<String>>,
+    #[cfg(feature = "tree-sitter")]
+    pub grammars: Option<Vec<String>>,
+    #[cfg(feature = "ner-onnx")]
+    pub ner: bool,
+    #[cfg(feature = "ner-onnx")]
+    pub ner_model: Option<String>,
+    #[cfg(feature = "ner-onnx")]
+    pub all_ner_models: bool,
+}
+
+/// Resolve the Hugging Face cache label shown in the warm summary: `Some` only when at
+/// least one requested model source actually reads the HF cache (paddle-ocr always does;
+/// embeddings/ner-onnx depend on what was requested).
+#[cfg(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr"))]
+fn resolve_hf_cache_label(
+    hf_cache_dir: &Option<PathBuf>,
+    #[cfg_attr(not(any(feature = "embeddings", feature = "ner-onnx")), allow(unused_variables))] options: &WarmOptions,
+) -> Option<String> {
     let uses_hf_cache = cfg!(feature = "paddle-ocr")
         || {
             #[cfg(feature = "embeddings")]
             {
-                all_embeddings || embedding_model.is_some()
+                options.all_embeddings || options.embedding_model.is_some()
             }
             #[cfg(not(feature = "embeddings"))]
             {
@@ -368,201 +412,238 @@ pub fn warm_command(
         || {
             #[cfg(feature = "ner-onnx")]
             {
-                ner || ner_model.is_some() || all_ner_models
+                options.ner || options.ner_model.is_some() || options.all_ner_models
             }
             #[cfg(not(feature = "ner-onnx"))]
             {
                 false
             }
         };
-    #[cfg(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr"))]
-    let hf_cache_label = uses_hf_cache.then(|| {
+    uses_hf_cache.then(|| {
         hf_cache_dir
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "HF_HUB_CACHE/HF_HOME/platform default".to_string())
-    });
-    #[cfg(not(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr")))]
-    let hf_cache_label: Option<String> = None;
-    let cache_base = resolve_cache_base(cache_dir);
+    })
+}
 
-    let mut downloaded: Vec<String> = Vec::new();
-    #[cfg(any(
-        feature = "paddle-ocr",
-        feature = "layout-detection",
-        feature = "tree-sitter",
-        feature = "formula-recognition"
-    ))]
-    let mut already_cached: Vec<String> = Vec::new();
-    #[cfg(not(any(
-        feature = "paddle-ocr",
-        feature = "layout-detection",
-        feature = "tree-sitter",
-        feature = "formula-recognition"
-    )))]
-    let already_cached: Vec<String> = Vec::new();
+/// Download (or confirm already cached) the PaddleOCR v2 model set.
+#[cfg(feature = "paddle-ocr")]
+fn warm_paddle_ocr_models(hf_cache_dir: Option<PathBuf>, downloaded: &mut Vec<String>) -> Result<()> {
+    let manager = hf_cache_dir
+        .map(xberg::paddle_ocr::ModelManager::new)
+        .unwrap_or_default();
 
-    #[cfg(feature = "paddle-ocr")]
-    {
-        let manager = hf_cache_dir
-            .clone()
-            .map(xberg::paddle_ocr::ModelManager::new)
-            .unwrap_or_default();
+    manager
+        .ensure_all_models()
+        .context("Failed to download PaddleOCR v2 models")?;
+    downloaded.push("paddle-ocr v2 (server+mobile det, cls, doc_ori, unified+per-script rec)".to_string());
+    Ok(())
+}
 
-        manager
-            .ensure_all_models()
-            .context("Failed to download PaddleOCR v2 models")?;
-        downloaded.push("paddle-ocr v2 (server+mobile det, cls, doc_ori, unified+per-script rec)".to_string());
+/// Download (or confirm already cached) the formula-recognition model set.
+#[cfg(feature = "formula-recognition")]
+fn warm_formula_recognition(
+    cache_base: &Path,
+    downloaded: &mut Vec<String>,
+    already_cached: &mut Vec<String>,
+) -> Result<()> {
+    let formula_dir = cache_base.join("formula-recognition");
+    if xberg::formula_recognition::models_cached_in(Some(&formula_dir)) {
+        already_cached.push("formula-recognition (latex_ocr)".to_string());
+    } else {
+        xberg::formula_recognition::ensure_models_in(Some(&formula_dir))
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("Failed to download formula recognition models")?;
+        downloaded.push("formula-recognition (latex_ocr)".to_string());
     }
+    Ok(())
+}
 
-    #[cfg(feature = "formula-recognition")]
-    {
-        let formula_dir = cache_base.join("formula-recognition");
-        if xberg::formula_recognition::models_cached_in(Some(&formula_dir)) {
-            already_cached.push("formula-recognition (latex_ocr)".to_string());
+/// Download (or confirm already cached) the layout-detection model set.
+#[cfg(feature = "layout-detection")]
+fn warm_layout_detection(
+    cache_base: &Path,
+    all_table_models: bool,
+    downloaded: &mut Vec<String>,
+    already_cached: &mut Vec<String>,
+) -> Result<()> {
+    let layout_dir = cache_base.join("layout");
+    let manager = xberg::layout::LayoutModelManager::new(Some(layout_dir));
+
+    if all_table_models {
+        let was_cached = manager.is_rtdetr_cached() && manager.is_tatr_cached();
+        if was_cached {
+            already_cached.push("layout (rtdetr, tatr, slanet variants)".to_string());
         } else {
-            xberg::formula_recognition::ensure_models_in(Some(&formula_dir))
-                .map_err(|e| anyhow::anyhow!(e))
-                .context("Failed to download formula recognition models")?;
-            downloaded.push("formula-recognition (latex_ocr)".to_string());
+            manager
+                .ensure_all_models()
+                .context("Failed to download layout models")?;
+            downloaded.push("layout (rtdetr, tatr, slanet variants)".to_string());
+        }
+    } else {
+        let was_cached = manager.is_rtdetr_cached() && manager.is_tatr_cached();
+        if was_cached {
+            already_cached.push("layout (rtdetr, tatr)".to_string());
+        } else {
+            manager
+                .ensure_default_models()
+                .context("Failed to download layout models")?;
+            downloaded.push("layout (rtdetr, tatr)".to_string());
         }
     }
+    Ok(())
+}
 
-    #[cfg(feature = "layout-detection")]
-    {
-        let layout_dir = cache_base.join("layout");
-        let manager = xberg::layout::LayoutModelManager::new(Some(layout_dir));
+/// Download (or confirm already cached) the Tesseract language data files.
+#[cfg(feature = "paddle-ocr")]
+fn warm_tessdata(cache_base: &Path, downloaded: &mut Vec<String>, already_cached: &mut Vec<String>) -> Result<()> {
+    let tessdata_dir = cache_base.join("tessdata");
+    let manager = xberg::ocr::TessdataManager::new(Some(tessdata_dir));
 
-        if all_table_models {
-            let was_cached = manager.is_rtdetr_cached() && manager.is_tatr_cached();
-            if was_cached {
-                already_cached.push("layout (rtdetr, tatr, slanet variants)".to_string());
-            } else {
-                manager
-                    .ensure_all_models()
-                    .context("Failed to download layout models")?;
-                downloaded.push("layout (rtdetr, tatr, slanet variants)".to_string());
-            }
-        } else {
-            let was_cached = manager.is_rtdetr_cached() && manager.is_tatr_cached();
-            if was_cached {
-                already_cached.push("layout (rtdetr, tatr)".to_string());
-            } else {
-                manager
-                    .ensure_default_models()
-                    .context("Failed to download layout models")?;
-                downloaded.push("layout (rtdetr, tatr)".to_string());
+    let newly_downloaded = manager
+        .ensure_all_languages()
+        .context("Failed to download tessdata files")?;
+
+    if newly_downloaded > 0 {
+        downloaded.push(format!("tessdata ({newly_downloaded} languages)"));
+    } else {
+        already_cached.push("tessdata (all languages)".to_string());
+    }
+    Ok(())
+}
+
+/// Download the requested embedding model preset(s).
+#[cfg(feature = "embeddings")]
+fn warm_embeddings(
+    all_embeddings: bool,
+    embedding_model: Option<String>,
+    hf_cache_dir: Option<PathBuf>,
+    downloaded: &mut Vec<String>,
+) -> Result<()> {
+    let presets_to_warm: Vec<xberg::EmbeddingPreset> = if all_embeddings {
+        xberg::list_embedding_presets()
+            .into_iter()
+            .filter_map(|name| xberg::get_embedding_preset(&name))
+            .collect()
+    } else if let Some(ref name) = embedding_model {
+        match xberg::get_embedding_preset(name) {
+            Some(preset) => vec![preset],
+            None => {
+                let available = xberg::list_embedding_presets();
+                anyhow::bail!(
+                    "Unknown embedding preset '{}'. Available: {}",
+                    name,
+                    available.join(", ")
+                );
             }
         }
+    } else {
+        vec![]
+    };
+
+    for preset in &presets_to_warm {
+        let label = format!("embedding ({})", preset.name);
+        xberg::embeddings::warm_model(
+            &xberg::core::config::EmbeddingModelType::Preset {
+                name: preset.name.clone(),
+            },
+            hf_cache_dir.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to download embedding model '{}': {}", preset.name, e))?;
+        downloaded.push(label);
     }
+    Ok(())
+}
 
-    #[cfg(feature = "paddle-ocr")]
-    {
-        let tessdata_dir = cache_base.join("tessdata");
-        let manager = xberg::ocr::TessdataManager::new(Some(tessdata_dir));
-
-        let newly_downloaded = manager
-            .ensure_all_languages()
-            .context("Failed to download tessdata files")?;
-
-        if newly_downloaded > 0 {
-            downloaded.push(format!("tessdata ({newly_downloaded} languages)"));
+/// Download the requested tree-sitter grammar(s).
+#[cfg(feature = "tree-sitter")]
+fn warm_tree_sitter_grammars(
+    all_grammars: bool,
+    grammar_groups: Option<Vec<String>>,
+    grammars: Option<Vec<String>>,
+    downloaded: &mut Vec<String>,
+    already_cached: &mut Vec<String>,
+) -> Result<()> {
+    if all_grammars {
+        let count = tree_sitter_language_pack::download_all().context("Failed to download all tree-sitter grammars")?;
+        if count > 0 {
+            downloaded.push(format!("tree-sitter grammars ({count} languages)"));
         } else {
-            already_cached.push("tessdata (all languages)".to_string());
+            already_cached.push("tree-sitter grammars (all)".to_string());
         }
-    }
-
-    #[cfg(feature = "embeddings")]
-    {
-        let presets_to_warm: Vec<xberg::EmbeddingPreset> = if all_embeddings {
-            xberg::list_embedding_presets()
-                .into_iter()
-                .filter_map(|name| xberg::get_embedding_preset(&name))
-                .collect()
-        } else if let Some(ref name) = embedding_model {
-            match xberg::get_embedding_preset(name) {
-                Some(preset) => vec![preset],
-                None => {
-                    let available = xberg::list_embedding_presets();
-                    anyhow::bail!(
-                        "Unknown embedding preset '{}'. Available: {}",
-                        name,
-                        available.join(", ")
-                    );
-                }
-            }
-        } else {
-            vec![]
+    } else if let Some(ref groups) = grammar_groups {
+        let config = tree_sitter_language_pack::PackConfig {
+            cache_dir: None,
+            languages: None,
+            groups: Some(groups.clone()),
         };
-
-        for preset in &presets_to_warm {
-            let label = format!("embedding ({})", preset.name);
-            xberg::embeddings::warm_model(
-                &xberg::core::config::EmbeddingModelType::Preset {
-                    name: preset.name.clone(),
-                },
-                hf_cache_dir.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to download embedding model '{}': {}", preset.name, e))?;
-            downloaded.push(label);
+        tree_sitter_language_pack::init(&config).context("Failed to download tree-sitter grammar groups")?;
+        downloaded.push(format!("tree-sitter grammars (groups: {})", groups.join(", ")));
+    } else if let Some(ref langs) = grammars {
+        let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+        let count = tree_sitter_language_pack::download(&refs).context("Failed to download tree-sitter grammars")?;
+        if count > 0 {
+            downloaded.push(format!("tree-sitter grammars ({count} languages)"));
+        } else {
+            already_cached.push(format!("tree-sitter grammars ({})", langs.join(", ")));
         }
     }
+    Ok(())
+}
 
-    #[cfg(feature = "tree-sitter")]
-    {
-        if all_grammars {
-            let count =
-                tree_sitter_language_pack::download_all().context("Failed to download all tree-sitter grammars")?;
-            if count > 0 {
-                downloaded.push(format!("tree-sitter grammars ({count} languages)"));
-            } else {
-                already_cached.push("tree-sitter grammars (all)".to_string());
-            }
-        } else if let Some(ref groups) = grammar_groups {
-            let config = tree_sitter_language_pack::PackConfig {
-                cache_dir: None,
-                languages: None,
-                groups: Some(groups.clone()),
-            };
-            tree_sitter_language_pack::init(&config).context("Failed to download tree-sitter grammar groups")?;
-            downloaded.push(format!("tree-sitter grammars (groups: {})", groups.join(", ")));
-        } else if let Some(ref langs) = grammars {
-            let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
-            let count =
-                tree_sitter_language_pack::download(&refs).context("Failed to download tree-sitter grammars")?;
-            if count > 0 {
-                downloaded.push(format!("tree-sitter grammars ({count} languages)"));
-            } else {
-                already_cached.push(format!("tree-sitter grammars ({})", langs.join(", ")));
-            }
-        }
+/// Download the requested GLiNER NER model(s).
+#[cfg(feature = "ner-onnx")]
+fn warm_ner_models(
+    ner: bool,
+    ner_model: Option<String>,
+    all_ner_models: bool,
+    hf_cache_dir: Option<PathBuf>,
+    downloaded: &mut Vec<String>,
+) -> Result<()> {
+    let ner_models: Vec<String> = ner_model.into_iter().collect();
+    if ner || !ner_models.is_empty() || all_ner_models {
+        let to_download = crate::commands::ner::select_models(ner, ner_models, all_ner_models)?;
+        downloaded.extend(
+            crate::commands::ner::download_models(&to_download, hf_cache_dir)
+                .context("Failed to download GLiNER NER models")?
+                .into_iter()
+                .map(|entry| format!("ner gliner ({entry})")),
+        );
     }
+    Ok(())
+}
 
-    #[cfg(feature = "ner-onnx")]
-    {
-        let ner_models: Vec<String> = ner_model.into_iter().collect();
-        if ner || !ner_models.is_empty() || all_ner_models {
-            let to_download = crate::commands::ner::select_models(ner, ner_models, all_ner_models)?;
-            downloaded.extend(
-                crate::commands::ner::download_models(&to_download, hf_cache_dir)
-                    .context("Failed to download GLiNER NER models")?
-                    .into_iter()
-                    .map(|entry| format!("ner gliner ({entry})")),
-            );
-        }
-    }
-
+/// Print the warm command's summary in the requested wire format.
+#[cfg(any(
+    feature = "embeddings",
+    feature = "layout-detection",
+    feature = "paddle-ocr",
+    feature = "tree-sitter",
+    feature = "ner-onnx"
+))]
+#[expect(
+    clippy::print_stdout,
+    reason = "cache warm download summary is the command's stdout result output"
+)]
+fn print_warm_summary(
+    format: WireFormat,
+    cache_base: &Path,
+    hf_cache_label: &Option<String>,
+    downloaded: &[String],
+    already_cached: &[String],
+) -> Result<()> {
     match format {
         WireFormat::Text => {
             if !downloaded.is_empty() {
                 println!("{}", style::label("Downloaded:"));
-                for d in &downloaded {
+                for d in downloaded {
                     println!("  {}", style::success(d));
                 }
             }
             if !already_cached.is_empty() {
                 println!("{}", style::label("Already cached:"));
-                for c in &already_cached {
+                for c in already_cached {
                     println!("  {}", style::dim(c));
                 }
             }
@@ -570,7 +651,7 @@ pub fn warm_command(
                 "Xberg-managed cache: {}",
                 style::success(&cache_base.display().to_string())
             );
-            if let Some(ref hf_cache) = hf_cache_label {
+            if let Some(hf_cache) = hf_cache_label {
                 println!("Hugging Face cache: {}", style::success(hf_cache));
             }
         }
@@ -603,6 +684,85 @@ pub fn warm_command(
     }
 
     Ok(())
+}
+
+/// Execute cache warm command - eagerly downloads all models.
+#[cfg(any(
+    feature = "embeddings",
+    feature = "layout-detection",
+    feature = "paddle-ocr",
+    feature = "tree-sitter",
+    feature = "ner-onnx"
+))]
+pub fn warm_command(cache_dir: Option<PathBuf>, format: WireFormat, options: WarmOptions) -> Result<()> {
+    #[cfg(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr"))]
+    let hf_cache_dir = cache_dir.clone();
+    #[cfg(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr"))]
+    let hf_cache_label = resolve_hf_cache_label(&hf_cache_dir, &options);
+    #[cfg(not(any(feature = "embeddings", feature = "ner-onnx", feature = "paddle-ocr")))]
+    let hf_cache_label: Option<String> = None;
+    let cache_base = resolve_cache_base(cache_dir);
+
+    let mut downloaded: Vec<String> = Vec::new();
+    #[cfg(any(
+        feature = "paddle-ocr",
+        feature = "layout-detection",
+        feature = "tree-sitter",
+        feature = "formula-recognition"
+    ))]
+    let mut already_cached: Vec<String> = Vec::new();
+    #[cfg(not(any(
+        feature = "paddle-ocr",
+        feature = "layout-detection",
+        feature = "tree-sitter",
+        feature = "formula-recognition"
+    )))]
+    let already_cached: Vec<String> = Vec::new();
+
+    #[cfg(feature = "paddle-ocr")]
+    warm_paddle_ocr_models(hf_cache_dir.clone(), &mut downloaded)?;
+
+    #[cfg(feature = "formula-recognition")]
+    warm_formula_recognition(&cache_base, &mut downloaded, &mut already_cached)?;
+
+    #[cfg(feature = "layout-detection")]
+    warm_layout_detection(
+        &cache_base,
+        options.all_table_models,
+        &mut downloaded,
+        &mut already_cached,
+    )?;
+
+    #[cfg(feature = "paddle-ocr")]
+    warm_tessdata(&cache_base, &mut downloaded, &mut already_cached)?;
+
+    #[cfg(feature = "embeddings")]
+    warm_embeddings(
+        options.all_embeddings,
+        options.embedding_model.clone(),
+        hf_cache_dir.clone(),
+        &mut downloaded,
+    )?;
+
+    #[cfg(feature = "tree-sitter")]
+    warm_tree_sitter_grammars(
+        options.all_grammars,
+        options.grammar_groups.clone(),
+        options.grammars.clone(),
+        &mut downloaded,
+        &mut already_cached,
+    )?;
+
+    #[cfg(feature = "ner-onnx")]
+    warm_ner_models(
+        options.ner,
+        options.ner_model.clone(),
+        options.all_ner_models,
+        hf_cache_dir.clone(),
+        &mut downloaded,
+    )?;
+
+    print_warm_summary(format, &cache_base, &hf_cache_label, &downloaded, &already_cached)
 }
 
 /// Resolve the cache base directory.

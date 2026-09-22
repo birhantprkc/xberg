@@ -57,17 +57,26 @@ pub fn serve_command(
     Ok(())
 }
 
+/// HTTP transport settings for [`mcp_command`], bundled so the command function itself
+/// stays within the CLI's parameter-count limit. Only read when `transport` is `"http"`;
+/// a `stdio` transport accepts and ignores them, so the CLI surface stays uniform across
+/// builds regardless of whether the `mcp-http` feature is enabled. Without `mcp-http` the
+/// fields are never read, so `dead_code` is allowed for that build only. ~keep
+#[cfg(feature = "mcp")]
+#[cfg_attr(not(feature = "mcp-http"), allow(dead_code))]
+pub struct McpTransportOptions {
+    pub host: String,
+    pub port: u16,
+    pub allowed_hosts: Vec<String>,
+}
+
 /// Execute MCP server command
 #[cfg(feature = "mcp")]
+#[cfg_attr(not(feature = "mcp-http"), allow(unused_variables))]
 pub fn mcp_command(
     config: xberg::ExtractionConfig,
     transport: String,
-    #[cfg(feature = "mcp-http")] host: String,
-    #[cfg(feature = "mcp-http")] port: u16,
-    #[cfg(feature = "mcp-http")] allowed_hosts: Vec<String>,
-    #[cfg(not(feature = "mcp-http"))] _host: String,
-    #[cfg(not(feature = "mcp-http"))] _port: u16,
-    #[cfg(not(feature = "mcp-http"))] _allowed_hosts: Vec<String>,
+    http_options: McpTransportOptions,
 ) -> Result<()> {
     tracing::debug!("Starting Xberg MCP server with transport: {}", transport);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -91,6 +100,11 @@ pub fn mcp_command(
 
             #[cfg(feature = "mcp-http")]
             {
+                let McpTransportOptions {
+                    host,
+                    port,
+                    allowed_hosts,
+                } = http_options;
                 tracing::debug!("Starting MCP server on http://{}:{}", host, port);
                 rt.block_on(xberg::mcp::start_mcp_server_http_with_config(
                     &host,

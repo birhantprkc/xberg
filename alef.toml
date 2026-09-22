@@ -600,18 +600,6 @@ traineddata = "traineddata"
 "crates/xberg-candle-ocr/src/models/paddleocr_vl/engine.rs" = ["function-too-long"]
 "crates/xberg-candle-ocr/src/models/paddleocr_vl/model.rs" = ["file-too-long", "function-too-long", "nesting-too-deep"]
 "crates/xberg-candle-ocr/src/models/trocr.rs" = ["function-too-long"]
-"crates/xberg-cli/src/commands/cache.rs" = ["cyclomatic-complexity", "function-too-long", "too-many-parameters"]
-"crates/xberg-cli/src/commands/doctor.rs" = ["function-too-long"]
-"crates/xberg-cli/src/commands/embed.rs" = ["function-too-long", "too-many-parameters"]
-"crates/xberg-cli/src/commands/extract.rs" = ["file-too-long"]
-"crates/xberg-cli/src/commands/overrides.rs" = [
-  "cyclomatic-complexity",
-  "file-too-long",
-  "function-too-long",
-  "type-too-long",
-]
-"crates/xberg-cli/src/commands/server.rs" = ["too-many-parameters"]
-"crates/xberg-cli/src/commands/tree_sitter.rs" = ["function-too-long"]
 "crates/xberg-cli/src/main.rs" = ["file-too-long", "function-too-long", "type-too-long"]
 "crates/xberg-cli/tests/commands_test.rs" = ["file-too-long"]
 "crates/xberg-gliner/src/candle/decode.rs" = ["nesting-too-deep", "too-many-parameters"]

@@ -44,6 +44,132 @@ fn resolve_pack_config(
     }
 }
 
+/// Outcome of a tree-sitter grammar download attempt: how many grammars were newly
+/// downloaded (0 for a group download, which doesn't report a count) and a human-readable
+/// description of what was requested.
+struct DownloadOutcome {
+    count: usize,
+    description: String,
+}
+
+/// Point the tree-sitter-language-pack crate at a custom cache directory, if one was
+/// resolved from CLI args or the config file.
+fn configure_pack_cache_dir(effective_cache_dir: Option<&PathBuf>) -> Result<()> {
+    let Some(dir) = effective_cache_dir else {
+        return Ok(());
+    };
+    let config = tree_sitter_language_pack::PackConfig {
+        cache_dir: Some(dir.clone()),
+        languages: None,
+        groups: None,
+    };
+    tree_sitter_language_pack::configure(&config).context("Failed to configure custom cache directory")
+}
+
+/// Download the grammars selected by `pack_config`/`all`, in the same precedence order as
+/// the CLI flags: `--all` first, then `--groups`, then explicit languages.
+fn download_selected_grammars(
+    pack_config: &tree_sitter_language_pack::PackConfig,
+    all: bool,
+    effective_cache_dir: Option<&PathBuf>,
+) -> Result<DownloadOutcome> {
+    if all {
+        let count = tree_sitter_language_pack::download_all().context("Failed to download all tree-sitter grammars")?;
+        return Ok(DownloadOutcome {
+            count,
+            description: "all available languages".to_string(),
+        });
+    }
+    if let Some(group_list) = &pack_config.groups {
+        let config = tree_sitter_language_pack::PackConfig {
+            cache_dir: effective_cache_dir.cloned(),
+            languages: None,
+            groups: Some(group_list.clone()),
+        };
+        tree_sitter_language_pack::init(&config).context("Failed to download tree-sitter grammar groups")?;
+        return Ok(DownloadOutcome {
+            count: 0,
+            description: format!("groups: {}", group_list.join(", ")),
+        });
+    }
+    if let Some(langs) = &pack_config.languages {
+        let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+        let count = tree_sitter_language_pack::download(&refs).context("Failed to download tree-sitter grammars")?;
+        return Ok(DownloadOutcome {
+            count,
+            description: format!("languages: {}", langs.join(", ")),
+        });
+    }
+    anyhow::bail!(
+        "No languages specified. Use language names, --all, --groups, or --from-config \
+         (with tree_sitter.languages/groups set in the xberg config file)."
+    );
+}
+
+/// Print the download outcome in the requested wire format.
+#[expect(
+    clippy::print_stdout,
+    reason = "tree-sitter download summary is the command's stdout result output"
+)]
+fn print_download_summary(
+    format: WireFormat,
+    pack_config: &tree_sitter_language_pack::PackConfig,
+    all: bool,
+    outcome: &DownloadOutcome,
+    effective_cache_dir: Option<&PathBuf>,
+) -> Result<()> {
+    match format {
+        WireFormat::Text => {
+            println!("{}", style::header("Tree-sitter Download"));
+            println!("{}", style::dim("===================="));
+            println!("{} {}", style::label("Requested:"), outcome.description);
+            if pack_config.groups.is_none() || all || pack_config.languages.is_some() {
+                println!(
+                    "{} {}",
+                    style::label("Newly downloaded:"),
+                    style::success(&outcome.count.to_string())
+                );
+            }
+            if let Some(dir) = effective_cache_dir {
+                println!(
+                    "{} {}",
+                    style::label("Cache directory:"),
+                    style::success(&dir.display().to_string())
+                );
+            }
+            println!("{}", style::success("Done"));
+        }
+        WireFormat::Json => {
+            let mut output = json!({
+                "requested": outcome.description,
+                "newly_downloaded": outcome.count,
+            });
+            if let Some(dir) = effective_cache_dir {
+                output["cache_dir"] = json!(dir.to_string_lossy());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).context("Failed to serialize download results to JSON")?
+            );
+        }
+        WireFormat::Toon => {
+            let mut output = json!({
+                "requested": outcome.description,
+                "newly_downloaded": outcome.count,
+            });
+            if let Some(dir) = effective_cache_dir {
+                output["cache_dir"] = json!(dir.to_string_lossy());
+            }
+            println!(
+                "{}",
+                serde_toon::to_string(&output).context("Failed to serialize download results to TOON")?
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Execute the tree-sitter download command.
 ///
 /// Downloads tree-sitter grammar parsers based on the provided arguments:
@@ -52,10 +178,6 @@ fn resolve_pack_config(
 /// - Language groups (--groups)
 /// - The auto-discovered/`--config` xberg config's `[tree_sitter]` section
 ///   (--from-config), for `cache_dir`/`languages`/`groups`
-#[expect(
-    clippy::print_stdout,
-    reason = "tree-sitter download summary is the command's stdout result output"
-)]
 pub fn download_command(
     languages: Vec<String>,
     all: bool,
@@ -78,91 +200,11 @@ pub fn download_command(
     let pack_config = resolve_pack_config(cache_dir.clone(), &languages, groups.as_deref(), file_config.as_ref());
     let effective_cache_dir = pack_config.cache_dir.clone();
 
-    if let Some(ref dir) = effective_cache_dir {
-        let config = tree_sitter_language_pack::PackConfig {
-            cache_dir: Some(dir.clone()),
-            languages: None,
-            groups: None,
-        };
-        tree_sitter_language_pack::configure(&config).context("Failed to configure custom cache directory")?;
-    }
+    configure_pack_cache_dir(effective_cache_dir.as_ref())?;
 
-    let count: usize;
-    let description: String;
+    let outcome = download_selected_grammars(&pack_config, all, effective_cache_dir.as_ref())?;
 
-    if all {
-        count = tree_sitter_language_pack::download_all().context("Failed to download all tree-sitter grammars")?;
-        description = "all available languages".to_string();
-    } else if let Some(ref group_list) = pack_config.groups {
-        let config = tree_sitter_language_pack::PackConfig {
-            cache_dir: effective_cache_dir.clone(),
-            languages: None,
-            groups: Some(group_list.clone()),
-        };
-        tree_sitter_language_pack::init(&config).context("Failed to download tree-sitter grammar groups")?;
-        count = 0;
-        description = format!("groups: {}", group_list.join(", "));
-    } else if let Some(ref langs) = pack_config.languages {
-        let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
-        count = tree_sitter_language_pack::download(&refs).context("Failed to download tree-sitter grammars")?;
-        description = format!("languages: {}", langs.join(", "));
-    } else {
-        anyhow::bail!(
-            "No languages specified. Use language names, --all, --groups, or --from-config \
-             (with tree_sitter.languages/groups set in the xberg config file)."
-        );
-    }
-
-    match format {
-        WireFormat::Text => {
-            println!("{}", style::header("Tree-sitter Download"));
-            println!("{}", style::dim("===================="));
-            println!("{} {}", style::label("Requested:"), description);
-            if pack_config.groups.is_none() || all || pack_config.languages.is_some() {
-                println!(
-                    "{} {}",
-                    style::label("Newly downloaded:"),
-                    style::success(&count.to_string())
-                );
-            }
-            if let Some(ref dir) = effective_cache_dir {
-                println!(
-                    "{} {}",
-                    style::label("Cache directory:"),
-                    style::success(&dir.display().to_string())
-                );
-            }
-            println!("{}", style::success("Done"));
-        }
-        WireFormat::Json => {
-            let mut output = json!({
-                "requested": description,
-                "newly_downloaded": count,
-            });
-            if let Some(ref dir) = effective_cache_dir {
-                output["cache_dir"] = json!(dir.to_string_lossy());
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).context("Failed to serialize download results to JSON")?
-            );
-        }
-        WireFormat::Toon => {
-            let mut output = json!({
-                "requested": description,
-                "newly_downloaded": count,
-            });
-            if let Some(ref dir) = effective_cache_dir {
-                output["cache_dir"] = json!(dir.to_string_lossy());
-            }
-            println!(
-                "{}",
-                serde_toon::to_string(&output).context("Failed to serialize download results to TOON")?
-            );
-        }
-    }
-
-    Ok(())
+    print_download_summary(format, &pack_config, all, &outcome, effective_cache_dir.as_ref())
 }
 
 /// Execute the tree-sitter list command.
