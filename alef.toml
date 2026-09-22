@@ -600,6 +600,7 @@ traineddata = "traineddata"
 "crates/xberg-candle-ocr/src/models/paddleocr_vl/engine.rs" = ["function-too-long"]
 "crates/xberg-candle-ocr/src/models/paddleocr_vl/model.rs" = ["file-too-long", "function-too-long", "nesting-too-deep"]
 "crates/xberg-candle-ocr/src/models/trocr.rs" = ["function-too-long"]
+"crates/xberg-cli/src/commands/overrides/mod.rs" = ["type-too-long"]
 "crates/xberg-cli/src/main.rs" = ["file-too-long", "function-too-long", "type-too-long"]
 "crates/xberg-cli/tests/commands_test.rs" = ["file-too-long"]
 "crates/xberg-gliner/src/candle/decode.rs" = ["nesting-too-deep", "too-many-parameters"]
