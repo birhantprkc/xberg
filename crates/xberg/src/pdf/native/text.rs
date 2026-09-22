@@ -1449,6 +1449,20 @@ fn page_low_occupancy_corridors(
     corridors
 }
 
+/// True if `line` carries an inked span that starts on or after `far_wall` --
+/// text following a label on the label's own line, rather than unrelated content
+/// in a neighbouring column across the corridor.
+///
+/// GH#1742: a hanging label always has its clause text on the *same visual line*,
+/// immediately after the label-to-text indent. A table's edge column has nothing
+/// there -- the row's other cells sit on the label side of the corridor, and
+/// whatever text appears past the corridor on that same `y` belongs to an
+/// unrelated, unpaired line in the opposite column. ~keep
+fn line_has_far_side_successor(spans: &[xberg_native_pdf::layout::TextSpan], line: &SpanLine, far_wall: f32) -> bool {
+    line.iter()
+        .any(|&index| span_has_ink(&spans[index]) && spans[index].bbox.left() >= far_wall)
+}
+
 /// True if `corridor` is a hanging-label indent rather than a column gutter:
 /// its left wall is a stack of narrow spans (at most `max_label_width` wide)
 /// that share a left edge, `MIN_DENSE_COLUMN_SPLIT_LINES` or more of them --
@@ -1460,6 +1474,15 @@ fn page_low_occupancy_corridors(
 /// wall. Only the left wall is examined, because a hanging label always
 /// precedes the text it labels; the *right* wall of a real gutter is very
 /// often the right column's own label stack, which must not disqualify it.
+///
+/// GH#1742: a narrow left-aligned stack alone is not enough -- a multi-column
+/// table's edge column (the reporter's `ignotum` stack, reproducer p1's own last
+/// column) is exactly that shape too, but labels *nothing*: no inked span
+/// follows on the far side of the corridor on the same line, because the row's
+/// remaining cells sit on the label side and whatever text starts past the
+/// corridor belongs to an unrelated, unpaired line. `line_has_far_side_successor`
+/// requires the label's own successor text to be present before a line counts
+/// toward the population, which a table's edge cells never satisfy. ~keep
 fn corridor_is_hanging_label_indent(
     spans: &[xberg_native_pdf::layout::TextSpan],
     lines: &[SpanLine],
@@ -1469,6 +1492,7 @@ fn corridor_is_hanging_label_indent(
     let wall = corridor.0;
     let mut left_edges: Vec<f32> = lines
         .iter()
+        .filter(|line| line_has_far_side_successor(spans, line, corridor.1))
         .filter_map(|line| {
             line.iter()
                 .filter_map(|&index| {
@@ -4609,6 +4633,311 @@ mod tests {
             expected.iter().map(String::as_str).collect::<Vec<_>>(),
             "the table column must precede the prose column, with the page number \
              trailing as its own boundary line"
+        );
+    }
+
+    const GH1742_P1_PAGE_WIDTH: f32 = 595.28;
+
+    /// GH#1742 real reproducer, page 1, transcribed verbatim (one span per
+    /// `PdfDocument::extract_spans` entry, `x`/`y`/`width`/`height` unmodified) from
+    /// `/1742.pdf` -- not committed; see the issue's own geometry table. A five-column
+    /// table (`Pars`/`Ex anno`/`Valor` plus a narrow fifth column at `x=262`, right
+    /// edges up to `286.90`, matching the issue's `ignotum` stack) fills the lower half
+    /// of the left column; a centred page number (`"1"`, `x=295.42..299.87`) sits in
+    /// the gutter. Before fix #2, `corridor_is_hanging_label_indent` reads the fifth
+    /// column's narrow, left-aligned cells as a hanging-label stack (nothing
+    /// distinguishes them from a real clause number) and the widened corridor search
+    /// refuses the true gutter, leaving `detect_split_x`'s polluted median (inside the
+    /// table) as the final split.
+    fn gh1742_p1_real_reproducer_spans() -> Vec<TextSpan> {
+        #[rustfmt::skip]
+        let spans = vec![
+            span_with_width("2.1. Lorem ipsum dolor sit amet", 38.00, 770.00, 133.05, 9.50, 9.50),
+            span_with_width("incididunt ut labore et dolore magna aliqua enim ad minim veniam", 38.00, 759.55, 247.55, 8.50, 8.50),
+            span_with_width("ut labore et dolore magna aliqua enim ad minim veniam quis", 38.00, 749.10, 227.23, 8.50, 8.50),
+            span_with_width("labore et dolore magna aliqua enim ad minim veniam quis nostrud", 38.00, 738.65, 248.49, 8.50, 8.50),
+            span_with_width("et dolore magna aliqua enim ad minim veniam quis nostrud", 38.00, 728.20, 222.50, 8.50, 8.50),
+            span_with_width("dolore magna aliqua enim ad minim veniam quis nostrud", 38.00, 717.75, 213.05, 8.50, 8.50),
+            span_with_width("magna aliqua enim ad minim veniam quis nostrud exercitation", 38.00, 707.30, 232.89, 8.50, 8.50),
+            span_with_width("aliqua enim ad minim veniam quis nostrud exercitation ullamco", 38.00, 696.85, 236.19, 8.50, 8.50),
+            span_with_width("enim ad minim veniam quis nostrud exercitation ullamco laboris", 38.00, 686.40, 238.54, 8.50, 8.50),
+            span_with_width("ut labore et dolore magna aliqua enim ad minim veniam quis", 307.00, 686.40, 227.23, 8.50, 8.50),
+            span_with_width("labore et dolore magna aliqua enim ad minim veniam quis nostrud", 307.00, 675.95, 248.49, 8.50, 8.50),
+            span_with_width("2.2. Consectetur adipiscing elit", 38.00, 665.50, 129.36, 9.50, 9.50),
+            span_with_width("velit esse cillum fugiat nulla pariatur excepteur sint occaecat", 38.00, 655.05, 225.81, 8.50, 8.50),
+            span_with_width("esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat", 38.00, 644.60, 245.19, 8.50, 8.50),
+            span_with_width("cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non", 38.00, 634.15, 241.42, 8.50, 8.50),
+            span_with_width("fugiat nulla pariatur excepteur sint occaecat cupidatat non proident", 38.00, 623.70, 250.41, 8.50, 8.50),
+            span_with_width("nulla pariatur excepteur sint occaecat cupidatat non proident sunt", 38.00, 613.25, 245.68, 8.50, 8.50),
+            span_with_width("pariatur excepteur sint occaecat cupidatat non proident sunt culpa", 38.00, 602.80, 248.05, 8.50, 8.50),
+            span_with_width("minim veniam quis nostrud exercitation ullamco laboris nisi aliquip", 307.00, 602.80, 247.99, 8.50, 8.50),
+            span_with_width("veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 307.00, 592.35, 246.12, 8.50, 8.50),
+            span_with_width("Table 1", 38.00, 581.90, 23.34, 7.00, 7.00),
+            span_with_width("Lorem ipsum dolor sit amet in consectetur adipiscing elit.", 38.00, 573.85, 175.84, 7.00, 7.00),
+            span_with_width("Pars", 92.00, 563.80, 14.39, 7.00, 7.00),
+            span_with_width("Ex anno", 140.00, 563.80, 25.68, 7.00, 7.00),
+            span_with_width("Valor", 185.00, 563.80, 16.34, 7.00, 7.00),
+            span_with_width("Dolor", 44.00, 555.75, 16.72, 7.00, 7.00),
+            span_with_width("91%", 92.00, 555.75, 14.01, 7.00, 7.00),
+            span_with_width("Anno 1983", 140.00, 555.75, 33.86, 7.00, 7.00),
+            span_with_width("Praedictum", 185.00, 555.75, 35.40, 7.00, 7.00),
+            span_with_width("Sit amet", 44.00, 547.70, 25.68, 7.00, 7.00),
+            span_with_width("80.5%", 92.00, 547.70, 19.85, 7.00, 7.00),
+            span_with_width("Anno 2023", 140.00, 547.70, 33.86, 7.00, 7.00),
+            span_with_width("Exclusio", 185.00, 547.70, 26.06, 7.00, 7.00),
+            span_with_width("Lorem", 44.00, 539.65, 19.84, 7.00, 7.00),
+            span_with_width("40-70%", 92.00, 539.65, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2016", 140.00, 539.65, 33.86, 7.00, 7.00),
+            span_with_width("Conflictus", 185.00, 539.65, 30.73, 7.00, 7.00),
+            span_with_width("Ipsum", 44.00, 531.60, 19.06, 7.00, 7.00),
+            span_with_width("10-20%", 92.00, 531.60, 24.12, 7.00, 7.00),
+            span_with_width("Nulla", 140.00, 531.60, 15.95, 7.00, 7.00),
+            span_with_width("Nullum", 185.00, 531.60, 21.78, 7.00, 7.00),
+            span_with_width("Magna", 44.00, 523.55, 21.40, 7.00, 7.00),
+            span_with_width("10-15%", 92.00, 523.55, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2001", 140.00, 523.55, 33.86, 7.00, 7.00),
+            span_with_width("Peior", 185.00, 523.55, 16.34, 7.00, 7.00),
+            span_with_width("Aliqua", 44.00, 515.50, 19.45, 7.00, 7.00),
+            span_with_width("50-79%", 92.00, 515.50, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2019", 140.00, 515.50, 33.86, 7.00, 7.00),
+            span_with_width("Melior", 185.00, 515.50, 19.05, 7.00, 7.00),
+            span_with_width("Veniam", 44.00, 507.45, 23.73, 7.00, 7.00),
+            span_with_width("5-55%", 92.00, 507.45, 20.23, 7.00, 7.00),
+            span_with_width("Anno 1983", 140.00, 507.45, 33.86, 7.00, 7.00),
+            span_with_width("Praedictum", 185.00, 507.45, 35.40, 7.00, 7.00),
+            span_with_width("Nostrud", 44.00, 499.40, 24.51, 7.00, 7.00),
+            span_with_width("62%", 92.00, 499.40, 14.01, 7.00, 7.00),
+            span_with_width("Anno 2023", 140.00, 499.40, 33.86, 7.00, 7.00),
+            span_with_width("Exclusio", 185.00, 499.40, 26.06, 7.00, 7.00),
+            span_with_width("Ullamco", 44.00, 491.35, 25.28, 7.00, 7.00),
+            span_with_width("33%", 92.00, 491.35, 14.01, 7.00, 7.00),
+            span_with_width("Anno 2016", 140.00, 491.35, 33.86, 7.00, 7.00),
+            span_with_width("Conflictus", 185.00, 491.35, 30.73, 7.00, 7.00),
+            span_with_width("Laboris", 44.00, 483.30, 22.95, 7.00, 7.00),
+            span_with_width("17%", 92.00, 483.30, 14.01, 7.00, 7.00),
+            span_with_width("Nulla", 140.00, 483.30, 15.95, 7.00, 7.00),
+            span_with_width("Nullum", 185.00, 483.30, 21.78, 7.00, 7.00),
+            span_with_width("Nisi", 44.00, 475.25, 11.66, 7.00, 7.00),
+            span_with_width("91%", 92.00, 475.25, 14.01, 7.00, 7.00),
+            span_with_width("Anno 2001", 140.00, 475.25, 33.86, 7.00, 7.00),
+            span_with_width("Peior", 185.00, 475.25, 16.34, 7.00, 7.00),
+            span_with_width("Aliquip", 44.00, 467.20, 21.01, 7.00, 7.00),
+            span_with_width("80.5%", 92.00, 467.20, 19.85, 7.00, 7.00),
+            span_with_width("Anno 2019", 140.00, 467.20, 33.86, 7.00, 7.00),
+            span_with_width("Melior", 185.00, 467.20, 19.05, 7.00, 7.00),
+            span_with_width("Commodo", 44.00, 459.15, 32.28, 7.00, 7.00),
+            span_with_width("40-70%", 92.00, 459.15, 24.12, 7.00, 7.00),
+            span_with_width("Anno 1983", 140.00, 459.15, 33.86, 7.00, 7.00),
+            span_with_width("Praedictum", 185.00, 459.15, 35.40, 7.00, 7.00),
+            span_with_width("Duis", 44.00, 451.10, 14.00, 7.00, 7.00),
+            span_with_width("10-20%", 92.00, 451.10, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2023", 140.00, 451.10, 33.86, 7.00, 7.00),
+            span_with_width("Exclusio", 185.00, 451.10, 26.06, 7.00, 7.00),
+            span_with_width("Aute", 44.00, 443.05, 14.40, 7.00, 7.00),
+            span_with_width("10-15%", 92.00, 443.05, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2016", 140.00, 443.05, 33.86, 7.00, 7.00),
+            span_with_width("Conflictus", 185.00, 443.05, 30.73, 7.00, 7.00),
+            span_with_width("Irure", 44.00, 435.00, 14.39, 7.00, 7.00),
+            span_with_width("50-79%", 92.00, 435.00, 24.12, 7.00, 7.00),
+            span_with_width("Nulla", 140.00, 435.00, 15.95, 7.00, 7.00),
+            span_with_width("Nullum", 185.00, 435.00, 21.78, 7.00, 7.00),
+            span_with_width("Velit", 44.00, 426.95, 13.62, 7.00, 7.00),
+            span_with_width("5-55%", 92.00, 426.95, 20.23, 7.00, 7.00),
+            span_with_width("Anno 2001", 140.00, 426.95, 33.86, 7.00, 7.00),
+            span_with_width("Peior", 185.00, 426.95, 16.34, 7.00, 7.00),
+            span_with_width("Esse", 44.00, 418.90, 15.56, 7.00, 7.00),
+            span_with_width("62%", 92.00, 418.90, 14.01, 7.00, 7.00),
+            span_with_width("Anno 2019", 140.00, 418.90, 33.86, 7.00, 7.00),
+            span_with_width("Melior", 185.00, 418.90, 19.05, 7.00, 7.00),
+            span_with_width("Cillum", 44.00, 410.85, 19.44, 7.00, 7.00),
+            span_with_width("33%", 92.00, 410.85, 14.01, 7.00, 7.00),
+            span_with_width("Anno 1983", 140.00, 410.85, 33.86, 7.00, 7.00),
+            span_with_width("Praedictum", 185.00, 410.85, 35.40, 7.00, 7.00),
+            span_with_width("Fugiat", 44.00, 402.80, 19.45, 7.00, 7.00),
+            span_with_width("17%", 92.00, 402.80, 14.01, 7.00, 7.00),
+            span_with_width("Anno 2023", 140.00, 402.80, 33.86, 7.00, 7.00),
+            span_with_width("Exclusio", 185.00, 402.80, 26.06, 7.00, 7.00),
+            span_with_width("Nulla", 44.00, 394.75, 15.95, 7.00, 7.00),
+            span_with_width("91%", 92.00, 394.75, 14.01, 7.00, 7.00),
+            span_with_width("Anno 2016", 140.00, 394.75, 33.86, 7.00, 7.00),
+            span_with_width("Conflictus", 185.00, 394.75, 30.73, 7.00, 7.00),
+            span_with_width("Sint", 44.00, 386.70, 12.06, 7.00, 7.00),
+            span_with_width("80.5%", 92.00, 386.70, 19.85, 7.00, 7.00),
+            span_with_width("Nulla", 140.00, 386.70, 15.95, 7.00, 7.00),
+            span_with_width("Nullum", 185.00, 386.70, 21.78, 7.00, 7.00),
+            span_with_width("Culpa", 44.00, 378.65, 18.28, 7.00, 7.00),
+            span_with_width("40-70%", 92.00, 378.65, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2001", 140.00, 378.65, 33.86, 7.00, 7.00),
+            span_with_width("Peior", 185.00, 378.65, 16.34, 7.00, 7.00),
+            span_with_width("Officia", 44.00, 370.60, 19.84, 7.00, 7.00),
+            span_with_width("10-20%", 92.00, 370.60, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2019", 140.00, 370.60, 33.86, 7.00, 7.00),
+            span_with_width("Melior", 185.00, 370.60, 19.05, 7.00, 7.00),
+            span_with_width("Mollit", 44.00, 362.55, 16.33, 7.00, 7.00),
+            span_with_width("10-15%", 92.00, 362.55, 24.12, 7.00, 7.00),
+            span_with_width("Anno 1983", 140.00, 362.55, 33.86, 7.00, 7.00),
+            span_with_width("Praedictum", 185.00, 362.55, 35.40, 7.00, 7.00),
+            span_with_width("Anim", 44.00, 354.50, 15.95, 7.00, 7.00),
+            span_with_width("50-79%", 92.00, 354.50, 24.12, 7.00, 7.00),
+            span_with_width("Anno 2023", 140.00, 354.50, 33.86, 7.00, 7.00),
+            span_with_width("Exclusio", 185.00, 354.50, 26.06, 7.00, 7.00),
+            span_with_width("2.3. Sed do eiusmod tempor", 307.00, 770.00, 119.34, 9.50, 9.50),
+            span_with_width("adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore", 307.00, 759.55, 251.34, 8.50, 8.50),
+            span_with_width("elit sed do eiusmod tempor incididunt ut labore et dolore magna", 307.00, 749.10, 239.53, 8.50, 8.50),
+            span_with_width("sed do eiusmod tempor incididunt ut labore et dolore magna aliqua", 307.00, 738.65, 251.34, 8.50, 8.50),
+            span_with_width("do eiusmod tempor incididunt ut labore et dolore magna aliqua", 307.00, 728.20, 235.28, 8.50, 8.50),
+            span_with_width("eiusmod tempor incididunt ut labore et dolore magna aliqua enim", 307.00, 717.75, 244.25, 8.50, 8.50),
+            span_with_width("tempor incididunt ut labore et dolore magna aliqua enim ad minim", 307.00, 707.30, 246.60, 8.50, 8.50),
+            span_with_width("incididunt ut labore et dolore magna aliqua enim ad minim veniam", 307.00, 696.85, 247.55, 8.50, 8.50),
+            span_with_width("et dolore magna aliqua enim ad minim veniam quis nostrud", 307.00, 665.50, 222.50, 8.50, 8.50),
+            span_with_width("dolore magna aliqua enim ad minim veniam quis nostrud", 307.00, 655.05, 213.05, 8.50, 8.50),
+            span_with_width("magna aliqua enim ad minim veniam quis nostrud exercitation", 307.00, 644.60, 232.89, 8.50, 8.50),
+            span_with_width("aliqua enim ad minim veniam quis nostrud exercitation ullamco", 307.00, 634.15, 236.19, 8.50, 8.50),
+            span_with_width("enim ad minim veniam quis nostrud exercitation ullamco laboris", 307.00, 623.70, 238.54, 8.50, 8.50),
+            span_with_width("ad minim veniam quis nostrud exercitation ullamco laboris nisi", 307.00, 613.25, 232.87, 8.50, 8.50),
+            span_with_width("quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 307.00, 581.90, 216.36, 8.50, 8.50),
+            span_with_width("nostrud exercitation ullamco laboris nisi aliquip ex ea commodo", 307.00, 571.45, 238.08, 8.50, 8.50),
+            span_with_width("Cura", 262.00, 563.80, 15.17, 7.00, 7.00),
+            span_with_width("exercitation ullamco laboris nisi aliquip ex ea commodo consequat", 307.00, 561.00, 248.96, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 555.75, 24.90, 7.00, 7.00),
+            span_with_width("ullamco laboris nisi aliquip ex ea commodo consequat duis aute", 307.00, 550.55, 239.99, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 547.70, 24.90, 7.00, 7.00),
+            span_with_width("nullum", 262.00, 539.65, 20.62, 7.00, 7.00),
+            span_with_width("laboris nisi aliquip ex ea commodo consequat duis aute irure in", 307.00, 540.10, 236.68, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 531.60, 24.90, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo consequat duis aute irure in", 307.00, 529.65, 209.29, 8.50, 8.50),
+            span_with_width("peius", 262.00, 523.55, 16.73, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in reprehenderit", 307.00, 519.20, 247.09, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 515.50, 24.90, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure in reprehenderit", 307.00, 508.75, 220.16, 8.50, 8.50),
+            span_with_width("melius", 262.00, 507.45, 20.22, 7.00, 7.00),
+            span_with_width("ignotum", 262.00, 499.40, 24.90, 7.00, 7.00),
+            span_with_width("ea commodo consequat duis aute irure in reprehenderit voluptate", 307.00, 498.30, 245.68, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 491.35, 24.90, 7.00, 7.00),
+            span_with_width("nullum", 262.00, 483.30, 20.62, 7.00, 7.00),
+            span_with_width("2.4. Ut labore et dolore magna", 307.00, 477.40, 128.32, 9.50, 9.50),
+            span_with_width("ignotum", 262.00, 475.25, 24.90, 7.00, 7.00),
+            span_with_width("peius", 262.00, 467.20, 16.73, 7.00, 7.00),
+            span_with_width("excepteur sint occaecat cupidatat non proident sunt culpa qui", 307.00, 466.95, 230.57, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 459.15, 24.90, 7.00, 7.00),
+            span_with_width("sint occaecat cupidatat non proident sunt culpa qui officia deserunt", 307.00, 456.50, 250.89, 8.50, 8.50),
+            span_with_width("melius", 262.00, 451.10, 20.22, 7.00, 7.00),
+            span_with_width("occaecat cupidatat non proident sunt culpa qui officia deserunt", 307.00, 446.05, 235.30, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 443.05, 24.90, 7.00, 7.00),
+            span_with_width("ignotum", 262.00, 435.00, 24.90, 7.00, 7.00),
+            span_with_width("cupidatat non proident sunt culpa qui officia deserunt mollit anim id", 307.00, 435.60, 250.87, 8.50, 8.50),
+            span_with_width("nullum", 262.00, 426.95, 20.62, 7.00, 7.00),
+            span_with_width("non proident sunt culpa qui officia deserunt mollit anim id est", 307.00, 425.15, 227.72, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 418.90, 24.90, 7.00, 7.00),
+            span_with_width("proident sunt culpa qui officia deserunt mollit anim id est laborum", 307.00, 414.70, 244.24, 8.50, 8.50),
+            span_with_width("peius", 262.00, 410.85, 16.73, 7.00, 7.00),
+            span_with_width("sunt culpa qui officia deserunt mollit anim id est laborum lorem", 307.00, 404.25, 234.78, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 402.80, 24.90, 7.00, 7.00),
+            span_with_width("melius", 262.00, 394.75, 20.22, 7.00, 7.00),
+            span_with_width("culpa qui officia deserunt mollit anim id est laborum lorem ipsum", 307.00, 393.80, 241.38, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 386.70, 24.90, 7.00, 7.00),
+            span_with_width("qui officia deserunt mollit anim id est laborum lorem ipsum dolor sit", 307.00, 383.35, 250.83, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 378.65, 24.90, 7.00, 7.00),
+            span_with_width("nullum", 262.00, 370.60, 20.62, 7.00, 7.00),
+            span_with_width("officia deserunt mollit anim id est laborum lorem ipsum dolor sit", 307.00, 372.90, 237.12, 8.50, 8.50),
+            span_with_width("ignotum", 262.00, 362.55, 24.90, 7.00, 7.00),
+            span_with_width("deserunt mollit anim id est laborum lorem ipsum dolor sit amet", 307.00, 362.45, 233.82, 8.50, 8.50),
+            span_with_width("peius", 262.00, 354.50, 16.73, 7.00, 7.00),
+            span_with_width("mollit anim id est laborum lorem ipsum dolor sit amet consectetur", 307.00, 352.00, 244.68, 8.50, 8.50),
+            span_with_width("anim id est laborum lorem ipsum dolor sit amet consectetur", 307.00, 341.55, 222.49, 8.50, 8.50),
+            span_with_width("id est laborum lorem ipsum dolor sit amet consectetur adipiscing", 307.00, 331.10, 241.86, 8.50, 8.50),
+            span_with_width("est laborum lorem ipsum dolor sit amet consectetur adipiscing elit", 307.00, 320.65, 246.11, 8.50, 8.50),
+            span_with_width("laborum lorem ipsum dolor sit amet consectetur adipiscing elit sed", 307.00, 310.20, 248.47, 8.50, 8.50),
+            span_with_width("lorem ipsum dolor sit amet consectetur adipiscing elit sed do", 307.00, 299.75, 227.22, 8.50, 8.50),
+            span_with_width("ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod", 307.00, 289.30, 238.09, 8.50, 8.50),
+            span_with_width("dolor sit amet consectetur adipiscing elit sed do eiusmod tempor", 307.00, 278.85, 241.88, 8.50, 8.50),
+            span_with_width("sit amet consectetur adipiscing elit sed do eiusmod tempor", 307.00, 268.40, 220.62, 8.50, 8.50),
+            span_with_width("amet consectetur adipiscing elit sed do eiusmod tempor incididunt", 307.00, 257.95, 248.02, 8.50, 8.50),
+            span_with_width("consectetur adipiscing elit sed do eiusmod tempor incididunt ut", 307.00, 247.50, 236.21, 8.50, 8.50),
+            span_with_width("adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore", 307.00, 237.05, 251.34, 8.50, 8.50),
+            span_with_width("elit sed do eiusmod tempor incididunt ut labore et dolore magna", 307.00, 226.60, 239.53, 8.50, 8.50),
+            span_with_width("sed do eiusmod tempor incididunt ut labore et dolore magna aliqua", 307.00, 216.15, 251.34, 8.50, 8.50),
+            span_with_width("do eiusmod tempor incididunt ut labore et dolore magna aliqua", 307.00, 205.70, 235.28, 8.50, 8.50),
+            span_with_width("eiusmod tempor incididunt ut labore et dolore magna aliqua enim", 307.00, 195.25, 244.25, 8.50, 8.50),
+            span_with_width("tempor incididunt ut labore et dolore magna aliqua enim ad minim", 307.00, 184.80, 246.60, 8.50, 8.50),
+            span_with_width("incididunt ut labore et dolore magna aliqua enim ad minim veniam", 307.00, 174.35, 247.55, 8.50, 8.50),
+            span_with_width("1", 295.42, 30.00, 4.45, 8.00, 8.00),
+        ];
+        spans
+    }
+
+    /// GH#1742: the fifth table column's narrow cells (`x=262`, right edge `286.90`)
+    /// must not be read as a hanging-label stack -- nothing follows any of them on
+    /// their own line past the corridor, unlike a real clause number.
+    #[test]
+    fn corridor_is_hanging_label_indent_rejects_a_table_edge_column_gh1742() {
+        let spans = gh1742_p1_real_reproducer_spans();
+        let order = spans_sorted_top_to_bottom(&spans);
+        let lines = group_into_lines(&spans, &order);
+        let page_width = GH1742_P1_PAGE_WIDTH;
+        let max_label_width = page_width * MAX_DENSE_COLUMN_SPLIT_SNAP_SPAN_FRACTION;
+        // The corridor the widened search actually finds on this page: the true
+        // gutter, narrowed by the centred page number to a single crossing line. ~keep
+        let corridor = (286.899, 307.0);
+
+        assert!(
+            !corridor_is_hanging_label_indent(&spans, &lines, max_label_width, corridor),
+            "a table's edge column must not disqualify the page's real gutter as a \
+             hanging-label indent"
+        );
+    }
+
+    /// GH#1742 end to end (reproducer page 1, verbatim geometry): the page must
+    /// reorder column-major -- the whole left column (prose, then the five-column
+    /// table) followed by the whole right column, with the centred page number left
+    /// as its own trailing boundary line. Before fix #2,
+    /// `reorder_dense_two_column_page` leaves the median inside the table (`~240`),
+    /// every straddling prose line becomes a single-line boundary band, and the page
+    /// comes out with both columns interleaved -- the reported `2.1 … 2.3` weld.
+    #[test]
+    fn dense_two_column_page_reorders_by_column_on_real_reproducer_page_one_gh1742() {
+        let mut spans = gh1742_p1_real_reproducer_spans();
+        let original_order: Vec<String> = spans.iter().map(|span| span.text.clone()).collect();
+
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1742_P1_PAGE_WIDTH),
+            "a two-column page with a five-column table in the lower half of one \
+             column and a page number in the gutter must still be reordered"
+        );
+
+        let reordered: Vec<String> = spans.iter().map(|span| span.text.clone()).collect();
+        assert_ne!(
+            reordered, original_order,
+            "the page must not be left in its original interleaved order"
+        );
+
+        // The left column's first heading must now be immediately followed by the
+        // left column's own next paragraph, not by the right column's `2.3` heading
+        // (the reported weld) or by any table cell.
+        let heading_index = reordered
+            .iter()
+            .position(|text| text == "2.1. Lorem ipsum dolor sit amet")
+            .expect("left column's first heading must survive the reorder");
+        assert_eq!(
+            reordered[heading_index + 1],
+            "incididunt ut labore et dolore magna aliqua enim ad minim veniam",
+            "the left column's heading must be followed by its own paragraph, not by \
+             the right column's heading or a table cell"
+        );
+
+        // The whole left column (ending in the table's last row) must precede the
+        // whole right column (starting with its own heading `2.3.`).
+        let last_table_cell_index = reordered
+            .iter()
+            .position(|text| text == "Anim")
+            .expect("the table's last row must survive the reorder");
+        let right_heading_index = reordered
+            .iter()
+            .position(|text| text == "2.3. Sed do eiusmod tempor")
+            .expect("the right column's heading must survive the reorder");
+        assert!(
+            last_table_cell_index < right_heading_index,
+            "the left column, table included, must be emitted before the right column"
         );
     }
 
