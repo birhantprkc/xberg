@@ -248,17 +248,17 @@ mod build_libwpd {
         fs::write(&path, patched).unwrap_or_else(|error| panic!("writing {path:?}: {error}"));
     }
 
-    pub fn build() {
-        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
-
+    /// Extract and patch the vendored librevenge/libwpd/boost archives into `out_dir`,
+    /// returning `(librevenge_root, libwpd_root, boost_root)`. ~keep
+    fn extract_sources(out_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
         let rev = extract(
-            &out_dir,
+            out_dir,
             "librevenge-0.0.6.tar.gz",
             Some(LIBREVENGE_SHA256),
             &format!("librevenge-{LIBREVENGE_VERSION}"),
         );
         let wpd = extract(
-            &out_dir,
+            out_dir,
             "libwpd-0.10.3.tar.gz",
             Some(LIBWPD_SHA256),
             &format!("libwpd-{LIBWPD_VERSION}"),
@@ -269,7 +269,13 @@ mod build_libwpd {
         // layout `bcp` produces, so the include root is the extracted `boost`
         // dir itself (headers live one level below it, at
         // `boost/boost/version.hpp`).
-        let boost = extract(&out_dir, "boost-subset.tar.gz", Some(BOOST_SUBSET_SHA256), "boost");
+        let boost = extract(out_dir, "boost-subset.tar.gz", Some(BOOST_SUBSET_SHA256), "boost");
+        (rev, wpd, boost)
+    }
+
+    pub fn build() {
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+        let (rev, wpd, boost) = extract_sources(&out_dir);
 
         let mut build = cc::Build::new();
         build
