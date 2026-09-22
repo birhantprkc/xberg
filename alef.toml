@@ -668,7 +668,6 @@ traineddata = "traineddata"
 ]
 "crates/xberg-native-pdf/src/document/spans_text.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/document/tables.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep"]
-"crates/xberg-native-pdf/src/document/tests.rs" = ["file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/document/text_assembly.rs" = [
   "cyclomatic-complexity",
   "file-too-long",

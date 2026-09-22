@@ -160,7 +160,7 @@ fn korean_numeral_hugs_counter_no_spurious_space() {
 }
 
 // NB: the ideograph↔digit split is guarded by the lib unit test
-// `document::tests::test_should_insert_space_ideograph_digit_still_splits` — it
+// `document::tests::spans_text::test_should_insert_space_ideograph_digit_still_splits` — it
 // can't be reproduced here because tightly-adjacent same-line glyphs merge into
 // one span before `should_insert_space` runs. ~keep
 

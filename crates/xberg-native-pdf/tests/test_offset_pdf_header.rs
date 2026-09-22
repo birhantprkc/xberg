@@ -95,7 +95,7 @@ fn garbage_prefix_with_sparse_rootless_trailer() {
 /// the public open path fails root validation on the `/Root`-less trailer
 /// and reconstructs a `/Root`-bearing trailer before `catalog()` runs
 /// (the `catalog()` fallback itself is covered by the unit test
-/// `document::tests::test_catalog_recovers_when_trailer_omits_root`).
+/// `document::tests::catalog::test_catalog_recovers_when_trailer_omits_root`).
 /// Either way the Catalog is discovered by scanning objects for
 /// `/Type /Catalog`, which is what Poppler / PDFium do.
 #[test]
