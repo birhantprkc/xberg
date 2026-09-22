@@ -30,6 +30,17 @@ struct CropProjectionMetadata {
     vertical_rotation_applied: bool,
 }
 
+/// Text boxes, their cropped images, and the projection metadata for each crop, in the order
+/// detection produced them. Named so the detection helper's signature stays readable. ~keep
+type DetectedRegions = (Vec<TextBox>, Vec<image::RgbImage>, Vec<Option<CropProjectionMetadata>>);
+
+/// Crops in recognition order, paired with the pre-rotation copy of every crop the angle
+/// classifier turned, keyed by its index. ~keep
+type RotatedRegions = (
+    Vec<image::RgbImage>,
+    HashMap<usize, ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
+);
+
 impl CropProjectionMetadata {
     fn new(box_points: &[Point], cropped_image: &image::RgbImage) -> Option<Self> {
         let points = box_points.get(..4)?;
@@ -561,7 +572,7 @@ impl PaddleOcrEngine {
         box_score_thresh: f32,
         box_thresh: f32,
         un_clip_ratio: f32,
-    ) -> Result<(Vec<TextBox>, Vec<image::RgbImage>, Vec<Option<CropProjectionMetadata>>), OcrError> {
+    ) -> Result<DetectedRegions, OcrError> {
         tracing::debug!("PaddleOCR: running DB-net text detection");
         let mut text_boxes = self
             .db_net
@@ -673,10 +684,7 @@ impl PaddleOcrEngine {
         angles: &[Angle],
         part_images: Vec<image::RgbImage>,
         angle_rollback: bool,
-    ) -> (
-        Vec<image::RgbImage>,
-        HashMap<usize, ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
-    ) {
+    ) -> RotatedRegions {
         let mut rotated_images: Vec<image::RgbImage> = Vec::with_capacity(part_images.len());
         let mut angle_rollback_records = HashMap::<usize, ImageBuffer<image::Rgb<u8>, Vec<u8>>>::new();
 
