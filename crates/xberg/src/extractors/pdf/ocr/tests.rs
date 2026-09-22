@@ -3538,68 +3538,9 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_cgroup_v2_unlimited_returns_none() {
-        assert_eq!(parse_cgroup_v2("max\n", "12345"), None);
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_cgroup_v2_numeric_saturating_subtraction() {
-        assert_eq!(parse_cgroup_v2("1000000000\n", "250000000\n"), Some(750_000_000));
-        assert_eq!(parse_cgroup_v2("100", "500"), Some(0));
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_cgroup_v2_invalid_returns_none() {
-        assert_eq!(parse_cgroup_v2("not-a-number", "0"), None);
-        assert_eq!(parse_cgroup_v2("1000", "not-a-number"), None);
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_cgroup_v1_unlimited_sentinel_returns_none() {
-        let unlimited = usize::MAX.to_string();
-        assert_eq!(parse_cgroup_v1(&unlimited, "0"), None);
-
-        let just_under = (isize::MAX as usize - 1).to_string();
-        assert!(parse_cgroup_v1(&just_under, "0").is_some());
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_cgroup_v1_numeric_saturating_subtraction() {
-        assert_eq!(parse_cgroup_v1("2000000", "500000"), Some(1_500_000));
-        assert_eq!(parse_cgroup_v1("100", "500"), Some(0));
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_meminfo_available_extracts_kb_and_converts_to_bytes() {
-        let synthetic = "\
-MemTotal:        8000000 kB
-MemFree:         1000000 kB
-MemAvailable:       2048 kB
-Buffers:           50000 kB
-";
-        assert_eq!(parse_meminfo_available(synthetic), Some(2048 * 1024));
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_meminfo_available_missing_field_reads_as_unknown() {
-        let synthetic = "MemTotal: 8000000 kB\nMemFree: 1000000 kB\n";
-        assert_eq!(parse_meminfo_available(synthetic), None);
-    }
-
-    #[cfg(all(feature = "ocr", target_os = "linux"))]
-    #[test]
-    fn parse_meminfo_available_handles_unparseable_value_as_unknown() {
-        let synthetic = "MemAvailable: notanumber kB\n";
-        assert_eq!(parse_meminfo_available(synthetic), None);
-    }
+    // The cgroup and `/proc/meminfo` parsers these tests covered now live beside
+    // the one reader in `core::config::concurrency`, and their coverage moved
+    // with them. `get_available_memory` here is a thin delegation. ~keep
 
     #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
     #[test]
@@ -3913,6 +3854,7 @@ Buffers:           50000 kB
             }),
             concurrency: Some(crate::core::config::ConcurrencyConfig {
                 max_threads: Some(BUDGET),
+                max_concurrent_ocr: None,
             }),
             ..Default::default()
         };
@@ -4072,6 +4014,7 @@ Buffers:           50000 kB
         });
         config.concurrency = Some(crate::core::config::ConcurrencyConfig {
             max_threads: Some(BUDGET),
+            max_concurrent_ocr: None,
         });
 
         extract_mixed_ocr_native("native", &[], &ocr_pages, &pdf, &config, None)

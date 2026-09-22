@@ -2715,82 +2715,16 @@ pub(super) fn estimate_png_encode_page_peak_bytes(width: u32, height: u32) -> cr
 }
 /// Query available system memory without external dependencies.
 ///
-/// On Linux (including Docker), reads `/proc/meminfo` for `MemAvailable`, capped by the
-/// cgroup's own headroom.
-/// On macOS, uses `sysctl hw.memsize` for total memory (conservative fallback).
-///
-/// `None` means the query could not tell, and the caller keeps its configured batch size.
-/// `Some(0)` is a real reading of a host with no headroom, and the caller narrows to one page.
+/// Delegates to the crate's single memory reader, which takes the lower of the
+/// cgroup headroom and the host's free memory on Linux and half of `hw.memsize`
+/// on macOS. This module used to carry its own copy of that logic; recognition
+/// concurrency needs the same number, and two readers of the same three files
+/// drift apart. `None` means the query could not tell, and the caller keeps its
+/// configured batch size; `Some(0)` is a real reading of a host with no headroom,
+/// and the caller narrows to one page. ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 pub(super) fn get_available_memory() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        let host = read_meminfo_available()?;
-        Some(host.min(cgroup_headroom().unwrap_or(usize::MAX)))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        if let Ok(output) = Command::new("sysctl").args(["-n", "hw.memsize"]).output()
-            && let Ok(s) = std::str::from_utf8(&output.stdout)
-            && let Ok(total) = s.trim().parse::<usize>()
-        {
-            return Some(total / 2);
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-/// `MemAvailable` in bytes, or `None` when the field is absent or unparseable. An absent
-/// field is "could not tell", which is not the same answer as a host with no memory free.
-#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), target_os = "linux"))]
-pub(super) fn parse_meminfo_available(contents: &str) -> Option<usize> {
-    contents
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("MemAvailable:")?
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse::<usize>()
-                .ok()
-        })
-        .map(|kb| kb * 1024)
-}
-#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), target_os = "linux"))]
-pub(super) fn read_meminfo_available() -> Option<usize> {
-    parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
-}
-#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), target_os = "linux"))]
-pub(super) fn parse_cgroup_v2(max: &str, current: &str) -> Option<usize> {
-    let max = max.trim();
-    if max == "max" {
-        return None;
-    }
-    let limit = max.parse::<usize>().ok()?;
-    let usage = current.trim().parse::<usize>().ok()?;
-    Some(limit.saturating_sub(usage))
-}
-#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), target_os = "linux"))]
-pub(super) fn parse_cgroup_v1(limit: &str, usage: &str) -> Option<usize> {
-    let limit = limit.trim().parse::<usize>().ok()?;
-    let usage = usage.trim().parse::<usize>().ok()?;
-    (limit < (isize::MAX as usize)).then(|| limit.saturating_sub(usage))
-}
-#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), target_os = "linux"))]
-pub(super) fn cgroup_headroom() -> Option<usize> {
-    if let (Ok(max), Ok(cur)) = (
-        std::fs::read_to_string("/sys/fs/cgroup/memory.max"),
-        std::fs::read_to_string("/sys/fs/cgroup/memory.current"),
-    ) {
-        return parse_cgroup_v2(&max, &cur);
-    }
-    let limit = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
-    let usage = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok()?;
-    parse_cgroup_v1(&limit, &usage)
+    crate::core::config::concurrency::available_memory_bytes().and_then(|bytes| usize::try_from(bytes).ok())
 }
 /// Minimum meaningful-word density (per 1,000 non-whitespace characters) a
 /// [`OcrPipelineSelection::PreferLastNonEmpty`] candidate must clear -- when the incumbent it

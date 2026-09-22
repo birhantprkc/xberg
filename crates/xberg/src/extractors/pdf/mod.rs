@@ -5360,7 +5360,10 @@ mod tests {
         let _backend = register_mock_ocr_backend("pdf-1665-batch-peak-thread-budget", OCR_TEXT);
 
         let config = ExtractionConfig {
-            concurrency: Some(ConcurrencyConfig { max_threads: Some(4) }),
+            concurrency: Some(ConcurrencyConfig {
+                max_threads: Some(4),
+                max_concurrent_ocr: None,
+            }),
             force_ocr_pages: Some(vec![1, 2, 3, 4]),
             security_limits: Some(SecurityLimits {
                 max_content_size: 50 * 1024 * 1024,
