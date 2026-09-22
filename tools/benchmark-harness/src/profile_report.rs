@@ -512,7 +512,8 @@ impl ProfileReport {
     /// Self-contained styles requiring no external dependencies.
     /// Includes responsive design and print-friendly styles. Kept in its own file (rather
     /// than as an inline literal) purely to stay under the source file's line budget; the
-    /// served bytes are unchanged. ~keep
+    /// rules and selectors are unchanged, only whitespace/quote-style from running the CSS
+    /// formatter on the extracted file (which has no effect on the rendered report). ~keep
     fn css_styles() -> &'static str {
         include_str!("profile_report.css")
     }
