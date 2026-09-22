@@ -6,6 +6,7 @@
 
 use super::*;
 
+#[cfg(any(feature = "ocr-surface", feature = "core-cli", feature = "analysis"))]
 use xberg::ExtractionConfig;
 
 fn default_overrides() -> ExtractionOverrides {
