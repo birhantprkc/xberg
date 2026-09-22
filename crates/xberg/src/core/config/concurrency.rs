@@ -225,7 +225,20 @@ const TESSERACT_SESSION_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 /// no memory bound, the same "no tighter limit was found" branch
 /// [`cgroup_cpu_quota_cores`] takes. It is not a reading of zero.
 pub(crate) fn available_memory_bytes() -> Option<u64> {
-    read_available_memory_bytes()
+    available_memory_reading(read_available_memory_bytes)
+}
+
+/// The behavioral seam [`available_memory_bytes`] delegates through.
+///
+/// The reader is a parameter rather than a direct call so a test can prove this
+/// function adds no caching of its own: inject a reader whose reading changes on
+/// every call and observe that every call here reflects it, rather than
+/// inspecting source text for cache-shaped identifiers. The latter missed the
+/// identical process-lifetime-cache regression once already, reinstated one
+/// call frame deeper than a guard that only ever read `available_memory_bytes`'s
+/// own one-line body could see (GH#1751). ~keep
+fn available_memory_reading(read: impl Fn() -> Option<u64>) -> Option<u64> {
+    read()
 }
 
 /// Take the lower of the cgroup headroom and the host's free memory.
@@ -716,14 +729,32 @@ fn build_global_rayon_pool(_budget: usize) {}
 /// assert_eq!(init_thread_pools(Some(&config)), 4);
 /// ```
 pub(crate) fn init_thread_pools(config: Option<&ConcurrencyConfig>) -> usize {
-    let budget = resolve_thread_budget(config);
     let limits = ActiveLimits {
         once: &POOL_INIT,
         thread_budget: &ACTIVE_THREAD_BUDGET,
         recognition: &ACTIVE_RECOGNITION_CONCURRENCY,
         latch_warned: &RECOGNITION_LATCH_WARNED,
     };
-    limits.install(config, budget, build_global_rayon_pool);
+    init_thread_pools_with(config, &limits, build_global_rayon_pool)
+}
+
+/// Pure core of [`init_thread_pools`], parameterized on the limits cells and
+/// the pool builder so a test can install into cells it owns.
+///
+/// This is the entry point that must pass `config` through to
+/// [`ActiveLimits::install`] rather than a stand-in `None` (GH#1751): the
+/// process-global statics [`init_thread_pools`] closes over cannot be
+/// asserted against directly, for the reason [`ActiveLimits`] documents on
+/// its own fields, so a test exercising `install` alone can never observe
+/// whether this wrapper's own call site actually forwards the caller's
+/// config. ~keep
+fn init_thread_pools_with(
+    config: Option<&ConcurrencyConfig>,
+    limits: &ActiveLimits<'_>,
+    build_pool: impl FnOnce(usize),
+) -> usize {
+    let budget = resolve_thread_budget(config);
+    limits.install(config, budget, build_pool);
     budget
 }
 
@@ -1347,6 +1378,27 @@ mod tests {
                 "the second extraction's max_concurrent_ocr must not move the fixed limit"
             );
 
+            // A later call that names the SAME limit the process already fixed must not
+            // warn: nothing was discarded. Uses its own latch cell so the guard already
+            // tripped above cannot mask this assertion (GH#1751: deleting `requested !=
+            // active` left every existing test green because none of them exercised this
+            // branch). ~keep
+            let matching_latch_warned = AtomicBool::new(false);
+            let matching_limits = ActiveLimits {
+                once: &once,
+                thread_budget: &thread_budget,
+                recognition: &recognition,
+                latch_warned: &matching_latch_warned,
+            };
+            assert!(
+                !matching_limits.install(Some(&first), 8, |_| {}),
+                "a later call still installs nothing"
+            );
+            assert!(
+                !matching_latch_warned.load(Ordering::Relaxed),
+                "requesting the limit the process already fixed must not warn"
+            );
+
             limits.install(Some(&first), 8, |_| {});
         });
 
@@ -1364,33 +1416,28 @@ mod tests {
 
     /// The memory reader must stay uncached. A latch here sizes every later
     /// document in a long-lived process from whatever was free during the
-    /// first extraction, which is the server regression this branch removed;
-    /// nothing else in the suite fails when it comes back. The reader's own
-    /// input is the host, so the instrument is the source rather than a
-    /// reading. ~keep
+    /// first extraction, which is the server regression this branch removed.
+    ///
+    /// Proven behaviorally through the seam [`available_memory_reading`] offers
+    /// rather than by inspecting source text: an injected reader that returns a
+    /// different value on every call must come back unmemoized on every call.
+    /// A prior version of this guard inspected `available_memory_bytes`'s own
+    /// one-line body for cache-shaped identifiers (`OnceLock`, `static`, ...)
+    /// and missed the identical regression reinstated one call frame deeper,
+    /// inside a platform `read_available_memory_bytes` body it never read
+    /// (GH#1751). ~keep
     #[test]
-    fn the_available_memory_reader_carries_no_cache() {
-        const SOURCE: &str = include_str!("concurrency.rs");
-        const SIGNATURE: &str = "pub(crate) fn available_memory_bytes() -> Option<u64> {";
+    fn available_memory_reading_returns_a_fresh_value_on_every_call() {
+        let calls = std::cell::Cell::new(0_u64);
+        let read = || {
+            let call = calls.get();
+            calls.set(call + 1);
+            Some(call)
+        };
 
-        let body = SOURCE
-            .split_once(SIGNATURE)
-            .expect("the memory reader's signature moved; update this guard")
-            .1
-            .split_once("\n}")
-            .expect("the memory reader's body is unterminated")
-            .0;
-        assert!(
-            body.contains("read_available_memory_bytes"),
-            "positive control: the guard no longer reads the reader's body, it read {body:?}"
-        );
-        for latch in ["OnceLock", "OnceCell", "LazyLock", "Lazy", "get_or_init", "static"] {
-            assert!(
-                !body.contains(latch),
-                "available_memory_bytes caches its reading through `{latch}`; \
-                 the OCR batch sizer must read free memory afresh for every document"
-            );
-        }
+        assert_eq!(available_memory_reading(read), Some(0));
+        assert_eq!(available_memory_reading(read), Some(1));
+        assert_eq!(available_memory_reading(read), Some(2));
     }
 
     /// Only the first call installs the pools, but every call reports the
@@ -1416,6 +1463,52 @@ mod tests {
             max_concurrent_ocr: None,
         };
         assert_eq!(init_thread_pools(Some(&config)), 7);
+    }
+
+    /// [`init_thread_pools`]'s own wrapper must pass the caller's `config`
+    /// through to [`ActiveLimits::install`], not a stand-in `None` (GH#1751):
+    /// recognition only reflects `max_concurrent_ocr` when `config` actually
+    /// reaches `resolve_recognition_concurrency` inside the fence. Exercises
+    /// [`init_thread_pools_with`] -- the entry point the real, process-global
+    /// `init_thread_pools` also runs through -- with cells this test owns, so
+    /// this closes the one gap `install`'s own direct tests cannot: whether
+    /// `init_thread_pools`'s call site forwards its argument at all. `999` is
+    /// far outside any value the automatic (no-config) path could resolve to
+    /// on a real host, so a `None` substitution cannot pass by coincidence.
+    #[test]
+    fn init_thread_pools_with_passes_the_callers_config_to_install() {
+        let once = Once::new();
+        let thread_budget = AtomicUsize::new(0);
+        let recognition = AtomicUsize::new(0);
+        let latch_warned = AtomicBool::new(false);
+        let limits = ActiveLimits {
+            once: &once,
+            thread_budget: &thread_budget,
+            recognition: &recognition,
+            latch_warned: &latch_warned,
+        };
+        let config = ConcurrencyConfig {
+            max_threads: Some(6),
+            max_concurrent_ocr: Some(999),
+        };
+        let mut pool_built_with = None;
+
+        let budget = init_thread_pools_with(Some(&config), &limits, |budget| pool_built_with = Some(budget));
+
+        assert_eq!(
+            budget, 6,
+            "the returned budget always reflects resolve_thread_budget(config)"
+        );
+        assert_eq!(
+            recognition.load(Ordering::Relaxed),
+            999,
+            "the installed recognition limit must come from the caller's config, not None"
+        );
+        assert_eq!(
+            pool_built_with,
+            Some(6),
+            "the pool builder must run inside the same install call, with the resolved budget"
+        );
     }
 
     #[test]
