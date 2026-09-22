@@ -248,8 +248,7 @@ fn capture_framework(
         inputs.config.max_concurrent,
         batch_workers,
     );
-    let configured_thread_budget =
-        configured_thread_budget(inputs.config.benchmark_mode, capability, adapter.as_ref());
+    let configured_thread_budget = configured_thread_budget(inputs.config.benchmark_mode, capability, adapter.as_ref());
 
     FrameworkProvenance {
         name: adapter.name().to_string(),

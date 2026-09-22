@@ -257,9 +257,7 @@ impl BlockAccumulator {
         use pulldown_cmark::{Event, Tag, TagEnd};
 
         match event {
-            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph)
-                if !self.in_list_item && !self.in_table =>
-            {
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) if !self.in_list_item && !self.in_table => {
                 self.flush_paragraph();
             }
             Event::Start(Tag::Strong) | Event::End(TagEnd::Strong) if !self.in_table && !self.in_code_block => {
