@@ -81,7 +81,7 @@ reference_link_style = "extensionless"
 
 # Include the command modules that define `#[command(flatten)]` structs (e.g.
 [workspace.docs.cli]
-sources = ["crates/xberg-cli/src/main.rs", "crates/xberg-cli/src/commands/overrides.rs"]
+sources = ["crates/xberg-cli/src/main.rs", "crates/xberg-cli/src/commands/overrides/mod.rs"]
 
 [workspace.docs.mcp]
 sources = ["crates/xberg/src/mcp/server.rs"]
