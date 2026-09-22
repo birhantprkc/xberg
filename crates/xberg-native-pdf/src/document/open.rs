@@ -726,10 +726,19 @@ impl PdfDocument {
         // uses to pick a decode branch. The embedded-image extraction pass
         // (`pdf/native/images.rs` in the `xberg` crate) is the only remaining
         // caller that actually needs decoded pixels for these images (GH#1732). ~keep
+        //
+        // `extract_images` also dropped anything under `ImageExtractFilter::default()`'s
+        // 8 x 8 px floor, and scan detection relied on that: a 1 x 1 px image stretched
+        // full-bleed is a background fill, not a raster scan, and counting its bbox would
+        // send a born-digital slide with one headline to OCR. Keep the same floor here. ~keep
         let images = self.page_image_handles(page).unwrap_or_default();
+        let size_floor = ImageExtractFilter::default();
         let mut img_area = 0.0f32;
         let mut codec = ImageCodecClass::None;
         for im in &images {
+            if i64::from(im.width) < size_floor.min_width || i64::from(im.height) < size_floor.min_height {
+                continue;
+            }
             img_area += Self::rect_isect_area(&im.bbox, px0, py0, px1, py1);
             let has_ccitt = im
                 .filter_chain
