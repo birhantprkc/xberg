@@ -742,16 +742,22 @@ fn hash_worktree() -> Option<String> {
 }
 
 fn scorer_hash() -> String {
-    // Paths are relative to this file's directory (`src/pipeline_benchmark/`); the quality
-    // module was split into `mod.rs` + `tests.rs` and this file into `mod.rs`, but the hash
-    // must keep covering the same logical scorer source as before the split. ~keep
+    // Paths are relative to this file's directory (`src/pipeline_benchmark/`). Four source files
+    // originally fed this hash: structural_sidecar.rs, quality.rs, markdown_quality.rs and
+    // pipeline_benchmark.rs. Three of them have since been split across a module directory purely
+    // to stay under the repo's file-length limit, so every resulting file is listed here — the
+    // hash must keep covering the same logical scorer source, tests included, as it did before
+    // the splits. Adding a file to any of those modules means adding it here too. ~keep
     let mut hasher = blake3::Hasher::new();
     for source in [
         include_bytes!("../structural_sidecar.rs").as_slice(),
+        include_bytes!("../structural_sidecar/scoring.rs").as_slice(),
+        include_bytes!("../structural_sidecar/scoring/tests.rs").as_slice(),
         include_bytes!("../quality/mod.rs").as_slice(),
         include_bytes!("../quality/tests.rs").as_slice(),
         include_bytes!("../markdown_quality.rs").as_slice(),
         include_bytes!("mod.rs").as_slice(),
+        include_bytes!("tests.rs").as_slice(),
     ] {
         hash_bytes_into(&mut hasher, source);
     }
