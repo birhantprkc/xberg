@@ -623,74 +623,25 @@ pub fn analyze_document_gaps(spans: &[TextSpan], config: Option<AdaptiveThreshol
         config.use_iqr
     );
 
-    if spans.len() < 2 {
-        let reason = if spans.is_empty() {
-            "No spans provided".to_string()
-        } else {
-            "Single span: no gaps to analyze".to_string()
-        };
-
-        debug!("{}, using default threshold", reason);
-
-        return AdaptiveThresholdResult {
-            threshold_pt: 0.1,
-            stats: None,
-            reason,
-        };
+    if let Some(result) = insufficient_span_result(spans) {
+        return result;
     }
 
     if let Some(bimodal_threshold) = detect_word_boundary_threshold(spans) {
-        let reason = format!(
-            "Bimodal detection: identified word boundary at {:.4}pt",
-            bimodal_threshold
-        );
-        debug!("Using bimodal threshold: {}", reason);
-
-        return AdaptiveThresholdResult {
-            threshold_pt: bimodal_threshold,
-            stats: None,
-            reason,
-        };
+        return bimodal_gap_result(bimodal_threshold);
     }
 
     let gaps = extract_gaps(spans);
 
     debug!("Extracted {} gaps from {} spans", gaps.len(), spans.len());
 
-    if gaps.len() < config.min_samples {
-        let reason = format!(
-            "Insufficient samples: {} gaps < min_samples ({}), using default",
-            gaps.len(),
-            config.min_samples
-        );
-
-        debug!("{}", reason);
-
-        return AdaptiveThresholdResult {
-            threshold_pt: 0.1,
-            stats: None,
-            reason,
-        };
+    if let Some(result) = insufficient_gap_samples_result(&gaps, &config) {
+        return result;
     }
 
     // Filter out negative gaps before computing statistics
     // (negative gaps represent text overlaps/kerning, not word boundaries) ~keep
-    let positive_gaps: Vec<f32> = gaps.iter().filter(|g| **g > 0.0).copied().collect();
-
-    let gaps_to_analyze = if positive_gaps.len() >= 10 {
-        debug!(
-            "Filtered to {} positive gaps (from {} total gaps)",
-            positive_gaps.len(),
-            gaps.len()
-        );
-        positive_gaps
-    } else {
-        debug!(
-            "Not enough positive gaps ({}) to filter, using all gaps",
-            positive_gaps.len()
-        );
-        gaps
-    };
+    let gaps_to_analyze = select_gaps_to_analyze(gaps);
 
     let stats = match calculate_statistics(gaps_to_analyze) {
         Some(s) => s,
@@ -707,14 +658,103 @@ pub fn analyze_document_gaps(spans: &[TextSpan], config: Option<AdaptiveThreshol
     };
 
     let threshold_pt = determine_adaptive_threshold(&stats, &config);
+    let reason = build_threshold_reason(&stats, &config, threshold_pt);
 
+    debug!("Threshold analysis: {}", reason);
+
+    AdaptiveThresholdResult {
+        threshold_pt,
+        stats: Some(stats),
+        reason,
+    }
+}
+
+/// Early-return result for zero or one span: there are no gaps to analyze. ~keep
+fn insufficient_span_result(spans: &[TextSpan]) -> Option<AdaptiveThresholdResult> {
+    if spans.len() >= 2 {
+        return None;
+    }
+
+    let reason = if spans.is_empty() {
+        "No spans provided".to_string()
+    } else {
+        "Single span: no gaps to analyze".to_string()
+    };
+
+    debug!("{}, using default threshold", reason);
+
+    Some(AdaptiveThresholdResult {
+        threshold_pt: 0.1,
+        stats: None,
+        reason,
+    })
+}
+
+/// Builds the result when bimodal detection already identified a word-boundary threshold. ~keep
+fn bimodal_gap_result(bimodal_threshold: f32) -> AdaptiveThresholdResult {
+    let reason = format!(
+        "Bimodal detection: identified word boundary at {:.4}pt",
+        bimodal_threshold
+    );
+    debug!("Using bimodal threshold: {}", reason);
+
+    AdaptiveThresholdResult {
+        threshold_pt: bimodal_threshold,
+        stats: None,
+        reason,
+    }
+}
+
+/// Early-return result when there aren't enough gap samples to compute statistics. ~keep
+fn insufficient_gap_samples_result(gaps: &[f32], config: &AdaptiveThresholdConfig) -> Option<AdaptiveThresholdResult> {
+    if gaps.len() >= config.min_samples {
+        return None;
+    }
+
+    let reason = format!(
+        "Insufficient samples: {} gaps < min_samples ({}), using default",
+        gaps.len(),
+        config.min_samples
+    );
+
+    debug!("{}", reason);
+
+    Some(AdaptiveThresholdResult {
+        threshold_pt: 0.1,
+        stats: None,
+        reason,
+    })
+}
+
+/// Filters to positive gaps when there are enough of them, otherwise keeps all gaps. ~keep
+fn select_gaps_to_analyze(gaps: Vec<f32>) -> Vec<f32> {
+    let positive_gaps: Vec<f32> = gaps.iter().filter(|g| **g > 0.0).copied().collect();
+
+    if positive_gaps.len() >= 10 {
+        debug!(
+            "Filtered to {} positive gaps (from {} total gaps)",
+            positive_gaps.len(),
+            gaps.len()
+        );
+        positive_gaps
+    } else {
+        debug!(
+            "Not enough positive gaps ({}) to filter, using all gaps",
+            positive_gaps.len()
+        );
+        gaps
+    }
+}
+
+/// Builds the human-readable reason string for a computed threshold. ~keep
+fn build_threshold_reason(stats: &GapStatistics, config: &AdaptiveThresholdConfig, threshold_pt: f32) -> String {
     let base_value = if config.use_iqr {
         format!("IQR={:.3}pt", stats.iqr())
     } else {
         format!("median={:.3}pt", stats.median)
     };
 
-    let reason = format!(
+    format!(
         "Computed from {} gaps: {} * {:.1} = {:.3}pt (clamped to {:.3}pt)",
         stats.count,
         base_value,
@@ -725,15 +765,7 @@ pub fn analyze_document_gaps(spans: &[TextSpan], config: Option<AdaptiveThreshol
             stats.median * config.median_multiplier
         },
         threshold_pt
-    );
-
-    debug!("Threshold analysis: {}", reason);
-
-    AdaptiveThresholdResult {
-        threshold_pt,
-        stats: Some(stats),
-        reason,
-    }
+    )
 }
 
 /// Helper function to compute percentiles using linear interpolation.
@@ -773,245 +805,4 @@ fn percentile(sorted_values: &[f32], percentile: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_percentile_single_value() {
-        let values = vec![5.0];
-        assert_eq!(percentile(&values, 0.5), 5.0);
-    }
-
-    #[test]
-    fn test_percentile_two_values() {
-        let values = vec![1.0, 3.0];
-        assert_eq!(percentile(&values, 0.0), 1.0);
-        assert_eq!(percentile(&values, 1.0), 3.0);
-        assert_eq!(percentile(&values, 0.5), 2.0);
-    }
-
-    #[test]
-    fn test_percentile_many_values() {
-        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        assert_eq!(percentile(&values, 0.0), 1.0);
-        assert_eq!(percentile(&values, 1.0), 10.0);
-        assert_eq!(percentile(&values, 0.5), 5.5);
-    }
-
-    #[test]
-    fn test_extract_gaps() {
-        use crate::geometry::Rect;
-
-        let spans = vec![
-            TextSpan {
-                provenance: None,
-                text_rise: 0.0,
-                artifact_type: None,
-                text: "Hello".to_string(),
-                bbox: Rect::new(0.0, 0.0, 30.0, 12.0),
-                font_name: "Arial".to_string(),
-                font_size: 12.0,
-                font_weight: crate::layout::FontWeight::Normal,
-                is_italic: false,
-                is_monospace: false,
-                color: crate::layout::Color::new(0.0, 0.0, 0.0),
-                mcid: None,
-                mcid_scope: None,
-                sequence: 0,
-                split_boundary_before: false,
-                offset_semantic: false,
-                char_spacing: 0.0,
-                word_spacing: 0.0,
-                horizontal_scaling: 100.0,
-                primary_detected: false,
-                char_widths: vec![],
-                char_x_offsets: Vec::new(),
-                heading_level: None,
-                rotation_degrees: 0.0,
-                wmode: 0,
-                rtl_draw_logical: false,
-                mirrored: false,
-                page_rotation_applied: 0,
-            },
-            TextSpan {
-                provenance: None,
-                text_rise: 0.0,
-                artifact_type: None,
-                text: "World".to_string(),
-                bbox: Rect::new(35.0, 0.0, 30.0, 12.0),
-                font_name: "Arial".to_string(),
-                font_size: 12.0,
-                font_weight: crate::layout::FontWeight::Normal,
-                is_italic: false,
-                is_monospace: false,
-                color: crate::layout::Color::new(0.0, 0.0, 0.0),
-                mcid: None,
-                mcid_scope: None,
-                sequence: 1,
-                split_boundary_before: false,
-                offset_semantic: false,
-                char_spacing: 0.0,
-                word_spacing: 0.0,
-                horizontal_scaling: 100.0,
-                primary_detected: false,
-                char_widths: vec![],
-                char_x_offsets: Vec::new(),
-                heading_level: None,
-                rotation_degrees: 0.0,
-                wmode: 0,
-                rtl_draw_logical: false,
-                mirrored: false,
-                page_rotation_applied: 0,
-            },
-        ];
-
-        let gaps = extract_gaps(&spans);
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0], 5.0);
-    }
-
-    #[test]
-    fn test_extract_gaps_empty() {
-        let gaps = extract_gaps(&[]);
-        assert!(gaps.is_empty());
-    }
-
-    #[test]
-    fn test_calculate_statistics() {
-        let gaps = vec![0.1, 0.2, 0.15, 0.25, 0.3];
-        let stats = calculate_statistics(gaps).unwrap();
-
-        assert_eq!(stats.count, 5);
-        assert_eq!(stats.min, 0.1);
-        assert_eq!(stats.max, 0.3);
-        assert!(stats.mean > 0.19 && stats.mean < 0.21);
-    }
-
-    #[test]
-    fn test_calculate_statistics_empty() {
-        let gaps = vec![];
-        assert!(calculate_statistics(gaps).is_none());
-    }
-
-    #[test]
-    fn test_gap_statistics_iqr() {
-        let gaps = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let stats = calculate_statistics(gaps).unwrap();
-        let iqr = stats.iqr();
-        assert!(iqr > 0.0);
-    }
-
-    #[test]
-    fn test_adaptive_threshold_config_defaults() {
-        let config = AdaptiveThresholdConfig::default();
-        assert_eq!(config.median_multiplier, 1.5);
-        assert_eq!(config.min_threshold_pt, 0.05);
-        // Phase 7 FIX: max_threshold_pt was increased from 1.0 to 100.0
-        // to allow computed thresholds for documents with larger word spacing ~keep
-        assert_eq!(config.max_threshold_pt, 100.0);
-        assert!(!config.use_iqr);
-        assert_eq!(config.min_samples, 10);
-    }
-
-    #[test]
-    fn test_adaptive_threshold_config_aggressive() {
-        let config = AdaptiveThresholdConfig::aggressive();
-        assert_eq!(config.median_multiplier, 1.2);
-    }
-
-    #[test]
-    fn test_adaptive_threshold_config_conservative() {
-        let config = AdaptiveThresholdConfig::conservative();
-        assert_eq!(config.median_multiplier, 2.0);
-    }
-
-    #[test]
-    fn test_determine_threshold_clamping() {
-        let gaps = vec![0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01];
-        let stats = calculate_statistics(gaps).unwrap();
-        let config = AdaptiveThresholdConfig::default();
-
-        let threshold = determine_adaptive_threshold(&stats, &config);
-        assert!(threshold >= config.min_threshold_pt);
-        assert!(threshold <= config.max_threshold_pt);
-    }
-
-    #[test]
-    fn test_analyze_document_gaps_empty() {
-        let result = analyze_document_gaps(&[], None);
-        assert_eq!(result.threshold_pt, 0.1);
-        assert!(result.stats.is_none());
-    }
-
-    #[test]
-    fn test_analyze_document_gaps_insufficient_samples() {
-        use crate::geometry::Rect;
-
-        let spans = vec![
-            TextSpan {
-                provenance: None,
-                text_rise: 0.0,
-                artifact_type: None,
-                text: "A".to_string(),
-                bbox: Rect::new(0.0, 0.0, 10.0, 12.0),
-                font_name: "Arial".to_string(),
-                font_size: 12.0,
-                font_weight: crate::layout::FontWeight::Normal,
-                is_italic: false,
-                is_monospace: false,
-                color: crate::layout::Color::new(0.0, 0.0, 0.0),
-                mcid: None,
-                mcid_scope: None,
-                sequence: 0,
-                split_boundary_before: false,
-                offset_semantic: false,
-                char_spacing: 0.0,
-                word_spacing: 0.0,
-                horizontal_scaling: 100.0,
-                primary_detected: false,
-                char_widths: vec![],
-                char_x_offsets: Vec::new(),
-                heading_level: None,
-                rotation_degrees: 0.0,
-                wmode: 0,
-                rtl_draw_logical: false,
-                mirrored: false,
-                page_rotation_applied: 0,
-            },
-            TextSpan {
-                provenance: None,
-                text_rise: 0.0,
-                artifact_type: None,
-                text: "B".to_string(),
-                bbox: Rect::new(15.0, 0.0, 10.0, 12.0),
-                font_name: "Arial".to_string(),
-                font_size: 12.0,
-                font_weight: crate::layout::FontWeight::Normal,
-                is_italic: false,
-                is_monospace: false,
-                color: crate::layout::Color::new(0.0, 0.0, 0.0),
-                mcid: None,
-                mcid_scope: None,
-                sequence: 1,
-                split_boundary_before: false,
-                offset_semantic: false,
-                char_spacing: 0.0,
-                word_spacing: 0.0,
-                horizontal_scaling: 100.0,
-                primary_detected: false,
-                char_widths: vec![],
-                char_x_offsets: Vec::new(),
-                heading_level: None,
-                rotation_degrees: 0.0,
-                wmode: 0,
-                rtl_draw_logical: false,
-                mirrored: false,
-                page_rotation_applied: 0,
-            },
-        ];
-
-        let result = analyze_document_gaps(&spans, None);
-        assert_eq!(result.threshold_pt, 0.1);
-        assert!(result.stats.is_none());
-    }
-}
+mod tests;

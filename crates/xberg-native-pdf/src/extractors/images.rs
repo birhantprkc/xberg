@@ -449,120 +449,123 @@ impl PdfImage {
     /// Convert this PDF image to a `DynamicImage`.
     pub fn to_dynamic_image(&self) -> Result<image::DynamicImage> {
         match &self.data {
-            ImageData::Jpeg(jpeg_data) => {
-                if self.color_space.components() == 4 {
-                    // 4-component (DeviceCMYK / ICCBased N=4) JPEGs must go
-                    // through the Adobe-aware CMYK path. image::load_from_memory
-                    // routes them through zune-jpeg's own CMYK->RGB, which does
-                    // not honor the APP14 inversion and yields near-black output
-                    // (see decode_cmyk_jpeg_to_rgb_with_profile). ~keep
-                    let transform = self.build_icc_transform();
-                    let rgb = decode_cmyk_jpeg_to_rgb_with_profile(jpeg_data, transform.as_ref())?;
-                    return image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(self.width, self.height, rgb)
-                        .ok_or_else(|| Error::Decode("Invalid CMYK image dimensions".to_string()))
-                        .map(image::DynamicImage::ImageRgb8);
-                }
-                tracing::debug!(
-                    "Decoding JPEG data ({} bytes), starts with: {:02X?}",
-                    jpeg_data.len(),
-                    &jpeg_data[..min(jpeg_data.len(), 16)]
-                );
-                image::load_from_memory(jpeg_data).map_err(|e| Error::Decode(format!("Failed to decode JPEG: {}", e)))
+            ImageData::Jpeg(jpeg_data) => self.jpeg_to_dynamic_image(jpeg_data),
+            ImageData::Raw { pixels, format } => self.raw_to_dynamic_image(pixels, format),
+        }
+    }
+
+    /// [`to_dynamic_image`](Self::to_dynamic_image) for `ImageData::Jpeg`.
+    fn jpeg_to_dynamic_image(&self, jpeg_data: &[u8]) -> Result<image::DynamicImage> {
+        if self.color_space.components() == 4 {
+            // 4-component (DeviceCMYK / ICCBased N=4) JPEGs must go
+            // through the Adobe-aware CMYK path. image::load_from_memory
+            // routes them through zune-jpeg's own CMYK->RGB, which does
+            // not honor the APP14 inversion and yields near-black output
+            // (see decode_cmyk_jpeg_to_rgb_with_profile). ~keep
+            let transform = self.build_icc_transform();
+            let rgb = decode_cmyk_jpeg_to_rgb_with_profile(jpeg_data, transform.as_ref())?;
+            return image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(self.width, self.height, rgb)
+                .ok_or_else(|| Error::Decode("Invalid CMYK image dimensions".to_string()))
+                .map(image::DynamicImage::ImageRgb8);
+        }
+        tracing::debug!(
+            "Decoding JPEG data ({} bytes), starts with: {:02X?}",
+            jpeg_data.len(),
+            &jpeg_data[..min(jpeg_data.len(), 16)]
+        );
+        image::load_from_memory(jpeg_data).map_err(|e| Error::Decode(format!("Failed to decode JPEG: {}", e)))
+    }
+
+    /// [`to_dynamic_image`](Self::to_dynamic_image) for `ImageData::Raw`.
+    fn raw_to_dynamic_image(&self, pixels: &[u8], format: &PixelFormat) -> Result<image::DynamicImage> {
+        let is_1bpc_gray = self.bits_per_component == 1 && matches!(self.color_space, ColorSpace::DeviceGray);
+        if is_1bpc_gray && self.ccitt_params.is_some() {
+            return self.ccitt_to_dynamic_image(pixels);
+        }
+        if is_1bpc_gray {
+            return self.unpack_1bpc_gray_to_dynamic_image(pixels);
+        }
+        match (format, self.color_space) {
+            (PixelFormat::RGB, ColorSpace::DeviceRGB) => {
+                image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(self.width, self.height, pixels.to_vec())
+                    .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
+                    .map(image::DynamicImage::ImageRgb8)
             }
-            ImageData::Raw { pixels, format } => {
-                if self.bits_per_component == 1
-                    && matches!(self.color_space, ColorSpace::DeviceGray)
-                    && self.ccitt_params.is_some()
-                {
-                    // Only genuinely CCITT-filtered images reach here — see
-                    // `extract_image_from_xobject`, which sets `ccitt_params`
-                    // solely when the XObject's `/Filter` is CCITTFaxDecode. ~keep
-                    let Some(params) = self.ccitt_params.clone() else {
-                        unreachable!("guarded by ccitt_params.is_some() above")
-                    };
-
-                    let decompressed = ccitt_bilevel::decompress_ccitt(pixels, &params)?;
-                    let grayscale = ccitt_bilevel::bilevel_to_grayscale(&decompressed, self.width, self.height);
-
-                    image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(self.width, self.height, grayscale)
-                        .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
-                        .map(image::DynamicImage::ImageLuma8)
-                } else if self.bits_per_component == 1 && matches!(self.color_space, ColorSpace::DeviceGray) {
-                    // Packed 1-bit DeviceGray rows, `ceil(width / 8)` bytes
-                    // each, MSB first. `extract_image_from_xobject` unpacks
-                    // sub-byte images to 8-bit samples (with /Decode applied)
-                    // before storing, so this branch only serves externally
-                    // constructed images; it unpacks with the ISO 32000-1
-                    // §8.9.5.2 Table 90 default semantics: sample bit 0 ->
-                    // component 0.0 (black), bit 1 -> component 1.0 (white). ~keep
-                    // `/Width` and `/Height` are document-declared and
-                    // untrusted, so the output buffer size is checked before
-                    // allocating — the same 256 MiB cap
-                    // `expand_indexed_to_rgb_with_transform` and
-                    // `samples_to_decoded_bytes` use elsewhere in this file. ~keep
-                    const MAX_GRAYSCALE_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-                    let output_bytes = (self.width as usize).checked_mul(self.height as usize).ok_or_else(|| {
-                        Error::Decode(format!(
-                            "1-bit DeviceGray image output size overflow: {} x {} exceeds usize",
-                            self.width, self.height
-                        ))
-                    })?;
-                    if output_bytes > MAX_GRAYSCALE_OUTPUT_BYTES {
-                        return Err(Error::Decode(format!(
-                            "1-bit DeviceGray image decode would produce {output_bytes} bytes, exceeds guard \
-                             limit of {MAX_GRAYSCALE_OUTPUT_BYTES} bytes (width={}, height={})",
-                            self.width, self.height
-                        )));
-                    }
-                    let row_bytes = (self.width as usize).div_ceil(8);
-                    let mut grayscale = Vec::with_capacity(output_bytes);
-                    for row in 0..self.height as usize {
-                        let row_start = row * row_bytes;
-                        for col in 0..self.width as usize {
-                            let byte_idx = row_start + col / 8;
-                            let bit = pixels.get(byte_idx).map(|b| (b >> (7 - (col % 8))) & 1).unwrap_or(1);
-                            grayscale.push(if bit == 0 { 0x00 } else { 0xFF });
-                        }
-                    }
-
-                    image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(self.width, self.height, grayscale)
-                        .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
-                        .map(image::DynamicImage::ImageLuma8)
-                } else {
-                    match (format, self.color_space) {
-                        (PixelFormat::RGB, ColorSpace::DeviceRGB) => {
-                            image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(
-                                self.width,
-                                self.height,
-                                pixels.clone(),
-                            )
-                            .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
-                            .map(image::DynamicImage::ImageRgb8)
-                        }
-                        (PixelFormat::Grayscale, ColorSpace::DeviceGray) => image::ImageBuffer::<
-                            image::Luma<u8>,
-                            Vec<u8>,
-                        >::from_raw(
-                            self.width, self.height, pixels.clone()
-                        )
-                        .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
-                        .map(image::DynamicImage::ImageLuma8),
-                        _ => {
-                            let rgb_pixels = match format {
-                                PixelFormat::Grayscale => pixels.iter().flat_map(|&g| vec![g, g, g]).collect(),
-                                PixelFormat::CMYK => {
-                                    cmyk_to_rgb_with_transform(pixels, self.build_icc_transform().as_ref())
-                                }
-                                PixelFormat::RGB => pixels.clone(),
-                            };
-                            image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(self.width, self.height, rgb_pixels)
-                                .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
-                                .map(image::DynamicImage::ImageRgb8)
-                        }
-                    }
-                }
+            (PixelFormat::Grayscale, ColorSpace::DeviceGray) => {
+                image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(self.width, self.height, pixels.to_vec())
+                    .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
+                    .map(image::DynamicImage::ImageLuma8)
+            }
+            _ => {
+                let rgb_pixels = match format {
+                    PixelFormat::Grayscale => pixels.iter().flat_map(|&g| vec![g, g, g]).collect(),
+                    PixelFormat::CMYK => cmyk_to_rgb_with_transform(pixels, self.build_icc_transform().as_ref()),
+                    PixelFormat::RGB => pixels.to_vec(),
+                };
+                image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(self.width, self.height, rgb_pixels)
+                    .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
+                    .map(image::DynamicImage::ImageRgb8)
             }
         }
+    }
+
+    /// [`raw_to_dynamic_image`](Self::raw_to_dynamic_image) for a genuinely
+    /// CCITT-filtered 1-bit DeviceGray image. Only reached from there — see
+    /// `extract_image_from_xobject`, which sets `ccitt_params` solely when
+    /// the XObject's `/Filter` is CCITTFaxDecode. ~keep
+    fn ccitt_to_dynamic_image(&self, pixels: &[u8]) -> Result<image::DynamicImage> {
+        let Some(params) = self.ccitt_params.clone() else {
+            unreachable!("guarded by ccitt_params.is_some() above")
+        };
+
+        let decompressed = ccitt_bilevel::decompress_ccitt(pixels, &params)?;
+        let grayscale = ccitt_bilevel::bilevel_to_grayscale(&decompressed, self.width, self.height);
+
+        image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(self.width, self.height, grayscale)
+            .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
+            .map(image::DynamicImage::ImageLuma8)
+    }
+
+    /// [`raw_to_dynamic_image`](Self::raw_to_dynamic_image) for packed 1-bit
+    /// DeviceGray rows, `ceil(width / 8)` bytes each, MSB first.
+    /// `extract_image_from_xobject` unpacks sub-byte images to 8-bit samples
+    /// (with /Decode applied) before storing, so this branch only serves
+    /// externally constructed images; it unpacks with the ISO 32000-1
+    /// §8.9.5.2 Table 90 default semantics: sample bit 0 -> component 0.0
+    /// (black), bit 1 -> component 1.0 (white). ~keep
+    fn unpack_1bpc_gray_to_dynamic_image(&self, pixels: &[u8]) -> Result<image::DynamicImage> {
+        // `/Width` and `/Height` are document-declared and untrusted, so the
+        // output buffer size is checked before allocating — the same 256 MiB
+        // cap `expand_indexed_to_rgb_with_transform` and
+        // `samples_to_decoded_bytes` use elsewhere in this file. ~keep
+        const MAX_GRAYSCALE_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+        let output_bytes = (self.width as usize).checked_mul(self.height as usize).ok_or_else(|| {
+            Error::Decode(format!(
+                "1-bit DeviceGray image output size overflow: {} x {} exceeds usize",
+                self.width, self.height
+            ))
+        })?;
+        if output_bytes > MAX_GRAYSCALE_OUTPUT_BYTES {
+            return Err(Error::Decode(format!(
+                "1-bit DeviceGray image decode would produce {output_bytes} bytes, exceeds guard \
+                 limit of {MAX_GRAYSCALE_OUTPUT_BYTES} bytes (width={}, height={})",
+                self.width, self.height
+            )));
+        }
+        let row_bytes = (self.width as usize).div_ceil(8);
+        let mut grayscale = Vec::with_capacity(output_bytes);
+        for row in 0..self.height as usize {
+            let row_start = row * row_bytes;
+            for col in 0..self.width as usize {
+                let byte_idx = row_start + col / 8;
+                let bit = pixels.get(byte_idx).map(|b| (b >> (7 - (col % 8))) & 1).unwrap_or(1);
+                grayscale.push(if bit == 0 { 0x00 } else { 0xFF });
+            }
+        }
+
+        image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(self.width, self.height, grayscale)
+            .ok_or_else(|| Error::Decode("Invalid image dimensions".to_string()))
+            .map(image::DynamicImage::ImageLuma8)
     }
 }
 
@@ -700,24 +703,7 @@ pub fn parse_color_space(obj: &crate::object::Object) -> Result<ColorSpace> {
                     "CalGray" => Ok(ColorSpace::CalGray),
                     "CalRGB" => Ok(ColorSpace::CalRGB),
                     "Lab" => Ok(ColorSpace::Lab),
-                    "ICCBased" => {
-                        let num_components = if arr.len() > 1 {
-                            if let Some(stream_dict) = arr[1].as_dict() {
-                                stream_dict
-                                    .get("N")
-                                    .and_then(|obj| match obj {
-                                        Object::Integer(n) => Some(*n as usize),
-                                        _ => None,
-                                    })
-                                    .unwrap_or(3)
-                            } else {
-                                3
-                            }
-                        } else {
-                            3
-                        };
-                        Ok(ColorSpace::ICCBased(num_components))
-                    }
+                    "ICCBased" => Ok(ColorSpace::ICCBased(iccbased_num_components(arr))),
                     "Separation" => Ok(ColorSpace::Separation),
                     "DeviceN" => Ok(ColorSpace::DeviceN),
                     "Pattern" => Ok(ColorSpace::Pattern),
@@ -729,6 +715,24 @@ pub fn parse_color_space(obj: &crate::object::Object) -> Result<ColorSpace> {
         }
         _ => Err(Error::Image(format!("Invalid color space object: {:?}", obj))),
     }
+}
+
+/// The `/N` component count from an `[/ICCBased <stream>]` color space array,
+/// defaulting to 3 when the stream dict is missing, unresolved, or carries no
+/// `/N` integer.
+fn iccbased_num_components(arr: &[crate::object::Object]) -> usize {
+    use crate::object::Object;
+
+    let Some(stream_dict) = arr.get(1).and_then(|obj| obj.as_dict()) else {
+        return 3;
+    };
+    stream_dict
+        .get("N")
+        .and_then(|obj| match obj {
+            Object::Integer(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(3)
 }
 
 /// True when a 1-bit image's `/Decode` array is `[1 0]` (inverted) rather
@@ -797,6 +801,41 @@ fn samples_to_decoded_bytes(
         return None;
     }
     let bpc = usize::from(bpc);
+    let (samples_per_row, row_bytes, total) = unpacked_sample_geometry(width, height, ncomp, bpc)?;
+    let lut = build_decode_lut(ncomp, bpc, ranges);
+
+    if bpc == 8 {
+        return Some(
+            data.iter()
+                .enumerate()
+                .map(|(i, &b)| lut[i % ncomp][b as usize])
+                .collect(),
+        );
+    }
+    let mask = (1u32 << bpc) - 1;
+    let mut out = Vec::with_capacity(total);
+    for row in 0..height as usize {
+        let row_start = row * row_bytes;
+        for s in 0..samples_per_row {
+            let bit_offset = s * bpc;
+            // Past the end of a short stream the sample reads as zero, which
+            // is what the packed path produced before unpacking existed. ~keep
+            let byte = data.get(row_start + bit_offset / 8).copied().unwrap_or(0);
+            // Cannot underflow: bpc < 8 here (the bpc == 8 case returned
+            // above) and `bit_offset % 8` is at most 8 - bpc for those depths. ~keep
+            let shift = 8 - bpc - (bit_offset % 8);
+            let raw = ((byte >> shift) as u32) & mask;
+            out.push(lut[s % ncomp][raw as usize]);
+        }
+    }
+    Some(out)
+}
+
+/// Row/total-byte geometry for [`samples_to_decoded_bytes`]'s output buffer,
+/// with the overflow and 256 MiB output-size guards it always applied.
+/// Returns `(samples_per_row, row_bytes, total)`, or `None` when a product
+/// overflows `usize` or the unpacked buffer would exceed the cap.
+fn unpacked_sample_geometry(width: u32, height: u32, ncomp: usize, bpc: usize) -> Option<(usize, usize, usize)> {
     // Sizes come from /Width and /Height, which a hostile file controls, so
     // every product is checked: a wrapped `usize` (reachable on 32-bit wasm
     // with ordinary dimensions) would under-reserve and then grow until the
@@ -830,10 +869,16 @@ fn samples_to_decoded_bytes(
         );
         return None;
     }
+    Some((samples_per_row, row_bytes, total))
+}
 
+/// Per-component 8-bit `/Decode` + bit-depth-scaling lookup table (ISO
+/// 32000-1 §8.9.5.2): `Dmin + raw · (Dmax − Dmin) / (2^bpc − 1)`, scaled to
+/// `0..=255`. Indexed by raw sample value, one table per component.
+fn build_decode_lut(ncomp: usize, bpc: usize, ranges: Option<&[(f32, f32)]>) -> Vec<[u8; 256]> {
     let levels = 1usize << bpc;
     let max = (levels - 1) as f32;
-    let lut: Vec<[u8; 256]> = (0..ncomp)
+    (0..ncomp)
         .map(|comp| {
             let (lo, hi) = ranges.map_or((0.0, 1.0), |r| r[comp]);
             let mut table = [0u8; 256];
@@ -843,33 +888,7 @@ fn samples_to_decoded_bytes(
             }
             table
         })
-        .collect();
-
-    if bpc == 8 {
-        return Some(
-            data.iter()
-                .enumerate()
-                .map(|(i, &b)| lut[i % ncomp][b as usize])
-                .collect(),
-        );
-    }
-    let mask = (1u32 << bpc) - 1;
-    let mut out = Vec::with_capacity(total);
-    for row in 0..height as usize {
-        let row_start = row * row_bytes;
-        for s in 0..samples_per_row {
-            let bit_offset = s * bpc;
-            // Past the end of a short stream the sample reads as zero, which
-            // is what the packed path produced before unpacking existed. ~keep
-            let byte = data.get(row_start + bit_offset / 8).copied().unwrap_or(0);
-            // Cannot underflow: bpc < 8 here (the bpc == 8 case returned
-            // above) and `bit_offset % 8` is at most 8 - bpc for those depths. ~keep
-            let shift = 8 - bpc - (bit_offset % 8);
-            let raw = ((byte >> shift) as u32) & mask;
-            out.push(lut[s % ncomp][raw as usize]);
-        }
-    }
-    Some(out)
+        .collect()
 }
 
 fn expected_image_filter_output_size(
@@ -944,34 +963,85 @@ pub(crate) fn decode_call_count() -> usize {
     DECODE_CALL_COUNT.with(std::cell::Cell::get)
 }
 
-/// Extract an image from an XObject stream.
-pub fn extract_image_from_xobject(
+/// Resolve an image dictionary's `/ColorSpace` entry to a direct object:
+/// one indirect-reference hop (with the document's named-resource map
+/// substituted for a plain `/Name`), then a second hop for array-form
+/// spaces whose second element is itself commonly an indirect reference
+/// to an ICC profile / palette stream (`[/ICCBased <ref>]`,
+/// `[/Indexed <base> <hi> <palette_ref>]`). `parse_color_space` only
+/// inspects the immediate `Object::Stream` dict, so leaving that second
+/// reference unresolved silently falls back to `N = 3` and mislabels a
+/// CMYK (N = 4) image as RGB. Split out of [`resolve_image_xobject_metadata`]
+/// purely to keep that function shorter. ~keep
+fn resolve_image_color_space_object(
     doc: Option<&crate::document::PdfDocument>,
-    xobject: &crate::object::Object,
-    obj_ref: Option<ObjectRef>,
+    color_space_obj: &crate::object::Object,
     color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
-) -> Result<PdfImage> {
+) -> Result<crate::object::Object> {
     use crate::object::Object;
 
-    #[cfg(test)]
-    DECODE_CALL_COUNT.with(|count| count.set(count.get() + 1));
+    let resolved_color_space = if let Some(d) = doc {
+        let res = if let Some(obj_ref) = color_space_obj.as_reference() {
+            d.load_object(obj_ref)?
+        } else {
+            color_space_obj.clone()
+        };
+        if let Object::Name(ref name) = res {
+            if let Some(map) = color_space_map {
+                map.get(name).cloned().unwrap_or(res)
+            } else {
+                res
+            }
+        } else {
+            res
+        }
+    } else {
+        color_space_obj.clone()
+    };
 
-    let dict = xobject
-        .as_dict()
-        .ok_or_else(|| Error::Image("XObject is not a stream".to_string()))?;
+    let resolved_color_space = if let (Some(doc_mut), Object::Array(arr)) = (doc, &resolved_color_space) {
+        if arr.len() > 1 {
+            if let Some(second_ref) = arr[1].as_reference() {
+                match doc_mut.load_object(second_ref) {
+                    Ok(resolved_second) => {
+                        let mut new_arr = arr.clone();
+                        new_arr[1] = resolved_second;
+                        Object::Array(new_arr)
+                    }
+                    _ => resolved_color_space,
+                }
+            } else {
+                resolved_color_space
+            }
+        } else {
+            resolved_color_space
+        }
+    } else {
+        resolved_color_space
+    };
 
-    let subtype = dict
-        .get("Subtype")
-        .and_then(|obj| obj.as_name())
-        .ok_or_else(|| Error::Image("XObject missing /Subtype".to_string()))?;
+    Ok(resolved_color_space)
+}
 
-    if subtype != "Image" {
-        return Err(Error::Image(format!("XObject subtype is not Image: {}", subtype)));
-    }
+/// An image XObject's `/Width`, `/Height` and effective `/BitsPerComponent`,
+/// plus whether it is an `/ImageMask`. Split out of
+/// [`resolve_image_xobject_metadata`] purely to keep that function shorter. ~keep
+struct ImageDimensions {
+    width: u32,
+    height: u32,
+    bits_per_component: u8,
+    is_image_mask: bool,
+}
 
-    // /Width and /Height may be indirect references (ISO 32000-1 §7.3.10
-    // permits any object entry to be an indirect reference); resolve them
-    // the same way the /ColorSpace resolution just below does. ~keep
+/// Resolve `/Width`, `/Height` and `/BitsPerComponent` (each of which may be
+/// an indirect reference per ISO 32000-1 §7.3.10) and whether `/ImageMask`
+/// is set. See [`ImageDimensions`] for why this is split out.
+fn resolve_image_dimensions(
+    doc: Option<&crate::document::PdfDocument>,
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+) -> Result<ImageDimensions> {
+    use crate::object::Object;
+
     let resolve_int = |obj: &Object| -> Option<i64> {
         if let (Some(d), Some(r)) = (doc, obj.as_reference()) {
             d.load_object(r).ok().and_then(|o| o.as_integer())
@@ -1000,103 +1070,35 @@ pub fn extract_image_from_xobject(
         .get("BitsPerComponent")
         .and_then(resolve_int)
         .unwrap_or(default_bits_per_component) as u8;
-    let default_mask_color_space = Object::Name("DeviceGray".to_string());
-    let color_space_obj = match dict.get("ColorSpace") {
-        Some(color_space) => color_space,
-        None if is_image_mask => &default_mask_color_space,
-        None => return Err(Error::Image("Image missing /ColorSpace".to_string())),
-    };
 
-    let resolved_color_space = if let Some(d) = doc {
-        let res = if let Some(obj_ref) = color_space_obj.as_reference() {
-            d.load_object(obj_ref)?
-        } else {
-            color_space_obj.clone()
-        };
-        if let Object::Name(ref name) = res {
-            if let Some(map) = color_space_map {
-                map.get(name).cloned().unwrap_or(res)
-            } else {
-                res
-            }
-        } else {
-            res
-        }
-    } else {
-        color_space_obj.clone()
-    };
+    Ok(ImageDimensions {
+        width,
+        height,
+        bits_per_component,
+        is_image_mask,
+    })
+}
 
-    // For array-form color spaces (e.g. [/ICCBased <ref>], [/Indexed <base> <hi> <palette_ref>])
-    // the second element is commonly an indirect reference to the ICC profile
-    // stream / palette. `parse_color_space` only inspects the immediate
-    // `Object::Stream` dict, so an unresolved reference silently falls back to
-    // `N = 3` and a CMYK (N = 4) image is labelled as RGB. Resolve the stream
-    // reference here so the component count reflects the real profile. ~keep
-    let resolved_color_space = if let (Some(doc_mut), Object::Array(arr)) = (doc, &resolved_color_space) {
-        if arr.len() > 1 {
-            if let Some(second_ref) = arr[1].as_reference() {
-                match doc_mut.load_object(second_ref) {
-                    Ok(resolved_second) => {
-                        let mut new_arr = arr.clone();
-                        new_arr[1] = resolved_second;
-                        Object::Array(new_arr)
-                    }
-                    _ => resolved_color_space,
-                }
-            } else {
-                resolved_color_space
-            }
-        } else {
-            resolved_color_space
-        }
-    } else {
-        resolved_color_space
-    };
+/// Which codec an image XObject's `/Filter` chain selects, plus the parsed
+/// CCITT parameters when applicable. Split out of
+/// [`resolve_image_xobject_metadata`] purely to keep that function shorter. ~keep
+struct ImageFilterInfo {
+    is_jbig2: bool,
+    is_jpx: bool,
+    is_jpeg_only: bool,
+    is_jpeg_chain: bool,
+    is_ccitt: bool,
+    ccitt_params: Option<crate::decoders::CcittParams>,
+}
 
-    let color_space = parse_color_space(&resolved_color_space)?;
-    // For Indexed color spaces, resolve the base color space and palette now so we
-    // can expand indices to RGB after decoding the stream. Without this, raw
-    // Indexed pixel data (1 byte per pixel) is mislabelled as RGB (3 bytes per
-    // pixel) and ImageBuffer::from_raw rejects the wrong length. Fail fast if
-    // the palette cannot be resolved so the error points at the real root cause
-    // instead of the downstream "Invalid RGB image dimensions" symptom. ~keep
-    let indexed_resolution: Option<IndexedResolution> = if color_space == ColorSpace::Indexed {
-        let resolved = resolve_indexed_palette(doc, &resolved_color_space)?;
-        if resolved.is_none() {
-            return Err(Error::Image(
-                "Unable to resolve Indexed color space palette".to_string(),
-            ));
-        }
-        resolved
-    } else {
-        None
-    };
-
-    // For a plain (non-Indexed) `[/ICCBased <stream>]` colour space,
-    // capture the profile bytes so the CMM can convert through the
-    // document's actual source characterisation instead of the
-    // §10.3.5 additive-clamp fallback.
-    //
-    // When the image uses plain `/DeviceCMYK` with no ICC profile of
-    // its own, fall back to the document's `/OutputIntents` CMYK
-    // profile if one exists — the standard PDF/X assumption per
-    // ISO 32000-1:2008 §14.11.5. ~keep
-    let direct_icc_profile = if matches!(color_space, ColorSpace::ICCBased(_)) {
-        resolve_icc_profile_from_obj(doc, &resolved_color_space)
-    } else if color_space == ColorSpace::DeviceCMYK {
-        doc.and_then(|d| d.output_intent_cmyk_profile())
-    } else {
-        None
-    };
-
-    // Per §8.6.5.8, an image dictionary may override the graphics-state
-    // rendering intent via `/Intent`. Unrecognised names fall through
-    // to `RelativeColorimetric`. ~keep
-    let rendering_intent = dict
-        .get("Intent")
-        .and_then(|obj| obj.as_name())
-        .map(crate::color::RenderingIntent::from_pdf_name)
-        .unwrap_or_default();
+/// Classify an image dictionary's `/Filter` chain and, for CCITT, parse its
+/// `/DecodeParms`. See [`ImageFilterInfo`] for why this is split out.
+fn resolve_image_filter_info(
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+    width: u32,
+    height: u32,
+) -> ImageFilterInfo {
+    use crate::object::Object;
 
     let filter_names = if let Some(filter_obj) = dict.get("Filter") {
         match filter_obj {
@@ -1143,6 +1145,195 @@ pub fn extract_image_from_xobject(
     } else {
         None
     };
+
+    ImageFilterInfo {
+        is_jbig2,
+        is_jpx,
+        is_jpeg_only,
+        is_jpeg_chain,
+        is_ccitt,
+        ccitt_params,
+    }
+}
+
+/// Resolve an already-parsed color space's Indexed palette (if any) and its
+/// direct or output-intent ICC profile (if any). Fails fast when the color
+/// space is Indexed but its palette cannot be resolved, so the error points
+/// at the real root cause instead of a downstream "Invalid RGB image
+/// dimensions" symptom. Split out of [`resolve_image_xobject_metadata`]
+/// purely to keep that function shorter. ~keep
+fn resolve_indexed_and_icc_profile(
+    doc: Option<&crate::document::PdfDocument>,
+    color_space: ColorSpace,
+    resolved_color_space: &crate::object::Object,
+) -> Result<(
+    Option<IndexedResolution>,
+    Option<std::sync::Arc<crate::color::IccProfile>>,
+)> {
+    // For Indexed color spaces, resolve the base color space and palette now so we
+    // can expand indices to RGB after decoding the stream. Without this, raw
+    // Indexed pixel data (1 byte per pixel) is mislabelled as RGB (3 bytes per
+    // pixel) and ImageBuffer::from_raw rejects the wrong length. ~keep
+    let indexed_resolution: Option<IndexedResolution> = if color_space == ColorSpace::Indexed {
+        let resolved = resolve_indexed_palette(doc, resolved_color_space)?;
+        if resolved.is_none() {
+            return Err(Error::Image(
+                "Unable to resolve Indexed color space palette".to_string(),
+            ));
+        }
+        resolved
+    } else {
+        None
+    };
+
+    // For a plain (non-Indexed) `[/ICCBased <stream>]` colour space,
+    // capture the profile bytes so the CMM can convert through the
+    // document's actual source characterisation instead of the
+    // §10.3.5 additive-clamp fallback.
+    //
+    // When the image uses plain `/DeviceCMYK` with no ICC profile of
+    // its own, fall back to the document's `/OutputIntents` CMYK
+    // profile if one exists — the standard PDF/X assumption per
+    // ISO 32000-1:2008 §14.11.5. ~keep
+    let direct_icc_profile = if matches!(color_space, ColorSpace::ICCBased(_)) {
+        resolve_icc_profile_from_obj(doc, resolved_color_space)
+    } else if color_space == ColorSpace::DeviceCMYK {
+        doc.and_then(|d| d.output_intent_cmyk_profile())
+    } else {
+        None
+    };
+
+    Ok((indexed_resolution, direct_icc_profile))
+}
+
+/// Metadata resolved from an image XObject dictionary before pixel decoding
+/// begins: dimensions, color space (with any Indexed palette or ICC profile
+/// already resolved), rendering intent, and which stream filter chain
+/// applies. Split out of `extract_image_from_xobject` purely to keep that
+/// function's decode branch -- which threads `stored_bpc`, `samples_are_raw`
+/// and `decode_folded_in` through several codecs -- legible on its own. ~keep
+struct ImageXObjectMetadata {
+    width: u32,
+    height: u32,
+    bits_per_component: u8,
+    color_space: ColorSpace,
+    resolved_color_space: crate::object::Object,
+    indexed_resolution: Option<IndexedResolution>,
+    direct_icc_profile: Option<std::sync::Arc<crate::color::IccProfile>>,
+    rendering_intent: crate::color::RenderingIntent,
+    is_jbig2: bool,
+    is_jpx: bool,
+    is_jpeg_only: bool,
+    is_jpeg_chain: bool,
+    is_ccitt: bool,
+    ccitt_params: Option<crate::decoders::CcittParams>,
+}
+
+/// Resolve dimensions, color space, ICC/rendering-intent metadata, and the
+/// applicable stream filter chain for an image XObject dictionary. See
+/// [`ImageXObjectMetadata`] for why this is split from the decode step.
+fn resolve_image_xobject_metadata(
+    doc: Option<&crate::document::PdfDocument>,
+    dict: &std::collections::HashMap<String, crate::object::Object>,
+    color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
+) -> Result<ImageXObjectMetadata> {
+    use crate::object::Object;
+
+    let ImageDimensions {
+        width,
+        height,
+        bits_per_component,
+        is_image_mask,
+    } = resolve_image_dimensions(doc, dict)?;
+
+    let default_mask_color_space = Object::Name("DeviceGray".to_string());
+    let color_space_obj = match dict.get("ColorSpace") {
+        Some(color_space) => color_space,
+        None if is_image_mask => &default_mask_color_space,
+        None => return Err(Error::Image("Image missing /ColorSpace".to_string())),
+    };
+
+    let resolved_color_space = resolve_image_color_space_object(doc, color_space_obj, color_space_map)?;
+
+    let color_space = parse_color_space(&resolved_color_space)?;
+    let (indexed_resolution, direct_icc_profile) =
+        resolve_indexed_and_icc_profile(doc, color_space, &resolved_color_space)?;
+
+    // Per §8.6.5.8, an image dictionary may override the graphics-state
+    // rendering intent via `/Intent`. Unrecognised names fall through
+    // to `RelativeColorimetric`. ~keep
+    let rendering_intent = dict
+        .get("Intent")
+        .and_then(|obj| obj.as_name())
+        .map(crate::color::RenderingIntent::from_pdf_name)
+        .unwrap_or_default();
+
+    let ImageFilterInfo {
+        is_jbig2,
+        is_jpx,
+        is_jpeg_only,
+        is_jpeg_chain,
+        is_ccitt,
+        ccitt_params,
+    } = resolve_image_filter_info(dict, width, height);
+
+    Ok(ImageXObjectMetadata {
+        width,
+        height,
+        bits_per_component,
+        color_space,
+        resolved_color_space,
+        indexed_resolution,
+        direct_icc_profile,
+        rendering_intent,
+        is_jbig2,
+        is_jpx,
+        is_jpeg_only,
+        is_jpeg_chain,
+        is_ccitt,
+        ccitt_params,
+    })
+}
+
+/// Extract an image from an XObject stream.
+pub fn extract_image_from_xobject(
+    doc: Option<&crate::document::PdfDocument>,
+    xobject: &crate::object::Object,
+    obj_ref: Option<ObjectRef>,
+    color_space_map: Option<&std::collections::HashMap<String, crate::object::Object>>,
+) -> Result<PdfImage> {
+    #[cfg(test)]
+    DECODE_CALL_COUNT.with(|count| count.set(count.get() + 1));
+
+    let dict = xobject
+        .as_dict()
+        .ok_or_else(|| Error::Image("XObject is not a stream".to_string()))?;
+
+    let subtype = dict
+        .get("Subtype")
+        .and_then(|obj| obj.as_name())
+        .ok_or_else(|| Error::Image("XObject missing /Subtype".to_string()))?;
+
+    if subtype != "Image" {
+        return Err(Error::Image(format!("XObject subtype is not Image: {}", subtype)));
+    }
+
+    let ImageXObjectMetadata {
+        width,
+        height,
+        bits_per_component,
+        color_space,
+        resolved_color_space,
+        indexed_resolution,
+        direct_icc_profile,
+        rendering_intent,
+        is_jbig2,
+        is_jpx,
+        is_jpeg_only,
+        is_jpeg_chain,
+        is_ccitt,
+        ccitt_params,
+    } = resolve_image_xobject_metadata(doc, dict, color_space_map)?;
 
     // Bit depth of the buffer actually stored: raised to 8 when a transform
     // below (sub-byte unpack, /Decode application, 16-bit reduction) rewrites
@@ -1201,15 +1392,15 @@ pub fn extract_image_from_xobject(
                 .base_profile
                 .clone()
                 .map(|p| crate::color::Transform::new_srgb_target(p, rendering_intent));
-            let expanded = expand_indexed_to_rgb_with_transform(
-                &decoded_data,
-                &ir.palette,
-                ir.base_fmt,
+            let expanded = expand_indexed_to_rgb_with_transform(IndexedExpandParams {
+                raw: &decoded_data,
+                palette: &ir.palette,
+                base_fmt: ir.base_fmt,
                 width,
                 height,
-                bits_per_component,
-                transform.as_ref(),
-            )?;
+                bpc: bits_per_component,
+                transform: transform.as_ref(),
+            })?;
             // Palette lookup replaces index samples with RGB, so the buffer
             // is no longer in the space the dictionary's entries describe. ~keep
             samples_are_raw = false;
@@ -1438,6 +1629,55 @@ fn resolve_indexed_palette(
         return Ok(None);
     }
 
+    let base = resolve_indexed_base(doc, arr)?;
+    let hival = resolve_indexed_hival(doc, arr)?;
+    let n = base.base_fmt.bytes_per_pixel();
+    let Some(palette_bytes) = resolve_indexed_palette_bytes(doc, arr, hival, n)? else {
+        return Ok(None);
+    };
+
+    // Device-independent colour-space palettes must be converted to
+    // RGB before being handed to the expander, which assumes palette
+    // bytes are already in the output colour space. Without this step
+    // Lab triples are mis-interpreted as raw RGB and render with
+    // perceptually wrong colours. ~keep
+    if matches!(base.base_cs, ColorSpace::Lab) {
+        let white = extract_lab_whitepoint(&base.base_obj);
+        let rgb_palette = lab_palette_to_rgb(&palette_bytes, white);
+        // Lab palettes are now RGB; no base ICC profile to carry through. ~keep
+        return Ok(Some(IndexedResolution {
+            base_fmt: PixelFormat::RGB,
+            palette: rgb_palette,
+            base_profile: None,
+        }));
+    }
+
+    Ok(Some(IndexedResolution {
+        base_fmt: base.base_fmt,
+        palette: palette_bytes,
+        base_profile: base.base_profile,
+    }))
+}
+
+/// The base color space resolved from an `[/Indexed base hival lookup]`
+/// array: its parsed [`ColorSpace`]/[`PixelFormat`], the resolved base object
+/// (needed again for a Lab whitepoint lookup), and its ICC profile when the
+/// base is `/ICCBased`.
+struct IndexedBase {
+    base_obj: crate::object::Object,
+    base_cs: ColorSpace,
+    base_fmt: PixelFormat,
+    base_profile: Option<std::sync::Arc<crate::color::IccProfile>>,
+}
+
+/// Resolve `arr[1]`, the base color space of an `[/Indexed base hival
+/// lookup]` array. See [`resolve_indexed_palette`].
+fn resolve_indexed_base(
+    doc: Option<&crate::document::PdfDocument>,
+    arr: &[crate::object::Object],
+) -> Result<IndexedBase> {
+    use crate::object::Object;
+
     // Resolve the base color-space object. When it's an array like
     // [/ICCBased <stream_ref>], resolve inner references so
     // parse_color_space can read /N from the ICC stream dict. ~keep
@@ -1464,7 +1704,6 @@ fn resolve_indexed_palette(
     };
     let base_cs = parse_color_space(&base_obj)?;
     let base_fmt = color_space_to_pixel_format(&base_cs);
-    let n = base_fmt.bytes_per_pixel();
 
     // When the base is `/ICCBased`, capture the profile bytes so the
     // extractor can later hand them to a CMM. Parse failures reduce to
@@ -1476,8 +1715,22 @@ fn resolve_indexed_palette(
         None
     };
 
-    // hival bounds the valid index range. Resolve via indirect reference if
-    // needed; treat invalid / missing values as "unknown" and skip truncation. ~keep
+    Ok(IndexedBase {
+        base_obj,
+        base_cs,
+        base_fmt,
+        base_profile,
+    })
+}
+
+/// Resolve `arr[2]`, the `hival` bound on valid palette indices, from an
+/// `[/Indexed base hival lookup]` array. Invalid or missing values resolve
+/// to `None` ("unknown"), which skips the palette-truncation step. See
+/// [`resolve_indexed_palette`].
+fn resolve_indexed_hival(
+    doc: Option<&crate::document::PdfDocument>,
+    arr: &[crate::object::Object],
+) -> Result<Option<usize>> {
     let hival_obj = if let Some(d) = doc {
         if let Some(r) = arr[2].as_reference() {
             d.load_object(r)?
@@ -1487,9 +1740,22 @@ fn resolve_indexed_palette(
     } else {
         arr[2].clone()
     };
-    let hival: Option<usize> = hival_obj
+    Ok(hival_obj
         .as_integer()
-        .and_then(|i| if (0..=255).contains(&i) { Some(i as usize) } else { None });
+        .and_then(|i| if (0..=255).contains(&i) { Some(i as usize) } else { None }))
+}
+
+/// Resolve `arr[3]`, the palette lookup bytes, from an `[/Indexed base hival
+/// lookup]` array, truncated to the logical length implied by `hival`. `None`
+/// when the lookup is neither a string nor a stream, or decodes empty. See
+/// [`resolve_indexed_palette`].
+fn resolve_indexed_palette_bytes(
+    doc: Option<&crate::document::PdfDocument>,
+    arr: &[crate::object::Object],
+    hival: Option<usize>,
+    n: usize,
+) -> Result<Option<Vec<u8>>> {
+    use crate::object::Object;
 
     let lookup_obj = if let Some(d) = doc {
         if let Some(r) = arr[3].as_reference() {
@@ -1520,27 +1786,7 @@ fn resolve_indexed_palette(
         }
     }
 
-    // Device-independent colour-space palettes must be converted to
-    // RGB before being handed to the expander, which assumes palette
-    // bytes are already in the output colour space. Without this step
-    // Lab triples are mis-interpreted as raw RGB and render with
-    // perceptually wrong colours. ~keep
-    if matches!(base_cs, ColorSpace::Lab) {
-        let white = extract_lab_whitepoint(&base_obj);
-        let rgb_palette = lab_palette_to_rgb(&palette_bytes, white);
-        // Lab palettes are now RGB; no base ICC profile to carry through. ~keep
-        return Ok(Some(IndexedResolution {
-            base_fmt: PixelFormat::RGB,
-            palette: rgb_palette,
-            base_profile: None,
-        }));
-    }
-
-    Ok(Some(IndexedResolution {
-        base_fmt,
-        palette: palette_bytes,
-        base_profile,
-    }))
+    Ok(Some(palette_bytes))
 }
 
 /// Reduce a big-endian 16-bit colour sample (`hi`, `lo` bytes) to 8 bits,
@@ -1574,30 +1820,37 @@ fn expand_indexed_to_rgb(
     height: u32,
     bpc: u8,
 ) -> Result<Vec<u8>> {
-    expand_indexed_to_rgb_with_transform(raw, palette, base_fmt, width, height, bpc, None)
+    expand_indexed_to_rgb_with_transform(IndexedExpandParams {
+        raw,
+        palette,
+        base_fmt,
+        width,
+        height,
+        bpc,
+        transform: None,
+    })
+}
+
+/// Parameters for [`expand_indexed_to_rgb_with_transform`]: an Indexed
+/// image's packed index stream, its resolved palette, and how to interpret
+/// both. Grouped into a struct purely to keep the entry function's own
+/// parameter list short; each field is exactly one of the prior positional
+/// arguments. ~keep
+struct IndexedExpandParams<'a> {
+    raw: &'a [u8],
+    palette: &'a [u8],
+    base_fmt: PixelFormat,
+    width: u32,
+    height: u32,
+    bpc: u8,
+    transform: Option<&'a crate::color::Transform>,
 }
 
 /// Like [`expand_indexed_to_rgb`] but routes CMYK palette entries
 /// through an ICC transform when one is supplied. Used during image
 /// extraction when the base colour space is `/ICCBased` with N=4.
-fn expand_indexed_to_rgb_with_transform(
-    raw: &[u8],
-    palette: &[u8],
-    base_fmt: PixelFormat,
-    width: u32,
-    height: u32,
-    bpc: u8,
-    transform: Option<&crate::color::Transform>,
-) -> Result<Vec<u8>> {
-    /// Hard cap on the decoded output buffer size (256 MiB). Legitimate
-    /// Indexed images in real PDFs are several orders of magnitude below
-    /// this — the cap only fires on pathological / adversarial inputs
-    /// where `width * height` is billions of pixels.
-    const MAX_INDEXED_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-
-    let w = width as usize;
-    let h = height as usize;
-    let n = base_fmt.bytes_per_pixel();
+fn expand_indexed_to_rgb_with_transform(params: IndexedExpandParams<'_>) -> Result<Vec<u8>> {
+    let bpc = params.bpc;
 
     // ISO 32000-2 §8.9.5.1 mandates bpc ∈ {1, 2, 4, 8} for Indexed color
     // spaces. Anything else (0, 3, 5, 6, 7, 9, 12, 16, …) used to be
@@ -1611,6 +1864,27 @@ fn expand_indexed_to_rgb_with_transform(
              (PDF spec requires 1, 2, 4, or 8)"
         )));
     }
+
+    let w = params.width as usize;
+    let h = params.height as usize;
+    let n = params.base_fmt.bytes_per_pixel();
+    let (bytes_per_row, output_bytes) = indexed_expand_geometry(w, h, bpc)?;
+    validate_indexed_input_len(params.raw, bytes_per_row, h)?;
+
+    let mut out = Vec::with_capacity(output_bytes);
+    decode_indexed_pixels(&params, w, h, bytes_per_row, n, &mut out);
+    Ok(out)
+}
+
+/// Row-byte stride and total RGB output size for an Indexed image of size
+/// `w × h` at `bpc` bits per index, with the same overflow and 256 MiB
+/// output-size guard [`expand_indexed_to_rgb_with_transform`] always applied.
+fn indexed_expand_geometry(w: usize, h: usize, bpc: u8) -> Result<(usize, usize)> {
+    /// Hard cap on the decoded output buffer size (256 MiB). Legitimate
+    /// Indexed images in real PDFs are several orders of magnitude below
+    /// this — the cap only fires on pathological / adversarial inputs
+    /// where `width * height` is billions of pixels.
+    const MAX_INDEXED_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
     let bytes_per_row = w.checked_mul(bpc as usize).map(|v| v.div_ceil(8)).ok_or_else(|| {
         Error::Image(format!(
@@ -1632,11 +1906,15 @@ fn expand_indexed_to_rgb_with_transform(
         )));
     }
 
-    // The decoded index stream must cover every row of the image.
-    // Truncated streams used to get silently zero-padded, which lets a
-    // malicious PDF pair a 10-byte stream with a 10 000 × 10 000 image
-    // and force a ~300 MiB allocation filled with default palette entry
-    // 0. Reject that shape up front. ~keep
+    Ok((bytes_per_row, output_bytes))
+}
+
+/// Reject an Indexed index stream too short to cover every row of `h` rows
+/// at `bytes_per_row` bytes each. Truncated streams used to be silently
+/// zero-padded, which lets a malicious PDF pair a 10-byte stream with a
+/// 10 000 × 10 000 image and force a ~300 MiB allocation filled with default
+/// palette entry 0. ~keep
+fn validate_indexed_input_len(raw: &[u8], bytes_per_row: usize, h: usize) -> Result<()> {
     let required_bytes = bytes_per_row.checked_mul(h).ok_or_else(|| {
         Error::Image(format!(
             "Indexed image required-input size overflow: {bytes_per_row} × {h} exceeds usize"
@@ -1652,69 +1930,81 @@ fn expand_indexed_to_rgb_with_transform(
             h
         )));
     }
+    Ok(())
+}
 
-    let mut out = Vec::with_capacity(output_bytes);
-
-    let read_index = |row: &[u8], x: usize| -> usize {
-        match bpc {
-            8 => row.get(x).copied().unwrap_or(0) as usize,
-            4 => {
-                let byte_idx = x / 2;
-                let b = row.get(byte_idx).copied().unwrap_or(0);
-                if x.is_multiple_of(2) {
-                    (b >> 4) as usize
-                } else {
-                    (b & 0x0F) as usize
-                }
+/// Read one packed Indexed pixel from `row` at column `x`, given index depth
+/// `bpc` (validated to be in {1, 2, 4, 8} by the caller).
+fn read_indexed_pixel(row: &[u8], x: usize, bpc: u8) -> usize {
+    match bpc {
+        8 => row.get(x).copied().unwrap_or(0) as usize,
+        4 => {
+            let byte_idx = x / 2;
+            let b = row.get(byte_idx).copied().unwrap_or(0);
+            if x.is_multiple_of(2) {
+                (b >> 4) as usize
+            } else {
+                (b & 0x0F) as usize
             }
-            2 => {
-                let byte_idx = x / 4;
-                let b = row.get(byte_idx).copied().unwrap_or(0);
-                let shift = 6 - (x % 4) * 2;
-                ((b >> shift) & 0x03) as usize
-            }
-            1 => {
-                let byte_idx = x / 8;
-                let b = row.get(byte_idx).copied().unwrap_or(0);
-                let shift = 7 - (x % 8);
-                ((b >> shift) & 0x01) as usize
-            }
-            // Unreachable: bpc is validated to be in {1, 2, 4, 8} above
-            // before the closure is called, so this arm only exists to
-            // satisfy exhaustiveness on `u8`. ~keep
-            _ => unreachable!("bpc validated to {{1,2,4,8}} before read_index"),
         }
-    };
+        2 => {
+            let byte_idx = x / 4;
+            let b = row.get(byte_idx).copied().unwrap_or(0);
+            let shift = 6 - (x % 4) * 2;
+            ((b >> shift) & 0x03) as usize
+        }
+        1 => {
+            let byte_idx = x / 8;
+            let b = row.get(byte_idx).copied().unwrap_or(0);
+            let shift = 7 - (x % 8);
+            ((b >> shift) & 0x01) as usize
+        }
+        // Unreachable: bpc is validated to be in {1, 2, 4, 8} above
+        // before this is called, so this arm only exists to satisfy
+        // exhaustiveness on `u8`. ~keep
+        _ => unreachable!("bpc validated to {{1,2,4,8}} before read_indexed_pixel"),
+    }
+}
 
+/// Fill `out` with RGB bytes for every pixel of an Indexed image, mapping
+/// each packed index through `params.palette`.
+fn decode_indexed_pixels(
+    params: &IndexedExpandParams<'_>,
+    w: usize,
+    h: usize,
+    bytes_per_row: usize,
+    n: usize,
+    out: &mut Vec<u8>,
+) {
     for y in 0..h {
         let row_start = y * bytes_per_row;
-        let row_end = (row_start + bytes_per_row).min(raw.len());
-        let row: &[u8] = if row_start < raw.len() {
-            &raw[row_start..row_end]
+        let row_end = (row_start + bytes_per_row).min(params.raw.len());
+        let row: &[u8] = if row_start < params.raw.len() {
+            &params.raw[row_start..row_end]
         } else {
             &[]
         };
         for x in 0..w {
-            let idx = read_index(row, x);
+            let idx = read_indexed_pixel(row, x, params.bpc);
             let off = idx * n;
-            if off + n > palette.len() {
+            if off + n > params.palette.len() {
                 out.extend_from_slice(&[0, 0, 0]);
                 continue;
             }
-            match base_fmt {
-                PixelFormat::RGB => out.extend_from_slice(&palette[off..off + 3]),
+            match params.base_fmt {
+                PixelFormat::RGB => out.extend_from_slice(&params.palette[off..off + 3]),
                 PixelFormat::Grayscale => {
-                    let g = palette[off];
+                    let g = params.palette[off];
                     out.push(g);
                     out.push(g);
                     out.push(g);
                 }
                 PixelFormat::CMYK => {
-                    let c = palette[off];
-                    let m = palette[off + 1];
-                    let y_c = palette[off + 2];
-                    let k = palette[off + 3];
-                    let [r, g, b] = if let Some(t) = transform {
+                    let c = params.palette[off];
+                    let m = params.palette[off + 1];
+                    let y_c = params.palette[off + 2];
+                    let k = params.palette[off + 3];
+                    let [r, g, b] = if let Some(t) = params.transform {
                         t.convert_cmyk_pixel(c, m, y_c, k)
                     } else {
                         cmyk_pixel_to_rgb(c, m, y_c, k)
@@ -1726,7 +2016,6 @@ fn expand_indexed_to_rgb_with_transform(
             }
         }
     }
-    Ok(out)
 }
 
 /// Convert a single DeviceCMYK pixel to RGB.
@@ -3352,27 +3641,7 @@ fn resolve_color_space_for_handle(
         // Resolve the base object, mirroring resolve_indexed_palette: an
         // indirect base ref, plus inner refs of an array base such as
         // [/ICCBased <stream_ref>] so parse_color_space can read /N. ~keep
-        let base_obj = if let Some(d) = doc {
-            let outer = if let Some(r) = arr[1].as_reference() {
-                d.load_object(r).unwrap_or_else(|_| arr[1].clone())
-            } else {
-                arr[1].clone()
-            };
-            if let Object::Array(mut inner) = outer {
-                for item in inner.iter_mut() {
-                    if let Some(r) = item.as_reference()
-                        && let Ok(resolved) = d.load_object(r)
-                    {
-                        *item = resolved;
-                    }
-                }
-                Object::Array(inner)
-            } else {
-                outer
-            }
-        } else {
-            arr[1].clone()
-        };
+        let base_obj = resolve_indexed_base_obj_for_handle(doc, arr);
         let base = parse_color_space(&base_obj).ok();
         return (ColorSpace::Indexed, base);
     }
@@ -3381,6 +3650,39 @@ fn resolve_color_space_for_handle(
         Ok(cs) => (cs, None),
         Err(_) => (ColorSpace::DeviceRGB, None),
     }
+}
+
+/// Resolve `arr[1]`, the base color-space object of an `[/Indexed base hival
+/// lookup]` array, for [`resolve_color_space_for_handle`]. Unlike
+/// [`resolve_indexed_base`], a `load_object` failure falls back to the
+/// unresolved reference rather than propagating an error, since this helper
+/// reports a best-effort `(ColorSpace, Option<ColorSpace>)` pair rather than
+/// a `Result`.
+fn resolve_indexed_base_obj_for_handle(
+    doc: Option<&crate::document::PdfDocument>,
+    arr: &[crate::object::Object],
+) -> crate::object::Object {
+    use crate::object::Object;
+
+    let Some(d) = doc else {
+        return arr[1].clone();
+    };
+    let outer = if let Some(r) = arr[1].as_reference() {
+        d.load_object(r).unwrap_or_else(|_| arr[1].clone())
+    } else {
+        arr[1].clone()
+    };
+    let Object::Array(mut inner) = outer else {
+        return outer;
+    };
+    for item in inner.iter_mut() {
+        if let Some(r) = item.as_reference()
+            && let Ok(resolved) = d.load_object(r)
+        {
+            *item = resolved;
+        }
+    }
+    Object::Array(inner)
 }
 
 /// Build a `PdfImageHandle` from an Image XObject dictionary entry.
@@ -3465,6 +3767,30 @@ pub(crate) fn image_handle_from_xobject<'doc>(
     })
 }
 
+/// Read `/Width`, `/Height`, and `/BitsPerComponent` from an inline image's
+/// expanded dictionary. Per §8.9.7 these are direct objects, unlike the
+/// indirect-reference-tolerant XObject path. Returns `None` when `/Width` or
+/// `/Height` is missing or non-positive.
+fn inline_image_dimensions(
+    expanded: &std::collections::HashMap<String, crate::object::Object>,
+) -> Option<(u32, u32, u8)> {
+    let w = expanded
+        .get("Width")
+        .and_then(|o| o.as_integer())
+        .filter(|&n| n > 0)
+        .map(|n| n as u32)?;
+    let h = expanded
+        .get("Height")
+        .and_then(|o| o.as_integer())
+        .filter(|&n| n > 0)
+        .map(|n| n as u32)?;
+    let bpc = expanded
+        .get("BitsPerComponent")
+        .and_then(|o| o.as_integer())
+        .unwrap_or(8) as u8;
+    Some((w, h, bpc))
+}
+
 /// Build a `PdfImageHandle` from an inline image (`BI`/`ID`/`EI` sequence).
 pub(crate) fn image_handle_from_inline<'doc>(
     doc: &'doc crate::document::PdfDocument,
@@ -3486,20 +3812,7 @@ pub(crate) fn image_handle_from_inline<'doc>(
     // These bare reads of `/Width`, `/Height` and `/BitsPerComponent` are
     // therefore deliberate, not an oversight of the indirect-reference sweep
     // applied to the XObject paths elsewhere in this file. ~keep
-    let w = expanded
-        .get("Width")
-        .and_then(|o| o.as_integer())
-        .filter(|&n| n > 0)
-        .map(|n| n as u32)?;
-    let h = expanded
-        .get("Height")
-        .and_then(|o| o.as_integer())
-        .filter(|&n| n > 0)
-        .map(|n| n as u32)?;
-    let bpc = expanded
-        .get("BitsPerComponent")
-        .and_then(|o| o.as_integer())
-        .unwrap_or(8) as u8;
+    let (w, h, bpc) = inline_image_dimensions(&expanded)?;
     let byte_size = data.len() as u64;
     let filter_chain = parse_filter_chain(&expanded);
 

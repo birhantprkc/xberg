@@ -35,48 +35,10 @@ pub fn decompress_ccitt(data: &[u8], params: &CcittParams) -> Result<Vec<u8>> {
     // `fax` 0.3 takes u32 dimensions, which is what CcittParams already holds:
     // the previous `as u16` narrowing silently truncated /Columns > 65535. ~keep
     let width = params.columns;
-    let height_opt = params.rows;
 
-    tracing::debug!(
-        "CCITT decompression: {} bytes, {}x{} pixels, K={}, BlackIs1={}",
-        data.len(),
-        params.columns,
-        params.rows.unwrap_or(0),
-        params.k,
-        params.black_is_1
-    );
+    log_ccitt_decompress_start(data, params);
 
-    if params.is_group_3() {
-        tracing::debug!("CCITT Group 3 decompression requested (K={})", params.k);
-    } else {
-        tracing::debug!("CCITT Group 4 decompression requested");
-    }
-
-    // Primary: the in-house decoder (Group 4 T.6, and Group 3 T.4 for K >= 0).
-    // It honors /EncodedByteAlign (which the fax crate cannot — its bit reader
-    // is private) and recovers partial content from truncated/damaged streams
-    // instead of blanking the page. ~keep
-    let in_house = crate::decoders::ccitt::decode(data, params);
-    let fax_result = match in_house {
-        Ok(decoded) => {
-            if decoded.recovered_partial {
-                tracing::warn!(
-                    "CCITT: recovered {} rows then padded white (truncated/damaged stream, {}x{}, {} bytes)",
-                    decoded.rows_decoded,
-                    params.columns,
-                    params.rows.unwrap_or(0),
-                    data.len()
-                );
-            }
-            Ok(decoded.data)
-        }
-        Err(in_house_err) => {
-            // A stream the in-house decoder couldn't make progress on: fall
-            // back to the legacy fax crate before giving up. ~keep
-            tracing::debug!("CCITT in-house decode declined ({in_house_err}); trying fax crate");
-            decompress_with_fax(data, width, height_opt, params)
-        }
-    };
+    let fax_result = decode_ccitt_with_fallback(data, width, params);
 
     match fax_result {
         Ok(mut output) => {
@@ -99,21 +61,79 @@ pub fn decompress_ccitt(data: &[u8], params: &CcittParams) -> Result<Vec<u8>> {
                 params.encoded_byte_align,
                 e
             );
-            let bytes_per_row = (width as usize).div_ceil(8);
-            let rows = usize::try_from(params.rows.unwrap_or(1))
-                .map_err(|_| Error::Decode("CCITT row count exceeds platform limits".to_string()))?;
-            let expected_bytes = rows
-                .checked_mul(bytes_per_row)
-                .ok_or_else(|| Error::Decode("CCITT fallback size overflow".to_string()))?;
-            let fallback_len = expected_bytes.max(bytes_per_row);
-            let mut fallback = Vec::new();
-            fallback
-                .try_reserve_exact(fallback_len)
-                .map_err(|_| Error::Decode(format!("Unable to allocate {fallback_len} bytes for CCITT fallback")))?;
-            fallback.resize(fallback_len, 0);
-            Ok(fallback)
+            build_blank_fallback(width, params)
         }
     }
+}
+
+/// Logs the CCITT decompression parameters at the start of a decode attempt. ~keep
+fn log_ccitt_decompress_start(data: &[u8], params: &CcittParams) {
+    tracing::debug!(
+        "CCITT decompression: {} bytes, {}x{} pixels, K={}, BlackIs1={}",
+        data.len(),
+        params.columns,
+        params.rows.unwrap_or(0),
+        params.k,
+        params.black_is_1
+    );
+
+    if params.is_group_3() {
+        tracing::debug!("CCITT Group 3 decompression requested (K={})", params.k);
+    } else {
+        tracing::debug!("CCITT Group 4 decompression requested");
+    }
+}
+
+/// Tries the in-house CCITT decoder first, falling back to the `fax` crate
+/// when it cannot make progress. Split out of [`decompress_ccitt`] to keep
+/// that function focused on the overall decode-then-fallback flow. ~keep
+fn decode_ccitt_with_fallback(data: &[u8], width: u32, params: &CcittParams) -> Result<Vec<u8>> {
+    let height_opt = params.rows;
+
+    // Primary: the in-house decoder (Group 4 T.6, and Group 3 T.4 for K >= 0).
+    // It honors /EncodedByteAlign (which the fax crate cannot — its bit reader
+    // is private) and recovers partial content from truncated/damaged streams
+    // instead of blanking the page. ~keep
+    let in_house = crate::decoders::ccitt::decode(data, params);
+    match in_house {
+        Ok(decoded) => {
+            if decoded.recovered_partial {
+                tracing::warn!(
+                    "CCITT: recovered {} rows then padded white (truncated/damaged stream, {}x{}, {} bytes)",
+                    decoded.rows_decoded,
+                    params.columns,
+                    params.rows.unwrap_or(0),
+                    data.len()
+                );
+            }
+            Ok(decoded.data)
+        }
+        Err(in_house_err) => {
+            // A stream the in-house decoder couldn't make progress on: fall
+            // back to the legacy fax crate before giving up. ~keep
+            tracing::debug!("CCITT in-house decode declined ({in_house_err}); trying fax crate");
+            decompress_with_fax(data, width, height_opt, params)
+        }
+    }
+}
+
+/// Builds a bounded all-white bilevel buffer to substitute when both CCITT
+/// decoders fail, so a controlled blank page is returned instead of panicking
+/// or propagating an unrecoverable error. ~keep
+fn build_blank_fallback(width: u32, params: &CcittParams) -> Result<Vec<u8>> {
+    let bytes_per_row = (width as usize).div_ceil(8);
+    let rows = usize::try_from(params.rows.unwrap_or(1))
+        .map_err(|_| Error::Decode("CCITT row count exceeds platform limits".to_string()))?;
+    let expected_bytes = rows
+        .checked_mul(bytes_per_row)
+        .ok_or_else(|| Error::Decode("CCITT fallback size overflow".to_string()))?;
+    let fallback_len = expected_bytes.max(bytes_per_row);
+    let mut fallback = Vec::new();
+    fallback
+        .try_reserve_exact(fallback_len)
+        .map_err(|_| Error::Decode(format!("Unable to allocate {fallback_len} bytes for CCITT fallback")))?;
+    fallback.resize(fallback_len, 0);
+    Ok(fallback)
 }
 
 /// Decompress CCITT data using the fax crate.

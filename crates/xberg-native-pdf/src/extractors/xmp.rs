@@ -309,62 +309,8 @@ impl XmpExtractor {
 
                     // Find the relevant property element (skip rdf:li, rdf:Seq, rdf:Bag, rdf:Alt)
                     // ~keep
-                    let property = element_stack
-                        .iter()
-                        .rev()
-                        .find(|el| !el.starts_with("rdf:") && !el.starts_with("x:"))
-                        .cloned();
-
-                    if let Some(prop) = property {
-                        match prop.as_str() {
-                            "dc:title" => {
-                                if metadata.dc_title.is_none() {
-                                    metadata.dc_title = Some(text);
-                                }
-                            }
-                            "dc:creator" => {
-                                metadata.dc_creator.push(text);
-                            }
-                            "dc:description" => {
-                                if metadata.dc_description.is_none() {
-                                    metadata.dc_description = Some(text);
-                                }
-                            }
-                            "dc:subject" => {
-                                metadata.dc_subject.push(text);
-                            }
-                            "dc:language" => metadata.dc_language = Some(text),
-                            "dc:rights" => {
-                                if metadata.dc_rights.is_none() {
-                                    metadata.dc_rights = Some(text);
-                                }
-                            }
-                            "dc:format" => metadata.dc_format = Some(text),
-
-                            "xmp:CreatorTool" => metadata.xmp_creator_tool = Some(text),
-                            "xmp:CreateDate" => metadata.xmp_create_date = Some(text),
-                            "xmp:ModifyDate" => metadata.xmp_modify_date = Some(text),
-                            "xmp:MetadataDate" => metadata.xmp_metadata_date = Some(text),
-
-                            "pdf:Producer" => metadata.pdf_producer = Some(text),
-                            "pdf:Keywords" => metadata.pdf_keywords = Some(text),
-                            "pdf:PDFVersion" => metadata.pdf_version = Some(text),
-                            "pdf:Trapped" => metadata.pdf_trapped = Some(text),
-
-                            "xmpRights:UsageTerms" => {
-                                if metadata.xmp_rights_usage_terms.is_none() {
-                                    metadata.xmp_rights_usage_terms = Some(text);
-                                }
-                            }
-                            "xmpRights:Marked" => {
-                                metadata.xmp_rights_marked = Some(text.to_lowercase() == "true");
-                            }
-                            "xmpRights:WebStatement" => metadata.xmp_rights_web_statement = Some(text),
-
-                            _ => {
-                                metadata.custom.insert(prop.clone(), text);
-                            }
-                        }
+                    if let Some(prop) = current_xmp_property(&element_stack) {
+                        apply_xmp_property_text(&mut metadata, &prop, text);
                     }
                 }
                 Ok(Event::End(_)) => {
@@ -396,6 +342,74 @@ impl XmpExtractor {
         let start = xml.find(open)?;
         let end_rel = xml[start..].find(close)?;
         Some(&xml[start..start + end_rel + close.len()])
+    }
+}
+
+/// Returns the innermost element on the stack that isn't an RDF/XMP wrapper
+/// tag (`rdf:li`, `rdf:Seq`, `rdf:Bag`, `rdf:Alt`, `x:xmpmeta`, …) — the
+/// property a text node belongs to. Split out of [`XmpExtractor::parse_xmp`]
+/// purely to keep that function's event loop short. ~keep
+fn current_xmp_property(element_stack: &[String]) -> Option<String> {
+    element_stack
+        .iter()
+        .rev()
+        .find(|el| !el.starts_with("rdf:") && !el.starts_with("x:"))
+        .cloned()
+}
+
+/// Records a text node's value against the [`XmpMetadata`] field its
+/// namespaced property name maps to, falling back to `custom` for anything
+/// unrecognized. Split out of [`XmpExtractor::parse_xmp`] purely to keep that
+/// function's event loop short. ~keep
+fn apply_xmp_property_text(metadata: &mut XmpMetadata, prop: &str, text: String) {
+    match prop {
+        "dc:title" => {
+            if metadata.dc_title.is_none() {
+                metadata.dc_title = Some(text);
+            }
+        }
+        "dc:creator" => {
+            metadata.dc_creator.push(text);
+        }
+        "dc:description" => {
+            if metadata.dc_description.is_none() {
+                metadata.dc_description = Some(text);
+            }
+        }
+        "dc:subject" => {
+            metadata.dc_subject.push(text);
+        }
+        "dc:language" => metadata.dc_language = Some(text),
+        "dc:rights" => {
+            if metadata.dc_rights.is_none() {
+                metadata.dc_rights = Some(text);
+            }
+        }
+        "dc:format" => metadata.dc_format = Some(text),
+
+        "xmp:CreatorTool" => metadata.xmp_creator_tool = Some(text),
+        "xmp:CreateDate" => metadata.xmp_create_date = Some(text),
+        "xmp:ModifyDate" => metadata.xmp_modify_date = Some(text),
+        "xmp:MetadataDate" => metadata.xmp_metadata_date = Some(text),
+
+        "pdf:Producer" => metadata.pdf_producer = Some(text),
+        "pdf:Keywords" => metadata.pdf_keywords = Some(text),
+        "pdf:PDFVersion" => metadata.pdf_version = Some(text),
+        "pdf:Trapped" => metadata.pdf_trapped = Some(text),
+
+        "xmpRights:UsageTerms" => {
+            if metadata.xmp_rights_usage_terms.is_none() {
+                metadata.xmp_rights_usage_terms = Some(text);
+            }
+        }
+        "xmpRights:Marked" => {
+            metadata.xmp_rights_marked = Some(text.to_lowercase() == "true");
+        }
+        "xmpRights:WebStatement" => metadata.xmp_rights_web_statement = Some(text),
+
+        _ => {
+            metadata.custom.insert(prop.to_string(), text);
+        }
     }
 }
 
