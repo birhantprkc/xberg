@@ -572,11 +572,24 @@ WebUI = "WebUI"
 traineddata = "traineddata"
 
 [workspace.poly.per-file-ignores]
-# Alef-generated config files. Both grow with the size of the surface alef manages and
-# with the quality-debt baseline below; a line count on generated config is not a
-# maintainability signal. ~keep
+# Alef config and its generated derivatives. All three grow with the size of the surface alef
+# manages and with the quality-debt baseline below -- alef.toml is where that baseline is
+# written, so paying it down makes this file shorter, never longer. A line count on declarative
+# config is not a maintainability signal. ~keep
+"alef.toml" = ["file-too-long"]
 "poly.toml" = ["file-too-long"]
 ".alef-toml-merge-provenance.toml" = ["file-too-long"]
+# CHANGELOG.md is an append-only release history in Keep a Changelog form: its length is the
+# number of releases, not a maintainability signal, and nothing in it can be deleted.
+# docs-site/.../changelog.md is a byte-identical mirror of it enforced by
+# scripts/ci/check-changelog-sync.py, so it cannot be shortened independently of the original. ~keep
+"CHANGELOG.md" = ["file-too-long"]
+"docs-site/src/content/docs/changelog.md" = ["file-too-long"]
+# Recorded benchmark measurements, one JSON object per corpus document or guardrail contract
+# (note their "generated_at"/"timestamp"/"git_sha" headers). Length tracks corpus size and these
+# files hold no functions, so the size metrics have nothing to measure. ~keep
+"tools/benchmark-harness/baselines/initial_baseline.json" = ["file-too-long"]
+"tools/benchmark-harness/guardrails.json" = ["file-too-long"]
 # --- quality-debt baseline (generated) ---
 # 865 size/complexity findings across 422 files that predate these
 # metrics. Listed per file rather than switching the rules off, so the metrics still
@@ -587,8 +600,6 @@ traineddata = "traineddata"
 ".github/workflows/benchmarks.yaml" = ["file-too-long"]
 ".github/workflows/profiling.yaml" = ["file-too-long"]
 ".github/workflows/publish.yaml" = ["file-too-long"]
-"CHANGELOG.md" = ["file-too-long"]
-"alef.toml" = ["file-too-long"]
 "crates/xberg-candle-ocr/src/models/deepseek_ocr/model.rs" = [
   "file-too-long",
   "function-too-long",
@@ -1234,7 +1245,6 @@ traineddata = "traineddata"
 "crates/xberg/tests/pipeline_integration.rs" = ["file-too-long"]
 "crates/xberg/tests/plugin_ocr_backend_test.rs" = ["file-too-long"]
 "crates/xberg/tests/typst_behavioral_tests.rs" = ["file-too-long"]
-"docs-site/src/content/docs/changelog.md" = ["file-too-long"]
 "docs-site/src/content/docs/cli/usage.mdx" = ["file-too-long"]
 "docs-site/src/content/docs/guides/ocr.mdx" = ["file-too-long"]
 "integrations/java/spring-ai/src/main/java/io/xberg/springai/XbergDocumentReader.java" = ["type-too-long"]
@@ -1245,8 +1255,6 @@ traineddata = "traineddata"
 "integrations/node/n8n-nodes-xberg/nodes/Xberg/Xberg.node.ts" = ["type-too-long"]
 "integrations/python/langchain/src/langchain_xberg/loader.py" = ["type-too-long"]
 "scripts/ci/ruby/vendor-xberg-core.py" = ["function-too-long"]
-"tools/benchmark-harness/baselines/initial_baseline.json" = ["file-too-long"]
-"tools/benchmark-harness/guardrails.json" = ["file-too-long"]
 "tools/benchmark-harness/scripts/TikaExtract.java" = ["type-too-long"]
 "tools/benchmark-harness/scripts/docling_extract.py" = ["function-too-long"]
 "tools/benchmark-harness/scripts/generate_markdown_gt.py" = ["function-too-long"]
