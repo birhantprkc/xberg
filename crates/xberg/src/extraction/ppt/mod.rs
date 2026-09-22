@@ -215,6 +215,39 @@ pub(crate) fn extract_ppt_text(content: &[u8]) -> Result<PptExtractionResult> {
 ///
 /// When `extract_images` is `true`, the OLE `Pictures` stream (if present)
 /// is walked for embedded raster images (#1417).
+/// Join every non-empty slide/loose text into the extraction result's flat
+/// `text` field. Computed before the synthetic-slide fallback runs, so
+/// `loose_texts` is never counted twice (once here, once folded in there).
+fn assemble_full_text(slides: &[PptSlideText], loose_texts: &[String]) -> String {
+    slides
+        .iter()
+        .map(|s| s.text.as_str())
+        .chain(loose_texts.iter().map(String::as_str))
+        .filter(|t| !t.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Extract embedded pictures from the `/Pictures` stream, if present and requested.
+fn extract_images_if_requested(
+    comp: &mut cfb::CompoundFile<Cursor<&[u8]>>,
+    ppt_stream: &[u8],
+    live_slides: Option<&LiveSlides>,
+    extract_images: bool,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Vec<ExtractedImage> {
+    if !extract_images {
+        return Vec::new();
+    }
+    match read_stream(comp, "/Pictures") {
+        Ok(pictures_stream) if !pictures_stream.is_empty() => {
+            let slide_numbers = picture_slide_numbers(ppt_stream, live_slides.map(|l| l.offsets.as_slice()));
+            extract_pictures_from_stream(&pictures_stream, &slide_numbers, warnings)
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn extract_ppt_text_with_options(
     content: &[u8],
     include_master_slides: bool,
@@ -251,15 +284,7 @@ pub(crate) fn extract_ppt_text_with_options(
         &mut processing_warnings,
     )?;
 
-    // Computed from the pre-fallback data so `loose_texts` is never counted
-    // twice below (once here, once folded into the synthetic slide).
-    let text = slides
-        .iter()
-        .map(|s| s.text.as_str())
-        .chain(loose_texts.iter().map(String::as_str))
-        .filter(|t| !t.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let text = assemble_full_text(&slides, &loose_texts);
 
     // Defensive fallback for a stream with no `RT_SLIDE` containers at all
     // but with top-level text outside any slide/notes container: surface it
@@ -274,18 +299,13 @@ pub(crate) fn extract_ppt_text_with_options(
     }
     let slide_count = slides.len();
 
-    let images = if extract_images {
-        match read_stream(&mut comp, "/Pictures") {
-            Ok(pictures_stream) if !pictures_stream.is_empty() => {
-                let slide_numbers =
-                    picture_slide_numbers(&ppt_stream, live_slides.as_ref().map(|l| l.offsets.as_slice()));
-                extract_pictures_from_stream(&pictures_stream, &slide_numbers, &mut processing_warnings)
-            }
-            _ => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
+    let images = extract_images_if_requested(
+        &mut comp,
+        &ppt_stream,
+        live_slides.as_ref(),
+        extract_images,
+        &mut processing_warnings,
+    );
 
     Ok(PptExtractionResult {
         text: text.trim().to_string(),
@@ -564,6 +584,53 @@ fn record_outline_text(
     outline_texts[index].push(cleaned);
 }
 
+/// Mutable state [`dispatch_cleaned_text`] routes one decoded text atom into,
+/// threaded through as one bundle so the function stays under the
+/// parameter-count limit; this type has no callers outside this module. ~keep
+struct TextDispatchState<'a> {
+    outline_texts: &'a mut Vec<Vec<String>>,
+    outline_titles: &'a mut Vec<Option<String>>,
+    outline_slide_index: Option<usize>,
+    outline_text_type: Option<u32>,
+    in_notes: bool,
+    current_notes_texts: &'a mut Vec<String>,
+    in_slide_text: bool,
+    current_slide_texts: &'a mut Vec<String>,
+    loose_texts: &'a mut Vec<String>,
+}
+
+/// Route one decoded, cleaned text atom (from either `RT_TEXT_CHARS_ATOM` or
+/// `RT_TEXT_BYTES_ATOM` -- both dispatch identically once decoded) to the
+/// outline collection, notes, current slide, or loose text, exactly as
+/// `extract_texts_from_records` did inline before this was split out.
+/// A no-op for an empty `cleaned` string.
+fn dispatch_cleaned_text(cleaned: String, state: TextDispatchState) {
+    if cleaned.is_empty() {
+        return;
+    }
+    if let Some(index) = state.outline_slide_index {
+        // Outline text belongs to a slide, not to `loose_texts` -- which is
+        // discarded whenever any slide exists, and is where every legacy
+        // title used to end up (#1612).
+        record_outline_text(
+            state.outline_texts,
+            state.outline_titles,
+            index,
+            state.outline_text_type,
+            cleaned,
+        );
+    } else {
+        if state.in_notes {
+            state.current_notes_texts.push(cleaned.clone());
+        }
+        if state.in_slide_text {
+            state.current_slide_texts.push(cleaned);
+        } else if !state.in_notes {
+            state.loose_texts.push(cleaned);
+        }
+    }
+}
+
 /// Commit one just-closed `RT_NOTES` container's accumulated text into `notes_by_slide`,
 /// keyed by the slide it belongs to (xberg-io/xberg#1640).
 ///
@@ -809,29 +876,20 @@ fn extract_texts_from_records(
                         .collect();
                     let text = String::from_utf16_lossy(&chars);
                     let cleaned = clean_ppt_text(&text);
-                    if !cleaned.is_empty() {
-                        if let Some(index) = outline_slide_index {
-                            // Outline text belongs to a slide, not to `loose_texts` -- which is
-                            // discarded whenever any slide exists, and is where every legacy
-                            // title used to end up (#1612).
-                            record_outline_text(
-                                &mut outline_texts,
-                                &mut outline_titles,
-                                index,
-                                outline_text_type,
-                                cleaned,
-                            );
-                        } else {
-                            if in_notes {
-                                current_notes_texts.push(cleaned.clone());
-                            }
-                            if in_slide_text {
-                                current_slide_texts.push(cleaned);
-                            } else if !in_notes {
-                                loose_texts.push(cleaned);
-                            }
-                        }
-                    }
+                    dispatch_cleaned_text(
+                        cleaned,
+                        TextDispatchState {
+                            outline_texts: &mut outline_texts,
+                            outline_titles: &mut outline_titles,
+                            outline_slide_index,
+                            outline_text_type,
+                            in_notes,
+                            current_notes_texts: &mut current_notes_texts,
+                            in_slide_text,
+                            current_slide_texts: &mut current_slide_texts,
+                            loose_texts: &mut loose_texts,
+                        },
+                    );
                     outline_text_type = None;
                 }
                 pos = content_end;
@@ -842,29 +900,20 @@ fn extract_texts_from_records(
                     let text_data = &data[content_start..content_end];
                     let text: String = text_data.iter().map(|&b| cp1252_to_char(b)).collect();
                     let cleaned = clean_ppt_text(&text);
-                    if !cleaned.is_empty() {
-                        if let Some(index) = outline_slide_index {
-                            // Outline text belongs to a slide, not to `loose_texts` -- which is
-                            // discarded whenever any slide exists, and is where every legacy
-                            // title used to end up (#1612).
-                            record_outline_text(
-                                &mut outline_texts,
-                                &mut outline_titles,
-                                index,
-                                outline_text_type,
-                                cleaned,
-                            );
-                        } else {
-                            if in_notes {
-                                current_notes_texts.push(cleaned.clone());
-                            }
-                            if in_slide_text {
-                                current_slide_texts.push(cleaned);
-                            } else if !in_notes {
-                                loose_texts.push(cleaned);
-                            }
-                        }
-                    }
+                    dispatch_cleaned_text(
+                        cleaned,
+                        TextDispatchState {
+                            outline_texts: &mut outline_texts,
+                            outline_titles: &mut outline_titles,
+                            outline_slide_index,
+                            outline_text_type,
+                            in_notes,
+                            current_notes_texts: &mut current_notes_texts,
+                            in_slide_text,
+                            current_slide_texts: &mut current_slide_texts,
+                            loose_texts: &mut loose_texts,
+                        },
+                    );
                     outline_text_type = None;
                 }
                 pos = content_end;
@@ -1096,6 +1145,118 @@ fn picture_slide_numbers(data: &[u8], live_slides: Option<&[usize]>) -> std::col
 /// Every length is validated against the remaining buffer before slicing,
 /// so a hostile `recLen` can only shrink the walk (skip a record or stop
 /// early), never over-read or allocate unboundedly.
+/// A blip record's position and header fields, as read from the `Pictures`
+/// stream before its picture bytes are decoded. Grouped so
+/// [`extract_blip_image`] stays under the parameter-count limit; this type
+/// has no callers outside this module. ~keep
+struct BlipRecordHeader {
+    pos: usize,
+    rec_instance: u16,
+    rec_len: usize,
+    content_start: usize,
+    content_end: usize,
+}
+
+/// Validate a blip record's declared length against its UID header and the
+/// size cap, returning the picture payload length, or `None` if the record
+/// should be skipped: too short or oversized (both push a `ProcessingWarning`)
+/// or empty (skipped silently), matching the original behaviour.
+fn validate_blip_picture_len(
+    pos: usize,
+    rec_len: usize,
+    header_len: usize,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Option<usize> {
+    if rec_len < header_len {
+        crate::core::diagnostics::push_warning(
+            warnings,
+            PPT_WARNING_SOURCE,
+            format!(
+                "Blip record at offset {pos} (recLen={rec_len}) is shorter than its UID header \
+                 ({header_len} bytes); skipped"
+            ),
+        );
+        return None;
+    }
+
+    let picture_len = rec_len - header_len;
+    if picture_len == 0 {
+        return None;
+    }
+
+    if picture_len > MAX_PICTURE_SIZE {
+        crate::core::diagnostics::push_warning(
+            warnings,
+            PPT_WARNING_SOURCE,
+            format!(
+                "Embedded picture at offset {pos} ({picture_len} bytes) exceeds the \
+                 {MAX_PICTURE_SIZE}-byte size cap and was skipped"
+            ),
+        );
+        return None;
+    }
+
+    Some(picture_len)
+}
+
+/// Decode one blip record's picture bytes into an `ExtractedImage`, or return
+/// `None` if the record is malformed/oversized/empty (see
+/// [`validate_blip_picture_len`]).
+fn extract_blip_image(
+    data: &[u8],
+    record: BlipRecordHeader,
+    format: Cow<'static, str>,
+    slide_numbers: &std::collections::HashMap<u32, u32>,
+    image_index: u32,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Option<ExtractedImage> {
+    let BlipRecordHeader {
+        pos,
+        rec_instance,
+        rec_len,
+        content_start,
+        content_end,
+    } = record;
+
+    // One `rgbUid` (16 bytes) + `tag` (1 byte) = 17-byte header, or
+    // two `rgbUid`s + `tag` = 33 bytes; per MS-ODRAW 2.2.27-2.2.29
+    // the low bit of `recInstance` is what distinguishes the two
+    // UID counts for every raster blip type (e.g. JPEG 0x46A vs
+    // 0x46B, PNG 0x6E0 vs 0x6E1, DIB 0x7A8 vs 0x7A9).
+    let header_len = if rec_instance & 0x1 == 1 { 33 } else { 17 };
+    validate_blip_picture_len(pos, rec_len, header_len, warnings)?;
+
+    let picture_start = content_start + header_len;
+    let picture_bytes = &data[picture_start..content_end];
+
+    Some(ExtractedImage {
+        data: Bytes::copy_from_slice(picture_bytes),
+        format,
+        image_index,
+        // `foDelay` in the BSE names this record's own start offset, so `pos` is the
+        // key the drawing refers to it by (#1620). ~keep
+        page_number: u32::try_from(pos)
+            .ok()
+            .and_then(|offset| slide_numbers.get(&offset))
+            .copied(),
+        width: None,
+        height: None,
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+        description: None,
+        ocr_result: None,
+        bounding_box: None,
+        source_path: None,
+        image_kind: None,
+        kind_confidence: None,
+        cluster_id: None,
+        caption: None,
+        qr_codes: None,
+        data_base64: None,
+    })
+}
+
 fn extract_pictures_from_stream(
     data: &[u8],
     slide_numbers: &std::collections::HashMap<u32, u32>,
@@ -1135,75 +1296,17 @@ fn extract_pictures_from_stream(
             _ => None,
         };
 
-        if let Some(format) = format {
-            // One `rgbUid` (16 bytes) + `tag` (1 byte) = 17-byte header, or
-            // two `rgbUid`s + `tag` = 33 bytes; per MS-ODRAW 2.2.27-2.2.29
-            // the low bit of `recInstance` is what distinguishes the two
-            // UID counts for every raster blip type (e.g. JPEG 0x46A vs
-            // 0x46B, PNG 0x6E0 vs 0x6E1, DIB 0x7A8 vs 0x7A9).
-            let header_len = if rec_instance & 0x1 == 1 { 33 } else { 17 };
-
-            if rec_len < header_len {
-                crate::core::diagnostics::push_warning(
-                    warnings,
-                    PPT_WARNING_SOURCE,
-                    format!(
-                        "Blip record at offset {pos} (recLen={rec_len}) is shorter than its UID header \
-                         ({header_len} bytes); skipped"
-                    ),
-                );
-                pos = content_end;
-                continue;
-            }
-
-            let picture_len = rec_len - header_len;
-            if picture_len == 0 {
-                pos = content_end;
-                continue;
-            }
-
-            if picture_len > MAX_PICTURE_SIZE {
-                crate::core::diagnostics::push_warning(
-                    warnings,
-                    PPT_WARNING_SOURCE,
-                    format!(
-                        "Embedded picture at offset {pos} ({picture_len} bytes) exceeds the \
-                         {MAX_PICTURE_SIZE}-byte size cap and was skipped"
-                    ),
-                );
-                pos = content_end;
-                continue;
-            }
-
-            let picture_start = content_start + header_len;
-            let picture_bytes = &data[picture_start..content_end];
-
-            images.push(ExtractedImage {
-                data: Bytes::copy_from_slice(picture_bytes),
-                format,
-                image_index,
-                // `foDelay` in the BSE names this record's own start offset, so `pos` is the
-                // key the drawing refers to it by (#1620). ~keep
-                page_number: u32::try_from(pos)
-                    .ok()
-                    .and_then(|offset| slide_numbers.get(&offset))
-                    .copied(),
-                width: None,
-                height: None,
-                colorspace: None,
-                bits_per_component: None,
-                is_mask: false,
-                description: None,
-                ocr_result: None,
-                bounding_box: None,
-                source_path: None,
-                image_kind: None,
-                kind_confidence: None,
-                cluster_id: None,
-                caption: None,
-                qr_codes: None,
-                data_base64: None,
-            });
+        let record = BlipRecordHeader {
+            pos,
+            rec_instance,
+            rec_len,
+            content_start,
+            content_end,
+        };
+        if let Some(format) = format
+            && let Some(image) = extract_blip_image(data, record, format, slide_numbers, image_index, warnings)
+        {
+            images.push(image);
             image_index += 1;
         }
 
@@ -1393,1148 +1496,4 @@ fn read_property_value(data: &[u8], offset: usize) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_clean_ppt_text() {
-        assert_eq!(clean_ppt_text("Hello\rWorld"), "Hello\nWorld");
-        assert_eq!(clean_ppt_text("A\x0BB"), "A\nB");
-    }
-
-    #[test]
-    fn test_cp1252_to_char() {
-        assert_eq!(cp1252_to_char(b'A'), 'A');
-        assert_eq!(cp1252_to_char(0x80), '\u{20AC}');
-    }
-
-    #[test]
-    fn test_extract_ppt_real_file() {
-        let test_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/ppt/simple.ppt");
-        if !test_file.exists() {
-            return;
-        }
-        let content = std::fs::read(&test_file).expect("Failed to read test PPT");
-        let result = extract_ppt_text(&content).expect("Failed to extract PPT text");
-        assert!(!result.text.is_empty(), "PPT extraction should produce text");
-    }
-
-    #[test]
-    fn test_extract_ppt_invalid_data() {
-        let result = extract_ppt_text(b"not a ppt file");
-        assert!(result.is_err());
-    }
-
-    /// #87 regression: `test_documents/ppt/simple.ppt` has exactly two
-    /// top-level `Slide` (0x03EE) containers and three `SlideListWithText`
-    /// (0x0FF0) containers holding only outline-view `SlidePersistAtom`
-    /// entries. Segmenting on `SlideListWithText` collapsed all real slide
-    /// text into a single trailing blob and reported the wrong slide count.
-    #[test]
-    fn test_extract_ppt_real_file_reports_two_slides() {
-        let test_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/ppt/simple.ppt");
-        if !test_file.exists() {
-            return;
-        }
-        let content = std::fs::read(&test_file).expect("Failed to read test PPT");
-        let result = extract_ppt_text(&content).expect("Failed to extract PPT text");
-        assert_eq!(result.slide_count, 2, "simple.ppt has exactly two Slide containers");
-    }
-
-    /// Build one PowerPoint record header (8 bytes: recVerInstance, recType, recLen).
-    fn record_header(rec_ver_instance: u16, rec_type: u16, rec_len: u32) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8);
-        buf.extend_from_slice(&rec_ver_instance.to_le_bytes());
-        buf.extend_from_slice(&rec_type.to_le_bytes());
-        buf.extend_from_slice(&rec_len.to_le_bytes());
-        buf
-    }
-
-    /// Build a container record (recVer nibble = 0xF) wrapping `children`.
-    fn container(rec_type: u16, children: &[u8]) -> Vec<u8> {
-        let mut buf = record_header(0x000F, rec_type, children.len() as u32);
-        buf.extend_from_slice(children);
-        buf
-    }
-
-    /// Build a `TextCharsAtom` (UTF-16LE) record for `text`.
-    fn text_chars_atom(text: &str) -> Vec<u8> {
-        let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let mut buf = record_header(0x0000, RT_TEXT_CHARS_ATOM, utf16.len() as u32);
-        buf.extend_from_slice(&utf16);
-        buf
-    }
-
-    /// Build a `TextHeaderAtom` (MS-PPT 2.13.33) declaring the `TextTypeEnum` value the
-    /// text atom that follows is typed as.
-    fn text_header_atom(text_type: u32) -> Vec<u8> {
-        let mut buf = record_header(0x0000, RT_TEXT_HEADER_ATOM, 4);
-        buf.extend_from_slice(&text_type.to_le_bytes());
-        buf
-    }
-
-    /// Build a `SlidePersistAtom` naming `persist_id`. Only the leading `persistIdRef`
-    /// matters to the reader; the remaining 16 bytes are the documented tail.
-    fn slide_persist_atom(persist_id: u32) -> Vec<u8> {
-        slide_persist_atom_with_slide_id(persist_id, 0)
-    }
-
-    /// Build a `SlidePersistAtom` naming both `persist_id` (which resolves the `Slide`
-    /// container's stream offset) and `slide_id` (what `NotesAtom.slideIdRef` names the
-    /// slide by -- #1640). Layout per MS-PPT 2.4.14: `persistIdRef` (4), `flags` (4),
-    /// `numberTexts` (4), `slideId` (4), `reserved2` (4).
-    fn slide_persist_atom_with_slide_id(persist_id: u32, slide_id: u32) -> Vec<u8> {
-        let mut buf = record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 20);
-        buf.extend_from_slice(&persist_id.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 4]); // flags
-        buf.extend_from_slice(&[0u8; 4]); // numberTexts
-        buf.extend_from_slice(&slide_id.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 4]); // reserved2
-        buf
-    }
-
-    /// Build a `NotesAtom` (MS-PPT 2.5.7): `slideIdRef` (4 bytes), then `slideFlags` (2)
-    /// and `unused` (2) -- neither read here.
-    fn notes_atom(slide_id_ref: u32) -> Vec<u8> {
-        let mut buf = record_header(0x0000, RT_NOTES_ATOM, 8);
-        buf.extend_from_slice(&slide_id_ref.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 4]);
-        buf
-    }
-
-    /// Build a `PersistDirectoryAtom` holding one single-id entry per `(id, offset)` pair.
-    fn persist_directory(entries: &[(u32, u32)]) -> Vec<u8> {
-        let mut body = Vec::new();
-        for (id, offset) in entries {
-            body.extend_from_slice(&((1u32 << PERSIST_COUNT_SHIFT) | (id & PERSIST_ID_MASK)).to_le_bytes());
-            body.extend_from_slice(&offset.to_le_bytes());
-        }
-        let mut buf = record_header(0x0000, RT_PERSIST_DIRECTORY_ATOM, body.len() as u32);
-        buf.extend_from_slice(&body);
-        buf
-    }
-
-    /// Build a `UserEditAtom`. `offset_last_edit` is 0 for the first save. `doc_persist_id_ref`
-    /// is the persist id of this save's live `DocumentContainer` (#1639).
-    fn user_edit_atom(offset_last_edit: u32, offset_persist_directory: u32, doc_persist_id_ref: u32) -> Vec<u8> {
-        let mut buf = record_header(0x0000, RT_USER_EDIT_ATOM, 28);
-        buf.extend_from_slice(&1u32.to_le_bytes()); // lastSlideIdRef
-        buf.extend_from_slice(&[0u8; 4]); // version / minorVersion / majorVersion
-        buf.extend_from_slice(&offset_last_edit.to_le_bytes());
-        buf.extend_from_slice(&offset_persist_directory.to_le_bytes());
-        buf.extend_from_slice(&doc_persist_id_ref.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 8]); // persistIdSeed, lastView, unused
-        buf
-    }
-
-    /// Build a `Current User` stream whose `CurrentUserAtom` points at `offset_to_current_edit`.
-    fn current_user_stream(offset_to_current_edit: u32) -> Vec<u8> {
-        let mut buf = record_header(0x0000, 0x0FF6, 0x14);
-        buf.extend_from_slice(&0x14u32.to_le_bytes()); // size
-        buf.extend_from_slice(&0xE391_C05Fu32.to_le_bytes()); // headerToken
-        buf.extend_from_slice(&offset_to_current_edit.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 8]);
-        buf
-    }
-
-    /// GH#1614: a `.ppt` stream is append-only across saves, so a superseded copy of a
-    /// slide is still present in the bytes. Walking the stream counts it as a slide of the
-    /// presentation; the live persist directory does not name it.
-    #[test]
-    fn a_superseded_slide_revision_is_not_extracted_as_a_slide() {
-        let stale = container(RT_SLIDE, &text_chars_atom("stale revision"));
-        let live_one = container(RT_SLIDE, &text_chars_atom("first slide"));
-        let live_two = container(RT_SLIDE, &text_chars_atom("second slide"));
-
-        let mut data = Vec::new();
-        let stale_offset = data.len() as u32;
-        data.extend_from_slice(&stale);
-        let one_offset = data.len() as u32;
-        data.extend_from_slice(&live_one);
-        let two_offset = data.len() as u32;
-        data.extend_from_slice(&live_two);
-
-        let slide_list = container(
-            RT_SLIDE_LIST_WITH_TEXT,
-            &[slide_persist_atom(1), slide_persist_atom(2)].concat(),
-        );
-        let document = container(RT_DOCUMENT, &slide_list);
-        let document_offset = data.len() as u32;
-        data.extend_from_slice(&document);
-
-        // Older save: persist id 1 pointed at the stale copy. Newer save: it points at the
-        // live one, and adds id 2. Persist id 20 is the `DocumentContainer` itself, named by
-        // both saves' `UserEditAtom.docPersistIdRef` (#1639).
-        let old_dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[(1, stale_offset)]));
-        let new_dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[
-            (1, one_offset),
-            (2, two_offset),
-            (20, document_offset),
-        ]));
-
-        let old_edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(0, old_dir_offset, 20));
-        let new_edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(old_edit_offset, new_dir_offset, 20));
-
-        let live =
-            live_slide_offsets(&data, &current_user_stream(new_edit_offset)).expect("the persist chain must resolve");
-        assert_eq!(
-            live.offsets,
-            vec![one_offset as usize, two_offset as usize],
-            "the stale revision's offset must not appear in the live slide list"
-        );
-
-        let mut warnings = Vec::new();
-        let (slides, _, _) = extract_texts_from_records(&data, false, Some(&live), &mut warnings)
-            .expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 2, "three Slide containers, two live slides");
-        assert_eq!(slides[0].text, "first slide");
-        assert_eq!(slides[1].text, "second slide");
-        assert!(
-            !slides.iter().any(|slide| slide.text.contains("stale")),
-            "a superseded revision must not reach the output"
-        );
-
-        // The fixture reproduces the defect, rather than merely being consistent with the
-        // fix: walked without the live list -- which is what this extractor did for every
-        // deck -- the stale revision is extracted and numbered as slide 1. ~keep
-        let mut stream_order_warnings = Vec::new();
-        let (stream_order_slides, _, _) = extract_texts_from_records(&data, false, None, &mut stream_order_warnings)
-            .expect("record parsing should succeed");
-        assert_eq!(
-            stream_order_slides.len(),
-            3,
-            "stream order counts the superseded revision"
-        );
-        assert_eq!(stream_order_slides[0].text, "stale revision");
-    }
-
-    /// GH#1614, the other half: `SlideListWithText` states the presentation order, which
-    /// need not be the byte order the saves left the containers in.
-    #[test]
-    fn slides_are_numbered_by_presentation_order_not_stream_order() {
-        let first_in_stream = container(RT_SLIDE, &text_chars_atom("appears second"));
-        let second_in_stream = container(RT_SLIDE, &text_chars_atom("appears first"));
-
-        let mut data = Vec::new();
-        let stream_a = data.len() as u32;
-        data.extend_from_slice(&first_in_stream);
-        let stream_b = data.len() as u32;
-        data.extend_from_slice(&second_in_stream);
-
-        // Persist id 1 is the deck's first slide and lives LATER in the stream.
-        let slide_list = container(
-            RT_SLIDE_LIST_WITH_TEXT,
-            &[slide_persist_atom(1), slide_persist_atom(2)].concat(),
-        );
-        let document = container(RT_DOCUMENT, &slide_list);
-        let document_offset = data.len() as u32;
-        data.extend_from_slice(&document);
-
-        let dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[
-            (1, stream_b),
-            (2, stream_a),
-            (20, document_offset),
-        ]));
-        let edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(0, dir_offset, 20));
-
-        let live =
-            live_slide_offsets(&data, &current_user_stream(edit_offset)).expect("the persist chain must resolve");
-        assert_eq!(live.offsets, vec![stream_b as usize, stream_a as usize]);
-
-        let mut warnings = Vec::new();
-        let (slides, _, _) = extract_texts_from_records(&data, false, Some(&live), &mut warnings)
-            .expect("record parsing should succeed");
-
-        assert_eq!(
-            slides.iter().map(|s| (s.number, s.text.as_str())).collect::<Vec<_>>(),
-            vec![(1, "appears first"), (2, "appears second")],
-            "slide numbers and order come from the slide list, not the byte order"
-        );
-    }
-
-    /// xberg-io/xberg#1639: a `.ppt` stream is append-only, so a deck saved more than once
-    /// carries one `SlideListWithText` per save. The first one in the stream is the
-    /// **oldest** save's; the live save's list -- reached via `docPersistIdRef` on the
-    /// current `UserEditAtom` -- is the presentation's. Reproduces the issue's own example:
-    /// a second save adds a slide, and the first save's list must not be read instead.
-    #[test]
-    fn the_live_document_slide_list_is_read_not_the_first_one_in_the_stream() {
-        let slide_a = container(RT_SLIDE, &text_chars_atom("Slide A"));
-        let mut data = Vec::new();
-        let slide_a_offset = data.len() as u32;
-        data.extend_from_slice(&slide_a);
-
-        let old_slide_list = container(RT_SLIDE_LIST_WITH_TEXT, &slide_persist_atom(4));
-        let old_document = container(RT_DOCUMENT, &old_slide_list);
-        let old_document_offset = data.len() as u32;
-        data.extend_from_slice(&old_document);
-
-        let old_dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[(4, slide_a_offset), (1, old_document_offset)]));
-        let old_edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(0, old_dir_offset, 1));
-
-        let slide_b = container(RT_SLIDE, &text_chars_atom("Slide B"));
-        let slide_b_offset = data.len() as u32;
-        data.extend_from_slice(&slide_b);
-
-        let new_slide_list = container(
-            RT_SLIDE_LIST_WITH_TEXT,
-            &[slide_persist_atom(4), slide_persist_atom(5)].concat(),
-        );
-        let new_document = container(RT_DOCUMENT, &new_slide_list);
-        let new_document_offset = data.len() as u32;
-        data.extend_from_slice(&new_document);
-
-        let new_dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[(5, slide_b_offset), (1, new_document_offset)]));
-        let new_edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(old_edit_offset, new_dir_offset, 1));
-
-        let live =
-            live_slide_offsets(&data, &current_user_stream(new_edit_offset)).expect("the persist chain must resolve");
-        assert_eq!(
-            live.offsets,
-            vec![slide_a_offset as usize, slide_b_offset as usize],
-            "the live document's slide list names both persist ids 4 and 5, not just the first save's 4"
-        );
-
-        let mut warnings = Vec::new();
-        let (slides, _, _) = extract_texts_from_records(&data, false, Some(&live), &mut warnings)
-            .expect("record parsing should succeed");
-        assert_eq!(slides.len(), 2, "the deck added a slide in its second save");
-        assert_eq!(slides[0].text, "Slide A");
-        assert_eq!(slides[1].text, "Slide B");
-    }
-
-    /// xberg-io/xberg#1639, the outline half: the outline-text harvest has the same
-    /// first-in-stream defect as the slide list -- every `SlideListWithText` met while
-    /// walking the whole stream contributed outline text, so a stale save's wording of a
-    /// slide's title could appear beside the live one. Only the live document's own list
-    /// may be harvested.
-    #[test]
-    fn outline_text_is_harvested_only_from_the_live_slide_list() {
-        let slide1 = container(RT_SLIDE, &text_chars_atom("body text"));
-        let mut data = Vec::new();
-        let slide1_offset = data.len() as u32;
-        data.extend_from_slice(&slide1);
-
-        let mut old_outline = Vec::new();
-        old_outline.extend_from_slice(&slide_persist_atom(1));
-        old_outline.extend_from_slice(&text_chars_atom("Old Title"));
-        let old_slide_list = container(RT_SLIDE_LIST_WITH_TEXT, &old_outline);
-        let old_document = container(RT_DOCUMENT, &old_slide_list);
-        let old_document_offset = data.len() as u32;
-        data.extend_from_slice(&old_document);
-
-        let old_dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[(1, slide1_offset), (2, old_document_offset)]));
-        let old_edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(0, old_dir_offset, 2));
-
-        let mut new_outline = Vec::new();
-        new_outline.extend_from_slice(&slide_persist_atom(1));
-        new_outline.extend_from_slice(&text_chars_atom("New Title"));
-        let new_slide_list = container(RT_SLIDE_LIST_WITH_TEXT, &new_outline);
-        let new_document = container(RT_DOCUMENT, &new_slide_list);
-        let new_document_offset = data.len() as u32;
-        data.extend_from_slice(&new_document);
-
-        let new_dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[(1, slide1_offset), (2, new_document_offset)]));
-        let new_edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(old_edit_offset, new_dir_offset, 2));
-
-        let live =
-            live_slide_offsets(&data, &current_user_stream(new_edit_offset)).expect("the persist chain must resolve");
-
-        let mut warnings = Vec::new();
-        let (slides, _, _) = extract_texts_from_records(&data, false, Some(&live), &mut warnings)
-            .expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 1);
-        assert_eq!(
-            slides[0].text, "New Title\nbody text",
-            "only the live save's outline title is recovered"
-        );
-        assert!(
-            !slides[0].text.contains("Old Title"),
-            "a stale save's outline text must not reach the output"
-        );
-    }
-
-    /// A deck whose chain cannot be read must keep the stream-order behaviour this
-    /// extractor had before, rather than losing slides to a partial answer.
-    #[test]
-    fn an_unreadable_persist_chain_falls_back_to_stream_order() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("one")));
-        data.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("two")));
-
-        assert!(
-            live_slide_offsets(&data, &[]).is_none(),
-            "an empty Current User stream resolves nothing"
-        );
-        assert!(
-            live_slide_offsets(&data, &current_user_stream(9_999)).is_none(),
-            "an offsetToCurrentEdit past the end of the stream resolves nothing"
-        );
-
-        let mut warnings = Vec::new();
-        let (slides, _, _) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-        assert_eq!(slides.len(), 2, "stream order still yields both slides");
-    }
-
-    /// #87: `SlideListWithText` (0x0FF0) is a per-document container of
-    /// `SlidePersistAtom` outline-view entries -- it does not occur once per
-    /// slide, and (as in real files) commonly holds no text of its own. The
-    /// actual per-slide text lives in each `Slide` (0x03EE) container.
-    /// Segmenting on `SlideListWithText` merges every slide's text into a
-    /// single blob attributed to the wrong slide count; segmenting on
-    /// `Slide` keeps each slide's text separate.
-    #[test]
-    fn test_extract_texts_segments_on_slide_not_slide_list_with_text() {
-        const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
-        const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
-
-        // A SlideListWithText container holding only SlidePersistAtom entries
-        // (no text), exactly as real files lay it out -- this used to be
-        // mistaken for a slide boundary.
-        let slide_persist_atom = record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0);
-        let bogus_slwt = container(RT_SLIDE_LIST_WITH_TEXT, &slide_persist_atom);
-
-        let slide1 = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let slide2 = container(RT_SLIDE, &text_chars_atom("Slide Two"));
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&bogus_slwt);
-        data.extend_from_slice(&slide1);
-        data.extend_from_slice(&slide2);
-
-        let mut warnings = Vec::new();
-        let (slides, loose_texts, notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(
-            slides.len(),
-            2,
-            "each Slide container is one slide, not each SlideListWithText"
-        );
-        assert_eq!(slides[0].number, 1);
-        assert_eq!(slides[0].text, "Slide One");
-        assert_eq!(slides[1].number, 2);
-        assert_eq!(slides[1].text, "Slide Two");
-        assert!(loose_texts.is_empty());
-        assert!(notes.is_empty());
-        assert!(warnings.is_empty(), "well-formed records should not warn: {warnings:?}");
-    }
-
-    /// xberg-io/xberg#1612: a legacy deck keeps a slide's title in the document-level
-    /// outline collection (`SlideListWithText`) and only the body in the slide's own drawing.
-    /// The walk collected text from `Slide` containers only, so every such title landed in
-    /// `loose_texts` -- which is discarded unless there are no slides at all -- and vanished.
-    ///
-    /// This does NOT re-segment on `SlideListWithText`; see
-    /// `test_extract_texts_segments_on_slide_not_slide_list_with_text`, which still pins that.
-    /// Slides are still one-per-`Slide`; the outline text is attributed to them by the order of
-    /// the `SlidePersistAtom` entries that introduce each slide's outline records. ~keep
-    #[test]
-    fn test_extract_texts_recovers_titles_from_slide_list_with_text() {
-        const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
-        const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
-
-        let mut outline = Vec::new();
-        outline.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
-        outline.extend_from_slice(&text_chars_atom("Search strategy development"));
-        outline.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
-        outline.extend_from_slice(&text_chars_atom("Results and discussion"));
-        let slwt = container(RT_SLIDE_LIST_WITH_TEXT, &outline);
-
-        let slide1 = container(RT_SLIDE, &text_chars_atom("=> FILE HCAPLUS"));
-        let slide2 = container(RT_SLIDE, &text_chars_atom("=> DISPLAY L1"));
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&slwt);
-        data.extend_from_slice(&slide1);
-        data.extend_from_slice(&slide2);
-
-        let mut warnings = Vec::new();
-        let (slides, loose_texts, notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 2, "still one slide per Slide container");
-        assert_eq!(slides[0].number, 1);
-        assert_eq!(slides[0].text, "Search strategy development\n=> FILE HCAPLUS");
-        assert_eq!(slides[1].number, 2);
-        assert_eq!(slides[1].text, "Results and discussion\n=> DISPLAY L1");
-        assert!(
-            loose_texts.is_empty(),
-            "outline text belongs to a slide, not to loose text"
-        );
-        assert!(notes.is_empty());
-        assert!(warnings.is_empty(), "well-formed records should not warn: {warnings:?}");
-    }
-
-    /// A title that is *also* drawn on the slide canvas must appear once, not twice: the
-    /// reporter noted that decks where the title is drawn are exactly the ones whose titles
-    /// already survived, so recovering the outline copy must not double them. ~keep
-    #[test]
-    fn test_outline_title_already_drawn_on_the_slide_is_not_duplicated() {
-        const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
-        const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
-
-        let mut outline = Vec::new();
-        outline.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
-        outline.extend_from_slice(&text_chars_atom("Title Slide"));
-        let slwt = container(RT_SLIDE_LIST_WITH_TEXT, &outline);
-
-        let mut slide_children = Vec::new();
-        slide_children.extend_from_slice(&text_chars_atom("Title Slide"));
-        slide_children.extend_from_slice(&text_chars_atom("With a subtitle"));
-        let slide1 = container(RT_SLIDE, &slide_children);
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&slwt);
-        data.extend_from_slice(&slide1);
-
-        let mut warnings = Vec::new();
-        let (slides, _loose, _notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 1);
-        assert_eq!(slides[0].text, "Title Slide\nWith a subtitle");
-    }
-
-    /// xberg-io/xberg#1635: the outline's own `TextHeaderAtom` says which run is the slide's
-    /// title (`Title` = 0) -- not the first line of whatever text ends up on the slide. A
-    /// body-typed atom (`Body` = 1) in the same outline entry must not be mistaken for one.
-    #[test]
-    fn test_extract_texts_reads_the_outline_title_type_not_the_first_line() {
-        let mut outline = Vec::new();
-        outline.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
-        outline.extend_from_slice(&text_header_atom(TEXT_TYPE_TITLE));
-        outline.extend_from_slice(&text_chars_atom("Search strategy development"));
-        outline.extend_from_slice(&text_header_atom(1)); // Body
-        outline.extend_from_slice(&text_chars_atom("a body bullet, not the title"));
-        let slwt = container(RT_SLIDE_LIST_WITH_TEXT, &outline);
-
-        let slide1 = container(RT_SLIDE, &text_chars_atom("=> FILE HCAPLUS"));
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&slwt);
-        data.extend_from_slice(&slide1);
-
-        let mut warnings = Vec::new();
-        let (slides, _loose, _notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 1);
-        assert_eq!(
-            slides[0].title.as_deref(),
-            Some("Search strategy development"),
-            "the Title-typed atom is the title, not the body bullet or the drawing's first line"
-        );
-    }
-
-    /// xberg-io/xberg#1635, negative control: `CenterTitle` is `6`, not `5` -- `5` is
-    /// `CenterBody`, ordinary body text. Reading the wrong value would silently promote a
-    /// slide's body to its title. ~keep
-    #[test]
-    fn test_extract_texts_treats_center_title_as_six_not_five() {
-        let mut center_title = Vec::new();
-        center_title.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
-        center_title.extend_from_slice(&text_header_atom(TEXT_TYPE_CENTER_TITLE));
-        center_title.extend_from_slice(&text_chars_atom("Refworks"));
-        let mut data = Vec::new();
-        data.extend_from_slice(&container(RT_SLIDE_LIST_WITH_TEXT, &center_title));
-        data.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("some body")));
-
-        let mut warnings = Vec::new();
-        let (slides, _, _) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-        assert_eq!(
-            slides[0].title.as_deref(),
-            Some("Refworks"),
-            "textType 6 (CenterTitle) is the centred-title placeholder"
-        );
-
-        let mut center_body = Vec::new();
-        center_body.extend_from_slice(&record_header(0x0000, RT_SLIDE_PERSIST_ATOM, 0));
-        center_body.extend_from_slice(&text_header_atom(5));
-        center_body.extend_from_slice(&text_chars_atom("body, not a title"));
-        let mut data5 = Vec::new();
-        data5.extend_from_slice(&container(RT_SLIDE_LIST_WITH_TEXT, &center_body));
-        data5.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("drawn body")));
-
-        let mut warnings5 = Vec::new();
-        let (slides5, _, _) =
-            extract_texts_from_records(&data5, false, None, &mut warnings5).expect("record parsing should succeed");
-        assert_eq!(
-            slides5[0].title, None,
-            "textType 5 is CenterBody, not CenterTitle -- must not become the title"
-        );
-    }
-
-    /// xberg-io/xberg#1640: the notes master is also an `RT_NOTES` container --
-    /// `NotesAtom.slideIdRef == 0x80000000` -- and carries the notes page's layout
-    /// placeholder text, not a slide's speaker notes. It must never reach
-    /// `speaker_notes` or attach to any slide.
-    #[test]
-    fn should_not_treat_the_notes_master_placeholder_as_a_speaker_note() {
-        let mut notes_master = Vec::new();
-        notes_master.extend_from_slice(&notes_atom(NOTES_MASTER_SLIDE_ID_REF));
-        notes_master.extend_from_slice(&text_chars_atom("Click to edit Master text styles"));
-        let notes_master_container = container(RT_NOTES, &notes_master);
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&notes_master_container);
-        data.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("Slide One")));
-
-        let mut warnings = Vec::new();
-        let (slides, _loose, speaker_notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert!(
-            speaker_notes.is_empty(),
-            "the notes master's placeholder text must not become a speaker note: {speaker_notes:?}"
-        );
-        assert_eq!(slides.len(), 1);
-        assert_eq!(
-            slides[0].notes, None,
-            "the master placeholder must not attach to slide 1 either"
-        );
-    }
-
-    /// xberg-io/xberg#1640: notes must attach to the slide `NotesAtom.slideIdRef` names,
-    /// resolved through the live `SlidePersistAtom.slideId` -- not to the slide at the same
-    /// position among the deck's non-empty notes pages. Slide 1 has no notes; slide 2's
-    /// note must land on slide 2, not shift onto slide 1.
-    #[test]
-    fn should_attach_notes_to_the_slide_named_by_slide_id_ref_not_position() {
-        let slide1 = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let slide2 = container(RT_SLIDE, &text_chars_atom("Slide Two"));
-
-        let mut data = Vec::new();
-        let slide1_offset = data.len() as u32;
-        data.extend_from_slice(&slide1);
-        let slide2_offset = data.len() as u32;
-        data.extend_from_slice(&slide2);
-
-        let mut notes2 = Vec::new();
-        notes2.extend_from_slice(&notes_atom(101));
-        notes2.extend_from_slice(&text_chars_atom("Notes for slide two"));
-        data.extend_from_slice(&container(RT_NOTES, &notes2));
-
-        let slide_list = container(
-            RT_SLIDE_LIST_WITH_TEXT,
-            &[
-                slide_persist_atom_with_slide_id(10, 100),
-                slide_persist_atom_with_slide_id(11, 101),
-            ]
-            .concat(),
-        );
-        let document = container(RT_DOCUMENT, &slide_list);
-        let document_offset = data.len() as u32;
-        data.extend_from_slice(&document);
-
-        let dir_offset = data.len() as u32;
-        data.extend_from_slice(&persist_directory(&[
-            (10, slide1_offset),
-            (11, slide2_offset),
-            (99, document_offset),
-        ]));
-        let edit_offset = data.len() as u32;
-        data.extend_from_slice(&user_edit_atom(0, dir_offset, 99));
-
-        let live =
-            live_slide_offsets(&data, &current_user_stream(edit_offset)).expect("the persist chain must resolve");
-
-        let mut warnings = Vec::new();
-        let (slides, _loose, speaker_notes) = extract_texts_from_records(&data, false, Some(&live), &mut warnings)
-            .expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 2);
-        assert_eq!(
-            slides[0].notes, None,
-            "slide 1 has no notes and must not inherit slide 2's by position"
-        );
-        assert_eq!(slides[1].notes.as_deref(), Some("Notes for slide two"));
-        assert_eq!(speaker_notes, vec!["Notes for slide two".to_string()]);
-    }
-
-    /// A `Notes` container's text must not bleed into the slide that follows
-    /// it once its own byte range has ended.
-    #[test]
-    fn test_extract_texts_closes_notes_range_before_next_slide() {
-        let notes = container(RT_NOTES, &text_chars_atom("Speaker notes"));
-        let slide1 = container(RT_SLIDE, &text_chars_atom("Slide One"));
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&notes);
-        data.extend_from_slice(&slide1);
-
-        let mut warnings = Vec::new();
-        let (slides, loose_texts, speaker_notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(slides.len(), 1);
-        assert_eq!(slides[0].number, 1);
-        assert_eq!(slides[0].text, "Slide One");
-        assert!(loose_texts.is_empty());
-        assert_eq!(speaker_notes, vec!["Speaker notes".to_string()]);
-    }
-
-    /// #1418: a slide's number must come from its position among `RT_SLIDE`
-    /// containers, not from the position of a text block after joining and
-    /// re-splitting on `"\n\n"`. A slide with no text atoms must still get a
-    /// number instead of vanishing and shifting every later slide down.
-    #[test]
-    fn should_number_slides_by_persist_order_when_a_middle_slide_has_no_text() {
-        let slide1 = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let slide2 = container(RT_SLIDE, &[]); // no text atoms at all
-        let slide3 = container(RT_SLIDE, &text_chars_atom("Slide Three"));
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&slide1);
-        data.extend_from_slice(&slide2);
-        data.extend_from_slice(&slide3);
-
-        let mut warnings = Vec::new();
-        let (slides, _loose_texts, _notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(
-            slides.len(),
-            3,
-            "the empty middle slide must still produce a slide entry"
-        );
-        assert_eq!(slides[0].number, 1);
-        assert_eq!(slides[0].text, "Slide One");
-        assert_eq!(slides[1].number, 2);
-        assert_eq!(
-            slides[1].text, "",
-            "a slide with no text atoms has empty text, not a missing entry"
-        );
-        assert_eq!(slides[2].number, 3);
-        assert_eq!(slides[2].text, "Slide Three");
-    }
-
-    /// #1418 root-cause regression: a single slide whose own atoms, once
-    /// joined by `clean_ppt_text`'s newline mapping, contain an internal
-    /// `"\n\n"` (a text atom ending in a blank trailing paragraph, i.e. two
-    /// consecutive `\r` paragraph marks) must still be reported as exactly
-    /// one slide. The old algorithm re-split the whole document's text on
-    /// `"\n\n"`, so this single slide's own text was itself indistinguishable
-    /// from a slide boundary.
-    #[test]
-    fn should_keep_one_slide_entry_when_slide_text_contains_internal_blank_line() {
-        let atom_with_trailing_blank_paragraph = text_chars_atom("Title\r\r");
-        let atom_body = text_chars_atom("Body");
-        let mut slide_children = Vec::new();
-        slide_children.extend_from_slice(&atom_with_trailing_blank_paragraph);
-        slide_children.extend_from_slice(&atom_body);
-        let slide1 = container(RT_SLIDE, &slide_children);
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&slide1);
-
-        let mut warnings = Vec::new();
-        let (slides, _loose_texts, _notes) =
-            extract_texts_from_records(&data, false, None, &mut warnings).expect("record parsing should succeed");
-
-        assert_eq!(
-            slides.len(),
-            1,
-            "one Slide container is one slide, however its joined text looks"
-        );
-        assert_eq!(slides[0].number, 1);
-        assert_eq!(
-            slides[0].text, "Title\n\nBody",
-            "the slide's own text legitimately contains an internal blank line"
-        );
-    }
-
-    /// Build a raster `OfficeArtBlip` record with a single 16-byte UID
-    /// (MS-ODRAW 2.2.27-2.2.29 "one UID" layout: `rgbUid1(16) + tag(1) +
-    /// BLIPFileData`). `rec_instance` must be even per spec (e.g. JPEG
-    /// 0x46A, PNG 0x6E0, DIB 0x7A8).
-    fn blip_record_one_uid(rec_instance: u16, rec_type: u16, picture_bytes: &[u8]) -> Vec<u8> {
-        assert_eq!(rec_instance & 0x1, 0, "one-UID recInstance must be even");
-        let rec_ver_instance = rec_instance << 4;
-        let rec_len = (17 + picture_bytes.len()) as u32;
-        let mut buf = record_header(rec_ver_instance, rec_type, rec_len);
-        buf.extend_from_slice(&[0u8; 16]);
-        buf.push(0xFF);
-        buf.extend_from_slice(picture_bytes);
-        buf
-    }
-
-    /// Build a raster `OfficeArtBlip` record with two 16-byte UIDs
-    /// ("two UID" layout: `rgbUid1(16) + rgbUid2(16) + tag(1) +
-    /// BLIPFileData`). `rec_instance` must be odd per spec (e.g. JPEG
-    /// 0x46B, PNG 0x6E1, DIB 0x7A9).
-    fn blip_record_two_uid(rec_instance: u16, rec_type: u16, picture_bytes: &[u8]) -> Vec<u8> {
-        assert_eq!(rec_instance & 0x1, 1, "two-UID recInstance must be odd");
-        let rec_ver_instance = rec_instance << 4;
-        let rec_len = (33 + picture_bytes.len()) as u32;
-        let mut buf = record_header(rec_ver_instance, rec_type, rec_len);
-        buf.extend_from_slice(&[0u8; 32]);
-        buf.push(0xFF);
-        buf.extend_from_slice(picture_bytes);
-        buf
-    }
-
-    #[test]
-    fn should_extract_jpeg_bytes_when_pictures_stream_has_one_uid_jpeg_blip() {
-        let picture = b"\xFF\xD8\xFFfake-jpeg-payload";
-        let data = blip_record_one_uid(0x46A, RT_BLIP_JPEG, picture);
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, "jpeg");
-        assert_eq!(images[0].image_index, 0);
-        assert_eq!(&images[0].data[..], &picture[..]);
-        assert!(warnings.is_empty());
-    }
-
-    #[test]
-    fn should_extract_png_bytes_when_pictures_stream_has_two_uid_png_blip() {
-        let picture = b"\x89PNG\r\n\x1a\nfake-png-payload";
-        let data = blip_record_two_uid(0x6E1, RT_BLIP_PNG, picture);
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, "png");
-        assert_eq!(&images[0].data[..], &picture[..]);
-        assert!(warnings.is_empty());
-    }
-
-    #[test]
-    fn should_extract_dib_bytes_and_tag_format_dib_when_pictures_stream_has_dib_blip() {
-        let picture = b"fake-dib-bitmap-payload";
-        let data = blip_record_one_uid(0x7A8, RT_BLIP_DIB, picture);
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, "dib");
-        assert_eq!(&images[0].data[..], &picture[..]);
-    }
-
-    #[test]
-    fn should_assign_sequential_image_index_when_pictures_stream_has_multiple_blips() {
-        let jpeg = blip_record_one_uid(0x46A, RT_BLIP_JPEG, b"jpeg-one");
-        let png = blip_record_one_uid(0x6E0, RT_BLIP_PNG, b"png-two");
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&jpeg);
-        data.extend_from_slice(&png);
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert_eq!(images.len(), 2);
-        assert_eq!(images[0].image_index, 0);
-        assert_eq!(images[0].format, "jpeg");
-        assert_eq!(images[1].image_index, 1);
-        assert_eq!(images[1].format, "png");
-    }
-
-    #[test]
-    fn should_skip_non_blip_records_when_walking_pictures_stream() {
-        // An arbitrary non-blip OfficeArt record (a group shape record,
-        // 0xF003) sitting between two real blips must not be mistaken for a
-        // picture and must not stop the walk.
-        const RT_UNRELATED: u16 = 0xF003;
-        let unrelated = record_header(0x0000, RT_UNRELATED, 4)
-            .into_iter()
-            .chain([1, 2, 3, 4])
-            .collect::<Vec<u8>>();
-        let jpeg = blip_record_one_uid(0x46A, RT_BLIP_JPEG, b"real-jpeg");
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&unrelated);
-        data.extend_from_slice(&jpeg);
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert_eq!(images.len(), 1);
-        assert_eq!(images[0].format, "jpeg");
-    }
-
-    /// Safety: a record whose declared `recLen` overruns the remaining
-    /// buffer must never panic or over-read -- the walk stops and a
-    /// diagnostic warning is recorded instead.
-    #[test]
-    fn should_stop_without_panicking_when_blip_declares_length_past_buffer_end() {
-        let mut data = record_header(0x46A << 4, RT_BLIP_JPEG, u32::MAX);
-        data.extend_from_slice(&[0u8; 4]); // far short of the declared recLen
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert!(images.is_empty());
-        assert!(
-            warnings.iter().any(|w| w.message.contains("truncated")),
-            "expected a truncation warning, got: {warnings:?}"
-        );
-    }
-
-    /// Safety: a blip record declaring fewer bytes than its own UID header
-    /// requires must be skipped, not underflow-subtracted into a bogus
-    /// picture length.
-    #[test]
-    fn should_skip_and_warn_when_blip_declared_length_is_shorter_than_uid_header() {
-        // recLen = 5, far short of the 17-byte one-UID header.
-        let data = record_header(0x46A << 4, RT_BLIP_JPEG, 5)
-            .into_iter()
-            .chain([0u8; 5])
-            .collect::<Vec<u8>>();
-
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&data, &Default::default(), &mut warnings);
-
-        assert!(images.is_empty());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.message.contains("shorter than its UID header")),
-            "expected a UID-header-too-short warning, got: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn should_return_no_images_when_pictures_stream_is_empty() {
-        let mut warnings = Vec::new();
-        let images = extract_pictures_from_stream(&[], &Default::default(), &mut warnings);
-        assert!(images.is_empty());
-        assert!(warnings.is_empty());
-    }
-
-    /// Build a minimal OLE/CFB container with a "PowerPoint Document" stream
-    /// and, optionally, a "Pictures" stream, mirroring what a real `.ppt`
-    /// looks like closely enough to drive `extract_ppt_text_with_options`
-    /// end-to-end. `test_documents/ppt/simple.ppt` has a `Pictures` stream
-    /// but it is empty (verified: 0 bytes), so this synthetic container is
-    /// the only way to exercise the `/Pictures` read path with real blips.
-    fn build_test_ppt_ole(ppt_document_stream: &[u8], pictures_stream: Option<&[u8]>) -> Vec<u8> {
-        use std::io::Write;
-        let cursor = Cursor::new(Vec::new());
-        let mut comp = cfb::CompoundFile::create(cursor).expect("create in-memory OLE container");
-        comp.create_stream("/PowerPoint Document")
-            .expect("create PowerPoint Document stream")
-            .write_all(ppt_document_stream)
-            .expect("write PowerPoint Document stream");
-        if let Some(pictures) = pictures_stream {
-            comp.create_stream("/Pictures")
-                .expect("create Pictures stream")
-                .write_all(pictures)
-                .expect("write Pictures stream");
-        }
-        comp.into_inner().into_inner()
-    }
-
-    #[test]
-    fn should_populate_images_when_pictures_stream_has_a_blip_and_extract_images_is_true() {
-        let ppt_stream = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let picture = b"\xFF\xD8\xFFsynthetic-jpeg-bytes";
-        let pictures_stream = blip_record_one_uid(0x46A, RT_BLIP_JPEG, picture);
-        let content = build_test_ppt_ole(&ppt_stream, Some(&pictures_stream));
-
-        let result =
-            extract_ppt_text_with_options(&content, false, true).expect("synthetic OLE container should parse");
-
-        assert_eq!(result.images.len(), 1);
-        assert_eq!(result.images[0].format, "jpeg");
-        assert_eq!(result.images[0].data.len(), picture.len());
-        assert_eq!(&result.images[0].data[..], &picture[..]);
-    }
-
-    #[test]
-    fn should_return_no_images_when_extract_images_is_false() {
-        let ppt_stream = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let pictures_stream = blip_record_one_uid(0x46A, RT_BLIP_JPEG, b"jpeg-bytes");
-        let content = build_test_ppt_ole(&ppt_stream, Some(&pictures_stream));
-
-        let result =
-            extract_ppt_text_with_options(&content, false, false).expect("synthetic OLE container should parse");
-
-        assert!(
-            result.images.is_empty(),
-            "extract_images=false must skip the Pictures stream entirely"
-        );
-    }
-
-    /// REV-CB regression for GH#1687 (shares the GH#1662/GH#1686 fix): an OCR-only
-    /// `ExtractionConfig` (no `images.extract_images`, no captioning, no QR codes) must
-    /// still read a `.ppt` OLE container's embedded image out of its `Pictures` stream,
-    /// not skip it. `needs_image_data` gained the OCR disjunct that makes this true
-    /// (#1662); PPT shares that predicate with DOCX, HTML and PPTX through
-    /// `PptExtractor::extract_content`'s `config.needs_image_data()` call (see
-    /// `extractors::ppt`), but until now nothing exercised that call site directly.
-    /// Before the fix, `extract_images` stayed `false` for an OCR-only config, so
-    /// `extract_ppt_text_with_options` never read `/Pictures` at all and
-    /// `InternalDocument::images` stayed empty, silently, with no warning -- the same
-    /// shape `should_return_no_images_when_extract_images_is_false` above proves at the
-    /// lower `extract_ppt_text_with_options(bool)` layer. This test lives here rather
-    /// than in `extractors::ppt`'s own test module because it reuses `build_test_ppt_ole`
-    /// and the blip/record builders already proven above, instead of a second hand-rolled
-    /// OLE/CFB writer for the same container shape.
-    #[tokio::test]
-    async fn should_read_real_embedded_image_bytes_for_ocr_only_config_at_extract_content() {
-        use crate::core::config::{ExtractionConfig, OcrConfig};
-        use crate::core::mime::LEGACY_POWERPOINT_MIME_TYPE;
-        use crate::extractors::ppt::PptExtractor;
-        use crate::plugins::InternalDocumentExtractor;
-
-        let ppt_stream = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let picture = b"\xFF\xD8\xFFsynthetic-jpeg-bytes";
-        let pictures_stream = blip_record_one_uid(0x46A, RT_BLIP_JPEG, picture);
-        let content = build_test_ppt_ole(&ppt_stream, Some(&pictures_stream));
-
-        let config = ExtractionConfig {
-            ocr: Some(OcrConfig::default()),
-            ..Default::default()
-        };
-
-        let extractor = PptExtractor::new();
-        let internal_doc = extractor
-            .extract_content(&content, LEGACY_POWERPOINT_MIME_TYPE, &config)
-            .await
-            .expect("synthetic OLE container must extract");
-
-        assert_eq!(internal_doc.images.len(), 1, "the single blip must yield one image");
-        assert_eq!(
-            internal_doc.images[0].data.as_ref(),
-            &picture[..],
-            "an OCR-only config must still read the real embedded-image bytes, not skip the Pictures stream"
-        );
-    }
-
-    #[test]
-    fn should_return_no_images_when_pictures_stream_is_absent() {
-        let ppt_stream = container(RT_SLIDE, &text_chars_atom("Slide One"));
-        let content = build_test_ppt_ole(&ppt_stream, None);
-
-        let result =
-            extract_ppt_text_with_options(&content, false, true).expect("synthetic OLE container should parse");
-
-        assert!(result.images.is_empty());
-    }
-
-    /// Build an `msofbtBSE` whose `foDelay` names `pictures_offset`. Only `foDelay` is
-    /// read; the surrounding documented fields are present so offsets are realistic.
-    fn bse_record(pictures_offset: u32) -> Vec<u8> {
-        let mut content = Vec::new();
-        content.extend_from_slice(&[0x06, 0x06]); // btWin32, btMacOS
-        content.extend_from_slice(&[0u8; 16]); // rgbUid
-        content.extend_from_slice(&[0u8; 2]); // tag
-        content.extend_from_slice(&0u32.to_le_bytes()); // size
-        content.extend_from_slice(&1u32.to_le_bytes()); // cRef
-        content.extend_from_slice(&pictures_offset.to_le_bytes()); // foDelay
-        content.extend_from_slice(&[0u8; 4]); // unused1..3, cbName
-        let mut buf = record_header(0x0000, MSOFBT_BSE, content.len() as u32);
-        buf.extend_from_slice(&content);
-        buf
-    }
-
-    /// Build an `msofbtOPT` property table carrying one `pib` entry.
-    fn opt_with_pib(pib: u32) -> Vec<u8> {
-        let mut content = Vec::new();
-        // `fBid` (bit 14) set, as a real picture shape writes it.
-        content.extend_from_slice(&(MSO_PROPERTY_PIB | 0x4000).to_le_bytes());
-        content.extend_from_slice(&pib.to_le_bytes());
-        let mut buf = record_header(1 << 4, MSOFBT_OPT[0], content.len() as u32);
-        buf.extend_from_slice(&content);
-        buf
-    }
-
-    /// #1620: a picture's slide comes from the drawing that references it, not from the
-    /// `Pictures` stream, which is in save order and names no slide at all.
-    #[test]
-    fn should_attribute_each_picture_to_the_slide_whose_drawing_references_it() {
-        let first_picture = b"\xFF\xD8\xFFfirst-picture";
-        let second_picture = b"\xFF\xD8\xFFsecond";
-        let first_blip = blip_record_one_uid(0x46A, RT_BLIP_JPEG, first_picture);
-        let second_blip = blip_record_one_uid(0x46A, RT_BLIP_JPEG, second_picture);
-        let second_offset = first_blip.len() as u32;
-        let mut pictures_stream = first_blip.clone();
-        pictures_stream.extend_from_slice(&second_blip);
-
-        // `pib` is 1-based: 1 -> the blip at offset 0, 2 -> the blip after it. ~keep
-        let mut bstore = bse_record(0);
-        bstore.extend_from_slice(&bse_record(second_offset));
-        let drawing_group = container(0xF001, &bstore);
-
-        // Slide 1 shows the *second* blip and slide 2 the first, so a passing test cannot
-        // be explained by the stream order the walk would otherwise fall back to.
-        let mut stream = drawing_group;
-        stream.extend_from_slice(&container(RT_SLIDE, &opt_with_pib(2)));
-        let mut slide_two = text_chars_atom("Slide Two");
-        slide_two.extend_from_slice(&opt_with_pib(1));
-        stream.extend_from_slice(&container(RT_SLIDE, &slide_two));
-
-        let content = build_test_ppt_ole(&stream, Some(&pictures_stream));
-        let result = extract_ppt_text_with_options(&content, false, true).expect("synthetic deck should parse");
-
-        assert_eq!(result.images.len(), 2, "both blips must still be extracted");
-        assert_eq!(&result.images[0].data[..], &first_picture[..]);
-        assert_eq!(
-            result.images[0].page_number,
-            Some(2),
-            "first blip is referenced by slide 2"
-        );
-        assert_eq!(&result.images[1].data[..], &second_picture[..]);
-        assert_eq!(
-            result.images[1].page_number,
-            Some(1),
-            "second blip is referenced by slide 1"
-        );
-    }
-
-    /// #1620: a blip in `Pictures` that no live shape displays keeps the pre-fix
-    /// behaviour -- still extracted, but attributed to no slide.
-    #[test]
-    fn should_leave_a_picture_no_shape_references_without_a_slide_number() {
-        let picture = b"\xFF\xD8\xFForphan";
-        let pictures_stream = blip_record_one_uid(0x46A, RT_BLIP_JPEG, picture);
-        let mut stream = container(0xF001, &bse_record(0));
-        stream.extend_from_slice(&container(RT_SLIDE, &text_chars_atom("Slide One")));
-
-        let content = build_test_ppt_ole(&stream, Some(&pictures_stream));
-        let result = extract_ppt_text_with_options(&content, false, true).expect("synthetic deck should parse");
-
-        assert_eq!(result.images.len(), 1);
-        assert_eq!(result.images[0].page_number, None);
-    }
-
-    /// #1620: a `pib` pointing past the end of the `BStoreContainer` is a corrupt deck,
-    /// not a panic -- the picture simply resolves to no slide.
-    #[test]
-    fn should_ignore_a_blip_index_beyond_the_blip_store() {
-        let picture = b"\xFF\xD8\xFFonly";
-        let pictures_stream = blip_record_one_uid(0x46A, RT_BLIP_JPEG, picture);
-        let mut stream = container(0xF001, &bse_record(0));
-        stream.extend_from_slice(&container(RT_SLIDE, &opt_with_pib(99)));
-
-        let content = build_test_ppt_ole(&stream, Some(&pictures_stream));
-        let result = extract_ppt_text_with_options(&content, false, true).expect("synthetic deck should parse");
-
-        assert_eq!(result.images.len(), 1);
-        assert_eq!(result.images[0].page_number, None);
-    }
-}
+mod tests;

@@ -5,6 +5,11 @@
 
 use ahash::AHashMap;
 
+use crate::error::Result;
+
+use super::content_builder::ContentBuilder;
+use super::{join_runs_with_spacing, parser};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct ElementPosition {
     pub(super) x: i64,
@@ -218,4 +223,186 @@ impl Default for ParserConfig {
 pub(super) enum ParsedContent {
     Text(TextElement),
     List(ListElement),
+}
+
+impl Slide {
+    pub(super) fn from_xml(slide_number: u32, xml_data: &[u8], rels_data: Option<&[u8]>) -> Result<Self> {
+        let elements = parser::parse_slide_xml(xml_data)?;
+
+        let (images, hyperlinks, rel_targets) = if let Some(rels) = rels_data {
+            let slide_rels = parser::parse_slide_rels(rels)?;
+            (slide_rels.images, slide_rels.hyperlinks, slide_rels.targets)
+        } else {
+            (Vec::new(), Vec::new(), AHashMap::new())
+        };
+
+        Ok(Self {
+            slide_number,
+            elements,
+            images,
+            hyperlinks,
+            rel_targets,
+        })
+    }
+
+    fn render_text_markdown(builder: &mut ContentBuilder, text: &TextElement, config: &ParserConfig) {
+        let text_content: String = if config.plain {
+            join_runs_with_spacing(&text.runs, Run::extract)
+        } else {
+            join_runs_with_spacing(&text.runs, Run::render_as_md)
+        };
+        builder.add_text(&text_content);
+    }
+
+    fn render_table_markdown(builder: &mut ContentBuilder, table: &TableElement, config: &ParserConfig) {
+        let extract_fn: fn(&Run) -> String = if config.plain { Run::extract } else { Run::render_as_md };
+        let table_rows: Vec<Vec<String>> = table
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| join_runs_with_spacing(&cell.runs, extract_fn))
+                    .collect()
+            })
+            .collect();
+        builder.add_table(&table_rows);
+    }
+
+    fn render_list_markdown(builder: &mut ContentBuilder, list: &ListElement, config: &ParserConfig) {
+        let extract_fn: fn(&Run) -> String = if config.plain { Run::extract } else { Run::render_as_md };
+        for item in &list.items {
+            let item_text = join_runs_with_spacing(&item.runs, extract_fn);
+            if item.has_bullet {
+                builder.add_list_item(item.level, item.is_ordered, &item_text);
+            } else {
+                builder.add_text(&item_text);
+            }
+        }
+    }
+
+    fn render_image_markdown(
+        builder: &mut ContentBuilder,
+        img_ref: &ImageReference,
+        images: &[ImageReference],
+        config: &ParserConfig,
+    ) {
+        if !config.inject_placeholders {
+            return;
+        }
+        let target = images
+            .iter()
+            .find(|rel| rel.id == img_ref.id)
+            .map(|rel| rel.target.as_str())
+            .unwrap_or("");
+        builder.add_image_with_desc(&img_ref.id, img_ref.description.as_deref(), target);
+    }
+
+    /// Find the element index `to_markdown` should render as the slide's
+    /// title: the first explicitly-marked title with non-empty text, or
+    /// (failing that) the first short (<100 char) text element, matching the
+    /// same two-pass search `build_slide_structure` does for its heading.
+    fn find_markdown_title_index(elements: &[SlideElement], element_indices: &[usize]) -> Option<usize> {
+        element_indices
+            .iter()
+            .find_map(|&idx| {
+                if let SlideElement::Text(text, _) = &elements[idx]
+                    && text.is_title
+                {
+                    let plain = join_runs_with_spacing(&text.runs, Run::extract);
+                    if !plain.trim().is_empty() {
+                        return Some(idx);
+                    }
+                }
+                None
+            })
+            .or_else(|| {
+                element_indices.iter().find_map(|&idx| {
+                    if let SlideElement::Text(text, _) = &elements[idx] {
+                        let plain = join_runs_with_spacing(&text.runs, Run::extract);
+                        let normalized = plain.replace('\n', " ");
+                        if normalized.len() < 100 && !normalized.trim().is_empty() {
+                            return Some(idx);
+                        }
+                    }
+                    None
+                })
+            })
+    }
+
+    pub(super) fn to_markdown(&self, config: &ParserConfig) -> String {
+        let mut builder = ContentBuilder::new(config.plain);
+
+        if config.include_slide_comment {
+            builder.add_slide_header(self.slide_number);
+        }
+
+        let mut element_indices: Vec<usize> = (0..self.elements.len()).collect();
+        element_indices.sort_by_key(|&i| {
+            let pos = self.elements[i].position();
+            (pos.y, pos.x)
+        });
+
+        let title_idx = Self::find_markdown_title_index(&self.elements, &element_indices);
+
+        if let Some(tidx) = title_idx
+            && let SlideElement::Text(text, _) = &self.elements[tidx]
+        {
+            let text_content: String = if config.plain {
+                join_runs_with_spacing(&text.runs, Run::extract)
+            } else {
+                join_runs_with_spacing(&text.runs, Run::render_as_md)
+            };
+            let normalized = text_content.replace('\n', " ");
+            builder.add_title(normalized.trim());
+        }
+
+        for &idx in &element_indices {
+            if Some(idx) == title_idx {
+                continue;
+            }
+
+            match &self.elements[idx] {
+                SlideElement::Text(text, _) => {
+                    Self::render_text_markdown(&mut builder, text, config);
+                }
+                SlideElement::Table(table, _) => {
+                    Self::render_table_markdown(&mut builder, table, config);
+                }
+                SlideElement::List(list, _) => {
+                    Self::render_list_markdown(&mut builder, list, config);
+                }
+                SlideElement::Image(img_ref, _) => {
+                    Self::render_image_markdown(&mut builder, img_ref, &self.images, config);
+                }
+                SlideElement::Chart(chart_ref, _) => {
+                    if let Some(text) = chart_ref.resolved_text.as_deref() {
+                        builder.add_text(text);
+                    }
+                }
+                SlideElement::SmartArt(diagram_ref, _) => {
+                    if let Some(text) = diagram_ref.resolved_text.as_deref() {
+                        builder.add_text(text);
+                    }
+                }
+                SlideElement::Unknown => {}
+            }
+        }
+
+        builder.build().0
+    }
+
+    pub(super) fn image_count(&self) -> usize {
+        self.elements
+            .iter()
+            .filter(|e| matches!(e, SlideElement::Image(_, _)))
+            .count()
+    }
+
+    pub(super) fn table_count(&self) -> usize {
+        self.elements
+            .iter()
+            .filter(|e| matches!(e, SlideElement::Table(_, _)))
+            .count()
+    }
 }

@@ -16,7 +16,8 @@ use roxmltree::Document;
 
 #[cfg(feature = "office")]
 use crate::extraction::office_metadata::{
-    app_properties::{DOC_SECURITY_KEY, decode_doc_security_flags},
+    app_properties::{DOC_SECURITY_KEY, PptxAppProperties, decode_doc_security_flags},
+    core_properties::CoreProperties,
     extract_core_properties, extract_custom_properties, extract_pptx_app_properties,
 };
 #[cfg(feature = "office")]
@@ -35,6 +36,103 @@ use crate::extraction::ooxml_constants::{
 /// read of `docProps/core.xml`, `docProps/app.xml`, or the custom properties
 /// part is surfaced as a `ProcessingWarning` rather than silently returning a
 /// document with those fields missing (#238).
+#[cfg(feature = "office")]
+fn merge_core_properties(metadata_map: &mut HashMap<String, String>, core: CoreProperties) {
+    if let Some(title) = core.title {
+        metadata_map.insert("title".to_string(), title);
+    }
+    if let Some(creator) = core.creator {
+        metadata_map.insert("author".to_string(), creator.clone());
+        metadata_map.insert("created_by".to_string(), creator);
+    }
+    if let Some(subject) = core.subject {
+        metadata_map.insert("subject".to_string(), subject.clone());
+        metadata_map.insert("summary".to_string(), subject);
+    }
+    if let Some(keywords) = core.keywords {
+        metadata_map.insert("keywords".to_string(), keywords);
+    }
+    if let Some(description) = core.description {
+        metadata_map.insert("description".to_string(), description);
+    }
+    if let Some(modified_by) = core.last_modified_by {
+        metadata_map.insert("modified_by".to_string(), modified_by);
+    }
+    if let Some(created) = core.created {
+        metadata_map.insert("created_at".to_string(), created);
+    }
+    if let Some(modified) = core.modified {
+        metadata_map.insert("modified_at".to_string(), modified);
+    }
+    if let Some(revision) = core.revision {
+        metadata_map.insert("revision".to_string(), revision);
+    }
+    if let Some(category) = core.category {
+        metadata_map.insert("category".to_string(), category);
+    }
+}
+
+/// Merge PPTX application properties into `metadata_map`, returning the slide count
+/// and slide names/titles for `PptxMetadata` (both are also tracked in `app`, but the
+/// caller keeps them as separate fields rather than a submap). ~keep
+#[cfg(feature = "office")]
+fn merge_app_properties(metadata_map: &mut HashMap<String, String>, app: PptxAppProperties) -> (usize, Vec<String>) {
+    let mut slide_count = 0;
+    let mut slide_names = Vec::new();
+
+    if let Some(slides) = app.slides {
+        metadata_map.insert("slide_count".to_string(), slides.to_string());
+        slide_count = slides.max(0) as usize;
+    }
+    if let Some(notes) = app.notes {
+        metadata_map.insert("notes_count".to_string(), notes.to_string());
+    }
+    if let Some(hidden_slides) = app.hidden_slides {
+        metadata_map.insert("hidden_slides".to_string(), hidden_slides.to_string());
+    }
+    if !app.slide_titles.is_empty() {
+        slide_names = app.slide_titles.clone();
+        metadata_map.insert("slide_titles".to_string(), app.slide_titles.join(", "));
+    }
+    if let Some(presentation_format) = app.presentation_format {
+        metadata_map.insert("presentation_format".to_string(), presentation_format);
+    }
+    if let Some(company) = app.company {
+        metadata_map.insert("organization".to_string(), company);
+    }
+    if let Some(application) = app.application {
+        metadata_map.insert("application".to_string(), application);
+    }
+    if let Some(app_version) = app.app_version {
+        metadata_map.insert("application_version".to_string(), app_version);
+    }
+    // #230: surface the raw DocSecurity integer plus its decoded ECMA-376
+    // flags. `PptxAppProperties` never reaches `FormatMetadata::Pptx`, so
+    // without this the presentation's protection state was discarded entirely. ~keep
+    if let Some(raw) = app.doc_security {
+        metadata_map.insert(DOC_SECURITY_KEY.to_string(), raw.to_string());
+        for (key, value) in decode_doc_security_flags(raw) {
+            metadata_map.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    (slide_count, slide_names)
+}
+
+#[cfg(feature = "office")]
+fn merge_custom_properties(metadata_map: &mut HashMap<String, String>, custom: HashMap<String, Value>) {
+    for (key, value) in custom {
+        let value_str = match value {
+            Value::String(s) => s,
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => "null".to_string(),
+            Value::Array(_) | Value::Object(_) => value.to_string(),
+        };
+        metadata_map.insert(format!("custom_{}", key), value_str);
+    }
+}
+
 #[cfg_attr(not(feature = "office"), allow(unused_variables))]
 pub(super) fn extract_metadata<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
@@ -47,40 +145,7 @@ pub(super) fn extract_metadata<R: Read + Seek>(
         let mut slide_names = Vec::new();
 
         match extract_core_properties(archive) {
-            Ok(core) => {
-                if let Some(title) = core.title {
-                    metadata_map.insert("title".to_string(), title);
-                }
-                if let Some(creator) = core.creator {
-                    metadata_map.insert("author".to_string(), creator.clone());
-                    metadata_map.insert("created_by".to_string(), creator);
-                }
-                if let Some(subject) = core.subject {
-                    metadata_map.insert("subject".to_string(), subject.clone());
-                    metadata_map.insert("summary".to_string(), subject);
-                }
-                if let Some(keywords) = core.keywords {
-                    metadata_map.insert("keywords".to_string(), keywords);
-                }
-                if let Some(description) = core.description {
-                    metadata_map.insert("description".to_string(), description);
-                }
-                if let Some(modified_by) = core.last_modified_by {
-                    metadata_map.insert("modified_by".to_string(), modified_by);
-                }
-                if let Some(created) = core.created {
-                    metadata_map.insert("created_at".to_string(), created);
-                }
-                if let Some(modified) = core.modified {
-                    metadata_map.insert("modified_at".to_string(), modified);
-                }
-                if let Some(revision) = core.revision {
-                    metadata_map.insert("revision".to_string(), revision);
-                }
-                if let Some(category) = core.category {
-                    metadata_map.insert("category".to_string(), category);
-                }
-            }
+            Ok(core) => merge_core_properties(&mut metadata_map, core),
             Err(e) => push_warning(
                 warnings,
                 "pptx",
@@ -92,43 +157,7 @@ pub(super) fn extract_metadata<R: Read + Seek>(
         }
 
         match extract_pptx_app_properties(archive) {
-            Ok(app) => {
-                if let Some(slides) = app.slides {
-                    metadata_map.insert("slide_count".to_string(), slides.to_string());
-                    slide_count = slides.max(0) as usize;
-                }
-                if let Some(notes) = app.notes {
-                    metadata_map.insert("notes_count".to_string(), notes.to_string());
-                }
-                if let Some(hidden_slides) = app.hidden_slides {
-                    metadata_map.insert("hidden_slides".to_string(), hidden_slides.to_string());
-                }
-                if !app.slide_titles.is_empty() {
-                    slide_names = app.slide_titles.clone();
-                    metadata_map.insert("slide_titles".to_string(), app.slide_titles.join(", "));
-                }
-                if let Some(presentation_format) = app.presentation_format {
-                    metadata_map.insert("presentation_format".to_string(), presentation_format);
-                }
-                if let Some(company) = app.company {
-                    metadata_map.insert("organization".to_string(), company);
-                }
-                if let Some(application) = app.application {
-                    metadata_map.insert("application".to_string(), application);
-                }
-                if let Some(app_version) = app.app_version {
-                    metadata_map.insert("application_version".to_string(), app_version);
-                }
-                // #230: surface the raw DocSecurity integer plus its decoded ECMA-376
-                // flags. `PptxAppProperties` never reaches `FormatMetadata::Pptx`, so
-                // without this the presentation's protection state was discarded entirely. ~keep
-                if let Some(raw) = app.doc_security {
-                    metadata_map.insert(DOC_SECURITY_KEY.to_string(), raw.to_string());
-                    for (key, value) in decode_doc_security_flags(raw) {
-                        metadata_map.insert(key.to_string(), value.to_string());
-                    }
-                }
-            }
+            Ok(app) => (slide_count, slide_names) = merge_app_properties(&mut metadata_map, app),
             Err(e) => push_warning(
                 warnings,
                 "pptx",
@@ -140,18 +169,7 @@ pub(super) fn extract_metadata<R: Read + Seek>(
         }
 
         match extract_custom_properties(archive) {
-            Ok(custom) => {
-                for (key, value) in custom {
-                    let value_str = match value {
-                        Value::String(s) => s,
-                        Value::Number(n) => n.to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        Value::Null => "null".to_string(),
-                        Value::Array(_) | Value::Object(_) => value.to_string(),
-                    };
-                    metadata_map.insert(format!("custom_{}", key), value_str);
-                }
-            }
+            Ok(custom) => merge_custom_properties(&mut metadata_map, custom),
             Err(e) => push_warning(
                 warnings,
                 "pptx",
@@ -225,6 +243,82 @@ pub(super) fn extract_all_notes<R: Read + Seek>(
     Ok(notes)
 }
 
+/// Build the slide-id -> 1-indexed-position map from the document's `<p:sldIdLst>`.
+fn build_slide_id_positions(doc: &Document) -> HashMap<u32, u32> {
+    let mut id_to_position: HashMap<u32, u32> = HashMap::new();
+    let Some(sld_id_lst) = doc
+        .descendants()
+        .find(|node| node.has_tag_name((PRESENTATIONML_NAMESPACE, "sldIdLst")))
+    else {
+        return id_to_position;
+    };
+
+    let mut position: u32 = 1;
+    for child in sld_id_lst.children() {
+        if !child.has_tag_name((PRESENTATIONML_NAMESPACE, "sldId")) {
+            continue;
+        }
+        if let Some(id_str) = child.attribute("id")
+            && let Ok(id) = id_str.parse::<u32>()
+        {
+            id_to_position.insert(id, position);
+        }
+        position += 1;
+    }
+
+    id_to_position
+}
+
+/// Map each slide id in `sld_id_lst`'s `<p14:sectionSldId>` children to `name` in `result`,
+/// using `id_to_position` to translate slide id to 1-indexed slide position.
+fn insert_section_slide_positions(
+    sld_id_lst: roxmltree::Node,
+    name: &str,
+    id_to_position: &HashMap<u32, u32>,
+    result: &mut HashMap<u32, String>,
+) {
+    for sld_id in sld_id_lst.children() {
+        if !sld_id.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "sectionSldId")) {
+            continue;
+        }
+        if let Some(id_str) = sld_id.attribute("id")
+            && let Ok(id) = id_str.parse::<u32>()
+            && let Some(&position) = id_to_position.get(&id)
+        {
+            result.insert(position, name.to_string());
+        }
+    }
+}
+
+/// Build the slide-position -> section-name map from the document's `<p14:sectionLst>`.
+fn build_section_names(doc: &Document, id_to_position: &HashMap<u32, u32>) -> HashMap<u32, String> {
+    let mut result: HashMap<u32, String> = HashMap::new();
+    let Some(section_lst) = doc
+        .descendants()
+        .find(|node| node.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "sectionLst")))
+    else {
+        return result;
+    };
+
+    for section in section_lst.children() {
+        if !section.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "section")) {
+            continue;
+        }
+        let name = match section.attribute("name") {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        for sld_id_lst in section.children() {
+            if !sld_id_lst.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "sectionSldIdLst")) {
+                continue;
+            }
+            insert_section_slide_positions(sld_id_lst, name, id_to_position, &mut result);
+        }
+    }
+
+    result
+}
+
 /// Extract section names from `ppt/presentation.xml`.
 ///
 /// Reads the `<p14:sectionLst>` extension element (PowerPoint 2010+) and maps
@@ -246,61 +340,12 @@ pub(super) fn extract_section_names<R: Read + Seek>(container: &mut PptxContaine
         Err(_) => return Ok(HashMap::new()),
     };
 
-    let mut id_to_position: HashMap<u32, u32> = HashMap::new();
-    for node in doc.descendants() {
-        if node.has_tag_name((PRESENTATIONML_NAMESPACE, "sldIdLst")) {
-            let mut position: u32 = 1;
-            for child in node.children() {
-                if child.has_tag_name((PRESENTATIONML_NAMESPACE, "sldId")) {
-                    if let Some(id_str) = child.attribute("id")
-                        && let Ok(id) = id_str.parse::<u32>()
-                    {
-                        id_to_position.insert(id, position);
-                    }
-                    position += 1;
-                }
-            }
-            break;
-        }
-    }
-
+    let id_to_position = build_slide_id_positions(&doc);
     if id_to_position.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut result: HashMap<u32, String> = HashMap::new();
-    for node in doc.descendants() {
-        if node.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "sectionLst")) {
-            for section in node.children() {
-                if !section.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "section")) {
-                    continue;
-                }
-                let name = match section.attribute("name") {
-                    Some(n) if !n.is_empty() => n.to_string(),
-                    _ => continue,
-                };
-                for sld_id_lst in section.children() {
-                    if !sld_id_lst.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "sectionSldIdLst")) {
-                        continue;
-                    }
-                    for sld_id in sld_id_lst.children() {
-                        if !sld_id.has_tag_name((PRESENTATIONML_2010_NAMESPACE, "sectionSldId")) {
-                            continue;
-                        }
-                        if let Some(id_str) = sld_id.attribute("id")
-                            && let Ok(id) = id_str.parse::<u32>()
-                            && let Some(&position) = id_to_position.get(&id)
-                        {
-                            result.insert(position, name.clone());
-                        }
-                    }
-                }
-            }
-            break;
-        }
-    }
-
-    Ok(result)
+    Ok(build_section_names(&doc, &id_to_position))
 }
 
 fn extract_notes_text(notes_xml: &[u8]) -> Result<String> {
@@ -334,14 +379,15 @@ mod tests {
         crate::extractors::security::SecurityLimits::default()
     }
 
-    fn make_pptx_with_sections(slide_ids: &[(u32, &str)], sections: &[(&str, &[u32])]) -> Vec<u8> {
-        use std::io::Write;
-
+    fn sld_id_lst_xml(slide_ids: &[(u32, &str)]) -> String {
         let mut sld_id_lst = String::new();
         for (i, (id, _)) in slide_ids.iter().enumerate() {
             sld_id_lst.push_str(&format!(r#"<p:sldId id="{}" r:id="rId{}"/>"#, id, i + 1));
         }
+        sld_id_lst
+    }
 
+    fn section_lst_xml(sections: &[(&str, &[u32])]) -> String {
         let mut section_lst = String::new();
         for (name, ids) in sections {
             let mut sld_ids = String::new();
@@ -353,6 +399,30 @@ mod tests {
                 name, sld_ids
             ));
         }
+        section_lst
+    }
+
+    fn presentation_rels_xml(slide_ids: &[(u32, &str)]) -> String {
+        let mut pres_rels = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for (i, (_, path)) in slide_ids.iter().enumerate() {
+            pres_rels.push_str(&format!(
+                r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="{}"/>"#,
+                i + 1,
+                path
+            ));
+        }
+        pres_rels.push_str("</Relationships>");
+        pres_rels
+    }
+
+    fn make_pptx_with_sections(slide_ids: &[(u32, &str)], sections: &[(&str, &[u32])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let sld_id_lst = sld_id_lst_xml(slide_ids);
+        let section_lst = section_lst_xml(sections);
 
         let presentation_xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -384,19 +454,7 @@ mod tests {
         zip.write_all(b"<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>").unwrap();
 
         zip.start_file("ppt/_rels/presentation.xml.rels", opts).unwrap();
-        let mut pres_rels = String::from(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
-        );
-        for (i, (_, path)) in slide_ids.iter().enumerate() {
-            pres_rels.push_str(&format!(
-                r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="{}"/>"#,
-                i + 1,
-                path
-            ));
-        }
-        pres_rels.push_str("</Relationships>");
-        zip.write_all(pres_rels.as_bytes()).unwrap();
+        zip.write_all(presentation_rels_xml(slide_ids).as_bytes()).unwrap();
 
         zip.start_file("ppt/presentation.xml", opts).unwrap();
         zip.write_all(presentation_xml.as_bytes()).unwrap();
