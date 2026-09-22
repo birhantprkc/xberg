@@ -138,7 +138,11 @@ def _segment_recall(oracle_flat: list[str], gt_set: set[str], lo: float, hi: flo
 
 
 def _reject_near_empty_gt(ev: Eval, g_tok: list[str]) -> bool:
-    """Empty/near-empty GT (e.g. a failed html_to_gfm produced "") is always bad, oracle-independent. ~keep"""
+    """Reject ground truth that is empty or near-empty.
+
+    Deliberately oracle-independent: a failed html_to_gfm run produces "", which is bad
+    regardless of what the oracle says, so this runs before any oracle check. ~keep
+    """
     if len(g_tok) < 3:
         ev.verdict, ev.reasons = "REJECT", [f"empty/near-empty GT ({len(g_tok)} tokens)"]
         return True
