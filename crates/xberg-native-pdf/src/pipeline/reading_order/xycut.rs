@@ -305,6 +305,28 @@ impl XYCutStrategy {
 
         for &idx in &order {
             let span = &spans[idx];
+
+            // A whitespace-only span carries no ink, so it must not break an
+            // otherwise-continuous heading run. A `TJ` array's tab kern
+            // (`[(3.)-1329.5(Title)] TJ`) turns into exactly such a span,
+            // always `FontWeight::Normal` regardless of the surrounding
+            // bold context (see `advance.rs`'s synthetic-space
+            // construction) — so `is_heading_like` below would reject it
+            // and sever the run at the marker/title boundary, splitting a
+            // numbered heading's marker from its own title into two
+            // separate (non-heading, single-span) fragments while the
+            // wrapped continuation line still merges into one. The
+            // narrower fragment's union bbox then no longer covers the
+            // marker's column position, letting an unrelated span at the
+            // marker's row/column slot in between during partitioning.
+            // Skipping (not breaking, not joining) the whitespace span
+            // keeps the run open across it, exactly as the same producer
+            // setting the marker in a separate text object (no kern, no
+            // synthetic space) already does. ~keep
+            if span.text.chars().all(char::is_whitespace) {
+                continue;
+            }
+
             if !is_heading_like(span) {
                 if !current.is_empty() {
                     runs.push(std::mem::take(&mut current));
@@ -2795,6 +2817,128 @@ mod tests {
             "heading-line-2 ordered late — likely the pre-fix \
              orphan-in-wrong-column behaviour. pos_second={pos_second}, \
              cap={cap}, order={order:?}"
+        );
+    }
+
+    /// GH#1738: a numbered heading whose producer set the marker and title
+    /// in ONE `TJ` array with a kern for the tab (`[(3.)-1329.5(Title )] TJ`)
+    /// must not absorb a right-column caption that Y-overlaps its first
+    /// line. The kern becomes a space-only span that is always
+    /// `FontWeight::Normal` (see `extractors/text/advance.rs`), which used
+    /// to break `find_heading_runs`'s clustering right at the
+    /// marker/title boundary: the marker ("3.") was left out of the run
+    /// while the wrapped title ("…GASTECHNISCHE" / "INSTALLATEUR")
+    /// formed a run on its own, whose narrower union bbox no longer
+    /// covered the marker's column position and let the caption's span
+    /// land between the run's two original lines once expanded.
+    ///
+    /// Geometry transcribed verbatim from `PdfDocument::extract_spans` on
+    /// page 1 of the GH#1738 reproducer (a two-column A4 page: a bold
+    /// numbered heading opening the top of the left column, a bold
+    /// caption at the top of the right column, and a body underneath
+    /// each) — `x`, `y` (top-origin) and `font_size` are the measured
+    /// values, and `y` decreases top-to-bottom exactly like every other
+    /// `y` in this file's `dense_two_column_*` fixtures. No position is
+    /// invented. ~keep
+    #[test]
+    fn gh1738_kern_tab_heading_does_not_absorb_other_column_caption() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+
+        let kern_space = |x: f32, y: f32, width: f32, font_size: f32| {
+            let mut s = make_span_text(x, y, width, font_size, " ", font_size);
+            s.offset_semantic = true;
+            s
+        };
+        let body = |x: f32, y: f32, width: f32, text: &str| make_span_text(x, y, width, 8.3, text, 8.3);
+
+        #[rustfmt::skip]
+        let spans = vec![
+            make_bold_span(30.07, 809.09, 7.51, "3.", 9.0),
+            kern_space(37.58, 809.09, 0.28, 9.0),
+            make_bold_span(312.60, 810.40, 129.00, "Fig. 6. Branderdruk (P1-P2)", 10.0),
+            make_bold_span(49.54, 809.09, 188.02, "INSTRUCTIES VOOR DE GASTECHNISCHE ", 9.0),
+            make_bold_span(49.54, 799.39, 67.66, "INSTALLATEUR", 9.0),
+            make_bold_span(30.07, 782.02, 12.51, "3.1", 9.0),
+            kern_space(42.58, 782.02, 0.28, 9.0),
+            make_bold_span(49.54, 782.02, 158.68, "GASAANSLUITING EN INSTALLATIE.", 9.0),
+            body(30.10, 764.00, 6.92, "1."),
+            body(42.80, 764.00, 224.46, "Werk altijd volgens de laatste eisen van de geldende normen"),
+            body(42.80, 755.00, 116.33, "en de plaatselijke voorschriften."),
+            body(30.10, 737.00, 6.92, "2."),
+            body(42.80, 737.00, 202.33, "Plaats bij te verwachten vuil in het gas bij voorkeur een"),
+            body(42.80, 728.00, 78.05, "gaszeef in de leiding."),
+            body(30.10, 710.00, 6.92, "3."),
+            body(42.80, 710.00, 225.82, "Als het gasblok op dichtheid wordt gecontroleerd, gebeurt dat"),
+            body(42.80, 701.00, 189.36, "met een druk van ten hoogste 500 mm waterkolom."),
+            body(30.10, 683.00, 6.92, "4."),
+            body(42.80, 683.00, 223.45, "De fabrieksafstelling van de tweetrapsregeling bedraagt 21,6"),
+            body(42.80, 674.00, 224.47, "kW voor warm water en 14 kW voor de verwarming. Voor het"),
+            body(42.80, 665.00, 219.31, "aanpassen van de verwarmingsinstelling, zie het kopje over"),
+            body(42.80, 656.00, 199.91, "de tweetrapsregeling. De branderdruk is de uitlaatdruk"),
+            body(42.80, 647.00, 220.75, "gemeten ten opzichte van de vuurhaarddruk. Voor de plaats"),
+            body(42.80, 638.00, 213.45, "van de meetnippels, zie fig. 5. Sluit voor het meten van de"),
+            body(42.80, 629.00, 210.56, "branderdruk de slangen van de drukverschilmeter aan op"),
+            body(42.80, 620.00, 196.75, "beide meetnippels. In fig. 6 is het nominale vermogen"),
+            body(42.80, 611.00, 113.12, "uitgezet tegen de branderdruk."),
+            make_bold_span(30.10, 519.00, 135.65, "Fig. 5. Branderdrukinstelling", 10.0),
+            make_bold_span(312.60, 518.40, 79.52, "Tweetrapsregeling", 9.0),
+            body(312.60, 500.30, 227.13, "Als de verwarmingsinstallatie meer of minder vermogen nodig"),
+            body(312.60, 491.30, 234.65, "heeft dan de fabrieksafstelling van 14 kW, kan de capaciteit van"),
+            body(312.60, 482.30, 223.06, "de ketel met de tweetrapsregeling worden aangepast aan de"),
+            body(312.60, 473.30, 220.77, "installatie. Op de fabriek wordt de hoogste belasting voor de"),
+            body(312.60, 464.30, 234.97, "warmwatervoorziening afgesteld op het nominale vermogen. De"),
+            body(312.60, 455.30, 197.63, "tweetrapsregeling (zie fig. 7) wordt als volgt ingesteld:"),
+            body(312.60, 446.30, 87.90, "a. Spoel onbekrachtigd."),
+            body(322.50, 437.30, 225.84, "Lage belasting instellen met de zeskante stelschroef A (let op"),
+            body(322.50, 428.30, 128.87, "dat deze vrij ligt van stelschroef B)."),
+            body(312.60, 419.30, 76.36, "b. Spoel bekrachtigd"),
+            body(322.50, 410.30, 205.03, "Hoogste belasting controleren en zo nodig afstellen met"),
+            body(322.50, 401.30, 50.31, "stelschroef B."),
+            body(322.50, 392.30, 191.66, "Stift tegenhouden met een inbussleutel van 2,5 mm."),
+            body(312.60, 383.30, 94.84, "c. Stelschroef A aflakken."),
+            body(312.60, 374.30, 115.11, "d. Branderdrukken controleren."),
+            make_bold_span(312.60, 293.20, 120.10, "Fig. 7. Tweetrapsregeling", 10.0),
+        ];
+
+        let context = ReadingOrderContext::new();
+        let ordered = strategy.apply(spans, &context).expect("apply");
+        let order: Vec<&str> = ordered.iter().map(|o| o.span.text.as_str()).collect();
+
+        let pos_marker = order
+            .iter()
+            .position(|&t| t == "3.")
+            .expect("the heading marker must appear in reading order");
+        let pos_title = order
+            .iter()
+            .position(|&t| t == "INSTRUCTIES VOOR DE GASTECHNISCHE ")
+            .expect("the heading title must appear in reading order");
+        let pos_wrap = order
+            .iter()
+            .position(|&t| t == "INSTALLATEUR")
+            .expect("the heading's wrapped second line must appear in reading order");
+        let pos_caption = order
+            .iter()
+            .position(|&t| t == "Fig. 6. Branderdruk (P1-P2)")
+            .expect("the other column's caption must appear in reading order");
+
+        assert_eq!(
+            pos_title,
+            pos_marker + 1,
+            "the marker and title must stay adjacent: {order:?}"
+        );
+        assert_eq!(
+            pos_wrap,
+            pos_title + 1,
+            "the wrapped second line must stay adjacent to the title, not have \
+             the other column's caption spliced in between: {order:?}"
+        );
+        assert!(
+            pos_caption < pos_marker || pos_caption > pos_wrap,
+            "the other column's caption must not land inside the heading run \
+             (marker={pos_marker}, title={pos_title}, wrap={pos_wrap}, \
+             caption={pos_caption}): {order:?}"
         );
     }
 

@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **(pdf): a numbered heading that wraps twice is no longer closed after its second line.** The paragraph grouper's heading-wrap exemption only recognised a heading that had absorbed exactly one wrap (`visual_line_count(&current_lines) == 2`), so a heading spanning three or more visual lines was cut before its own last line: the orphaned line was then welded to the body paragraph beneath it, with no signal left to separate the two on a two-column page. The exemption no longer counts wraps; it now applies at every line while the paragraph is still nothing but the heading and its accepted continuations, so a heading is closed at the first line that genuinely fails to continue it, however many wraps came before. (GH#1740)
+### Fixed
+
+- **(pdf): a numbered heading set as one `TJ` array with a kern for the tab no longer absorbs the other column's line at the top of a two-column page.** When a producer places a heading's marker and title in one `TJ` array with a kern standing in for the tab (`[(3.)-1329.5(Title )] TJ`), the kern becomes a space-only span that is always regular weight regardless of the surrounding bold context, which broke the reading-order heading-run detector's clustering right at the marker/title boundary. The narrower run this produced no longer covered the marker's column position, letting an unrelated span from the other column land inside the heading. The same page set with the marker in its own text object (no kern) already read correctly; it now reads the same way regardless of how the producer set the marker. (GH#1738)
 
 ## [1.2.7] - 2026-09-22
 
