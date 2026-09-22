@@ -1273,7 +1273,6 @@ traineddata = "traineddata"
   "function-too-long",
   "nesting-too-deep",
 ]
-"tools/benchmark-harness/src/validate_artifacts.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
   "function-too-long",
