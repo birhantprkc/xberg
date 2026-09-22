@@ -2041,48 +2041,67 @@ fn blocks_to_paragraphs(
             // two-line heading was never closed and pulled the whole body in
             // after it. A numbered heading that spans exactly one wrap is still
             // a heading and must still close. ~keep
-            let heading_absorbed_one_wrap = !current_is_single_visual_line
-                && visual_line_count(&current_lines) == 2
+            // GH#1740: closing used to require `visual_line_count(&current_lines) ==
+            // 2` -- a numbered heading was allowed to wrap once and never twice,
+            // because a THIRD line made the element no longer "a single visual
+            // line plus one wrap" and this term stopped applying, so
+            // `follows_section` closed the heading one line early regardless of
+            // whether the third line actually continued it. The count is dropped:
+            // this stays true for as long as `current_lines` is nothing but the
+            // heading's own first line and lines already accepted as its
+            // continuation, however many there have been, so the SAME per-line
+            // continuation test (`heading_continuation_accepted`, below) decides
+            // every subsequent line too, and `follows_section` closes at the
+            // first one that fails it. ~keep
+            let heading_wrap_chain_open = !current_is_single_visual_line
                 && current_lines
                     .first()
                     .is_some_and(|first| super::classify::is_numbered_section_heading(first.text.trim()));
             // For a wrapped heading `prev` is the continuation line, whose own
             // text carries no number -- so the numbered-heading test has to look
             // at the paragraph's first segment instead, which
-            // `heading_absorbed_one_wrap` already does. ~keep
+            // `heading_wrap_chain_open` already does. ~keep
             // GH#1637: `heading_wraps_onto` is a RIGHT-edge test and must stay
             // scoped to the `current_is_single_visual_line` branch (#1467's
             // no-indent heading, where a right edge is the only signal available).
-            // A hanging-indent heading that has absorbed its one wrap already has a
+            // A hanging-indent heading that has absorbed a wrap already has a
             // LEFT-edge answer from `heading_continuation_is_hanging_indent` below,
             // and that answer is authoritative: a wrap's last line and a run-in
             // sub-heading beneath it are both short by definition, so their right
             // edges land within tolerance of each other by coincidence on real
             // documents, not because the run-in continues the heading. Applying
-            // `heading_wraps_onto` to `heading_absorbed_one_wrap` too let that
-            // coincidence override the correct left-edge answer and kept the
-            // heading open across the run-in and the body beneath it. ~keep
+            // `heading_wraps_onto` beyond the first wrap let that coincidence
+            // override the correct left-edge answer and kept the heading open
+            // across the run-in and the body beneath it -- true at every wrap
+            // depth, not just the second line, so `heading_wraps_onto` stays
+            // scoped to `current_is_single_visual_line` after GH#1740 too. ~keep
             // GH#1650: `heading_wraps_onto` and `heading_continuation_is_hanging_indent`
             // are both blind to a no-indent heading whose title is set in the HEADING
             // font: there is no indent to measure, and the wrap's short last line never
             // matches the heading's own right edge. `heading_continuation_at_margin` is
-            // the third exemption, scoped like `heading_wraps_onto` to a heading that
-            // has not yet absorbed a wrap -- it measures the heading's own line against
-            // the body column beneath the pair, not the continuation's own width, so a
-            // short last line cannot satisfy it by accident (see its own doc comment
-            // and GH#1650's page 4 control). ~keep
+            // the third exemption -- it measures the line BEFORE the one being tested
+            // against the body column beneath the pair, not the continuation's own
+            // width, so a short last line cannot satisfy it by accident (see its own
+            // doc comment and GH#1650's page 4 control). GH#1740: that is also what
+            // lets it generalise to a heading's third line, fourth, and so on --
+            // `prev` is always the immediately preceding line, wrap or not, so the
+            // same "does the line before `line` fill the column" test applies
+            // unchanged at every step, and a heading's genuinely last line (always
+            // short, by definition) fails it and stops the chain. ~keep
             let heading_continuation_accepted = current_lines.first().is_some_and(|heading_start| {
                 (current_is_single_visual_line
                     && super::classify::is_numbered_section_heading(&visual_line_texts[prev_idx])
                     && (heading_wraps_onto(prev, line)
                         || heading_continuation_at_margin(heading_start, prev, line, &lines, line_idx)))
+                    || (heading_wrap_chain_open
+                        && heading_continuation_at_margin(heading_start, prev, line, &lines, line_idx))
                     || heading_continuation_is_hanging_indent(heading_start, prev, line)
             });
             let follows_section = starts_new_line
                 && ((current_is_single_visual_line
                     && super::classify::is_numbered_section_heading(&visual_line_texts[prev_idx])
                     && !heading_continuation_accepted)
-                    || heading_absorbed_one_wrap)
+                    || heading_wrap_chain_open)
                 && !heading_continuation_accepted;
             // GH#1650: a heading set larger than the body outruns the body's own
             // leading by construction -- `compute_paragraph_gap_ys_in_shared_frame`'s
@@ -2324,28 +2343,6 @@ pub(super) fn heading_wraps_onto(prev: &SegmentData, line: &SegmentData) -> bool
 /// `heading_start` and `prev` coincide, no indent is established, and the pair still
 /// splits. `starts_section` is evaluated independently of all this, so a following
 /// line that is itself a numbered heading breaks regardless. ~keep
-/// Number of distinct visual lines (baselines) among `segments`.
-///
-/// Used to tell a numbered heading that has absorbed exactly one wrap from a
-/// paragraph that is genuinely several lines long. See GH#1634. ~keep
-pub(super) fn visual_line_count(segments: &[&SegmentData]) -> usize {
-    let mut count = 0usize;
-    let mut last_baseline: Option<f32> = None;
-    for segment in segments {
-        let baseline = segment.upright_baseline();
-        if !baseline.is_finite() {
-            continue;
-        }
-        let is_new_line =
-            last_baseline.is_none_or(|previous| (baseline - previous).abs() > INLINE_STYLE_BASELINE_TOLERANCE);
-        if is_new_line {
-            count += 1;
-            last_baseline = Some(baseline);
-        }
-    }
-    count
-}
-
 pub(super) fn heading_continuation_is_hanging_indent(
     heading_start: &SegmentData,
     prev: &SegmentData,

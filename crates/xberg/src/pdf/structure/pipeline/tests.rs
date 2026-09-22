@@ -1679,7 +1679,7 @@ fn a_numbered_heading_followed_by_margin_aligned_body_still_splits() {
     );
 }
 
-/// GH#1637: `heading_absorbed_one_wrap`'s closing term (added by GH#1634 /
+/// GH#1637: `heading_wrap_chain_open`'s closing term (added by GH#1634 /
 /// `8681d72ec`) still required `!heading_wraps_onto(prev, line)`, which compares
 /// RIGHT edges. A hanging-indent wrap's own last line is short by definition, and
 /// so is a run-in sub-heading at the margin beneath it -- when the two happen to
@@ -1941,6 +1941,201 @@ fn complete_numbered_heading_followed_by_unrelated_bold_line_still_splits() {
     );
     assert_eq!(paragraph_segment_text(&paragraphs[0]), "Section 4. Software");
     assert_eq!(paragraph_segment_text(&paragraphs[1]), "eIDAS and related services");
+}
+
+/// GH#1740. A numbered heading set in italic, at the body's own size, that
+/// wraps TWICE (three visual lines) was closed after its second line: the
+/// count-based `heading_absorbed_one_wrap` (`visual_line_count(&current_lines)
+/// == 2`) stopped applying once a third line made the element no longer "a
+/// single visual line plus one wrap", so `follows_section` cut it a line
+/// early and the orphaned third line was then welded to the body paragraph
+/// beneath it (nothing else separates them: same font size, same weight,
+/// only italic differs, and the paragraph-gap detector never sees the 21pt
+/// seam on a two-column page). Geometry transcribed verbatim from the
+/// issue's own trace (PDF user space, right column x 306.6-557.7, 8pt
+/// Helvetica/Helvetica-Oblique, 21pt from the heading's last baseline to the
+/// body's first, whose first line is indented 12pt and opens capitalised).
+#[test]
+fn numbered_heading_wrapping_twice_stays_whole_and_splits_from_body() {
+    let heading_line_1 = SegmentData {
+        is_italic: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "3.1. Increased frequency of T cells exhibiting pro-inflammatory responses",
+            306.6,
+            245.1,
+            428.9,
+        )
+    };
+    let heading_line_2 = SegmentData {
+        is_italic: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "in both ileal continuous Peyer's patch and jejunal discrete Peyer's patch of",
+            306.6,
+            245.1,
+            418.4,
+        )
+    };
+    let heading_line_3 = SegmentData {
+        is_italic: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg("vaccinated-challenged calves", 306.6, 95.2, 408.0)
+    };
+    let body_line_1 = SegmentData {
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "IFN- and TNF-secreting T helper and cytotoxic T cells have been",
+            318.6,
+            239.1,
+            387.0,
+        )
+    };
+    let body_line_2 = SegmentData {
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "shown to play important roles in the control of intracellular bacterial",
+            306.6,
+            251.1,
+            376.55,
+        )
+    };
+
+    let paragraphs = blocks_to_paragraphs(
+        vec![heading_line_1, heading_line_2, heading_line_3, body_line_1, body_line_2],
+        &[],
+        &[],
+    );
+
+    assert_eq!(
+        paragraphs.len(),
+        2,
+        "the twice-wrapped heading must be its own element, separate from the body"
+    );
+    assert_eq!(
+        paragraph_segment_text(&paragraphs[0]),
+        "3.1. Increased frequency of T cells exhibiting pro-inflammatory responses in both ileal \
+         continuous Peyer's patch and jejunal discrete Peyer's patch of vaccinated-challenged calves",
+        "the heading must survive whole, all three of its lines, with no body text welded to it"
+    );
+    assert_eq!(
+        paragraph_segment_text(&paragraphs[1]),
+        "IFN- and TNF-secreting T helper and cytotoxic T cells have been shown to play important \
+         roles in the control of intracellular bacterial",
+        "the body must be a separate element, not fused to the heading's last line"
+    );
+}
+
+/// GH#1740 control, one-wrap shape (the reproducer's page 3 / GH#1634): the
+/// same column geometry and pitch, but the heading wraps only ONCE before the
+/// body begins. `heading_wrap_chain_open` must still close it -- the fix must
+/// not require a SECOND wrap to trigger the closing term.
+#[test]
+fn numbered_heading_wrapping_once_still_splits_from_body_after_the_twice_wrapped_fix() {
+    let heading_line_1 = SegmentData {
+        is_italic: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg("3.3. Increased frequency of central memory", 306.6, 245.1, 428.9)
+    };
+    let heading_line_2 = SegmentData {
+        is_italic: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg("cells in ileum and jejunum Peyer's patches", 306.6, 95.2, 418.4)
+    };
+    let body_line_1 = SegmentData {
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "IFN- and TNF-secreting T helper and cytotoxic T cells have been",
+            318.6,
+            239.1,
+            397.4,
+        )
+    };
+
+    let paragraphs = blocks_to_paragraphs(vec![heading_line_1, heading_line_2, body_line_1], &[], &[]);
+
+    assert_eq!(
+        paragraphs.len(),
+        2,
+        "GH#1634 control: a one-wrap heading must still be its own element after the GH#1740 fix"
+    );
+    assert_eq!(
+        paragraph_segment_text(&paragraphs[0]),
+        "3.3. Increased frequency of central memory cells in ileum and jejunum Peyer's patches"
+    );
+}
+
+/// GH#1740 control, the reproducer's page 4: the same three-line heading as
+/// above, set in BOLD rather than italic. `bold_change` already separates the
+/// heading from the body regardless of this fix; the point of this control is
+/// that the fix must not stop the grouper from keeping the heading's own
+/// three lines together in one pass, without depending on the merge pass to
+/// reunite an orphaned third line the way it had to before GH#1740.
+#[test]
+fn numbered_heading_wrapping_twice_in_bold_still_splits_from_body() {
+    let heading_line_1 = SegmentData {
+        is_bold: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "3.1. Increased frequency of T cells exhibiting pro-inflammatory responses",
+            306.6,
+            245.1,
+            428.9,
+        )
+    };
+    let heading_line_2 = SegmentData {
+        is_bold: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "in both ileal continuous Peyer's patch and jejunal discrete Peyer's patch of",
+            306.6,
+            245.1,
+            418.4,
+        )
+    };
+    let heading_line_3 = SegmentData {
+        is_bold: true,
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg("vaccinated-challenged calves", 306.6, 95.2, 408.0)
+    };
+    let body_line_1 = SegmentData {
+        font_size: 8.0,
+        height: 8.0,
+        ..column_seg(
+            "IFN- and TNF-secreting T helper and cytotoxic T cells have been",
+            318.6,
+            239.1,
+            387.0,
+        )
+    };
+
+    let paragraphs = blocks_to_paragraphs(
+        vec![heading_line_1, heading_line_2, heading_line_3, body_line_1],
+        &[],
+        &[],
+    );
+
+    assert_eq!(
+        paragraphs.len(),
+        2,
+        "GH#1740 control (bold): the twice-wrapped heading must stay whole, separate from the body"
+    );
+    assert_eq!(
+        paragraph_segment_text(&paragraphs[0]),
+        "3.1. Increased frequency of T cells exhibiting pro-inflammatory responses in both ileal \
+         continuous Peyer's patch and jejunal discrete Peyer's patch of vaccinated-challenged calves"
+    );
 }
 
 /// GH#1608 page 9: with the predicate blind to the keyword form, a run of
