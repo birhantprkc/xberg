@@ -67,6 +67,102 @@ fn heading_level_to_element_type(level: u8) -> ElementType {
     }
 }
 
+/// Flush any accumulated non-heading text in `leftover` into `elements` as a
+/// NarrativeText paragraph, then clear it.
+fn flush_leftover_paragraph(
+    elements: &mut Vec<Element>,
+    leftover: &mut String,
+    page_number: u32,
+    title: &Option<String>,
+) {
+    if !leftover.is_empty() {
+        add_paragraphs(elements, leftover.trim(), page_number, title);
+        leftover.clear();
+    }
+}
+
+/// Push a markdown heading paragraph, classified by `detect_markdown_heading`.
+fn push_heading_element(
+    elements: &mut Vec<Element>,
+    para_text: &str,
+    level: u8,
+    page_number: u32,
+    title: &Option<String>,
+) {
+    let element_type = heading_level_to_element_type(level);
+    let heading_text = para_text.trim_start_matches('#').trim();
+    let element_id = generate_element_id(heading_text, element_type, Some(page_number));
+    elements.push(Element {
+        element_id,
+        element_type,
+        text: heading_text.to_string(),
+        metadata: ElementMetadata {
+            page_number: Some(page_number),
+            filename: title.clone(),
+            coordinates: None,
+            element_index: Some(elements.len()),
+            additional: {
+                let mut m = HashMap::new();
+                m.insert("heading_level".to_string(), level.to_string());
+                m
+            },
+        },
+    });
+}
+
+/// Push an `[Image: ...]` placeholder paragraph, classified by `detect_image_placeholder`.
+fn push_image_placeholder_element(
+    elements: &mut Vec<Element>,
+    para_text: &str,
+    description: &str,
+    page_number: u32,
+    title: &Option<String>,
+) {
+    let element_id = generate_element_id(para_text, ElementType::Image, Some(page_number));
+    elements.push(Element {
+        element_id,
+        element_type: ElementType::Image,
+        text: para_text.to_string(),
+        metadata: ElementMetadata {
+            page_number: Some(page_number),
+            filename: title.clone(),
+            coordinates: None,
+            element_index: Some(elements.len()),
+            additional: {
+                let mut m = HashMap::new();
+                m.insert("image_description".to_string(), description.to_string());
+                m
+            },
+        },
+    });
+}
+
+/// Push an isolated numbered heading paragraph, classified by `detect_isolated_numbered_heading`.
+fn push_numbered_heading_element(
+    elements: &mut Vec<Element>,
+    para_text: &str,
+    page_number: u32,
+    title: &Option<String>,
+) {
+    let element_id = generate_element_id(para_text, ElementType::Heading, Some(page_number));
+    elements.push(Element {
+        element_id,
+        element_type: ElementType::Heading,
+        text: para_text.to_string(),
+        metadata: ElementMetadata {
+            page_number: Some(page_number),
+            filename: title.clone(),
+            coordinates: None,
+            element_index: Some(elements.len()),
+            additional: {
+                let mut m = HashMap::new();
+                m.insert("heading_level".to_string(), "1".to_string());
+                m
+            },
+        },
+    });
+}
+
 /// Add paragraphs to `elements`, but first attempt to classify each paragraph as
 /// a markdown heading or an `[Image: ...]` placeholder. Falls back to
 /// NarrativeText (via `add_paragraphs`) when neither pattern matches.
@@ -91,79 +187,20 @@ fn add_paragraphs_with_classification(
         let is_single_line = !para_text.contains('\n');
 
         if is_single_line && let Some(level) = detect_markdown_heading(para_text) {
-            if !leftover.is_empty() {
-                add_paragraphs(elements, leftover.trim(), page_number, title);
-                leftover.clear();
-            }
-            let element_type = heading_level_to_element_type(level);
-            let heading_text = para_text.trim_start_matches('#').trim();
-            let element_id = generate_element_id(heading_text, element_type, Some(page_number));
-            elements.push(Element {
-                element_id,
-                element_type,
-                text: heading_text.to_string(),
-                metadata: ElementMetadata {
-                    page_number: Some(page_number),
-                    filename: title.clone(),
-                    coordinates: None,
-                    element_index: Some(elements.len()),
-                    additional: {
-                        let mut m = HashMap::new();
-                        m.insert("heading_level".to_string(), level.to_string());
-                        m
-                    },
-                },
-            });
+            flush_leftover_paragraph(elements, &mut leftover, page_number, title);
+            push_heading_element(elements, para_text, level, page_number, title);
             continue;
         }
 
         if is_single_line && let Some(description) = detect_image_placeholder(para_text) {
-            if !leftover.is_empty() {
-                add_paragraphs(elements, leftover.trim(), page_number, title);
-                leftover.clear();
-            }
-            let element_id = generate_element_id(para_text, ElementType::Image, Some(page_number));
-            elements.push(Element {
-                element_id,
-                element_type: ElementType::Image,
-                text: para_text.to_string(),
-                metadata: ElementMetadata {
-                    page_number: Some(page_number),
-                    filename: title.clone(),
-                    coordinates: None,
-                    element_index: Some(elements.len()),
-                    additional: {
-                        let mut m = HashMap::new();
-                        m.insert("image_description".to_string(), description.to_string());
-                        m
-                    },
-                },
-            });
+            flush_leftover_paragraph(elements, &mut leftover, page_number, title);
+            push_image_placeholder_element(elements, para_text, description, page_number, title);
             continue;
         }
 
         if is_single_line && detect_isolated_numbered_heading(para_text) {
-            if !leftover.is_empty() {
-                add_paragraphs(elements, leftover.trim(), page_number, title);
-                leftover.clear();
-            }
-            let element_id = generate_element_id(para_text, ElementType::Heading, Some(page_number));
-            elements.push(Element {
-                element_id,
-                element_type: ElementType::Heading,
-                text: para_text.to_string(),
-                metadata: ElementMetadata {
-                    page_number: Some(page_number),
-                    filename: title.clone(),
-                    coordinates: None,
-                    element_index: Some(elements.len()),
-                    additional: {
-                        let mut m = HashMap::new();
-                        m.insert("heading_level".to_string(), "1".to_string());
-                        m
-                    },
-                },
-            });
+            flush_leftover_paragraph(elements, &mut leftover, page_number, title);
+            push_numbered_heading_element(elements, para_text, page_number, title);
             continue;
         }
 
@@ -173,9 +210,7 @@ fn add_paragraphs_with_classification(
         leftover.push_str(para_text);
     }
 
-    if !leftover.is_empty() {
-        add_paragraphs(elements, leftover.trim(), page_number, title);
-    }
+    flush_leftover_paragraph(elements, &mut leftover, page_number, title);
 }
 
 /// Adjust a byte offset to the nearest valid UTF-8 char boundary, searching forward.

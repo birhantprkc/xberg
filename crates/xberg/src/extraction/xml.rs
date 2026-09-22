@@ -69,122 +69,28 @@ fn parse_xml_inner(
     svg_mode: bool,
     limits: &SecurityLimits,
 ) -> Result<XmlExtractionResult> {
-    let decoded_bytes;
-    let effective_bytes = if xml_bytes.len() >= 2 && xml_bytes[0] == 0xFF && xml_bytes[1] == 0xFE {
-        decoded_bytes = decode_utf16_to_utf8(xml_bytes, false)?;
-        &decoded_bytes
-    } else if xml_bytes.len() >= 2 && xml_bytes[0] == 0xFE && xml_bytes[1] == 0xFF {
-        decoded_bytes = decode_utf16_to_utf8(xml_bytes, true)?;
-        &decoded_bytes
-    } else if std::str::from_utf8(xml_bytes).is_err() {
-        // quick-xml validates UTF-8 as it parses, so anything that is not already
-        // UTF-8 has to be transcoded here or the whole document fails to read.
-        // Before quick-xml 0.42 the reader handed back raw bytes and each caller
-        // decoded lossily, which is the graceful degradation #395 requires: a
-        // mis-encoded document must still extract, not vanish. ~keep
-        decoded_bytes = crate::utils::decode_with_provenance(xml_bytes, None).text.into_bytes();
-        &decoded_bytes
-    } else {
-        xml_bytes
-    };
+    let effective_bytes = normalize_to_utf8(xml_bytes)?;
 
     // No reader-level trim_text: EntityReader coalesces text fragments around
     // entity references, and trimming fragments first would corrupt spacing.
     // Text is trimmed below (when `preserve_whitespace` is off), after coalescing. ~keep
-    let mut reader = EntityReader::from_bytes(effective_bytes);
+    let mut reader = EntityReader::from_bytes(&effective_bytes);
     reader.config_mut().check_end_names = false;
 
     let mut budget = SecurityBudget::from_limits(limits);
-    let mut content = String::new();
-    let mut element_count = 0usize;
-    let mut unique_elements_set = AHashSet::new();
-    let mut element_stack: Vec<String> = Vec::new();
-    let mut had_depth1_element = false;
+    let mut state = XmlParseState {
+        content: String::new(),
+        element_count: 0,
+        unique_elements_set: AHashSet::new(),
+        element_stack: Vec::new(),
+        had_depth1_element: false,
+    };
 
     loop {
         budget.step()?;
         match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                budget.enter()?;
-                let name_owned = e.name().as_ref().to_string();
-                element_count += 1;
-                unique_elements_set.insert(name_owned.clone());
-
-                if !svg_mode {
-                    for attr in e.attributes().flatten() {
-                        let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
-                        let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
-                        budget.check_attr(&key, &val)?;
-                    }
-                    let depth = element_stack.len();
-                    let label = format_element_label(&name_owned, e.attributes());
-                    write_element_line(&mut content, &label, depth, &mut had_depth1_element);
-                }
-
-                element_stack.push(name_owned);
-            }
-            Ok(Event::Empty(e)) => {
-                let name_owned = e.name().as_ref().to_string();
-                element_count += 1;
-                unique_elements_set.insert(name_owned.clone());
-
-                if !svg_mode {
-                    for attr in e.attributes().flatten() {
-                        let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
-                        let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
-                        budget.check_attr(&key, &val)?;
-                    }
-                    let depth = element_stack.len();
-                    let label = format_element_label(&name_owned, e.attributes());
-                    write_element_line(&mut content, &label, depth, &mut had_depth1_element);
-                }
-            }
-            Ok(Event::End(_e)) => {
-                budget.leave();
-                element_stack.pop();
-            }
-            Ok(Event::Text(e)) => {
-                let text_cow: Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
-                let trimmed = if preserve_whitespace {
-                    text_cow.to_string()
-                } else {
-                    text_cow.trim().to_string()
-                };
-
-                if !trimmed.is_empty() {
-                    budget.check_entity(&trimmed)?;
-                    budget.account_text(trimmed.len())?;
-                    if svg_mode {
-                        let in_text_element = element_stack
-                            .iter()
-                            .any(|name| SVG_TEXT_ELEMENTS.contains(&name.as_str()));
-                        if in_text_element {
-                            if !content.is_empty() && !content.ends_with('\n') && !content.ends_with(' ') {
-                                content.push(' ');
-                            }
-                            content.push_str(&trimmed);
-                        }
-                    } else {
-                        write_text_line(&mut content, &trimmed, element_stack.len());
-                    }
-                }
-            }
-            Ok(Event::CData(e)) => {
-                if svg_mode {
-                    let in_text_element = element_stack
-                        .iter()
-                        .any(|name| SVG_TEXT_ELEMENTS.contains(&name.as_str()));
-                    if !in_text_element {
-                        continue;
-                    }
-                }
-
-                let text_cow: Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
-                budget.check_entity(&text_cow)?;
-                budget.account_text(text_cow.len())?;
-                write_text_line(&mut content, &text_cow, element_stack.len());
-            }
             Ok(Event::Eof) => break,
+            Ok(event) => process_xml_event(event, preserve_whitespace, svg_mode, &mut budget, &mut state)?,
             Err(e) => {
                 return Err(XbergError::parsing(format!(
                     "XML parsing error at position {}: {}",
@@ -192,19 +98,170 @@ fn parse_xml_inner(
                     e
                 )));
             }
-            _ => {}
         }
     }
 
-    let content = content.trim().to_string();
-    let mut unique_elements: Vec<String> = unique_elements_set.into_iter().collect();
+    let content = state.content.trim().to_string();
+    let mut unique_elements: Vec<String> = state.unique_elements_set.into_iter().collect();
     unique_elements.sort();
 
     Ok(XmlExtractionResult {
         content,
-        element_count,
+        element_count: state.element_count,
         unique_elements,
     })
+}
+
+/// Mutable accumulator threaded through `process_xml_event` for one `parse_xml_inner` run.
+struct XmlParseState {
+    content: String,
+    element_count: usize,
+    unique_elements_set: AHashSet<String>,
+    element_stack: Vec<String>,
+    had_depth1_element: bool,
+}
+
+/// Apply one non-EOF `quick_xml` event to `state`. `Event::Eof` is handled by the
+/// caller's loop, not here.
+fn process_xml_event(
+    event: Event,
+    preserve_whitespace: bool,
+    svg_mode: bool,
+    budget: &mut SecurityBudget,
+    state: &mut XmlParseState,
+) -> Result<()> {
+    match event {
+        Event::Start(e) => {
+            budget.enter()?;
+            let name_owned = record_open_tag(&e, svg_mode, budget, state)?;
+            state.element_stack.push(name_owned);
+        }
+        Event::Empty(e) => {
+            record_open_tag(&e, svg_mode, budget, state)?;
+        }
+        Event::End(_e) => {
+            budget.leave();
+            state.element_stack.pop();
+        }
+        Event::Text(e) => {
+            let text_cow: Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
+            let trimmed = if preserve_whitespace {
+                text_cow.to_string()
+            } else {
+                text_cow.trim().to_string()
+            };
+
+            if !trimmed.is_empty() {
+                budget.check_entity(&trimmed)?;
+                budget.account_text(trimmed.len())?;
+                if svg_mode {
+                    append_svg_text(&mut state.content, &trimmed, &state.element_stack);
+                } else {
+                    write_text_line(&mut state.content, &trimmed, state.element_stack.len());
+                }
+            }
+        }
+        Event::CData(e) => {
+            let should_process = !svg_mode
+                || state
+                    .element_stack
+                    .iter()
+                    .any(|name| SVG_TEXT_ELEMENTS.contains(&name.as_str()));
+            if !should_process {
+                return Ok(());
+            }
+
+            let text_cow: Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
+            budget.check_entity(&text_cow)?;
+            budget.account_text(text_cow.len())?;
+            write_text_line(&mut state.content, &text_cow, state.element_stack.len());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Normalize `xml_bytes` to UTF-8, transcoding BOM-marked UTF-16 or otherwise
+/// non-UTF-8 input; already-UTF-8 input passes through unchanged.
+fn normalize_to_utf8(xml_bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
+    if xml_bytes.len() >= 2 && xml_bytes[0] == 0xFF && xml_bytes[1] == 0xFE {
+        Ok(Cow::Owned(decode_utf16_to_utf8(xml_bytes, false)?))
+    } else if xml_bytes.len() >= 2 && xml_bytes[0] == 0xFE && xml_bytes[1] == 0xFF {
+        Ok(Cow::Owned(decode_utf16_to_utf8(xml_bytes, true)?))
+    } else if std::str::from_utf8(xml_bytes).is_err() {
+        // quick-xml validates UTF-8 as it parses, so anything that is not already
+        // UTF-8 has to be transcoded here or the whole document fails to read.
+        // Before quick-xml 0.42 the reader handed back raw bytes and each caller
+        // decoded lossily, which is the graceful degradation #395 requires: a
+        // mis-encoded document must still extract, not vanish. ~keep
+        Ok(Cow::Owned(
+            crate::utils::decode_with_provenance(xml_bytes, None).text.into_bytes(),
+        ))
+    } else {
+        Ok(Cow::Borrowed(xml_bytes))
+    }
+}
+
+/// Record a `Start` or `Empty` tag's name/count/attributes into `state`, returning
+/// the owned element name so `Start` can push it onto the element stack afterward
+/// (the one difference between the two event arms).
+fn record_open_tag(
+    e: &quick_xml::events::BytesStart,
+    svg_mode: bool,
+    budget: &mut SecurityBudget,
+    state: &mut XmlParseState,
+) -> Result<String> {
+    let name_owned = e.name().as_ref().to_string();
+    state.element_count += 1;
+    state.unique_elements_set.insert(name_owned.clone());
+
+    if !svg_mode {
+        write_open_tag_line(
+            &mut state.content,
+            e,
+            &name_owned,
+            state.element_stack.len(),
+            budget,
+            &mut state.had_depth1_element,
+        )?;
+    }
+
+    Ok(name_owned)
+}
+
+/// Check attribute budget and emit an indented element-open line for a `Start` or
+/// `Empty` tag. Shared by both event arms in `parse_xml_inner`, which are identical
+/// apart from whether the tag is pushed onto the element stack afterward.
+fn write_open_tag_line(
+    content: &mut String,
+    e: &quick_xml::events::BytesStart,
+    name_owned: &str,
+    depth: usize,
+    budget: &mut SecurityBudget,
+    had_depth1_element: &mut bool,
+) -> Result<()> {
+    for attr in e.attributes().flatten() {
+        let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
+        let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
+        budget.check_attr(&key, &val)?;
+    }
+    let label = format_element_label(name_owned, e.attributes());
+    write_element_line(content, &label, depth, had_depth1_element);
+    Ok(())
+}
+
+/// In SVG mode, append `trimmed` to `content` when the current element stack is
+/// inside an SVG text-bearing element, joining with a space where needed.
+fn append_svg_text(content: &mut String, trimmed: &str, element_stack: &[String]) {
+    let in_text_element = element_stack
+        .iter()
+        .any(|name| SVG_TEXT_ELEMENTS.contains(&name.as_str()));
+    if in_text_element {
+        if !content.is_empty() && !content.ends_with('\n') && !content.ends_with(' ') {
+            content.push(' ');
+        }
+        content.push_str(trimmed);
+    }
 }
 
 /// Decode UTF-16 bytes (with BOM) to UTF-8 bytes.

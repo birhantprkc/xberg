@@ -21,7 +21,7 @@ pub use types::{ListItemMetadata, ListType};
 /// with the transform path (#227).
 pub(crate) use elements::normalize_line_endings;
 
-use crate::types::internal::{ElementKind, InternalDocument};
+use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
 use crate::types::{Element, ExtractedDocument};
 use content::{
     add_page_break, format_table_as_text, process_content, process_hierarchy, process_images, process_tables,
@@ -56,83 +56,103 @@ pub fn convert_internal_elements_to_elements(doc: &InternalDocument, filename: &
             continue;
         }
 
-        let page_number = internal_elem.page;
-        let coordinates = internal_elem.bbox.map(|b| crate::types::BoundingBox {
-            x0: b.x0,
-            y0: b.y0,
-            x1: b.x1,
-            y1: b.y1,
-        });
-
-        let element_type = match internal_elem.kind {
-            ElementKind::Title => crate::types::ElementType::Title,
-            ElementKind::Heading { level: 1 } => crate::types::ElementType::Title,
-            ElementKind::Heading { .. } => crate::types::ElementType::Heading,
-            ElementKind::ListItem { .. } => crate::types::ElementType::ListItem,
-            ElementKind::Table { .. } => crate::types::ElementType::Table,
-            ElementKind::Image { .. } => crate::types::ElementType::Image,
-            ElementKind::PageBreak => crate::types::ElementType::PageBreak,
-            ElementKind::Code => crate::types::ElementType::CodeBlock,
-            ElementKind::Formula => crate::types::ElementType::Formula,
-            _ => crate::types::ElementType::NarrativeText,
-        };
-
-        let text = match internal_elem.kind {
-            ElementKind::Table { table_index } => {
-                if let Some(table) = doc.tables.get(table_index as usize) {
-                    format_table_as_text(table)
-                } else {
-                    internal_elem.text.clone()
-                }
-            }
-            ElementKind::Image { image_index } => {
-                if let Some(img) = doc.images.get(image_index as usize) {
-                    format!(
-                        "Image: {} ({}x{})",
-                        img.format,
-                        img.width.unwrap_or(0),
-                        img.height.unwrap_or(0)
-                    )
-                } else {
-                    internal_elem.text.clone()
-                }
-            }
-            _ => internal_elem.text.clone(),
-        };
-
-        if text.trim().is_empty() && !matches!(internal_elem.kind, ElementKind::PageBreak) {
-            continue;
+        if let Some(element) = convert_internal_element(doc, internal_elem, filename, elements.len()) {
+            elements.push(element);
         }
-
-        // `ElementKind::Heading { level }` carries the depth that distinguishes `##`
-        // from `######`, but that level lives on the enum discriminant, not in
-        // `InternalElement::attributes` -- `push_heading`/`push_heading_in_current_container`
-        // never write it there, so `public_attributes()` alone always omits it. Every other
-        // heading-emitting path in this crate (`transform/content.rs`) already publishes the
-        // level under the `heading_level` key as a decimal string, so match that key and
-        // format here instead of leaving `elements` unable to tell heading depths apart
-        // (xberg-io/xberg#1504). ~keep
-        let mut additional = internal_elem.public_attributes().unwrap_or_default();
-        if let ElementKind::Heading { level } = internal_elem.kind {
-            additional.insert("heading_level".to_string(), level.to_string());
-        }
-
-        let element_id = elements::generate_element_id(&text, element_type, page_number);
-        elements.push(Element {
-            element_id,
-            element_type,
-            text,
-            metadata: crate::types::ElementMetadata {
-                page_number,
-                filename: filename.clone(),
-                coordinates,
-                element_index: Some(elements.len()),
-                additional,
-            },
-        });
     }
 
     elements
+}
+
+/// Convert a single non-container `InternalElement` to an `Element`, or `None` when it
+/// carries no renderable text (see the empty-text skip in the original inline loop).
+/// `element_index` is the position this element will occupy in the caller's output vector.
+fn convert_internal_element(
+    doc: &InternalDocument,
+    internal_elem: &InternalElement,
+    filename: &Option<String>,
+    element_index: usize,
+) -> Option<Element> {
+    let page_number = internal_elem.page;
+    let coordinates = internal_elem.bbox.map(|b| crate::types::BoundingBox {
+        x0: b.x0,
+        y0: b.y0,
+        x1: b.x1,
+        y1: b.y1,
+    });
+
+    let element_type = match internal_elem.kind {
+        ElementKind::Title => crate::types::ElementType::Title,
+        ElementKind::Heading { level: 1 } => crate::types::ElementType::Title,
+        ElementKind::Heading { .. } => crate::types::ElementType::Heading,
+        ElementKind::ListItem { .. } => crate::types::ElementType::ListItem,
+        ElementKind::Table { .. } => crate::types::ElementType::Table,
+        ElementKind::Image { .. } => crate::types::ElementType::Image,
+        ElementKind::PageBreak => crate::types::ElementType::PageBreak,
+        ElementKind::Code => crate::types::ElementType::CodeBlock,
+        ElementKind::Formula => crate::types::ElementType::Formula,
+        _ => crate::types::ElementType::NarrativeText,
+    };
+
+    let text = resolve_internal_element_text(doc, internal_elem);
+
+    if text.trim().is_empty() && !matches!(internal_elem.kind, ElementKind::PageBreak) {
+        return None;
+    }
+
+    // `ElementKind::Heading { level }` carries the depth that distinguishes `##`
+    // from `######`, but that level lives on the enum discriminant, not in
+    // `InternalElement::attributes` -- `push_heading`/`push_heading_in_current_container`
+    // never write it there, so `public_attributes()` alone always omits it. Every other
+    // heading-emitting path in this crate (`transform/content.rs`) already publishes the
+    // level under the `heading_level` key as a decimal string, so match that key and
+    // format here instead of leaving `elements` unable to tell heading depths apart
+    // (xberg-io/xberg#1504). ~keep
+    let mut additional = internal_elem.public_attributes().unwrap_or_default();
+    if let ElementKind::Heading { level } = internal_elem.kind {
+        additional.insert("heading_level".to_string(), level.to_string());
+    }
+
+    let element_id = elements::generate_element_id(&text, element_type, page_number);
+    Some(Element {
+        element_id,
+        element_type,
+        text,
+        metadata: crate::types::ElementMetadata {
+            page_number,
+            filename: filename.clone(),
+            coordinates,
+            element_index: Some(element_index),
+            additional,
+        },
+    })
+}
+
+/// Render an `InternalElement`'s display text, resolving table/image indices against
+/// `doc` when present and falling back to the element's own stored text otherwise.
+fn resolve_internal_element_text(doc: &InternalDocument, internal_elem: &InternalElement) -> String {
+    match internal_elem.kind {
+        ElementKind::Table { table_index } => {
+            if let Some(table) = doc.tables.get(table_index as usize) {
+                format_table_as_text(table)
+            } else {
+                internal_elem.text.clone()
+            }
+        }
+        ElementKind::Image { image_index } => {
+            if let Some(img) = doc.images.get(image_index as usize) {
+                format!(
+                    "Image: {} ({}x{})",
+                    img.format,
+                    img.width.unwrap_or(0),
+                    img.height.unwrap_or(0)
+                )
+            } else {
+                internal_elem.text.clone()
+            }
+        }
+        _ => internal_elem.text.clone(),
+    }
 }
 
 /// Transform an extraction result into semantic elements.
@@ -171,92 +191,104 @@ pub fn transform_extraction_result_to_elements(result: &ExtractedDocument) -> Ve
 
     if let Some(ref pages) = result.pages {
         for page in pages {
-            let page_number = page.page_number;
-
-            let hierarchy_covered_body = if let Some(ref hierarchy) = page.hierarchy {
-                process_hierarchy(&mut elements, hierarchy, page_number, &result.metadata.title)
-            } else {
-                false
-            };
-
-            process_tables(&mut elements, &page.tables, page_number, &result.metadata.title);
-
-            let all_images = result.images.as_deref().unwrap_or(&[]);
-            process_images(
-                &mut elements,
-                &page.image_indices,
-                all_images,
-                page_number,
-                &result.metadata.title,
-            );
-
-            if !hierarchy_covered_body {
-                process_content(&mut elements, &page.content, page_number, &result.metadata.title);
-            }
-
-            if page_number < pages.len() as u32 {
-                add_page_break(&mut elements, page_number, page_number + 1, &result.metadata.title);
-            }
+            process_page_into_elements(&mut elements, result, page, pages.len());
         }
     } else {
-        process_content(&mut elements, &result.content, 1, &result.metadata.title);
-
-        for table in &result.tables {
-            let table_text = format_table_as_text(table);
-            let element_id = elements::generate_element_id(&table_text, crate::types::ElementType::Table, Some(1));
-            elements.push(Element {
-                element_id,
-                element_type: crate::types::ElementType::Table,
-                text: table_text,
-                metadata: crate::types::ElementMetadata {
-                    page_number: Some(1),
-                    filename: result.metadata.title.clone(),
-                    coordinates: None,
-                    element_index: Some(elements.len()),
-                    additional: std::collections::HashMap::new(),
-                },
-            });
-        }
-
-        if let Some(ref images) = result.images {
-            for image in images {
-                let image_text = format!(
-                    "Image: {} ({}x{})",
-                    image.format,
-                    image.width.unwrap_or(0),
-                    image.height.unwrap_or(0)
-                );
-                let page_num = image.page_number.unwrap_or(1);
-
-                let element_id =
-                    elements::generate_element_id(&image_text, crate::types::ElementType::Image, Some(page_num));
-                elements.push(Element {
-                    element_id,
-                    element_type: crate::types::ElementType::Image,
-                    text: image_text,
-                    metadata: crate::types::ElementMetadata {
-                        page_number: Some(page_num),
-                        filename: result.metadata.title.clone(),
-                        coordinates: None,
-                        element_index: Some(elements.len()),
-                        additional: {
-                            let mut m = std::collections::HashMap::new();
-                            m.insert("format".to_string(), image.format.to_string());
-                            if let Some(width) = image.width {
-                                m.insert("width".to_string(), width.to_string());
-                            }
-                            if let Some(height) = image.height {
-                                m.insert("height".to_string(), height.to_string());
-                            }
-                            m
-                        },
-                    },
-                });
-            }
-        }
+        process_flat_result_into_elements(&mut elements, result);
     }
 
     elements
+}
+
+/// Convert one `PageContent` (hierarchy, tables, images, body content, and the
+/// trailing page break) into `elements`, mirroring the original per-page loop body.
+fn process_page_into_elements(
+    elements: &mut Vec<Element>,
+    result: &ExtractedDocument,
+    page: &crate::types::page::PageContent,
+    total_pages: usize,
+) {
+    let page_number = page.page_number;
+    let title = &result.metadata.title;
+
+    let hierarchy_covered_body = if let Some(ref hierarchy) = page.hierarchy {
+        process_hierarchy(elements, hierarchy, page_number, title)
+    } else {
+        false
+    };
+
+    process_tables(elements, &page.tables, page_number, title);
+
+    let all_images = result.images.as_deref().unwrap_or(&[]);
+    process_images(elements, &page.image_indices, all_images, page_number, title);
+
+    if !hierarchy_covered_body {
+        process_content(elements, &page.content, page_number, title);
+    }
+
+    if page_number < total_pages as u32 {
+        add_page_break(elements, page_number, page_number + 1, title);
+    }
+}
+
+/// Convert a paged-less `ExtractedDocument` (flat `content`/`tables`/`images`) into
+/// `elements`, mirroring the original fallback branch used when `result.pages` is `None`.
+fn process_flat_result_into_elements(elements: &mut Vec<Element>, result: &ExtractedDocument) {
+    process_content(elements, &result.content, 1, &result.metadata.title);
+
+    for table in &result.tables {
+        let table_text = format_table_as_text(table);
+        let element_id = elements::generate_element_id(&table_text, crate::types::ElementType::Table, Some(1));
+        elements.push(Element {
+            element_id,
+            element_type: crate::types::ElementType::Table,
+            text: table_text,
+            metadata: crate::types::ElementMetadata {
+                page_number: Some(1),
+                filename: result.metadata.title.clone(),
+                coordinates: None,
+                element_index: Some(elements.len()),
+                additional: std::collections::HashMap::new(),
+            },
+        });
+    }
+
+    if let Some(ref images) = result.images {
+        for image in images {
+            let image_text = format!(
+                "Image: {} ({}x{})",
+                image.format,
+                image.width.unwrap_or(0),
+                image.height.unwrap_or(0)
+            );
+            let page_num = image.page_number.unwrap_or(1);
+
+            let element_id =
+                elements::generate_element_id(&image_text, crate::types::ElementType::Image, Some(page_num));
+            elements.push(Element {
+                element_id,
+                element_type: crate::types::ElementType::Image,
+                text: image_text,
+                metadata: crate::types::ElementMetadata {
+                    page_number: Some(page_num),
+                    filename: result.metadata.title.clone(),
+                    coordinates: None,
+                    element_index: Some(elements.len()),
+                    additional: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("format".to_string(), image.format.to_string());
+                        if let Some(width) = image.width {
+                            m.insert("width".to_string(), width.to_string());
+                        }
+                        if let Some(height) = image.height {
+                            m.insert("height".to_string(), height.to_string());
+                        }
+                        m
+                    },
+                },
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -521,22 +553,42 @@ mod tests {
         }
     }
 
+    /// Build a `PageContent` for tests, filling every field this module's tests never vary
+    /// with its empty/`None` default so a test's struct literal only states what it asserts on.
+    fn page_content_for_test(
+        page_number: u32,
+        content: &str,
+        hierarchy: Option<crate::types::PageHierarchy>,
+    ) -> crate::types::PageContent {
+        crate::types::PageContent {
+            page_number,
+            content: content.to_string(),
+            tables: vec![],
+            image_indices: vec![],
+            image_preprocessing: None,
+            hierarchy,
+            is_blank: None,
+            layout_regions: None,
+            speaker_notes: None,
+            section_name: None,
+            sheet_name: None,
+            ocr_confidence: None,
+        }
+    }
+
     #[test]
     fn test_transform_with_pages_and_hierarchy() {
-        use crate::types::{ElementType, ExtractedDocument, HierarchicalBlock, PageContent, PageHierarchy};
+        use crate::types::{ElementType, ExtractedDocument, HierarchicalBlock, PageHierarchy};
 
         let result = ExtractedDocument {
             content: "Full document content".to_string(),
             mime_type: Cow::Borrowed("application/pdf"),
             metadata: test_metadata(Some("Test Document".to_string())),
             pages: Some(vec![
-                PageContent {
-                    page_number: 1,
-                    content: "This is a test paragraph.\n\nAnother paragraph here.".to_string(),
-                    tables: vec![],
-                    image_indices: vec![],
-                    image_preprocessing: None,
-                    hierarchy: Some(PageHierarchy {
+                page_content_for_test(
+                    1,
+                    "This is a test paragraph.\n\nAnother paragraph here.",
+                    Some(PageHierarchy {
                         block_count: 2,
                         blocks: vec![
                             HierarchicalBlock {
@@ -553,27 +605,8 @@ mod tests {
                             },
                         ],
                     }),
-                    is_blank: None,
-                    layout_regions: None,
-                    speaker_notes: None,
-                    section_name: None,
-                    sheet_name: None,
-                    ocr_confidence: None,
-                },
-                PageContent {
-                    page_number: 2,
-                    content: "- List item 1\n- List item 2".to_string(),
-                    tables: vec![],
-                    image_indices: vec![],
-                    image_preprocessing: None,
-                    hierarchy: None,
-                    is_blank: None,
-                    layout_regions: None,
-                    speaker_notes: None,
-                    section_name: None,
-                    sheet_name: None,
-                    ocr_confidence: None,
-                },
+                ),
+                page_content_for_test(2, "- List item 1\n- List item 2", None),
             ]),
             ..Default::default()
         };

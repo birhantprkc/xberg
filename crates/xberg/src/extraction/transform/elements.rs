@@ -36,116 +36,96 @@ pub(crate) fn detect_list_items(text: &str) -> Vec<ListItemMetadata> {
         let line_start_offset = current_byte_offset;
         let trimmed = line.trim_start();
         let indent_level = (line.len() - trimmed.len()) / 2;
-
         let byte_end = line_start_offset + line.len();
+        let next_offset = advance_past_line_ending(text, byte_end);
 
-        let next_offset = if byte_end < text.len() {
-            let rest = &text.as_bytes()[byte_end..];
-            if rest.starts_with(b"\r\n") {
-                byte_end + 2
-            } else if rest.starts_with(b"\n") || rest.starts_with(b"\r") {
-                byte_end + 1
-            } else {
-                byte_end
-            }
-        } else {
-            byte_end
-        };
-
-        if let Some(stripped) = trimmed.strip_prefix('-')
-            && (stripped.starts_with(' ') || stripped.is_empty())
-        {
+        if let Some(list_type) = classify_list_line(trimmed, indent_level, text, line_start_offset) {
             items.push(ListItemMetadata {
-                list_type: ListType::Bullet,
+                list_type,
                 byte_start: line_start_offset,
                 byte_end,
                 indent_level: indent_level as u32,
             });
-            current_byte_offset = next_offset;
-            continue;
-        }
-
-        if let Some(stripped) = trimmed.strip_prefix('*')
-            && (stripped.starts_with(' ') || stripped.is_empty())
-        {
-            items.push(ListItemMetadata {
-                list_type: ListType::Bullet,
-                byte_start: line_start_offset,
-                byte_end,
-                indent_level: indent_level as u32,
-            });
-            current_byte_offset = next_offset;
-            continue;
-        }
-
-        if let Some(stripped) = trimmed.strip_prefix('•')
-            && (stripped.starts_with(' ') || stripped.is_empty())
-        {
-            items.push(ListItemMetadata {
-                list_type: ListType::Bullet,
-                byte_start: line_start_offset,
-                byte_end,
-                indent_level: indent_level as u32,
-            });
-            current_byte_offset = next_offset;
-            continue;
-        }
-
-        if let Some(pos) = trimmed.find('.') {
-            let prefix = &trimmed[..pos];
-            let uppercase_initial = trimmed[pos + 1..].chars().nth(1).is_some_and(|c| c.is_uppercase());
-            if prefix.chars().all(|c| c.is_ascii_digit())
-                && pos > 0
-                && pos < 3
-                && trimmed.len() > pos + 1
-                && trimmed[pos + 1..].starts_with(' ')
-                && !(uppercase_initial && is_lone_numbered_line_in_paragraph(text, line_start_offset))
-            {
-                items.push(ListItemMetadata {
-                    list_type: ListType::Numbered,
-                    byte_start: line_start_offset,
-                    byte_end,
-                    indent_level: indent_level as u32,
-                });
-                current_byte_offset = next_offset;
-                continue;
-            }
-        }
-
-        if let Some(pos) = trimmed.find('.') {
-            let prefix = &trimmed[..pos];
-            if prefix.len() == 1
-                && prefix.chars().all(|c| c.is_alphabetic())
-                && pos > 0
-                && trimmed.len() > pos + 1
-                && trimmed[pos + 1..].starts_with(' ')
-            {
-                items.push(ListItemMetadata {
-                    list_type: ListType::Lettered,
-                    byte_start: line_start_offset,
-                    byte_end,
-                    indent_level: indent_level as u32,
-                });
-                current_byte_offset = next_offset;
-                continue;
-            }
-        }
-
-        if indent_level >= 2 && !trimmed.is_empty() {
-            items.push(ListItemMetadata {
-                list_type: ListType::Indented,
-                byte_start: line_start_offset,
-                byte_end,
-                indent_level: indent_level as u32,
-            });
-            current_byte_offset = next_offset;
-            continue;
         }
 
         current_byte_offset = next_offset;
     }
 
     items
+}
+
+/// Byte offset immediately after `line`'s terminator (`\r\n`, `\n`, or `\r`),
+/// or `byte_end` unchanged when the line has no terminator (end of `text`).
+fn advance_past_line_ending(text: &str, byte_end: usize) -> usize {
+    if byte_end >= text.len() {
+        return byte_end;
+    }
+    let rest = &text.as_bytes()[byte_end..];
+    if rest.starts_with(b"\r\n") {
+        byte_end + 2
+    } else if rest.starts_with(b"\n") || rest.starts_with(b"\r") {
+        byte_end + 1
+    } else {
+        byte_end
+    }
+}
+
+/// Classify an already left-trimmed line as a list item, checked in the same
+/// precedence order as the original inline chain: bullet, numbered, lettered,
+/// then indented.
+fn classify_list_line(trimmed: &str, indent_level: usize, text: &str, line_start_offset: usize) -> Option<ListType> {
+    if is_bullet_marker(trimmed) {
+        Some(ListType::Bullet)
+    } else if is_numbered_marker(trimmed, text, line_start_offset) {
+        Some(ListType::Numbered)
+    } else if is_lettered_marker(trimmed) {
+        Some(ListType::Lettered)
+    } else if indent_level >= 2 && !trimmed.is_empty() {
+        Some(ListType::Indented)
+    } else {
+        None
+    }
+}
+
+/// True for a `-`, `*`, or `•` bullet marker followed by a space or end of line.
+fn is_bullet_marker(trimmed: &str) -> bool {
+    for prefix in ['-', '*', '•'] {
+        if let Some(stripped) = trimmed.strip_prefix(prefix)
+            && (stripped.starts_with(' ') || stripped.is_empty())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True for a `1. ` style numbered marker, excluding lone numbered lines
+/// promoted to headings elsewhere (see `is_lone_numbered_line_in_paragraph`).
+fn is_numbered_marker(trimmed: &str, text: &str, line_start_offset: usize) -> bool {
+    let Some(pos) = trimmed.find('.') else {
+        return false;
+    };
+    let prefix = &trimmed[..pos];
+    let uppercase_initial = trimmed[pos + 1..].chars().nth(1).is_some_and(|c| c.is_uppercase());
+    prefix.chars().all(|c| c.is_ascii_digit())
+        && pos > 0
+        && pos < 3
+        && trimmed.len() > pos + 1
+        && trimmed[pos + 1..].starts_with(' ')
+        && !(uppercase_initial && is_lone_numbered_line_in_paragraph(text, line_start_offset))
+}
+
+/// True for an `a. ` style single-letter marker.
+fn is_lettered_marker(trimmed: &str) -> bool {
+    let Some(pos) = trimmed.find('.') else {
+        return false;
+    };
+    let prefix = &trimmed[..pos];
+    prefix.len() == 1
+        && prefix.chars().all(|c| c.is_alphabetic())
+        && pos > 0
+        && trimmed.len() > pos + 1
+        && trimmed[pos + 1..].starts_with(' ')
 }
 
 /// Generate a unique element ID for semantic content.

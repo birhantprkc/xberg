@@ -220,6 +220,60 @@ fn extract_json_schema(
     }
 }
 
+fn extract_from_json_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    path: &mut String,
+    config: &JsonExtractionConfig,
+    metadata: &mut HashMap<String, String>,
+    text_fields: &mut Vec<String>,
+) -> Vec<String> {
+    if !config.flatten_nested_objects && !path.is_empty() {
+        let rendered = if config.include_type_info {
+            format!("{} (object): {}", path, value)
+        } else {
+            format!("{}: {}", path, value)
+        };
+        return vec![rendered];
+    }
+
+    let mut text_parts = Vec::new();
+    for (key, val) in obj {
+        let base_len = path.len();
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(key);
+        text_parts.extend(extract_from_json_value(val, path, config, metadata, text_fields));
+        path.truncate(base_len);
+    }
+    text_parts
+}
+
+fn extract_from_json_array(
+    arr: &[serde_json::Value],
+    path: &mut String,
+    config: &JsonExtractionConfig,
+    metadata: &mut HashMap<String, String>,
+    text_fields: &mut Vec<String>,
+) -> Vec<String> {
+    let mut text_parts = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        let base_len = path.len();
+        if path.is_empty() {
+            path.push_str("item_");
+            path.push_str(&i.to_string());
+        } else {
+            path.push('[');
+            path.push_str(&i.to_string());
+            path.push(']');
+        }
+        text_parts.extend(extract_from_json_value(item, path, config, metadata, text_fields));
+        path.truncate(base_len);
+    }
+    text_parts
+}
+
 fn extract_from_json_value(
     value: &serde_json::Value,
     path: &mut String,
@@ -228,45 +282,8 @@ fn extract_from_json_value(
     text_fields: &mut Vec<String>,
 ) -> Vec<String> {
     match value {
-        serde_json::Value::Object(obj) => {
-            if !config.flatten_nested_objects && !path.is_empty() {
-                let rendered = if config.include_type_info {
-                    format!("{} (object): {}", path, value)
-                } else {
-                    format!("{}: {}", path, value)
-                };
-                return vec![rendered];
-            }
-
-            let mut text_parts = Vec::new();
-            for (key, val) in obj {
-                let base_len = path.len();
-                if !path.is_empty() {
-                    path.push('.');
-                }
-                path.push_str(key);
-                text_parts.extend(extract_from_json_value(val, path, config, metadata, text_fields));
-                path.truncate(base_len);
-            }
-            text_parts
-        }
-        serde_json::Value::Array(arr) => {
-            let mut text_parts = Vec::new();
-            for (i, item) in arr.iter().enumerate() {
-                let base_len = path.len();
-                if path.is_empty() {
-                    path.push_str("item_");
-                    path.push_str(&i.to_string());
-                } else {
-                    path.push('[');
-                    path.push_str(&i.to_string());
-                    path.push(']');
-                }
-                text_parts.extend(extract_from_json_value(item, path, config, metadata, text_fields));
-                path.truncate(base_len);
-            }
-            text_parts
-        }
+        serde_json::Value::Object(obj) => extract_from_json_object(obj, value, path, config, metadata, text_fields),
+        serde_json::Value::Array(arr) => extract_from_json_array(arr, path, config, metadata, text_fields),
         serde_json::Value::String(s) => {
             if !s.trim().is_empty() {
                 let formatted = if config.include_type_info {
