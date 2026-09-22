@@ -59,7 +59,7 @@ use super::rendering::{
     fallback_render_document, open_pdf_for_full_ocr, open_pdf_for_page_ocr, page_dimensions_pt,
     page_needs_xobject_fallback, recover_page_text_from_image_xobjects, render_full_pdf_ocr_batch,
     render_selected_pages_from_document, share_rendered_page_images, valid_page_indices,
-    validate_png_encode_batch_peak, xobject_fallback_warning,
+    validate_png_encode_pages_individually, xobject_fallback_warning,
 };
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 use super::scoring::{
@@ -624,9 +624,10 @@ pub(crate) async fn extract_mixed_ocr_native(
                 // page at the 300 DPI an `images` config implies rejects the whole batch, and
                 // every page in it, from a width of two upwards. The batch's own footprint is
                 // bounded by `batch_size` above, which free memory decides. ~keep
-                for (_, image) in &page_images {
-                    validate_png_encode_batch_peak(std::iter::once(image.as_ref()), false, security_limits)?;
-                }
+                validate_png_encode_pages_individually(
+                    page_images.iter().map(|(_, image)| image.as_ref()),
+                    security_limits,
+                )?;
                 for (page_idx, image) in &page_images {
                     let rgb = clone_rgb_for_png_encode(image, security_limits)?;
                     let (w, h) = rgb.dimensions();
@@ -661,9 +662,7 @@ pub(crate) async fn extract_mixed_ocr_native(
         // thread budget, so a wide batch rejected every page in it (#1665) and the narrow
         // batch that hid the defect in #1666 was the workaround. The batch's own footprint is
         // bounded by `batch_size` above, which free memory decides. ~keep
-        for (_, image) in batch_slice {
-            validate_png_encode_batch_peak(std::iter::once(image), false, security_limits)?;
-        }
+        validate_png_encode_pages_individually(batch_slice.iter().map(|(_, image)| image), security_limits)?;
 
         #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
         let encoded: crate::Result<Vec<EncodedPage>> = batch_slice
@@ -1573,9 +1572,7 @@ pub(super) async fn extract_with_ocr_for_page(
             // dropped (#1731). Matches the per-page check the mixed native-and-OCR route runs
             // at its own encode step. The batch's own footprint is bounded by `batch_size`,
             // which the thread budget decides; `max_content_size` does not bound it. ~keep
-            for image in slice.iter() {
-                validate_png_encode_batch_peak(std::iter::once(image), false, security_limits)?;
-            }
+            validate_png_encode_pages_individually(slice.iter(), security_limits)?;
             #[allow(clippy::type_complexity)]
             #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
             let encoded: crate::Result<Vec<(usize, Arc<Vec<u8>>, u32, u32)>> = slice

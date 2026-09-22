@@ -145,6 +145,30 @@ pub(super) fn validate_png_encode_batch_peak<'a>(
         security_limits,
     )
 }
+/// Charge every page in `images` against `security_limits.max_content_size` on its own,
+/// never as a running total.
+///
+/// `max_content_size` bounds what a single page may cost to render and encode; summing a
+/// whole batch against it makes that per-image ceiling a function of the batch width
+/// instead, so a wide batch is refused whole and every page in it is silently dropped. Three
+/// call sites each grew their own copy of this per-page loop over
+/// [`validate_png_encode_batch_peak`] (#1665, #1731, #1748): this is the one place left, so
+/// a fourth route cannot reintroduce the sum by calling the batch-peak function directly with
+/// a whole slice again. Each call is still independently `false` (sequential) accounting:
+/// this validates what one page costs in isolation, not what the caller's own batch
+/// concurrency adds on top -- callers whose encode step runs pages in parallel already bound
+/// that width separately (by memory, by the thread budget), and this only ever guards the
+/// per-page ceiling `max_content_size` actually documents. ~keep
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+pub(super) fn validate_png_encode_pages_individually<'a>(
+    images: impl IntoIterator<Item = &'a image::DynamicImage>,
+    security_limits: &crate::extractors::security::SecurityLimits,
+) -> crate::Result<()> {
+    for image in images {
+        validate_png_encode_batch_peak(std::iter::once(image), false, security_limits)?;
+    }
+    Ok(())
+}
 
 #[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 mod png_encode_peak_tests {
@@ -166,6 +190,54 @@ mod png_encode_peak_tests {
         let error = validate_png_encode_batch_peak(images.iter(), true, &limits)
             .expect_err("parallel page conversions must be budgeted together");
 
+        assert!(matches!(error, crate::XbergError::Validation { .. }));
+    }
+
+    /// #1748: a batch wider than any single page's own allowance must still validate every
+    /// page, because [`validate_png_encode_pages_individually`] charges each one on its own
+    /// rather than summing the batch. Eight 10x10 pages charged in one
+    /// `validate_png_encode_batch_peak` call (the bug this helper replaces) peak at
+    /// 2,400 source bytes + 300 conversion bytes + 2,100,352 output bytes = 2,103,052,
+    /// which trips the 526,000 limit below and rejects every page in the batch; charged one
+    /// at a time each page peaks at 300 + 300 + 262,544 = 263,144, comfortably under it. The
+    /// three production call sites (`extract_mixed_ocr_native`'s raster-capture and
+    /// single-backend paths, `extract_with_ocr_for_page`'s pre-rendered-images path) all
+    /// delegate to this one helper now, so a fourth call site written against
+    /// `validate_png_encode_batch_peak` directly is the only way to reintroduce the sum.
+    #[test]
+    fn validate_pages_individually_accepts_a_batch_wider_than_one_page_allows() {
+        const PAGE_COUNT: usize = 8;
+        let images: Vec<image::DynamicImage> = (0..PAGE_COUNT)
+            .map(|_| image::DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)))
+            .collect();
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 526_000,
+            ..Default::default()
+        };
+
+        // A literal batch-wide sum would trip here (peaks at 2,103,052 bytes, see above).
+        validate_png_encode_pages_individually(images.iter(), &limits).expect(
+            "each page must be charged against max_content_size on its own; a batch summed \
+             wholesale would reject every page here, not just the ones that are actually too big",
+        );
+    }
+
+    /// #1748: the per-page allowance must not grow just because the batch happens to be
+    /// wide. A single page over the limit still fails even inside an otherwise-small batch,
+    /// which a whole-batch-average accounting could mask.
+    #[test]
+    fn validate_pages_individually_still_rejects_one_oversized_page() {
+        let images = [
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(10, 10)),
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(1000, 1000)),
+        ];
+        let limits = crate::extractors::security::SecurityLimits {
+            max_content_size: 526_000,
+            ..Default::default()
+        };
+
+        let error = validate_png_encode_pages_individually(images.iter(), &limits)
+            .expect_err("the oversized second page must still be rejected on its own");
         assert!(matches!(error, crate::XbergError::Validation { .. }));
     }
 }

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **(ocr): the per-page OCR-image render/encode size check now runs through one shared helper instead of three separate copies.** GH#1724 and GH#1731 each fixed a route that summed a whole page batch against `security_limits.max_content_size` -- a limit its own error text names as a per-image bound -- rejecting every page in the batch once the sum crossed it. Both fixes, and the mixed native/OCR route's own single-backend path, now call one `validate_png_encode_pages_individually` helper that charges each page on its own, so a new call site cannot reintroduce the batch-summing shape by calling the lower-level batch-peak function directly. No behaviour change on any of the three existing routes. (GH#1748)
+
 ## [1.2.7] - 2026-09-22
 
 ### Added
