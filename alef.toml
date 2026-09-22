@@ -575,11 +575,6 @@ traineddata = "traineddata"
 # Alef-generated config files. Both grow with the size of the surface alef manages and
 # with the quality-debt baseline below; a line count on generated config is not a
 # maintainability signal. ~keep
-"crates/xberg-native-pdf/src/content/operators.rs" = ["file-too-long", "type-too-long"]
-"crates/xberg-native-pdf/src/extractors/text/span_ordering.rs" = ["function-too-long"]
-"crates/xberg-native-pdf/src/fonts/cff_encoding.rs" = ["file-too-long"]
-"crates/xberg-native-pdf/src/fonts/cmap.rs" = ["file-too-long"]
-"crates/xberg-paddle-ocr/src/ocr_lite.rs" = ["too-many-parameters"]
 "poly.toml" = ["file-too-long"]
 ".alef-toml-merge-provenance.toml" = ["file-too-long"]
 # --- quality-debt baseline (generated) ---
@@ -611,6 +606,7 @@ traineddata = "traineddata"
   "function-too-long",
   "type-too-long",
 ]
+"crates/xberg-native-pdf/src/content/operators.rs" = ["file-too-long", "type-too-long"]
 "crates/xberg-native-pdf/src/content/parser.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/converters/text_post_processor.rs" = [
   "file-too-long",
@@ -701,6 +697,7 @@ traineddata = "traineddata"
   "function-too-long",
   "nesting-too-deep",
 ]
+"crates/xberg-native-pdf/src/extractors/text/span_ordering.rs" = ["function-too-long"]
 "crates/xberg-native-pdf/src/extractors/text/tj_arrays.rs" = ["function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/src/extractors/text/xobjects.rs" = [
   "cyclomatic-complexity",
@@ -712,6 +709,8 @@ traineddata = "traineddata"
   "function-too-long",
   "nesting-too-deep",
 ]
+"crates/xberg-native-pdf/src/fonts/cff_encoding.rs" = ["file-too-long"]
+"crates/xberg-native-pdf/src/fonts/cmap.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/src/fonts/font_dict.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
@@ -815,6 +814,7 @@ traineddata = "traineddata"
 "crates/xberg-native-pdf/tests/test_transparency_flattening_qa_round2.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/tests/test_vertical_writing_mode_qa_probes.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/tests/test_word_boundary_detection.rs" = ["file-too-long"]
+"crates/xberg-paddle-ocr/src/ocr_lite.rs" = ["too-many-parameters"]
 "crates/xberg-pdfium-render/src/bindgen/pdfium_7678.rs" = ["file-too-long"]
 "crates/xberg-pdfium-render/src/bindings.rs" = ["file-too-long", "too-many-parameters", "type-too-long"]
 "crates/xberg-pdfium-render/src/bindings/dynamic_bindings.rs" = [
