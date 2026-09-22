@@ -366,21 +366,16 @@ fn push_stray_text(builder: &mut InternalDocumentBuilder, text: &str, page: u32,
     }
 }
 
-/// Push one parsed element, plus its caption when it has one.
-fn push_element(builder: &mut InternalDocumentBuilder, name: &str, inner: &[Token<'_>], page: u32) {
-    let (bbox, consumed) = take_location(inner);
-    let body = &inner[consumed..];
-    let page = Some(page);
-
-    let caption = find_caption(body).map(|(start, end)| {
-        let caption_inner = &body[start + 1..end.min(body.len())];
-        let (caption_bbox, caption_consumed) = take_location(caption_inner);
-        (text_of(&caption_inner[caption_consumed..]), caption_bbox)
-    });
-    let content_end = find_caption(body).map(|(start, _)| start).unwrap_or(body.len());
-    let content = &body[..content_end];
-
-    let element = match name {
+/// Push the element body itself (everything but the caption handling in [`push_element`]),
+/// dispatching on tag name to the right `InternalDocumentBuilder` push method.
+fn push_element_body(
+    builder: &mut InternalDocumentBuilder,
+    name: &str,
+    content: &[Token<'_>],
+    page: Option<u32>,
+    bbox: Option<BoundingBox>,
+) -> Option<u32> {
+    match name {
         "otsl" => {
             let cells = parse_otsl_cells(content);
             // Docling emits table regions it found no cells in. There is no
@@ -443,7 +438,24 @@ fn push_element(builder: &mut InternalDocumentBuilder, name: &str, inner: &[Toke
         }
         // `text` and anything else that wraps prose.
         _ => Some(builder.push_paragraph(&text_of(content), Vec::new(), page, bbox)),
-    };
+    }
+}
+
+/// Push one parsed element, plus its caption when it has one.
+fn push_element(builder: &mut InternalDocumentBuilder, name: &str, inner: &[Token<'_>], page: u32) {
+    let (bbox, consumed) = take_location(inner);
+    let body = &inner[consumed..];
+    let page = Some(page);
+
+    let caption = find_caption(body).map(|(start, end)| {
+        let caption_inner = &body[start + 1..end.min(body.len())];
+        let (caption_bbox, caption_consumed) = take_location(caption_inner);
+        (text_of(&caption_inner[caption_consumed..]), caption_bbox)
+    });
+    let content_end = find_caption(body).map(|(start, _)| start).unwrap_or(body.len());
+    let content = &body[..content_end];
+
+    let element = push_element_body(builder, name, content, page, bbox);
 
     if let Some((caption_text, caption_bbox)) = caption
         && !caption_text.is_empty()
