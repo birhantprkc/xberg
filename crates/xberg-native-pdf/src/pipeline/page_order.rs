@@ -73,6 +73,12 @@ fn page_reading_order_inner(
     // order-divergence gate in `page_article_bead_rects` — which is provably a
     // no-op on single-column / geometric-order threads. ~keep
     let mut context = build_context(doc, page_index);
+    // `build_context` has no spans, and the gutter is a property of them.
+    // This is the third and last XY-cut entry point on an output path; the
+    // heading-run pre-pass is inert without it (GH#1757). ~keep
+    if let Some(gutter_x) = PdfDocument::detect_column_gutter(&spans) {
+        context = context.with_column_gutter(gutter_x);
+    }
     if !context.has_structure_tree
         && let Some(beads) = page_article_bead_rects(doc, page_index, &spans)
     {

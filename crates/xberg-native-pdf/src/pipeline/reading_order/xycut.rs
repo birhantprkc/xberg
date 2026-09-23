@@ -214,8 +214,13 @@ impl XYCutStrategy {
     /// body paragraph, line 2..N orphaned into the wrong block — and the
     /// markdown converter then promotes the orphan tail to a phantom
     /// heading (`### …`) in the wrong location.
-    pub fn partition_region(&self, spans: &[TextSpan]) -> Vec<Vec<TextSpan>> {
-        let heading_runs = self.find_heading_runs(spans);
+    ///
+    /// `column_gutter` is the mid-X of the page's column gutter when the
+    /// caller has detected one; it keeps the heading-run pre-pass from
+    /// folding a heading that opens the other column into a wrapped
+    /// heading's run (GH#1757). `None` leaves that fold unconditional.
+    pub fn partition_region(&self, spans: &[TextSpan], column_gutter: Option<f32>) -> Vec<Vec<TextSpan>> {
+        let heading_runs = self.find_heading_runs(spans, column_gutter);
         if heading_runs.is_empty() {
             // Hot path: no headings found, skip the synthesize/expand
             // pair entirely so the cost is bounded to one O(n log n) sort
@@ -252,7 +257,7 @@ impl XYCutStrategy {
     ///
     /// `median_font_size` is computed across non-bold spans so heavy
     /// bold runs don't bias the body-size estimate upward.
-    fn find_heading_runs(&self, spans: &[TextSpan]) -> Vec<HeadingRun> {
+    fn find_heading_runs(&self, spans: &[TextSpan], column_gutter: Option<f32>) -> Vec<HeadingRun> {
         if spans.len() < 2 {
             return Vec::new();
         }
@@ -350,6 +355,26 @@ impl XYCutStrategy {
             // SAME wrapped-heading line, e.g. two bold Tj segments). ~keep
             let same_line = (span.bbox.top() - last.bbox.top()).abs() <= 1.0;
 
+            // Rows are sorted by top across the WHOLE page, so a heading
+            // opening the other column can sort between a wrapped heading's
+            // two lines (GH#1757: 0.25 pt below line 1, 78.9 pt away across
+            // the gutter). Skip it — neither fold it in nor let it close the
+            // run — so the run stays open for the real continuation line,
+            // which is the whole point of this pre-pass. Folding it in makes
+            // it the run's last span and the continuation line then fails the
+            // indent test against the WRONG column's x; letting it break the
+            // run leaves two single-line candidates that the >= 2 distinct
+            // lines filter below drops. This sits BEFORE the size/weight
+            // tests because both failure modes cost the run: the issue's
+            // 10 pt variant fails `size_ok` and breaks it instead.
+            //
+            // Inert unless the caller supplied a gutter, so every XY-cut
+            // entry point on an output path must pass one — see
+            // `PdfDocument::detect_column_gutter`. ~keep
+            if same_line && Self::same_line_span_belongs_to_other_column(span, last, column_gutter) {
+                continue;
+            }
+
             if size_ok && bold_ok && same_line {
                 current.push(idx);
                 continue;
@@ -409,6 +434,34 @@ impl XYCutStrategy {
                 })
             })
             .collect()
+    }
+
+    /// Whether `span`, which shares a line with the current run's last span
+    /// `last`, in fact belongs to a DIFFERENT column — in which case it is
+    /// neither run material nor a reason to close the run.
+    ///
+    /// The answer is geometric and exact: the two spans are in different
+    /// columns when one ends before the gutter and the other begins after it.
+    /// A span that straddles the gutter (a full-width banner heading) is in
+    /// neither column and is never separated from anything by this test.
+    ///
+    /// `None` — a caller with no gutter to give — answers `false`, so the
+    /// fold is unconditional exactly as it was before GH#1757. A width-based
+    /// stand-in was measured and rejected: on a page with no detected gutter
+    /// the gaps it would have to reject are the same size as the gaps inside
+    /// legitimate heading lines (median 82 pt, half at or above the 79 pt of
+    /// GH#1757's own gutter, on one corpus document), so no threshold
+    /// separates the two populations and every such page would change. ~keep
+    fn same_line_span_belongs_to_other_column(span: &TextSpan, last: &TextSpan, column_gutter: Option<f32>) -> bool {
+        let Some(gutter_x) = column_gutter else {
+            return false;
+        };
+        let (left_box, right_box) = if span.bbox.left() <= last.bbox.left() {
+            (span, last)
+        } else {
+            (last, span)
+        };
+        left_box.bbox.right() <= gutter_x && right_box.bbox.left() >= gutter_x
     }
 
     /// Build a synthetic span list where each detected `HeadingRun`
@@ -2005,13 +2058,13 @@ struct ProjectionProfile {
 }
 
 impl ReadingOrderStrategy for XYCutStrategy {
-    fn apply(&self, spans: Vec<TextSpan>, _context: &ReadingOrderContext) -> Result<Vec<OrderedTextSpan>> {
+    fn apply(&self, spans: Vec<TextSpan>, context: &ReadingOrderContext) -> Result<Vec<OrderedTextSpan>> {
         // Detects multi-line heading runs and routes the
         // partition through synthetic-span space so the splitter treats
         // each wrapped heading as a single atomic block. When no
         // headings are found we use the original index-only path that
         // avoids span clones during recursion. ~keep
-        let heading_runs = self.find_heading_runs(&spans);
+        let heading_runs = self.find_heading_runs(&spans, context.column_gutter);
 
         let index_groups: Vec<Vec<usize>> = if heading_runs.is_empty() {
             let indices: Vec<usize> = (0..spans.len()).collect();
@@ -2122,7 +2175,7 @@ mod tests {
             make_span(10.0, 70.0, 50.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 3);
     }
@@ -2154,7 +2207,7 @@ mod tests {
             y -= leading;
         }
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(
             groups.len(),
             1,
@@ -2229,7 +2282,7 @@ mod tests {
             y -= 14.0;
         }
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(
             groups.len() <= 2,
             "single-column with header should produce at most 2 groups, got {}",
@@ -2251,7 +2304,7 @@ mod tests {
             make_span(100.0, 85.0, 50.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(!groups.is_empty(), "Expected at least 1 group");
         let total_spans: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total_spans, 4, "Expected all 4 spans to be preserved");
@@ -2282,7 +2335,7 @@ mod tests {
             make_span_text(253.33, 612.13, 12.08, 11.59, "GJ", 11.59),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let texts: Vec<&str> = groups.iter().flatten().map(|s| s.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2314,7 +2367,7 @@ mod tests {
             make_span_text(100.0, 186.0, 50.0, 10.0, "B2", 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let texts: Vec<&str> = groups.iter().flatten().map(|s| s.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2338,7 +2391,7 @@ mod tests {
             make_span(350.0, 85.0, 100.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(groups.len() >= 2, "Expected at least 2 groups, got {}", groups.len());
     }
 
@@ -2347,7 +2400,7 @@ mod tests {
         let strategy = XYCutStrategy::new();
         let spans = vec![make_span(10.0, 100.0, 50.0, 10.0)];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
     }
@@ -2405,7 +2458,7 @@ mod tests {
         let strategy = XYCutStrategy::new();
         let spans = vec![make_span(10.0, 100.0, 30.0, 10.0), make_span(45.0, 100.0, 30.0, 10.0)];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(groups.len(), 1);
     }
 
@@ -2468,7 +2521,7 @@ mod tests {
             make_span_text(210.0, 532.0, 45.0, 10.0, "Northwind", 10.0),
             make_span_text(290.0, 532.0, 34.0, 10.0, "Traders", 10.0),
         ];
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(
             groups.len(),
             1,
@@ -2655,7 +2708,7 @@ mod tests {
             14.0,
         ));
 
-        let runs = strategy.find_heading_runs(&spans);
+        let runs = strategy.find_heading_runs(&spans, None);
         assert_eq!(runs.len(), 1, "expected exactly one heading run, got {runs:?}");
         assert_eq!(
             runs[0].span_indices.len(),
@@ -2667,7 +2720,7 @@ mod tests {
         // case is a single-line heading that XY-cut already handles. ~keep
         let mut spans_single = vec![make_body_span(body_left, 720.0, body_width, 12.0); 5];
         spans_single.push(make_bold_span(body_left, 500.0, 180.0, "Lone Heading", 14.0));
-        let runs_single = strategy.find_heading_runs(&spans_single);
+        let runs_single = strategy.find_heading_runs(&spans_single, None);
         assert!(
             runs_single.is_empty(),
             "single-line bold runs must not produce a HeadingRun"
@@ -2720,7 +2773,7 @@ mod tests {
         spans.push(make_body_span(right_col_x, 420.0, col_width, 12.0));
         spans.push(make_body_span(right_col_x, 404.0, col_width, 12.0));
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
 
         let heading_first_group = groups
             .iter()
@@ -2820,17 +2873,14 @@ mod tests {
         );
     }
 
-    /// GH#1738: a numbered heading whose producer set the marker and title
-    /// in ONE `TJ` array with a kern for the tab (`[(3.)-1329.5(Title )] TJ`)
-    /// must not absorb a right-column caption that Y-overlaps its first
-    /// line. The kern becomes a space-only span that is always
-    /// `FontWeight::Normal` (see `extractors/text/advance.rs`), which used
-    /// to break `find_heading_runs`'s clustering right at the
-    /// marker/title boundary: the marker ("3.") was left out of the run
-    /// while the wrapped title ("…GASTECHNISCHE" / "INSTALLATEUR")
-    /// formed a run on its own, whose narrower union bbox no longer
-    /// covered the marker's column position and let the caption's span
-    /// land between the run's two original lines once expanded.
+    /// GH#1738: mid-X between the left column's right edge (237.56) and the
+    /// right column's left edge (312.60) on the reproducer's page 1.
+    const GH1738_GUTTER_X: f32 = 275.08;
+
+    /// The GH#1738 reproducer's page 1 as a fixture, with the right column's
+    /// caption parameterised. `(10.0, 810.40)` is the measured original; the
+    /// GH#1757 negative control re-runs the same page with the caption at the
+    /// heading's own size and on its row.
     ///
     /// Geometry transcribed verbatim from `PdfDocument::extract_spans` on
     /// page 1 of the GH#1738 reproducer (a two-column A4 page: a bold
@@ -2840,12 +2890,7 @@ mod tests {
     /// values, and `y` decreases top-to-bottom exactly like every other
     /// `y` in this file's `dense_two_column_*` fixtures. No position is
     /// invented. ~keep
-    #[test]
-    fn gh1738_kern_tab_heading_does_not_absorb_other_column_caption() {
-        use crate::pipeline::reading_order::ReadingOrderContext;
-
-        let strategy = XYCutStrategy::new();
-
+    fn gh1738_page(caption_font_size: f32, caption_top: f32) -> Vec<TextSpan> {
         let kern_space = |x: f32, y: f32, width: f32, font_size: f32| {
             let mut s = make_span_text(x, y, width, font_size, " ", font_size);
             s.offset_semantic = true;
@@ -2857,7 +2902,7 @@ mod tests {
         let spans = vec![
             make_bold_span(30.07, 809.09, 7.51, "3.", 9.0),
             kern_space(37.58, 809.09, 0.28, 9.0),
-            make_bold_span(312.60, 810.40, 129.00, "Fig. 6. Branderdruk (P1-P2)", 10.0),
+            make_bold_span(312.60, caption_top, 129.00, "Fig. 6. Branderdruk (P1-P2)", caption_font_size),
             make_bold_span(49.54, 809.09, 188.02, "INSTRUCTIES VOOR DE GASTECHNISCHE ", 9.0),
             make_bold_span(49.54, 799.39, 67.66, "INSTALLATEUR", 9.0),
             make_bold_span(30.07, 782.02, 12.51, "3.1", 9.0),
@@ -2901,6 +2946,26 @@ mod tests {
             body(312.60, 374.30, 115.11, "d. Branderdrukken controleren."),
             make_bold_span(312.60, 293.20, 120.10, "Fig. 7. Tweetrapsregeling", 10.0),
         ];
+        spans
+    }
+
+    /// GH#1738: a numbered heading whose producer set the marker and title
+    /// in ONE `TJ` array with a kern for the tab (`[(3.)-1329.5(Title )] TJ`)
+    /// must not absorb a right-column caption that Y-overlaps its first
+    /// line. The kern becomes a space-only span that is always
+    /// `FontWeight::Normal` (see `extractors/text/advance.rs`), which used
+    /// to break `find_heading_runs`'s clustering right at the
+    /// marker/title boundary: the marker ("3.") was left out of the run
+    /// while the wrapped title ("…GASTECHNISCHE" / "INSTALLATEUR")
+    /// formed a run on its own, whose narrower union bbox no longer
+    /// covered the marker's column position and let the caption's span
+    /// land between the run's two original lines once expanded. ~keep
+    #[test]
+    fn gh1738_kern_tab_heading_does_not_absorb_other_column_caption() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+        let spans = gh1738_page(10.0, 810.40);
 
         let context = ReadingOrderContext::new();
         let ordered = strategy.apply(spans, &context).expect("apply");
@@ -2939,6 +3004,345 @@ mod tests {
             "the other column's caption must not land inside the heading run \
              (marker={pos_marker}, title={pos_title}, wrap={pos_wrap}, \
              caption={pos_caption}): {order:?}"
+        );
+    }
+
+    /// GH#1757 left column, line 1: the chapter title following the `3.` marker.
+    const GH1757_TITLE: &str = "INSTRUKTIES VOOR DE GASTECHNISCHE ";
+    /// GH#1757 right column: the section heading that hijacked the run.
+    const GH1757_RIGHT_HEADING: &str = "3.2 VERBRANDINGSGASAFVOER EN LUCHTTOEVOER";
+    /// GH#1757: mid-X of the gutter between the page's two detected columns
+    /// (`Detected 2 columns: [(34.622, 276.310), (276.310, 560.031)]`).
+    const GH1757_GUTTER_X: f32 = 276.31;
+
+    /// GH#1757: page 4 of the installation manual (A4, 595 × 842). A numbered
+    /// chapter heading wraps to a second line at the top of the LEFT column
+    /// while the RIGHT column opens with a section heading in the same face,
+    /// 0.25 pt lower. `right_top`, `right_bold` and `right_font_size` select
+    /// the rows of the issue's variants table.
+    ///
+    /// Heading positions are the reporter's measured values, in PDF
+    /// coordinates (`y` = box top, decreasing down the page) — the left
+    /// heading's two lines at 804.93 / 794.13 and the right heading at
+    /// 804.68 are the content stream's own `Tm` operands. Body lines carry
+    /// the manual's measured leading with paraphrased text, exactly as the
+    /// reporter's reproducer sets them. ~keep
+    fn gh1757_wrapped_heading_over_two_columns(
+        right_top: f32,
+        right_bold: bool,
+        right_font_size: f32,
+    ) -> Vec<TextSpan> {
+        let kern_space = |x: f32, y: f32, width: f32, font_size: f32| {
+            let mut s = make_span_text(x, y, width, font_size, " ", font_size);
+            s.offset_semantic = true;
+            s
+        };
+        let body = |x: f32, y: f32, width: f32, text: &str| make_span_text(x, y, width, 8.3, text, 8.3);
+
+        let right_heading = if right_bold {
+            make_bold_span(322.7, right_top, 237.1, GH1757_RIGHT_HEADING, right_font_size)
+        } else {
+            make_span_text(
+                322.7,
+                right_top,
+                237.1,
+                right_font_size,
+                GH1757_RIGHT_HEADING,
+                right_font_size,
+            )
+        };
+
+        // The producer draws the whole RIGHT column as one text object and the
+        // whole LEFT column as a second, so the right heading precedes the
+        // left heading in span order. ~keep
+        let mut spans = vec![right_heading];
+        for (i, text) in [
+            "Het afvoersysteem en de uitmonding voldoen aan de geldende",
+            "norm voor gesloten toestellen met ventilator in een",
+            "opstellingsruimte. De afvoerleiding mag op afschot naar het",
+            "toestel liggen, want bij de toegestane lengte en de",
+            "voorgeschreven mantel ontstaat er geen condens. Een",
+            "doorvoer naar buiten ligt op een afschot van ten minste vijf",
+            "millimeter per meter naar buiten, zodat er geen regen in kan",
+            "lopen. Het toestel vangt zelf geen condens of regenwater op.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            spans.push(body(322.7, 784.8 - (i as f32) * 10.5, 237.3, text));
+        }
+        spans.push(make_bold_span(
+            322.7,
+            668.0,
+            149.8,
+            "3.2.1 AANSLUITING OP DE KETEL",
+            9.0,
+        ));
+        for (i, text) in [
+            "Het toestel wordt geleverd met een aansluitset voor een",
+            "bovenaansluiting met twee stompen van rond 80 mm. Op",
+            "bestelling is een set voor een achteraansluiting leverbaar,",
+            "eveneens met twee stompen van rond 80 mm.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            spans.push(body(322.7, 648.2 - (i as f32) * 10.5, 237.3, text));
+        }
+
+        spans.push(make_bold_span(34.6, 804.93, 7.5, "3.", 9.0));
+        spans.push(kern_space(42.14, 804.93, 0.28, 9.0));
+        spans.push(make_bold_span(55.9, 804.93, 185.2, GH1757_TITLE, 9.0));
+        spans.push(make_bold_span(55.9, 794.13, 67.6, "INSTALLATEUR", 9.0));
+        spans.push(make_bold_span(
+            34.6,
+            773.3,
+            179.9,
+            "3.1 GASAANSLUITING EN INSTALLATIE.",
+            9.0,
+        ));
+        for (i, text) in [
+            "1. Werk altijd volgens de laatste eisen en de plaatselijke",
+            "voorschriften.",
+            "2. Plaats bij te verwachten vuil in het gas bij voorkeur een",
+            "gaszeef.",
+            "3. Een dichtheidscontrole van het gasblok gebeurt met een druk",
+            "van ten hoogste 500 mm waterkolom.",
+            "4. Heeft de installatie minder vermogen nodig dan de",
+            "fabrieksafstelling, dan kan de branderdruk naar de gewenste",
+            "capaciteit worden aangepast volgens figuur 3.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            spans.push(body(34.6, 753.5 - (i as f32) * 10.5, 236.8, text));
+        }
+        spans
+    }
+
+    /// Texts of the spans backing each detected heading run, in run order.
+    fn heading_run_texts<'a>(spans: &'a [TextSpan], runs: &[HeadingRun]) -> Vec<Vec<&'a str>> {
+        runs.iter()
+            .map(|r| r.span_indices.iter().map(|&i| spans[i].text.as_str()).collect())
+            .collect()
+    }
+
+    /// GH#1757: the left column's wrapped chapter heading must be locked as
+    /// ONE run even though the right column's section heading sorts between
+    /// its two lines. The right heading sits across the detected gutter, so
+    /// it is neither folded into the run nor allowed to close it.
+    #[test]
+    fn wrapped_heading_run_survives_other_column_heading_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, true, 9.0);
+
+        let runs = strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X));
+        let texts = heading_run_texts(&spans, &runs);
+
+        assert_eq!(
+            texts,
+            vec![vec!["3.", GH1757_TITLE, "INSTALLATEUR"]],
+            "expected exactly one locked heading run covering the marker, the \
+             title and its wrapped continuation line"
+        );
+        assert!(
+            !texts.iter().flatten().any(|t| *t == GH1757_RIGHT_HEADING),
+            "the other column's heading must not be part of any heading run: {texts:?}"
+        );
+    }
+
+    /// GH#1757: the skip is gated entirely on a known gutter. A caller with
+    /// none must get the pre-GH#1757 behaviour verbatim — the far span folds
+    /// in and the run is lost — so that pages nobody classified as
+    /// multi-column are untouched.
+    ///
+    /// A width-based stand-in for the gutter was built and measured, and it
+    /// is why this test asserts the defect rather than the fix: on one corpus
+    /// document it fired 1385 times with a median gap of 82 pt, half of them
+    /// at or above the 79 pt gap of GH#1757's own gutter. No threshold
+    /// separates a cross-gutter gap from an in-line one without a gutter to
+    /// measure against. The fix is to give every output path the gutter (see
+    /// `PdfDocument::detect_column_gutter`), not to guess at one here. ~keep
+    #[test]
+    fn heading_run_fold_is_unchanged_without_a_known_gutter_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, true, 9.0);
+
+        assert!(
+            strategy.find_heading_runs(&spans, None).is_empty(),
+            "with no gutter the far span must still fold in, exactly as before"
+        );
+    }
+
+    /// GH#1757 at the entry points that actually reach the output lenses.
+    ///
+    /// `find_heading_runs` runs about a dozen times per page from several
+    /// call sites; `postprocess_spans` is only one of them, and threading the
+    /// gutter through it alone left the reproducer welded because the text
+    /// and markdown lenses read the ordering produced by `partition_region`
+    /// and by `apply`. Both must honour the gutter, so both are asserted
+    /// here: the marker, its title and the wrapped continuation line come out
+    /// adjacent and ahead of the other column's heading. ~keep
+    #[test]
+    fn output_path_entry_points_honour_the_gutter_gh1757() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, true, 9.0);
+
+        let partition_groups = strategy.partition_region(&spans, Some(GH1757_GUTTER_X));
+        let from_partition: Vec<&str> = partition_groups.iter().flatten().map(|s| s.text.as_str()).collect();
+
+        let context = ReadingOrderContext::new().with_column_gutter(GH1757_GUTTER_X);
+        let applied = strategy.apply(spans.clone(), &context).expect("apply");
+        let from_apply: Vec<&str> = applied.iter().map(|o| o.span.text.as_str()).collect();
+
+        for (label, order) in [("partition_region", &from_partition), ("apply", &from_apply)] {
+            let position = |needle: &str| {
+                order
+                    .iter()
+                    .position(|t| *t == needle)
+                    .unwrap_or_else(|| panic!("{label}: {needle:?} missing from {order:?}"))
+            };
+            let marker = position("3.");
+            let title = position(GH1757_TITLE);
+            let wrap = position("INSTALLATEUR");
+            let other = position(GH1757_RIGHT_HEADING);
+
+            assert_eq!(
+                title,
+                marker + 1,
+                "{label}: marker and title must stay adjacent: {order:?}"
+            );
+            assert_eq!(
+                wrap,
+                title + 1,
+                "{label}: the wrapped line must follow the title: {order:?}"
+            );
+            assert!(
+                other > wrap,
+                "{label}: the other column's heading must not precede or split the \
+                 heading run (marker={marker}, title={title}, wrap={wrap}, \
+                 other={other}): {order:?}"
+            );
+        }
+    }
+
+    /// GH#1757 control (the reproducer's page 2): the right column's heading
+    /// 1.5 pt ABOVE line 1 sorts before it and falls outside the 1 pt
+    /// same-line window, so the left heading already locks correctly today.
+    /// It must keep doing so.
+    #[test]
+    fn wrapped_heading_run_intact_when_other_column_heading_sits_higher_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(806.43, true, 9.0);
+
+        assert_eq!(
+            heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X))),
+            vec![vec!["3.", GH1757_TITLE, "INSTALLATEUR"]],
+            "the control page's heading run must stay intact"
+        );
+    }
+
+    /// GH#1757 variants table, the two rows that weld on the stock build:
+    /// the right heading on exactly the same baseline as line 1, and the
+    /// right heading one point larger. Both must leave the left column's run
+    /// whole.
+    ///
+    /// Asserting the run's exact membership matters here: "the right heading
+    /// is in no run" is also true of the defect, which produces no runs at
+    /// all. ~keep
+    #[test]
+    fn other_column_bold_heading_variants_keep_the_run_gh1757() {
+        let strategy = XYCutStrategy::new();
+
+        for (right_top, right_font_size, label) in [
+            (804.9295_f32, 9.0_f32, "same baseline"),
+            (804.68_f32, 10.0_f32, "10 pt"),
+        ] {
+            let spans = gh1757_wrapped_heading_over_two_columns(right_top, true, right_font_size);
+            let texts = heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X)));
+            assert_eq!(
+                texts,
+                vec![vec!["3.", GH1757_TITLE, "INSTALLATEUR"]],
+                "variant '{label}': the left column's heading run must stay whole"
+            );
+        }
+    }
+
+    /// GH#1757 variants table, the regular-face row. It never welded — a
+    /// 9 pt regular span on a 8.3 pt body page is not heading-like, so
+    /// clustering rejects it before any same-line test. Green before and
+    /// after the fix; pinned so a later widening of `is_heading_like` cannot
+    /// quietly turn the other column's opening line into run material.
+    ///
+    /// The left column's run is still lost on this variant — a far
+    /// non-heading-like span BREAKS the run rather than being skipped, which
+    /// is the issue's option 3 and is not addressed here. ~keep
+    #[test]
+    fn other_column_regular_face_line_never_joins_the_run_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, false, 9.0);
+
+        let texts = heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X)));
+
+        assert!(
+            !texts.iter().flatten().any(|t| *t == GH1757_RIGHT_HEADING),
+            "a regular-face line in the other column must not join a heading run: {texts:?}"
+        );
+    }
+
+    /// GH#1757 negative control for GH#1738. That test's caption clears
+    /// `size_ok` (10 pt against the heading's 9 pt) AND sits 1.31 pt above
+    /// the heading row, outside the 1 pt same-line window — two independent
+    /// reasons it never reached the same-line fold. Put it at the heading's
+    /// own size and 0.25 pt below its row, as GH#1757's page has it, and it
+    /// takes exactly the GH#1757 path: the stock build folds it in, the
+    /// wrapped line then fails the indent test against it, and the run is
+    /// lost. `apply` then welds the whole top row into one line.
+    #[test]
+    fn gh1738_equal_size_caption_on_the_heading_row_is_not_absorbed_gh1757() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+        let spans = gh1738_page(9.0, 808.84);
+
+        assert_eq!(
+            heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1738_GUTTER_X))),
+            vec![vec!["3.", "INSTRUCTIES VOOR DE GASTECHNISCHE ", "INSTALLATEUR"]],
+            "the caption must not be folded into the heading run"
+        );
+
+        let context = ReadingOrderContext::new().with_column_gutter(GH1738_GUTTER_X);
+        let ordered = strategy.apply(spans, &context).expect("apply");
+        let order: Vec<&str> = ordered.iter().map(|o| o.span.text.as_str()).collect();
+
+        let position = |needle: &str| {
+            order
+                .iter()
+                .position(|t| *t == needle)
+                .unwrap_or_else(|| panic!("{needle:?} must appear in reading order: {order:?}"))
+        };
+        let pos_marker = position("3.");
+        let pos_title = position("INSTRUCTIES VOOR DE GASTECHNISCHE ");
+        let pos_wrap = position("INSTALLATEUR");
+        let pos_caption = position("Fig. 6. Branderdruk (P1-P2)");
+
+        assert_eq!(
+            pos_title,
+            pos_marker + 1,
+            "the marker and title must stay adjacent: {order:?}"
+        );
+        assert_eq!(
+            pos_wrap,
+            pos_title + 1,
+            "the wrapped second line must stay adjacent to the title: {order:?}"
+        );
+        assert!(
+            pos_caption < pos_marker || pos_caption > pos_wrap,
+            "an equal-size caption on the heading's own row must not land inside \
+             the heading run (marker={pos_marker}, title={pos_title}, \
+             wrap={pos_wrap}, caption={pos_caption}): {order:?}"
         );
     }
 
@@ -2995,7 +3399,7 @@ mod tests {
         spans.push(make_word(455.0, 670.0, "(1)"));
         spans.push(make_word(505.0, 660.0, "(2)"));
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(
             groups.len() >= 2,
             "expected at least 2 groups (column split) for narrow-gutter 2-col body \
@@ -3061,7 +3465,7 @@ mod tests {
         spans.push(make_word(80.0, 410.0, "caption"));
         spans.push(make_word(300.0, 410.0, "(continued)"));
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         // For a true single-column page, partition_region should
         // return either ONE group or a small number from row/header
         // splits — never a column split that lands left-side spans
@@ -3211,7 +3615,7 @@ mod tests {
             make_span(degenerate_x, 100.0, 30.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, spans.len(), "all spans must be preserved");
     }
@@ -3229,7 +3633,7 @@ mod tests {
             .map(|i| make_span(10.0, (i as f32) * 11.0, 30.0, 10.0))
             .collect();
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, spans.len(), "depth guard must not drop spans");
     }

@@ -1025,6 +1025,27 @@ impl PdfDocument {
         top as f32 >= 0.70 * total as f32
     }
 
+    /// Mid-X of the page's column gutter, for callers that need the value and
+    /// not just `is_multi_column_page`'s yes/no.
+    ///
+    /// Tries the same three detectors, in the same order, that the text path
+    /// in `text_assembly.rs` uses, plus the density probe that finds the tight
+    /// (10-14 pt) gutters the cover scan misses. Each returns `None` on
+    /// single-column, grid/form/table and off-centre pages, so a caller that
+    /// gates on `Some` is unchanged on all of those.
+    ///
+    /// Consumed by the XY-cut's heading-run pre-pass, which needs to tell a
+    /// heading opening the other column apart from a second `Tj` segment of
+    /// the same heading line (GH#1757). Every XY-cut entry point on an output
+    /// path must pass this, not `None`: `find_heading_runs` runs about a dozen
+    /// times per page from several call sites, and threading only one of them
+    /// leaves the defect reachable through the others. ~keep
+    pub(crate) fn detect_column_gutter(spans: &[crate::layout::TextSpan]) -> Option<f32> {
+        Self::prose_two_column_gutter(spans)
+            .or_else(|| Self::density_central_gutter(spans))
+            .or_else(|| Self::classifier_column_gutter(spans))
+    }
+
     pub(super) fn is_multi_column_page(spans: &[crate::layout::TextSpan]) -> bool {
         // Clean-gutter detector (handles short pages the histogram gates below
         // reject for lack of spans). A genuine empty vertical channel that no

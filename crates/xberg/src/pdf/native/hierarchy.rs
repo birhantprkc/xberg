@@ -248,7 +248,16 @@ fn apply_xy_cut_if_column_aware(
     if order != xberg_native_pdf::document::ReadingOrder::ColumnAware {
         return;
     }
-    let context = ReadingOrderContext::new().with_page(page_index as u32);
+    // The gutter is what lets the XY-cut's heading-run pre-pass tell a heading
+    // opening the other column apart from a second `Tj` segment of the same
+    // heading line; without it the pre-pass is inert on this path and a
+    // wrapped heading is welded to the other column's opening line
+    // (xberg-io/xberg#1757). This ordering reaches the markdown lens, so it
+    // has to carry the gutter like every other XY-cut entry point. ~keep
+    let mut context = ReadingOrderContext::new().with_page(page_index as u32);
+    if let Some(gutter_x) = xberg_native_pdf::pipeline::reading_order::detect_column_gutter(spans.as_slice()) {
+        context = context.with_column_gutter(gutter_x);
+    }
     match XYCutStrategy::new().apply(spans.clone(), &context) {
         Ok(ordered) => *spans = ordered.into_iter().map(|item| item.span).collect(),
         Err(error) => tracing::debug!(
