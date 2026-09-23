@@ -324,38 +324,7 @@ pub(crate) fn build_structured_page_full(
     column_mode: ColumnMode,
     struct_info: &McidStructInfo,
 ) -> StructuredPage {
-    // Column assignment is computed over body spans only (chrome/headings are
-    // full-width by convention). ~keep
-    let body_refs: Vec<&TextSpan> = spans
-        .iter()
-        .filter(|s| matches!(role_for_span(s), RegionRole::BodyBlock | RegionRole::MarginalLabel))
-        .collect();
-    let gutter = match column_mode {
-        ColumnMode::Auto => detect_gutter_x(&body_refs, page_width),
-        // Forced two-column: prefer the detected gutter, else the page midpoint. ~keep
-        ColumnMode::Two => detect_gutter_x(&body_refs, page_width).or(Some(page_width * 0.5)),
-        ColumnMode::Single => None,
-    };
-
-    // Body content width over the same finite, non-empty spans the detector
-    // uses, so a full-width title/rule (a gutter-bridging span) is assigned no
-    // column rather than being forced to one side by its centre. ~keep
-    let (content_min, content_max) = body_refs
-        .iter()
-        .filter(|s| s.bbox.width > 0.0 && s.bbox.x.is_finite() && s.bbox.width.is_finite() && !s.text.trim().is_empty())
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
-            (lo.min(s.bbox.x), hi.max(s.bbox.x + s.bbox.width))
-        });
-    let bridge_w = (content_max - content_min) * COLUMN_BRIDGE_FRACTION;
-
-    let column_of = |span: &TextSpan| -> Option<usize> {
-        let g = gutter?;
-        if span.bbox.width > bridge_w {
-            return None; // cross-column chrome spans both columns ~keep
-        }
-        let center = span.bbox.x + span.bbox.width * 0.5;
-        Some(if center < g { 0 } else { 1 })
-    };
+    let assigner = ColumnAssigner::new(&spans, page_width, column_mode);
 
     let mut regions: Vec<StructuredRegion> = Vec::new();
     for span in spans {
@@ -373,34 +342,13 @@ pub(crate) fn build_structured_page_full(
             role_for_span(&span)
         };
         let col = match kind {
-            RegionRole::BodyBlock | RegionRole::MarginalLabel => column_of(&span),
+            RegionRole::BodyBlock | RegionRole::MarginalLabel => assigner.column_of(&span),
             _ => None,
         };
         // Nearest Sect/Art/Part section (§14.8.4.2 — §5/§6). ~keep
         let section = mcid.and_then(|m| struct_info.section.get(&m).copied());
 
-        // Region grouping:
-        //  * A column-tagged body span (`col` is `Some`) merges into the FIRST
-        //    region of the same role + column (+ section) so a two-column page
-        //    yields one region per column — left column whole, then right —
-        //    instead of interleaved per-line regions (Fix 1). The per-column
-        //    spans arrive in reading (y) order, so each region's text is the
-        //    column read top-to-bottom. A section change forces a new region so
-        //    chapters stay separate.
-        //  * Full-width / untagged content keeps adjacent-only coalescing, so
-        //    distinct blocks (separate headings, paragraphs) stay separate. ~keep
-        let merge_idx = if col.is_some() {
-            regions
-                .iter()
-                .position(|r| r.kind == kind && r.column_index == col && r.section_id == section)
-        } else {
-            match regions.last() {
-                Some(r) if r.kind == kind && r.column_index == col && r.section_id == section => {
-                    Some(regions.len() - 1)
-                }
-                _ => None,
-            }
-        };
+        let merge_idx = merge_target(&regions, &kind, col, section);
         if let Some(i) = merge_idx {
             let r = &mut regions[i];
             r.text.push(' ');
@@ -424,6 +372,82 @@ pub(crate) fn build_structured_page_full(
         page_width,
         page_height,
         regions,
+    }
+}
+
+/// Two-column geometry for one page: the gutter X and the width above which a
+/// span is treated as cross-column chrome rather than column content.
+struct ColumnAssigner {
+    gutter: Option<f32>,
+    bridge_w: f32,
+}
+
+impl ColumnAssigner {
+    fn new(spans: &[TextSpan], page_width: f32, column_mode: ColumnMode) -> Self {
+        // Column assignment is computed over body spans only (chrome/headings are
+        // full-width by convention). ~keep
+        let body_refs: Vec<&TextSpan> = spans
+            .iter()
+            .filter(|s| matches!(role_for_span(s), RegionRole::BodyBlock | RegionRole::MarginalLabel))
+            .collect();
+        let gutter = match column_mode {
+            ColumnMode::Auto => detect_gutter_x(&body_refs, page_width),
+            // Forced two-column: prefer the detected gutter, else the page midpoint. ~keep
+            ColumnMode::Two => detect_gutter_x(&body_refs, page_width).or(Some(page_width * 0.5)),
+            ColumnMode::Single => None,
+        };
+
+        // Body content width over the same finite, non-empty spans the detector
+        // uses, so a full-width title/rule (a gutter-bridging span) is assigned no
+        // column rather than being forced to one side by its centre. ~keep
+        let (content_min, content_max) = body_refs
+            .iter()
+            .filter(|s| {
+                s.bbox.width > 0.0 && s.bbox.x.is_finite() && s.bbox.width.is_finite() && !s.text.trim().is_empty()
+            })
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+                (lo.min(s.bbox.x), hi.max(s.bbox.x + s.bbox.width))
+            });
+        Self {
+            gutter,
+            bridge_w: (content_max - content_min) * COLUMN_BRIDGE_FRACTION,
+        }
+    }
+
+    fn column_of(&self, span: &TextSpan) -> Option<usize> {
+        let g = self.gutter?;
+        if span.bbox.width > self.bridge_w {
+            return None; // cross-column chrome spans both columns ~keep
+        }
+        let center = span.bbox.x + span.bbox.width * 0.5;
+        Some(if center < g { 0 } else { 1 })
+    }
+}
+
+/// Index of the region this span should merge into, if any.
+///
+/// A column-tagged body span (`col` is `Some`) merges into the FIRST region of
+/// the same role + column (+ section) so a two-column page yields one region per
+/// column — left column whole, then right — instead of interleaved per-line
+/// regions (Fix 1). The per-column spans arrive in reading (y) order, so each
+/// region's text is the column read top-to-bottom. A section change forces a new
+/// region so chapters stay separate. Full-width / untagged content keeps
+/// adjacent-only coalescing, so distinct blocks (separate headings, paragraphs)
+/// stay separate. ~keep
+fn merge_target(
+    regions: &[StructuredRegion],
+    kind: &RegionRole,
+    col: Option<usize>,
+    section: Option<usize>,
+) -> Option<usize> {
+    if col.is_some() {
+        return regions
+            .iter()
+            .position(|r| r.kind == *kind && r.column_index == col && r.section_id == section);
+    }
+    match regions.last() {
+        Some(r) if r.kind == *kind && r.column_index == col && r.section_id == section => Some(regions.len() - 1),
+        _ => None,
     }
 }
 
