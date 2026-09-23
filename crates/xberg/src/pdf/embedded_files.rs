@@ -204,6 +204,50 @@ fn resolve_object<'a>(document: &'a Document, obj: &'a Object) -> Option<Object>
     }
 }
 
+/// Check an embedded file against the decompression-ratio and size caps.
+///
+/// Returns the warning to record when the file must be skipped, or `None` when
+/// it is eligible for extraction.
+#[cfg(feature = "tokio-runtime")]
+fn embedded_file_skip_warning(
+    file: &EmbeddedFile,
+    max_ratio: usize,
+    max_embedded_file_bytes: Option<u64>,
+) -> Option<ProcessingWarning> {
+    if file.compressed_size > 0 {
+        let ratio = file.data.len() as f64 / file.compressed_size as f64;
+        if ratio > max_ratio as f64 {
+            return Some(ProcessingWarning {
+                source: Cow::Borrowed("pdf_embedded_files"),
+                message: Cow::Owned(format!(
+                    "Skipped embedded file '{}': decompression ratio {:.0}x exceeds limit {}x \
+                     (compressed {} B → decompressed {} B)",
+                    file.name,
+                    ratio,
+                    max_ratio,
+                    file.compressed_size,
+                    file.data.len(),
+                )),
+            });
+        }
+    }
+
+    if max_embedded_file_bytes.is_some_and(|cap| file.data.len() as u64 > cap) {
+        let cap = max_embedded_file_bytes.unwrap_or(0);
+        return Some(ProcessingWarning {
+            source: Cow::Borrowed("pdf_embedded_files"),
+            message: Cow::Owned(format!(
+                "Skipped embedded file '{}': size {} bytes exceeds cap {} bytes",
+                file.name,
+                file.data.len(),
+                cap,
+            )),
+        });
+    }
+
+    None
+}
+
 /// Extract embedded files from PDF bytes and recursively process them.
 ///
 /// Returns `(children, warnings)`. The children are `ArchiveEntry` values
@@ -240,39 +284,9 @@ pub(crate) async fn extract_and_process_embedded_files(
         .unwrap_or(100);
 
     for file in embedded {
-        if file.compressed_size > 0 {
-            let ratio = file.data.len() as f64 / file.compressed_size as f64;
-            if ratio > max_ratio as f64 {
-                warnings.push(ProcessingWarning {
-                    source: Cow::Borrowed("pdf_embedded_files"),
-                    message: Cow::Owned(format!(
-                        "Skipped embedded file '{}': decompression ratio {:.0}x exceeds limit {}x \
-                         (compressed {} B → decompressed {} B)",
-                        file.name,
-                        ratio,
-                        max_ratio,
-                        file.compressed_size,
-                        file.data.len(),
-                    )),
-                });
-                continue;
-            }
-        }
-
-        if config
-            .max_embedded_file_bytes
-            .is_some_and(|cap| file.data.len() as u64 > cap)
-        {
-            let cap = config.max_embedded_file_bytes.unwrap_or(0);
-            warnings.push(ProcessingWarning {
-                source: Cow::Borrowed("pdf_embedded_files"),
-                message: Cow::Owned(format!(
-                    "Skipped embedded file '{}': size {} bytes exceeds cap {} bytes",
-                    file.name,
-                    file.data.len(),
-                    cap,
-                )),
-            });
+        let skipped = embedded_file_skip_warning(&file, max_ratio, config.max_embedded_file_bytes);
+        if let Some(warning) = skipped {
+            warnings.push(warning);
             continue;
         }
 
