@@ -1181,6 +1181,61 @@ fn line_has_grid_row_gaps(spans: &[xberg_native_pdf::layout::TextSpan], line: &S
     gap_count >= MIN_GRID_ROW_GAP_COUNT
 }
 
+// GH#1756: one shared left edge is a margin, not a grid. Two is the floor at which a
+// set of column edges describes a table at all, and a row that `line_has_grid_row_gaps`
+// accepts has five or more cells, so a genuine table's grid clears this with room to
+// spare -- it only refuses the degenerate case where the excluded rows agree on a
+// single x, where every line on the page that starts there would otherwise be read as
+// a table line. ~keep
+const MIN_GRID_COLUMNS_FOR_CELL_GAP_VOTES: usize = 2;
+
+/// True if the gap at `midpoint` that `line` is about to vote for is a gap *between*
+/// two of `columns` -- a table's own cell gap -- and `line` is itself a row of that
+/// table rather than prose running across it.
+///
+/// GH#1756: `line_has_grid_row_gaps` removes a table's *full* rows from
+/// `detect_split_x`'s vote, but a table typeset by a journal also carries sparse lines
+/// -- the second and third line of a wrapped column header, a standard-deviation line
+/// under its row, a row whose long label closes the gap to its first value, a group row
+/// with empty cells, a units line. Each opens only one to three internal gaps, so each
+/// keeps its vote, and each votes for a gap deep inside the table. With the full rows
+/// gone those sparse lines are the *majority* of the vote: measured on the reporter's
+/// carrier the vote fell from 38 midpoints to 11, the median moved from 383.3 to 449.1,
+/// and the distance from the true gutter corridor grew from 84.5pt to 150.3pt -- 1.5pt
+/// past `MAX_REDIRECT_DISTANCE_FRACTION` of the page width (148.8pt), so the redirect
+/// that had been rescuing the page could no longer reach it.
+///
+/// The rows the gap-count filter already excluded are what identifies the rest of the
+/// table: they establish its column grid (`strong_column_edges`, which still requires
+/// `MIN_DENSE_COLUMN_SPLIT_LINES` independent rows to agree on an edge).
+/// `row_follows_column_grid` -- the same predicate `order_region_by_panels` uses to
+/// tell a table row from a caption running across one, reused rather than reinvented --
+/// then recognises the sparse rows whatever their gap count.
+///
+/// The vote's own position is the second half of the test, and it is what keeps this
+/// from throwing away real evidence: a table row's *last* gap, between its rightmost
+/// cell and the opposite column, IS the page gutter and is the only per-line evidence
+/// some pages have. Only a gap that falls between two of the table's own column edges
+/// is a cell gap. Both halves are load-bearing in opposite directions: without the
+/// alignment test, ordinary prose whose gap happens to fall across a table elsewhere on
+/// the page loses its vote; without the position test, a table row whose widest gap is
+/// the gutter loses its vote, which on the GH#1742 reproducer moves the median 5pt into
+/// the left column's longest line. ~keep
+fn vote_is_a_grid_cell_gap(
+    spans: &[xberg_native_pdf::layout::TextSpan],
+    line: &SpanLine,
+    columns: &[f32],
+    midpoint: f32,
+) -> bool {
+    if columns.len() < MIN_GRID_COLUMNS_FOR_CELL_GAP_VOTES {
+        return false;
+    }
+    let (Some(&first), Some(&last)) = (columns.first(), columns.last()) else {
+        return false;
+    };
+    midpoint > first && midpoint < last && row_follows_column_grid(spans, line, columns)
+}
+
 // GH#1742 (reproducer page 4): a three-column table row opens only two internal
 // gaps, one short of `MIN_GRID_ROW_GAP_COUNT`, so it is never excluded from
 // `detect_split_x`'s vote and can still make the median land inside the table. Once
@@ -1273,21 +1328,36 @@ fn lines_with_internal_gap_at(
 /// `MAX_DENSE_COLUMN_GUTTER_FRACTION` in `widest_gap_midpoint` below, which independently
 /// rejects the same line's gap for being implausibly wide -- either fix alone
 /// already removes it from the vote. ~keep
+///
+/// GH#1756: the lines `line_has_grid_row_gaps` rejects are not only removed from the
+/// vote, they are read first, for the column grid they establish. A line that sits on
+/// that grid and votes for a gap between two of its columns is a table row whatever
+/// its own gap count, and is removed too (`vote_is_a_grid_cell_gap`). ~keep
 fn detect_split_x(spans: &[xberg_native_pdf::layout::TextSpan], lines: &[SpanLine], page_width: f32) -> Option<f32> {
     let min_gutter = (page_width * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
     let max_gutter = page_width * MAX_DENSE_COLUMN_GUTTER_FRACTION;
     let furniture_width = page_width * FULL_WIDTH_FURNITURE_FRACTION;
 
-    let mut midpoints: Vec<f32> = lines
-        .iter()
-        .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
-        .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+    let voting_lines = || {
+        lines
+            .iter()
+            .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
+            .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+    };
+    let grid_rows: Vec<SpanLine> = voting_lines()
+        .filter(|&line| line_has_grid_row_gaps(spans, line, min_gutter))
+        .cloned()
+        .collect();
+    let grid_columns = strong_column_edges(spans, &grid_rows);
+
+    let mut midpoints: Vec<f32> = voting_lines()
         .filter(|&line| !line_has_grid_row_gaps(spans, line, min_gutter))
         .filter_map(|line| {
             let edges = line
                 .iter()
                 .map(|&index| (spans[index].bbox.left(), spans[index].bbox.right()));
-            widest_gap_midpoint(edges, min_gutter, max_gutter)
+            let midpoint = widest_gap_midpoint(edges, min_gutter, max_gutter)?;
+            (!vote_is_a_grid_cell_gap(spans, line, &grid_columns, midpoint)).then_some(midpoint)
         })
         .collect();
     if midpoints.len() < MIN_DENSE_COLUMN_SPLIT_LINES {
@@ -5119,6 +5189,338 @@ mod tests {
             last_table_cell_index < right_heading_index,
             "the left column, table included, must be emitted before the right column"
         );
+    }
+
+    const GH1756_PAGE_WIDTH: f32 = 595.3;
+    /// The reporter's own whitespace corridor between the two columns: the left
+    /// column's right edge and the right column's left edge, midpoint 298.8.
+    const GH1756_GUTTER_CORRIDOR: (f32, f32) = (291.0, 306.6);
+    /// The column grid the carrier's full table rows establish (issue #1756's own
+    /// measurement: 312.6 / 397.2 / 441.0 / 488.4 / 534.7), as `(left, width)`. Every
+    /// consecutive pair leaves a gap wider than `min_gutter` (11.9pt at this page
+    /// width), so a full row opens four internal gaps and `line_has_grid_row_gaps`
+    /// already excludes it from the vote on both builds.
+    const GH1756_GRID_ROW: [(f32, f32); 5] = [
+        (312.6, 30.0),
+        (397.2, 20.0),
+        (441.0, 20.0),
+        (488.4, 21.1),
+        (534.7, 22.0),
+    ];
+    /// One full row above the wrapped column header, then 26 below it -- the 27 grid
+    /// rows the issue counts, covering y 325.0..700.3, the extent all six sparse lines
+    /// fall inside.
+    const GH1756_TOP_GRID_ROW_Y: f32 = 700.3;
+    const GH1756_FIRST_BODY_GRID_ROW_Y: f32 = 675.0;
+    const GH1756_BODY_GRID_ROW_COUNT: usize = 26;
+    const GH1756_GRID_ROW_LEADING: f32 = 14.0;
+
+    /// The six sparse table lines of the reporter's page 1, as `(y, cells)` with each
+    /// cell `(left, width)`. Each reproduces the three facts the issue measures for
+    /// that line -- its internal gap count (one to three, always under
+    /// `MIN_GRID_ROW_GAP_COUNT`, so it keeps its vote), the midpoint of its widest gap,
+    /// and how many of its spans sit on the grid above -- rather than the carrier's
+    /// literal text:
+    ///
+    /// | y | issue: gaps / midpoint / aligned | fixture: gaps / midpoint / aligned |
+    /// |---|---|---|
+    /// | 691.7 | 1 / 482.1 / 2 of 2 | 1 / 482.1 / 2 of 2 |
+    /// | 683.1 | 1 / 471.7 / 2 of 4 | 1 / 471.7 / 2 of 2 |
+    /// | 652.9 | 1 / 449.1 / 2 of 2 | 1 / 449.1 / 2 of 2 |
+    /// | 627.2 | 3 / 522.1 / 5 of 7 | 3 / 522.1 / 5 of 7 |
+    /// | 601.5 | 3 / 465.7 / 5 of 5 | 3 / 464.7 / 5 of 5 |
+    /// | 327.3 | 2 / 449.1 / 2 of 3 | 2 / 449.1 / 2 of 3 |
+    ///
+    /// The y-601.5 midpoint is 464.7 rather than the issue's 465.7: that line's widest
+    /// gap runs between two zero-width empty-cell markers, which can only sit on the
+    /// grid's own column edges, so the midpoint is pinned to (441.0 + 488.4) / 2. The
+    /// 1.0pt difference does not move the median, which is the 449.1 six places in.
+    const GH1756_SPARSE_TABLE_LINES: [(f32, &[(f32, f32)]); 6] = [
+        (691.7, &[(441.0, 34.8), (488.4, 34.0)]),
+        (683.1, &[(441.0, 14.0), (488.4, 22.0)]),
+        (652.9, &[(397.2, 12.6), (488.4, 20.0)]),
+        (
+            627.2,
+            &[
+                (312.6, 20.0),
+                (334.0, 6.0),
+                (341.0, 45.0),
+                (397.2, 25.0),
+                (441.0, 28.0),
+                (488.4, 21.1),
+                (534.7, 22.0),
+            ],
+        ),
+        (
+            601.5,
+            &[(312.6, 77.4), (397.2, 0.0), (441.0, 0.0), (488.4, 0.0), (534.7, 22.0)],
+        ),
+        (327.3, &[(320.0, 30.0), (397.2, 12.6), (488.4, 20.0)]),
+    ];
+    /// The reporter's page 3 removes the four sparse lines whose widest gap lies
+    /// furthest right (y 691.7, 683.1, 627.2, 601.5), leaving these two.
+    const GH1756_P3_SPARSE_TABLE_LINES: [usize; 2] = [2, 5];
+
+    /// The five ordinary prose lines that keep their vote on every build, contributing
+    /// the issue's measured midpoints 255.0, 276.0, 298.8, 304.8 and 365.0 in that
+    /// order. The first two sit inside the table's y extent and off its column grid, so
+    /// they are the fixture's own control that the grid exclusion discriminates by
+    /// alignment and not merely by y.
+    const GH1756_PROSE_VOTE_LINES: [(f32, &[(f32, f32)]); 5] = [
+        (668.0, &[(37.6, 211.4), (261.0, 30.0)]),
+        (640.0, &[(37.6, 232.4), (282.0, 9.0)]),
+        (760.0, &[(37.6, 253.4), (306.6, 235.0)]),
+        (746.0, &[(37.6, 253.4), (318.6, 223.0)]),
+        (720.0, &[(306.6, 46.4), (377.0, 60.0)]),
+    ];
+
+    /// The band below the table that makes the wrong split *act*: the issue's own
+    /// reordering band (its y 418.7..472.9, left 33 inked `Prose` spans, right 6
+    /// `Mixed`, row pairing 0.23). Interleaved left-only prose lines and right-only
+    /// cells, neither of which straddles the bad split at 449.1, so the whole run stays
+    /// one content band with six inked spans a side and no row pairing across it --
+    /// `reorder_band_columns` accepts it, `reorder_dense_two_column_page` returns
+    /// `true`, and the page is emitted in y order. None of these lines has an internal
+    /// gap of its own, so the band adds no vote on either build.
+    const GH1756_REORDERING_BAND_TOP_Y: f32 = 297.0;
+    const GH1756_REORDERING_BAND_LEADING: f32 = 7.0;
+    const GH1756_REORDERING_BAND_LINES: usize = 2 * MIN_DENSE_COLUMN_SPANS_PER_SIDE;
+    const GH1756_BAND_PROSE_TEXT: &str = "left column body text continuing past the table";
+    const GH1756_BAND_PROSE_X: f32 = 37.6;
+    const GH1756_BAND_PROSE_WIDTH: f32 = 200.0;
+    const GH1756_BAND_CELL_X: f32 = 488.4;
+    const GH1756_BAND_CELL_WIDTH: f32 = 60.0;
+
+    fn gh1756_push_line(spans: &mut Vec<TextSpan>, y: f32, cells: &[(f32, f32)]) {
+        for &(x, width) in cells {
+            // The carrier marks an empty table cell with a zero-width U+200B, which
+            // `trim()` does not remove -- so it counts as ink and holds its column's
+            // position, which is why the y-601.5 group row aligns 5 of 5. ~keep
+            let text = if width == 0.0 { "\u{200b}" } else { "cell" };
+            spans.push(span_with_width(text, x, y, width, 7.0, 7.0));
+        }
+    }
+
+    fn gh1756_push_grid_rows(spans: &mut Vec<TextSpan>) {
+        gh1756_push_line(spans, GH1756_TOP_GRID_ROW_Y, &GH1756_GRID_ROW);
+        for row in 0..GH1756_BODY_GRID_ROW_COUNT {
+            let y = GH1756_FIRST_BODY_GRID_ROW_Y - row as f32 * GH1756_GRID_ROW_LEADING;
+            gh1756_push_line(spans, y, &GH1756_GRID_ROW);
+        }
+    }
+
+    fn gh1756_push_reordering_band(spans: &mut Vec<TextSpan>) {
+        for line in 0..GH1756_REORDERING_BAND_LINES {
+            let y = GH1756_REORDERING_BAND_TOP_Y - line as f32 * GH1756_REORDERING_BAND_LEADING;
+            if line.is_multiple_of(2) {
+                spans.push(span_with_width(
+                    GH1756_BAND_PROSE_TEXT,
+                    GH1756_BAND_PROSE_X,
+                    y,
+                    GH1756_BAND_PROSE_WIDTH,
+                    8.5,
+                    8.5,
+                ));
+            } else {
+                spans.push(span_with_width(
+                    "cell",
+                    GH1756_BAND_CELL_X,
+                    y,
+                    GH1756_BAND_CELL_WIDTH,
+                    7.0,
+                    7.0,
+                ));
+            }
+        }
+    }
+
+    fn gh1756_page_with_sparse_lines(sparse_lines: &[usize]) -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        gh1756_push_grid_rows(&mut spans);
+        for &line in sparse_lines {
+            let (y, cells) = GH1756_SPARSE_TABLE_LINES[line];
+            gh1756_push_line(&mut spans, y, cells);
+        }
+        for &(y, cells) in &GH1756_PROSE_VOTE_LINES {
+            gh1756_push_line(&mut spans, y, cells);
+        }
+        gh1756_push_reordering_band(&mut spans);
+        spans
+    }
+
+    /// GH#1756 (the reporter's page 1): a journal table whose 27 full rows are already
+    /// excluded from `detect_split_x`'s vote, plus the six *sparse* table lines that
+    /// are not -- a wrapped column header's second and third line, an SD line under its
+    /// row, a row whose long label closes the gap to its first value, a group row with
+    /// empty cells, and a units line. Five ordinary prose lines are the only genuine
+    /// gutter evidence left. On v1.2.7 the six sparse lines outvote them six to five
+    /// and the median lands at 449.1, deep inside the right column and 150.3pt from the
+    /// true corridor -- 1.5pt past what `MAX_REDIRECT_DISTANCE_FRACTION` (148.8pt at
+    /// this page width) lets the redirect reach back.
+    fn gh1756_sparse_table_rows_page() -> Vec<TextSpan> {
+        gh1756_page_with_sparse_lines(&[0, 1, 2, 3, 4, 5])
+    }
+
+    /// GH#1756 (the reporter's page 3): the same page with four of the six sparse lines
+    /// removed.
+    fn gh1756_two_sparse_table_rows_page() -> Vec<TextSpan> {
+        gh1756_page_with_sparse_lines(&GH1756_P3_SPARSE_TABLE_LINES)
+    }
+
+    /// GH#1756's control page: the same 27-row table with no sparse lines at all, and
+    /// six genuine two-column prose lines interleaved with the table's own rows.
+    /// Excluding a table's sparse rows must not cost the page the gutter evidence that
+    /// merely sits beside the table.
+    fn gh1756_prose_beside_a_full_grid_table() -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        gh1756_push_grid_rows(&mut spans);
+        for line in 0..MIN_DENSE_COLUMN_SPLIT_LINES {
+            let y = 668.0 - line as f32 * GH1756_GRID_ROW_LEADING;
+            gh1756_push_line(&mut spans, y, &[(37.6, 253.4), (306.6, 235.0)]);
+        }
+        spans
+    }
+
+    fn gh1756_detect_split_x(spans: &[TextSpan]) -> Option<f32> {
+        let order = spans_sorted_top_to_bottom(spans);
+        let lines = group_into_lines(spans, &order);
+        detect_split_x(spans, &lines, GH1756_PAGE_WIDTH)
+    }
+
+    /// GH#1756: with the table's full rows already out of the vote, its six sparse
+    /// lines are the majority of what is left and carry the median to 449.1 -- inside
+    /// the right column, and further from the gutter than the redirect may reach. The
+    /// sparse lines sit on the very column grid the excluded full rows establish, so
+    /// excluding them too leaves the five prose votes, one short of the
+    /// `MIN_DENSE_COLUMN_SPLIT_LINES` quorum: the repair declines and the page falls to
+    /// the XY-cut, which reads it in column order (the reporter measures exactly that
+    /// on their page 2).
+    #[test]
+    fn detect_split_x_declines_when_sparse_table_rows_outvote_the_gutter_gh1756() {
+        let spans = gh1756_sparse_table_rows_page();
+
+        assert_eq!(
+            gh1756_detect_split_x(&spans),
+            None,
+            "the table's sparse lines must not be gutter evidence: with only the five \
+             genuine prose votes left the vote is below quorum and must decline rather \
+             than place the split at 449.1, inside the right column"
+        );
+    }
+
+    /// GH#1756 (the reporter's page 3): two sparse lines instead of six. On v1.2.7 the
+    /// median lands at 304.8, inside the gutter corridor, by luck of where the two
+    /// survivors' gaps fall -- the page reads correctly but for the wrong reason. Both
+    /// survivors are still table lines on the grid, so the repair declines here too and
+    /// the page reaches the same correct column order through the XY-cut.
+    #[test]
+    fn detect_split_x_declines_on_two_sparse_table_rows_gh1756() {
+        let spans = gh1756_two_sparse_table_rows_page();
+
+        assert_eq!(
+            gh1756_detect_split_x(&spans),
+            None,
+            "both surviving sparse lines sit on the table's own column grid, so the \
+             five prose votes are all that is left and the vote is below quorum"
+        );
+    }
+
+    fn gh1756_grid_columns(spans: &[TextSpan]) -> Vec<f32> {
+        let order = spans_sorted_top_to_bottom(spans);
+        let lines = group_into_lines(spans, &order);
+        let min_gutter = (GH1756_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1756_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+        let grid_rows: Vec<SpanLine> = lines
+            .iter()
+            .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
+            .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+            .filter(|&line| line_has_grid_row_gaps(spans, line, min_gutter))
+            .cloned()
+            .collect();
+        strong_column_edges(spans, &grid_rows)
+    }
+
+    fn gh1756_line_at(spans: &[TextSpan], y: f32) -> SpanLine {
+        let order = spans_sorted_top_to_bottom(spans);
+        group_into_lines(spans, &order)
+            .into_iter()
+            .find(|line| (spans[line[0]].bbox.y - y).abs() < LINE_Y_TOLERANCE_PTS)
+            .expect("the fixture must carry a line on this baseline")
+    }
+
+    /// GH#1756: the predicate's two halves discriminate in opposite directions, so each
+    /// needs its own control. A sparse table line is on the grid *and* votes for a gap
+    /// between two of its columns. A prose line whose own gap happens to fall across
+    /// the table's columns is not on the grid, and keeps its vote. A prose line in the
+    /// real gutter is neither.
+    #[test]
+    fn only_a_grid_row_voting_for_its_own_cell_gap_is_excluded_gh1756() {
+        let spans = gh1756_sparse_table_rows_page();
+        let columns = gh1756_grid_columns(&spans);
+
+        assert_eq!(
+            columns,
+            GH1756_GRID_ROW.iter().map(|&(x, _)| x).collect::<Vec<_>>(),
+            "the full rows the gap-count filter already excluded must establish the \
+             table's own column grid"
+        );
+        assert!(
+            vote_is_a_grid_cell_gap(&spans, &gh1756_line_at(&spans, 652.9), &columns, 449.1),
+            "the SD line under `Age, y` sits on the grid and votes for the gap between \
+             the table's own second and fourth columns"
+        );
+        assert!(
+            !vote_is_a_grid_cell_gap(&spans, &gh1756_line_at(&spans, 720.0), &columns, 365.0),
+            "a prose line whose gap falls across the table's columns, but whose spans \
+             start nowhere near their edges, must keep its vote"
+        );
+        assert!(
+            !vote_is_a_grid_cell_gap(&spans, &gh1756_line_at(&spans, 760.0), &columns, 298.8),
+            "a line voting for the page's real gutter, left of the table entirely, must \
+             keep its vote"
+        );
+    }
+
+    /// GH#1756's end-to-end control: six genuine two-column prose lines whose baselines
+    /// interleave a 27-row table's own rows keep their votes and carry the median to
+    /// the true gutter. Without this the exclusion could pass its own tests by
+    /// swallowing every line level with a table.
+    #[test]
+    fn detect_split_x_keeps_prose_votes_beside_a_table_gh1756() {
+        let spans = gh1756_prose_beside_a_full_grid_table();
+
+        let detected = gh1756_detect_split_x(&spans).expect("six paired prose lines meet the quorum on their own");
+        assert!(
+            detected > GH1756_GUTTER_CORRIDOR.0 && detected < GH1756_GUTTER_CORRIDOR.1,
+            "prose beside a table must keep its gutter vote; expected a split inside \
+             {GH1756_GUTTER_CORRIDOR:?}, got {detected}"
+        );
+    }
+
+    /// GH#1756 end to end: with the vote below quorum `reorder_dense_two_column_page`
+    /// declines and leaves every span exactly where it was, handing the page to the
+    /// XY-cut fallback. On v1.2.7 it instead returns `true` on a split of 449.1 and the
+    /// page is emitted in y order -- the left column's `2.6.` heading welded to the
+    /// right column's `Table 4`, and prose from the two columns interleaved.
+    #[test]
+    fn dense_two_column_page_with_sparse_table_rows_declines_the_repair_gh1756() {
+        let mut spans = gh1756_sparse_table_rows_page();
+        let original: Vec<(String, f32, f32)> = spans
+            .iter()
+            .map(|span| (span.text.clone(), span.bbox.x, span.bbox.y))
+            .collect();
+
+        assert!(
+            !reorder_dense_two_column_page(&mut spans, GH1756_PAGE_WIDTH),
+            "a page whose only remaining gutter evidence is five prose lines must \
+             decline the dense two-column repair rather than split inside a column"
+        );
+
+        let after: Vec<(String, f32, f32)> = spans
+            .iter()
+            .map(|span| (span.text.clone(), span.bbox.x, span.bbox.y))
+            .collect();
+        assert_eq!(after, original, "a declined repair must leave the page untouched");
     }
 
     const GH1655_PAGE_WIDTH: f32 = 595.28;
