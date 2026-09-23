@@ -84,6 +84,69 @@ struct HeadingRun {
     combined_bbox: Rect,
 }
 
+/// Within a valley run `[start, end)` of a projection profile's density
+/// array, choose the split OFFSET at the run's deepest (lowest-density)
+/// point rather than its arithmetic midpoint (GH#1763).
+///
+/// A wide interior run classified "below threshold" is not uniformly
+/// empty: `horizontal_projection_indexed` only excludes spans wider than
+/// 55% of the region and spans with fewer than 2 non-whitespace
+/// characters, so a full-width caption line or a single-char table-cell
+/// row can still occupy bins inside the run with nonzero (but
+/// sub-threshold) density. The run's arithmetic midpoint has no relation
+/// to where that content sits, so it can land squarely inside a figure
+/// caption even though a genuinely empty gutter exists elsewhere in the
+/// same run.
+///
+/// Tie-break order, applied to the contiguous sub-runs that attain the
+/// run's minimum density value:
+///   1. Widest sub-run wins — a genuine open gutter is wide; an isolated
+///      single-bin dip that happens to share the same minimum density
+///      is not a gutter and should not win over a real one.
+///   2. On a width tie, the sub-run whose center is nearest the WHOLE
+///      run's arithmetic midpoint wins — keeps the choice deterministic
+///      and, when nothing else distinguishes the candidates, close to
+///      the pre-fix behavior.
+///
+/// When the run is uniformly at its minimum density throughout (the
+/// common case: a real, empty column gutter with no stray content), the
+/// single minimal sub-run IS the whole run, so this returns exactly the
+/// old midpoint — the fix only changes behavior in the buggy case where
+/// sub-threshold content is unevenly distributed inside the run. ~keep
+fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> usize {
+    debug_assert!(start < end && end <= density.len());
+    let run_mid = start + (end - start) / 2;
+    if start >= end || end > density.len() {
+        return run_mid;
+    }
+    let min_density = density[start..end].iter().copied().fold(f32::INFINITY, f32::min);
+
+    let mut best_width = 0usize;
+    let mut best_dist = usize::MAX;
+    let mut best_center = run_mid;
+
+    let mut i = start;
+    while i < end {
+        if density[i] != min_density {
+            i += 1;
+            continue;
+        }
+        let sub_start = i;
+        while i < end && density[i] == min_density {
+            i += 1;
+        }
+        let width = i - sub_start;
+        let center = sub_start + width / 2;
+        let dist = center.abs_diff(run_mid);
+        if width > best_width || (width == best_width && dist < best_dist) {
+            best_width = width;
+            best_dist = dist;
+            best_center = center;
+        }
+    }
+    best_center
+}
+
 /// Union of the bboxes of `spans[indices]`. Empty index list yields a
 /// zero-sized rect at the origin (never built in practice — guarded by
 /// the caller).
@@ -1557,7 +1620,9 @@ impl XYCutStrategy {
             if vw < self.min_valley_width {
                 return None;
             }
-            profile.x_min + (vs + ve) as f32 / 2.0
+            // Deepest point within the valley run, not its midpoint
+            // (GH#1763) — see `deepest_valley_point` for why. ~keep
+            profile.x_min + deepest_valley_point(&profile.density, vs, ve) as f32
         } else {
             self.find_split_between_peaks(&profile)?
         };
@@ -1766,7 +1831,9 @@ impl XYCutStrategy {
             return None;
         }
 
-        let split_y = profile.y_min + (valley_start + valley_end) as f32 / 2.0;
+        // Deepest point within the valley run, not its midpoint (GH#1763,
+        // same fix as the horizontal split — see `deepest_valley_point`). ~keep
+        let split_y = profile.y_min + deepest_valley_point(&profile.density, valley_start, valley_end) as f32;
 
         // `Rect::top()` returns `self.y`, the SMALLER Y coordinate of the
         // normalized rectangle — the method name follows a screen-coordinate
@@ -1987,6 +2054,21 @@ impl XYCutStrategy {
             .into_iter()
             .map(|(start, end)| (start, end, (end - start) as f32))
             .max_by(|a, b| crate::utils::safe_float_cmp(a.2, b.2))
+    }
+
+    /// Test-only wrapper exposing `deepest_valley_point` (a free function)
+    /// as an associated fn so tests can call it the same way as the other
+    /// `#[cfg(test)]` wrappers in this file.
+    #[cfg(test)]
+    fn deepest_point_wrapper(density: &[f32], start: usize, end: usize) -> usize {
+        deepest_valley_point(density, start, end)
+    }
+
+    /// Old (pre-GH#1763) split-point formula, kept only so the fixed
+    /// behaviour can be asserted against what the bug used to produce. ~keep
+    #[cfg(test)]
+    fn legacy_valley_midpoint(start: usize, end: usize) -> f32 {
+        (start + end) as f32 / 2.0
     }
 
     /// Test-only wrapper for horizontal projection on a contiguous slice.
@@ -3636,5 +3718,200 @@ mod tests {
         let groups = strategy.partition_region(&spans, None);
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, spans.len(), "depth guard must not drop spans");
+    }
+
+    /// GH#1763 target split X: the center of the widest all-zero sub-run
+    /// inside the wide interior valley `gh1763_page` produces — see that
+    /// function's doc comment for the derivation. The pre-fix midpoint
+    /// formula instead lands at 254.5, inside the "CAP5…" caption
+    /// fragment's span (see `legacy_valley_midpoint`). ~keep
+    const GH1763_GUTTER_X: f32 = 466.0;
+
+    /// Reproduces GH#1763: a figure-caption block (left) beside a body
+    /// column (right) whose true empty gutter sits OFF the interior
+    /// valley's arithmetic midpoint.
+    ///
+    /// Geometry (all X in points, region x_min = 0):
+    ///   - `CAP1`/`CAP2` (2/3 non-ws chars, 10pt font ⇒ core width 9/13.5pt,
+    ///     both left-edge 0) overlap at bin 0, giving density 20 there —
+    ///     ABOVE the run's threshold (18 = 0.3 × peak 60) so `find_valley`'s
+    ///     interior filter (`start > first_nonzero`) admits the run that
+    ///     follows instead of treating the whole region as one leading
+    ///     margin. This is the "super-threshold strip at the left content
+    ///     edge" the bug fix's interior-run gate requires.
+    ///   - `FIG.3.A` (bold, 14pt, 7 non-ws chars ⇒ core width 44.1pt,
+    ///     left-edge 60) and `CAP4`/`CAP5` (30/25 non-ws chars, 10pt,
+    ///     left-edges 150/320) are ragged sub-threshold caption content —
+    ///     real ink, never above 18 density, ending at x = 342 (CAP5's
+    ///     core right edge = 320 + 25×4.5 = 432.5, ceil 433 — the LAST
+    ///     content before the true gutter).
+    ///   - `BODY1..BODY6` (56 non-ws chars, 10pt ⇒ core width 252pt,
+    ///     left-edge 500, six identical lines) set the peak: 6 × 10 = 60.
+    ///
+    /// The resulting horizontal-projection run below threshold spans bins
+    /// [9, 500) (width 491, comfortably the widest and only interior
+    /// valley — `BODY` is uniform so it contributes no valley of its
+    /// own). Within that run the true empty gutter is [433, 500) (width
+    /// 67) — clearly off-center: the run's own arithmetic midpoint,
+    /// (9 + 500) / 2 = 254.5, lands inside `CAP4`'s span (density 10 at
+    /// that x), not in the empty band.
+    ///
+    /// All five upstream column/prose detectors decline on this fixture
+    /// before reaching the valley split, so the bug path is genuinely
+    /// exercised: `detect_two_column_prose` sees 5 left-edge clusters
+    /// (0, 60, 150, 320, 500 — the staggered caption starts plus the
+    /// body's own), not the exactly-2 it requires; `detect_narrow_gutter_prose`
+    /// declines outright (11 spans < its 24-span floor); and
+    /// `is_single_column_region` returns false because no single line's
+    /// extent reaches 60% of the 752pt region width. ~keep
+    fn gh1763_page() -> Vec<TextSpan> {
+        let cap1 = make_span_text(0.0, 740.0, 9.0, 10.0, "c1", 10.0);
+        let cap2 = make_span_text(0.0, 725.0, 13.5, 10.0, "c2z", 10.0);
+        let fig3 = make_bold_span(60.0, 760.0, 44.1, "FIG.3.A", 14.0);
+        let cap4 = make_span_text(150.0, 705.0, 135.0, 10.0, &format!("CAP4{}", "x".repeat(26)), 10.0);
+        let cap5 = make_span_text(320.0, 685.0, 112.5, 10.0, &format!("CAP5{}", "x".repeat(21)), 10.0);
+
+        let mut spans = vec![cap1, cap2, fig3, cap4, cap5];
+        for (i, y) in [655.0, 635.0, 615.0, 595.0, 575.0, 555.0].into_iter().enumerate() {
+            spans.push(make_span_text(
+                500.0,
+                y,
+                252.0,
+                10.0,
+                &format!("BODY{}{}", i, "x".repeat(51)),
+                10.0,
+            ));
+        }
+        spans
+    }
+
+    /// RED-then-GREEN unit test for the GH#1763 fix. Asserts the profile,
+    /// the chosen valley run, and the resulting split coordinate
+    /// explicitly — not just inferred from final group membership. Before
+    /// the fix, `find_horizontal_split_indexed` used
+    /// `legacy_valley_midpoint(vs, ve)` (254.5) here; that value falls
+    /// inside `CAP4`'s span, which this test also pins down. ~keep
+    #[test]
+    fn find_valley_selects_the_deepest_point_not_the_midpoint_gh1763() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1763_page();
+
+        let profile = strategy
+            .horizontal_projection(&spans)
+            .expect("non-empty span set must produce a projection profile");
+
+        let (valley_start, valley_end, valley_width) = strategy
+            .find_valley(&profile)
+            .expect("a wide interior valley must be found");
+        assert_eq!(
+            (valley_start, valley_end, valley_width),
+            (9, 500, 491.0),
+            "unexpected valley run bounds"
+        );
+
+        let buggy_midpoint = XYCutStrategy::legacy_valley_midpoint(valley_start, valley_end);
+        assert_eq!(buggy_midpoint, 254.5, "pre-fix formula must land inside CAP4's span");
+        assert_eq!(
+            profile.density[254], 10.0,
+            "the pre-fix midpoint must land on real (sub-threshold) caption content, not empty space"
+        );
+
+        let deepest = XYCutStrategy::deepest_point_wrapper(&profile.density, valley_start, valley_end);
+        assert_eq!(
+            deepest, 466,
+            "fixed split must land at the center of the widest zero-density sub-run"
+        );
+        assert_eq!(
+            profile.density[466], 0.0,
+            "the fixed split point must land in the true empty gutter, not on caption content"
+        );
+        assert_ne!(
+            deepest as f32, buggy_midpoint,
+            "the fix must actually move the split point"
+        );
+    }
+
+    /// Behavioral counterpart: `find_horizontal_split_indexed` (the real
+    /// caller, not a hand-rolled reimplementation) must partition the
+    /// GH#1763 fixture so every caption fragment (`CAP1`, `CAP2`,
+    /// `FIG.3.A`, `CAP4`, `CAP5`) stays on the left and every body line
+    /// (`BODY*`) stays on the right — pre-fix, `CAP5` crossed into the
+    /// body side because the buggy midpoint (254.5) sits to the LEFT of
+    /// CAP5's own left edge (320). ~keep
+    #[test]
+    fn find_horizontal_split_indexed_keeps_caption_fragments_together_gh1763() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1763_page();
+        let indices: Vec<usize> = (0..spans.len()).collect();
+
+        let (left, right) = strategy
+            .find_horizontal_split_indexed(&spans, &indices)
+            .expect("a valid column split must be found");
+
+        assert_eq!(
+            left,
+            vec![0, 1, 2, 3, 4],
+            "left side must hold exactly the 5 caption fragments"
+        );
+        assert_eq!(
+            right,
+            vec![5, 6, 7, 8, 9, 10],
+            "right side must hold exactly the 6 body lines"
+        );
+    }
+
+    /// Integration-level counterpart via the public `partition_region`
+    /// entry point. Column purity — no caption fragment sharing a final
+    /// group with any body line, and vice versa — is asserted rather
+    /// than "same group_id for all 5 caption fragments", because the
+    /// sparse, widely-spaced caption fragments legitimately subdivide
+    /// further under recursion (each such sub-split is rejected by
+    /// `MIN_RESULT_WIDTH_PT`, so in practice they land in one group, but
+    /// the invariant that must hold regardless is column purity). ~keep
+    #[test]
+    fn gh1763_caption_fragments_never_bleed_into_the_body_column() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1763_page();
+
+        let groups = strategy.partition_region(&spans);
+
+        let group_of = |text: &str| -> usize {
+            groups
+                .iter()
+                .position(|g| g.iter().any(|s| s.text == text))
+                .unwrap_or_else(|| panic!("{text} missing from output: {groups:?}"))
+        };
+
+        let caption_texts = ["c1", "c2z", "FIG.3.A"];
+        let caption_groups: Vec<usize> = caption_texts.iter().map(|t| group_of(t)).collect();
+        let cap4_group = groups
+            .iter()
+            .position(|g| g.iter().any(|s| s.text.starts_with("CAP4")))
+            .expect("CAP4 fragment missing");
+        let cap5_group = groups
+            .iter()
+            .position(|g| g.iter().any(|s| s.text.starts_with("CAP5")))
+            .expect("CAP5 fragment missing");
+        let body_groups: Vec<usize> = (0..6)
+            .map(|i| {
+                groups
+                    .iter()
+                    .position(|g| g.iter().any(|s| s.text.starts_with(&format!("BODY{i}"))))
+                    .unwrap_or_else(|| panic!("BODY{i} missing from output: {groups:?}"))
+            })
+            .collect();
+
+        for &cg in caption_groups.iter().chain([&cap4_group, &cap5_group]) {
+            assert!(
+                !body_groups.contains(&cg),
+                "a caption fragment must never share a group with body content: {groups:?}"
+            );
+        }
+        // The specific manifestation of the bug: CAP5 must stay with FIG.3.A,
+        // not fall into the body group. ~keep
+        assert_eq!(
+            cap5_group, caption_groups[2],
+            "CAP5 must group with FIG.3.A, not drift to the body column: {groups:?}"
+        );
     }
 }
