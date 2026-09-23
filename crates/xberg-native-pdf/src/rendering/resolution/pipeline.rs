@@ -242,91 +242,84 @@ fn eval_separation_alt_cmyk(
     let func_dict = func_obj.as_dict()?;
     let func_type = func_dict.get("FunctionType").and_then(|o| o.as_integer())?;
     match func_type {
-        2 => {
-            // Type 2 exponential: y_j = C0_j + tint^N * (C1_j - C0_j). ~keep
-            let n = func_dict
-                .get("N")
-                .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
-                .unwrap_or(1.0) as f32;
-            let c0 = func_dict.get("C0").and_then(|o| o.as_array());
-            let c1 = func_dict.get("C1").and_then(|o| o.as_array());
-            let pow = if n == 1.0 { tint } else { tint.powf(n) };
-            let mut out = [0.0f32; 4];
-            for j in 0..4 {
-                let c0j = c0
-                    .and_then(|a| a.get(j))
-                    .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
-                    .unwrap_or(0.0) as f32;
-                let c1j = c1
-                    .and_then(|a| a.get(j))
-                    .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
-                    .unwrap_or(if j == 3 { 0.0 } else { 1.0 }) as f32;
-                out[j] = (c0j + pow * (c1j - c0j)).clamp(0.0, 1.0);
-            }
-            Some(out)
-        }
-        4 => {
-            // Type 4 PostScript calculator: invoke the shared evaluator. ~keep
-            let Object::Stream { dict, .. } = func_obj else {
-                return None;
-            };
-            let bytes = func_obj.decode_stream_data().ok()?;
-            let domain = dict
-                .get("Domain")
-                .and_then(|o| o.as_array())
-                .map(|a| {
-                    a.as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|c| {
-                            let lo = c[0]
-                                .as_real()
-                                .or_else(|| c[0].as_integer().map(|i| i as f64))
-                                .unwrap_or(0.0);
-                            let hi = c[1]
-                                .as_real()
-                                .or_else(|| c[1].as_integer().map(|i| i as f64))
-                                .unwrap_or(1.0);
-                            [lo, hi]
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let range = dict
-                .get("Range")
-                .and_then(|o| o.as_array())
-                .map(|a| {
-                    a.as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|c| {
-                            let lo = c[0]
-                                .as_real()
-                                .or_else(|| c[0].as_integer().map(|i| i as f64))
-                                .unwrap_or(0.0);
-                            let hi = c[1]
-                                .as_real()
-                                .or_else(|| c[1].as_integer().map(|i| i as f64))
-                                .unwrap_or(1.0);
-                            [lo, hi]
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let inputs = vec![tint as f64];
-            let out = crate::functions::evaluate_type4_clamped(&bytes, &inputs, &domain, &range).ok()?;
-            if out.len() < 4 {
-                return None;
-            }
-            Some([
-                out[0].clamp(0.0, 1.0) as f32,
-                out[1].clamp(0.0, 1.0) as f32,
-                out[2].clamp(0.0, 1.0) as f32,
-                out[3].clamp(0.0, 1.0) as f32,
-            ])
-        }
+        2 => eval_type2_exponential(func_dict, tint),
+        4 => eval_type4_calculator(func_obj, tint),
         _ => None,
     }
+}
+
+/// Type 2 exponential interpolation: `y_j = C0_j + tint^N * (C1_j - C0_j)`. ~keep
+fn eval_type2_exponential(
+    func_dict: &std::collections::HashMap<String, crate::object::Object>,
+    tint: f32,
+) -> Option<[f32; 4]> {
+    let n = func_dict
+        .get("N")
+        .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+        .unwrap_or(1.0) as f32;
+    let c0 = func_dict.get("C0").and_then(|o| o.as_array());
+    let c1 = func_dict.get("C1").and_then(|o| o.as_array());
+    let pow = if n == 1.0 { tint } else { tint.powf(n) };
+    let mut out = [0.0f32; 4];
+    for j in 0..4 {
+        let c0j = c0
+            .and_then(|a| a.get(j))
+            .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+            .unwrap_or(0.0) as f32;
+        let c1j = c1
+            .and_then(|a| a.get(j))
+            .and_then(|o| o.as_real().or_else(|| o.as_integer().map(|i| i as f64)))
+            .unwrap_or(if j == 3 { 0.0 } else { 1.0 }) as f32;
+        out[j] = (c0j + pow * (c1j - c0j)).clamp(0.0, 1.0);
+    }
+    Some(out)
+}
+
+/// Type 4 PostScript calculator: invoke the shared evaluator. ~keep
+fn eval_type4_calculator(func_obj: &crate::object::Object, tint: f32) -> Option<[f32; 4]> {
+    use crate::object::Object;
+    let Object::Stream { dict, .. } = func_obj else {
+        return None;
+    };
+    let bytes = func_obj.decode_stream_data().ok()?;
+    let domain = interval_array(dict, "Domain");
+    let range = interval_array(dict, "Range");
+    let inputs = vec![tint as f64];
+    let out = crate::functions::evaluate_type4_clamped(&bytes, &inputs, &domain, &range).ok()?;
+    if out.len() < 4 {
+        return None;
+    }
+    Some([
+        out[0].clamp(0.0, 1.0) as f32,
+        out[1].clamp(0.0, 1.0) as f32,
+        out[2].clamp(0.0, 1.0) as f32,
+        out[3].clamp(0.0, 1.0) as f32,
+    ])
+}
+
+/// Read a `/Domain`- or `/Range`-shaped array as `[lo, hi]` pairs, defaulting a
+/// missing or non-numeric bound to 0.0 / 1.0 and a trailing odd element away.
+fn interval_array(dict: &std::collections::HashMap<String, crate::object::Object>, key: &str) -> Vec<[f64; 2]> {
+    dict.get(key)
+        .and_then(|o| o.as_array())
+        .map(|a| {
+            a.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| {
+                    let lo = c[0]
+                        .as_real()
+                        .or_else(|| c[0].as_integer().map(|i| i as f64))
+                        .unwrap_or(0.0);
+                    let hi = c[1]
+                        .as_real()
+                        .or_else(|| c[1].as_integer().map(|i| i as f64))
+                        .unwrap_or(1.0);
+                    [lo, hi]
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
