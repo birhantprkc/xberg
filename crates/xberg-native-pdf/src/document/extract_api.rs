@@ -63,6 +63,15 @@ impl PdfDocument {
         })?;
 
         if self.page_cannot_have_text(page_dict) {
+            // A whole page discarded with no log line is why GH#1754 needed a downstream
+            // consumer to find it. Both this guard and `may_contain_text` below drop every
+            // span on the page, so both say which page and why. ~keep
+            tracing::debug!(
+                target: LOG_TARGET,
+                page_index,
+                reason = "no /Font resources and no Form XObjects",
+                "skipping page text extraction"
+            );
             return Ok(Vec::new());
         }
 
@@ -82,6 +91,13 @@ impl PdfDocument {
         };
 
         if !Self::may_contain_text(&content_data) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                page_index,
+                content_bytes = content_data.len(),
+                reason = "content stream has no BT and no Do operator",
+                "skipping page text extraction"
+            );
             return Ok(Vec::new());
         }
 
