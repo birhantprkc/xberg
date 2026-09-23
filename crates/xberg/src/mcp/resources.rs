@@ -58,86 +58,93 @@ pub fn read_resource(uri: &str) -> Result<ReadResourceResult, ErrorData> {
     match uri {
         URI_FORMATS => {
             let formats = crate::core::mime::list_supported_formats();
-            let json = serde_json::to_string_pretty(&formats).unwrap_or_default();
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(json, uri).with_mime_type("application/json"),
-            ]))
+            Ok(json_resource(
+                serde_json::to_string_pretty(&formats).unwrap_or_default(),
+                uri,
+            ))
         }
 
-        URI_MODELS => {
-            #[allow(unused_mut)]
-            let mut entries: Vec<serde_json::Value> = Vec::new();
+        URI_MODELS => Ok(json_resource(models_manifest_json(), uri)),
 
-            #[cfg(paddle_ocr)]
-            {
-                let manifest = crate::paddle_ocr::ModelManager::manifest();
-                for entry in manifest {
-                    entries.push(serde_json::to_value(&entry).unwrap_or_default());
-                }
-            }
-
-            #[cfg(feature = "layout-detection")]
-            {
-                let manifest = crate::layout::LayoutModelManager::manifest();
-                for entry in manifest {
-                    entries.push(serde_json::to_value(&entry).unwrap_or_default());
-                }
-            }
-
-            #[cfg(feature = "ner-onnx")]
-            {
-                let manifest = crate::text::ner::manifest();
-                for entry in manifest {
-                    entries.push(serde_json::to_value(&entry).unwrap_or_default());
-                }
-            }
-
-            let payload = serde_json::json!({
-                "xberg_version": env!("CARGO_PKG_VERSION"),
-                "models": entries,
-            });
-            let json = serde_json::to_string_pretty(&payload).unwrap_or_default();
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(json, uri).with_mime_type("application/json"),
-            ]))
-        }
-
-        URI_OCR_LANGUAGES => {
-            let langs = serde_json::json!({
-                "languages": [
-                    "afr","amh","ara","asm","aze","bel","ben","bod","bos","bul",
-                    "cat","ceb","ces","chi_sim","chi_tra","chr","cos","cym","dan","deu",
-                    "div","dzo","ell","eng","enm","epo","est","eus","fao","fas",
-                    "fil","fin","fra","frm","gle","glg","grc","guj","hat","heb",
-                    "hin","hrv","hun","hye","iku","ind","isl","ita","ita_old","jav",
-                    "jpn","kan","kat","kaz","khm","kir","kor","kur","lao","lat",
-                    "lav","lit","ltz","mal","mar","mkd","mlt","mon","mri","msa",
-                    "mya","nep","nor","oci","ori","pan","pol","por","pus","ron",
-                    "rus","san","sin","slk","slv","snd","spa","spa_old","sqi","srp",
-                    "swa","swe","syr","tam","tat","tel","tgk","tgl","tha","tir",
-                    "ton","tur","uig","ukr","urd","uzb","vie","yid","yor"
-                ],
-                "source": "tesseract"
-            });
-            let json = serde_json::to_string_pretty(&langs).unwrap_or_default();
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(json, uri).with_mime_type("application/json"),
-            ]))
-        }
+        URI_OCR_LANGUAGES => Ok(json_resource(ocr_languages_json(), uri)),
 
         #[cfg(feature = "embeddings")]
         URI_EMBEDDING_PRESETS => {
             let presets = crate::embeddings::list_presets();
             let payload = serde_json::json!({ "presets": presets });
-            let json = serde_json::to_string_pretty(&payload).unwrap_or_default();
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(json, uri).with_mime_type("application/json"),
-            ]))
+            Ok(json_resource(
+                serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                uri,
+            ))
         }
 
         other => Err(ErrorData::invalid_params(format!("Resource not found: {other}"), None)),
     }
 }
+
+/// Wrap an already-serialised JSON body as the single `application/json` content of `uri`.
+fn json_resource(json: String, uri: &str) -> ReadResourceResult {
+    ReadResourceResult::new(vec![
+        ResourceContents::text(json, uri).with_mime_type("application/json"),
+    ])
+}
+
+/// Serialise the model manifest, merging the manifests of whichever model-backed features are
+/// compiled in. Feature-gated blocks append in a fixed order so the output is stable. ~keep
+fn models_manifest_json() -> String {
+    #[allow(unused_mut)]
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    #[cfg(paddle_ocr)]
+    {
+        let manifest = crate::paddle_ocr::ModelManager::manifest();
+        for entry in manifest {
+            entries.push(serde_json::to_value(&entry).unwrap_or_default());
+        }
+    }
+
+    #[cfg(feature = "layout-detection")]
+    {
+        let manifest = crate::layout::LayoutModelManager::manifest();
+        for entry in manifest {
+            entries.push(serde_json::to_value(&entry).unwrap_or_default());
+        }
+    }
+
+    #[cfg(feature = "ner-onnx")]
+    {
+        let manifest = crate::text::ner::manifest();
+        for entry in manifest {
+            entries.push(serde_json::to_value(&entry).unwrap_or_default());
+        }
+    }
+
+    let payload = serde_json::json!({
+        "xberg_version": env!("CARGO_PKG_VERSION"),
+        "models": entries,
+    });
+    serde_json::to_string_pretty(&payload).unwrap_or_default()
+}
+
+/// Serialise the advertised OCR language codes.
+fn ocr_languages_json() -> String {
+    let langs = serde_json::json!({
+        "languages": OCR_LANGUAGE_CODES,
+        "source": "tesseract"
+    });
+    serde_json::to_string_pretty(&langs).unwrap_or_default()
+}
+
+/// Tesseract's language codes, in the order they are reported to MCP clients. ~keep
+const OCR_LANGUAGE_CODES: &[&str] = &[
+    "afr", "amh", "ara", "asm", "aze", "bel", "ben", "bod", "bos", "bul", "cat", "ceb", "ces", "chi_sim", "chi_tra",
+    "chr", "cos", "cym", "dan", "deu", "div", "dzo", "ell", "eng", "enm", "epo", "est", "eus", "fao", "fas", "fil",
+    "fin", "fra", "frm", "gle", "glg", "grc", "guj", "hat", "heb", "hin", "hrv", "hun", "hye", "iku", "ind", "isl",
+    "ita", "ita_old", "jav", "jpn", "kan", "kat", "kaz", "khm", "kir", "kor", "kur", "lao", "lat", "lav", "lit", "ltz",
+    "mal", "mar", "mkd", "mlt", "mon", "mri", "msa", "mya", "nep", "nor", "oci", "ori", "pan", "pol", "por", "pus",
+    "ron", "rus", "san", "sin", "slk", "slv", "snd", "spa", "spa_old", "sqi", "srp", "swa", "swe", "syr", "tam", "tat",
+    "tel", "tgk", "tgl", "tha", "tir", "ton", "tur", "uig", "ukr", "urd", "uzb", "vie", "yid", "yor",
+];
 
 #[cfg(test)]
 mod tests {

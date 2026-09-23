@@ -162,6 +162,70 @@ fn page_for_offset(offset: usize, boundaries: &[PageBoundary]) -> Option<u32> {
         .or_else(|| boundaries.last().map(|b| b.page_number))
 }
 
+/// Per-section page data derived from `page_boundaries`.
+struct SectionPageData {
+    first_page: Option<u32>,
+    last_page: Option<u32>,
+    page_spans: Vec<crate::types::PageSpan>,
+}
+
+/// Compute the page span data for a section from `page_boundaries`.
+fn section_page_data(section: &Section, page_boundaries: Option<&[PageBoundary]>) -> SectionPageData {
+    let (first_page, last_page) = match page_boundaries {
+        Some(b) if !b.is_empty() => (
+            page_for_offset(section.byte_start, b),
+            page_for_offset(section.byte_start, b),
+        ),
+        _ => (None, None),
+    };
+    let page_spans: Vec<crate::types::PageSpan> = first_page
+        .map(|page| vec![crate::types::PageSpan { page, bbox: None }])
+        .unwrap_or_default();
+
+    SectionPageData {
+        first_page,
+        last_page,
+        page_spans,
+    }
+}
+
+/// Build `ChunkMetadata` for a section (or sub-chunk) from its byte range, token count,
+/// and page data.
+fn section_chunk_metadata(
+    byte_start: usize,
+    byte_end: usize,
+    token_count: Option<usize>,
+    page_data: &SectionPageData,
+) -> ChunkMetadata {
+    ChunkMetadata {
+        byte_start,
+        byte_end,
+        token_count,
+        chunk_index: 0,
+        total_chunks: 0,
+        first_page: page_data.first_page,
+        last_page: page_data.last_page,
+        heading_context: None,
+        heading_path: Vec::new(),
+        image_indices: Vec::new(),
+        node_ids: Vec::new(),
+        page_spans: page_data.page_spans.clone(),
+        classifications: Vec::new(),
+    }
+}
+
+/// Build a `Chunk` from its content and metadata.
+fn build_chunk(content: String, metadata: ChunkMetadata) -> Chunk {
+    Chunk {
+        content,
+        chunk_type: Default::default(),
+        embedding: None,
+        sparse_embedding: None,
+        late_interaction: None,
+        metadata,
+    }
+}
+
 /// Shared logic: convert Sections into Chunks, handling oversized splitting.
 fn build_chunks_from_sections(
     sections: &[Section],
@@ -174,42 +238,12 @@ fn build_chunks_from_sections(
     for section in sections {
         let prefix = format!("# {}", section.key);
         let content = format!("{}\n\n{}", prefix, section.value.trim());
-
-        let (first_page, last_page) = match page_boundaries {
-            Some(b) if !b.is_empty() => (
-                page_for_offset(section.byte_start, b),
-                page_for_offset(section.byte_start, b),
-            ),
-            _ => (None, None),
-        };
-        let page_spans: Vec<crate::types::PageSpan> = first_page
-            .map(|page| vec![crate::types::PageSpan { page, bbox: None }])
-            .unwrap_or_default();
+        let page_data = section_page_data(section, page_boundaries);
 
         if config.max_characters == 0 || content.len() <= config.max_characters {
             let token_count = token_counter.as_ref().map(|counter| counter(&content));
-            chunks.push(Chunk {
-                content,
-                chunk_type: Default::default(),
-                embedding: None,
-                sparse_embedding: None,
-                late_interaction: None,
-                metadata: ChunkMetadata {
-                    byte_start: section.byte_start,
-                    byte_end: section.byte_end,
-                    token_count,
-                    chunk_index: 0,
-                    total_chunks: 0,
-                    first_page,
-                    last_page,
-                    heading_context: None,
-                    heading_path: Vec::new(),
-                    image_indices: Vec::new(),
-                    node_ids: Vec::new(),
-                    page_spans: page_spans.clone(),
-                    classifications: Vec::new(),
-                },
-            });
+            let metadata = section_chunk_metadata(section.byte_start, section.byte_end, token_count, &page_data);
+            chunks.push(build_chunk(content, metadata));
         } else {
             let sub_result = super::core::chunk_text(
                 section.value.trim(),
@@ -220,28 +254,13 @@ fn build_chunks_from_sections(
                 None,
             )?;
             for sub_chunk in sub_result.chunks {
-                chunks.push(Chunk {
-                    content: format!("{}\n\n{}", prefix, sub_chunk.content),
-                    chunk_type: Default::default(),
-                    embedding: None,
-                    sparse_embedding: None,
-                    late_interaction: None,
-                    metadata: ChunkMetadata {
-                        byte_start: section.byte_start + sub_chunk.metadata.byte_start,
-                        byte_end: section.byte_start + sub_chunk.metadata.byte_end,
-                        token_count: sub_chunk.metadata.token_count,
-                        chunk_index: 0,
-                        total_chunks: 0,
-                        first_page,
-                        last_page,
-                        heading_context: None,
-                        heading_path: Vec::new(),
-                        image_indices: Vec::new(),
-                        node_ids: Vec::new(),
-                        page_spans: page_spans.clone(),
-                        classifications: Vec::new(),
-                    },
-                });
+                let metadata = section_chunk_metadata(
+                    section.byte_start + sub_chunk.metadata.byte_start,
+                    section.byte_start + sub_chunk.metadata.byte_end,
+                    sub_chunk.metadata.token_count,
+                    &page_data,
+                );
+                chunks.push(build_chunk(format!("{}\n\n{}", prefix, sub_chunk.content), metadata));
             }
         }
     }

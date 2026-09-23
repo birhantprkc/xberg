@@ -379,15 +379,9 @@ where
         self.cursor = start;
     }
 
-    /// Find the ideal next sections, breaking it up until we find the largest chunk.
-    /// Increasing length of chunk until we find biggest size to minimize validation time
-    /// on huge chunks
-    fn update_next_sections(&mut self) -> usize {
-        self.next_sections.clear();
-
-        let remaining_text = self.text.get(self.cursor..).unwrap();
-
-        let (semantic_level, mut max_offset) = self.chunk_sizer.find_correct_level(
+    /// The deepest semantic level whose first section still fits, with the offset cap it implies.
+    fn semantic_level_and_offset(&mut self, remaining_text: &'text str) -> (Option<Level>, Option<usize>) {
+        self.chunk_sizer.find_correct_level(
             self.cursor,
             &self.capacity,
             self.semantic_split
@@ -399,7 +393,40 @@ where
                         .map(|(_, str)| (level, str))
                 }),
             self.trim,
+        )
+    }
+
+    /// The fallback level to split on when no semantic level fits, with `max_offset` narrowed to it.
+    fn fallback_level_and_offset(
+        &mut self,
+        remaining_text: &'text str,
+        max_offset: Option<usize>,
+    ) -> (FallbackLevel, Option<usize>) {
+        let (semantic_level, fallback_max_offset) = self.chunk_sizer.find_correct_level(
+            self.cursor,
+            &self.capacity,
+            FallbackLevel::iter()
+                .filter_map(|level| level.sections(remaining_text).next().map(|(_, str)| (level, str))),
+            self.trim,
         );
+
+        let max_offset = match (fallback_max_offset, max_offset) {
+            (Some(fallback), Some(max)) => Some(fallback.min(max)),
+            (fallback, max) => fallback.or(max),
+        };
+
+        (semantic_level.unwrap_or(FallbackLevel::Char), max_offset)
+    }
+
+    /// Find the ideal next sections, breaking it up until we find the largest chunk.
+    /// Increasing length of chunk until we find biggest size to minimize validation time
+    /// on huge chunks
+    fn update_next_sections(&mut self) -> usize {
+        self.next_sections.clear();
+
+        let remaining_text = self.text.get(self.cursor..).unwrap();
+
+        let (semantic_level, mut max_offset) = self.semantic_level_and_offset(remaining_text);
 
         let sections = if let Some(semantic_level) = semantic_level {
             Either::Left(
@@ -407,20 +434,8 @@ where
                     .semantic_chunks(self.cursor, remaining_text, semantic_level),
             )
         } else {
-            let (semantic_level, fallback_max_offset) = self.chunk_sizer.find_correct_level(
-                self.cursor,
-                &self.capacity,
-                FallbackLevel::iter()
-                    .filter_map(|level| level.sections(remaining_text).next().map(|(_, str)| (level, str))),
-                self.trim,
-            );
-
-            max_offset = match (fallback_max_offset, max_offset) {
-                (Some(fallback), Some(max)) => Some(fallback.min(max)),
-                (fallback, max) => fallback.or(max),
-            };
-
-            let fallback_level = semantic_level.unwrap_or(FallbackLevel::Char);
+            let (fallback_level, merged_max_offset) = self.fallback_level_and_offset(remaining_text, max_offset);
+            max_offset = merged_max_offset;
 
             Either::Right(
                 fallback_level
@@ -439,15 +454,10 @@ where
         let mut target_offset = self.chunk_stats.max_chunk_size.unwrap_or(max);
 
         loop {
-            let prev_num = self.next_sections.len();
-            for (offset, str) in sections.by_ref() {
-                self.next_sections.push((offset, str));
-                if offset + str.len() > (self.cursor.saturating_add(target_offset)) {
-                    break;
-                }
-            }
+            let offset_limit = self.cursor.saturating_add(target_offset);
+            let added = push_sections_until(&mut self.next_sections, &mut sections, offset_limit);
             let new_num = self.next_sections.len();
-            if new_num - prev_num == 0 {
+            if added == 0 {
                 break;
             }
 
@@ -465,13 +475,7 @@ where
 
                 if fits.is_le() {
                     let final_offset = offset + str.len() - self.cursor;
-                    let size = chunk_size.max(1);
-                    let diff = (max - size).max(1);
-                    let avg_size = final_offset.div_ceil(size);
-
-                    target_offset = final_offset
-                        .saturating_add(diff.saturating_mul(avg_size))
-                        .saturating_add(final_offset.div_ceil(10));
+                    target_offset = grown_target_offset(final_offset, chunk_size, max);
                 }
 
                 match fits {
@@ -495,6 +499,31 @@ where
 
         low
     }
+}
+
+/// Drain `sections` into `next_sections` until one reaches past `offset_limit`, returning how many were added.
+fn push_sections_until<'text>(
+    next_sections: &mut Vec<(usize, &'text str)>,
+    sections: &mut impl Iterator<Item = (usize, &'text str)>,
+    offset_limit: usize,
+) -> usize {
+    let prev_num = next_sections.len();
+    for (offset, str) in sections.by_ref() {
+        next_sections.push((offset, str));
+        if offset + str.len() > offset_limit {
+            break;
+        }
+    }
+    next_sections.len() - prev_num
+}
+
+fn grown_target_offset(final_offset: usize, chunk_size: usize, max: usize) -> usize {
+    let size = chunk_size.max(1);
+    let diff = (max - size).max(1);
+    let avg_size = final_offset.div_ceil(size);
+    final_offset
+        .saturating_add(diff.saturating_mul(avg_size))
+        .saturating_add(final_offset.div_ceil(10))
 }
 
 impl<'sizer, 'text: 'sizer, Sizer, Level> Iterator for TextChunks<'text, 'sizer, Sizer, Level>

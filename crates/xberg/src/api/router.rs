@@ -159,6 +159,60 @@ fn build_api_state(config: ExtractionConfig, server_config: &ServerConfig) -> Ap
     }
 }
 
+/// Build the CORS layer for `server_config`, warning when the resulting policy is permissive.
+///
+/// An explicitly configured origin list that parses to nothing falls back to the permissive
+/// policy rather than locking the server out of every browser client. ~keep
+fn build_cors_layer(server_config: &ServerConfig) -> CorsLayer {
+    if server_config.cors_allows_all() {
+        tracing::warn!(
+            "CORS configured to allow all origins (default). This permits CSRF attacks. \
+             For production, set XBERG_CORS_ORIGINS environment variable to comma-separated \
+             list of allowed origins (e.g., 'https://app.example.com,https://api.example.com')"
+        );
+        return CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+    }
+
+    let origins: Vec<_> = server_config
+        .cors_origins
+        .iter()
+        .filter_map(|s| s.trim().parse::<axum::http::HeaderValue>().ok())
+        .collect();
+
+    if !origins.is_empty() {
+        tracing::info!("CORS configured with {} explicit allowed origin(s)", origins.len());
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        tracing::warn!(
+            "CORS origins configured but empty/invalid - falling back to permissive CORS. \
+             This allows CSRF attacks. Set explicit origins for production."
+        );
+        CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)
+    }
+}
+
+/// Outermost layer: cap how many requests process concurrently so a burst of
+/// large uploads applies backpressure instead of exhausting memory (#1368). ~keep
+fn apply_concurrency_limit(router: Router<ApiState>) -> Router<ApiState> {
+    let max_concurrent_requests = resolve_max_concurrent_requests();
+    if max_concurrent_requests > 0 {
+        tracing::info!(
+            max_concurrent_requests,
+            "API global concurrency limit active (set {MAX_CONCURRENT_REQUESTS_ENV}=0 to disable)"
+        );
+        router.layer(GlobalConcurrencyLimitLayer::new(max_concurrent_requests))
+    } else {
+        tracing::warn!(
+            "API global concurrency limit DISABLED ({MAX_CONCURRENT_REQUESTS_ENV}=0); \
+             concurrent requests are unbounded and may exhaust memory under load"
+        );
+        router
+    }
+}
+
 /// Create the API router with custom size limits and server configuration.
 ///
 /// This function provides full control over request limits, CORS, and server settings via ServerConfig.
@@ -198,34 +252,7 @@ pub(crate) fn create_router_with_limits_and_server_config(
 ) -> Router {
     let state = build_api_state(config, &server_config);
 
-    let cors_layer = if server_config.cors_allows_all() {
-        tracing::warn!(
-            "CORS configured to allow all origins (default). This permits CSRF attacks. \
-             For production, set XBERG_CORS_ORIGINS environment variable to comma-separated \
-             list of allowed origins (e.g., 'https://app.example.com,https://api.example.com')"
-        );
-        CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)
-    } else {
-        let origins: Vec<_> = server_config
-            .cors_origins
-            .iter()
-            .filter_map(|s| s.trim().parse::<axum::http::HeaderValue>().ok())
-            .collect();
-
-        if !origins.is_empty() {
-            tracing::info!("CORS configured with {} explicit allowed origin(s)", origins.len());
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
-                .allow_methods(Any)
-                .allow_headers(Any)
-        } else {
-            tracing::warn!(
-                "CORS origins configured but empty/invalid - falling back to permissive CORS. \
-                 This allows CSRF attacks. Set explicit origins for production."
-            );
-            CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)
-        }
-    };
+    let cors_layer = build_cors_layer(&server_config);
 
     let mut router = Router::new()
         .route("/extract", post(extract_handler))
@@ -272,22 +299,7 @@ pub(crate) fn create_router_with_limits_and_server_config(
                 .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
         );
 
-    // Outermost layer: cap how many requests process concurrently so a burst of
-    // large uploads applies backpressure instead of exhausting memory (#1368).
-    let max_concurrent_requests = resolve_max_concurrent_requests();
-    let router = if max_concurrent_requests > 0 {
-        tracing::info!(
-            max_concurrent_requests,
-            "API global concurrency limit active (set {MAX_CONCURRENT_REQUESTS_ENV}=0 to disable)"
-        );
-        router.layer(GlobalConcurrencyLimitLayer::new(max_concurrent_requests))
-    } else {
-        tracing::warn!(
-            "API global concurrency limit DISABLED ({MAX_CONCURRENT_REQUESTS_ENV}=0); \
-             concurrent requests are unbounded and may exhaust memory under load"
-        );
-        router
-    };
+    let router = apply_concurrency_limit(router);
 
     router.with_state(state)
 }

@@ -77,20 +77,8 @@ pub fn analyze_document(
 ) -> Result<ChunkingDecision> {
     info!("Analyzing document for chunking decision");
 
-    if let Some(user_config) = &metadata.user_chunk_config {
-        if user_config.disable_chunking {
-            debug!("Chunking disabled by user configuration");
-            return Ok(ChunkingDecision::NoChunking {
-                reason: NoChunkingReason::ChunkingDisabled,
-            });
-        }
-
-        if let Some(page_ranges) = &user_config.page_ranges {
-            debug!(num_ranges = page_ranges.len(), "Using user-provided page ranges");
-            return Ok(ChunkingDecision::UseOverrides {
-                user_chunks: page_ranges.clone(),
-            });
-        }
+    if let Some(decision) = user_override_decision(metadata) {
+        return Ok(decision);
     }
 
     if !metadata.chunking_enabled {
@@ -112,36 +100,8 @@ pub fn analyze_document(
         });
     }
 
-    let force_chunking = metadata.user_chunk_config.as_ref().is_some_and(|c| c.force_chunking);
-
-    if !force_chunking && metadata.size_bytes < config.file_size_threshold_bytes {
-        if let Some(page_count) = metadata.page_count {
-            if page_count < config.page_count_threshold {
-                debug!(
-                    size_bytes = metadata.size_bytes,
-                    page_count = page_count,
-                    "Document below thresholds, no chunking needed"
-                );
-                return Ok(ChunkingDecision::NoChunking {
-                    reason: NoChunkingReason::FewPages {
-                        page_count,
-                        threshold: config.page_count_threshold,
-                    },
-                });
-            }
-        } else {
-            debug!(
-                size_bytes = metadata.size_bytes,
-                threshold = config.file_size_threshold_bytes,
-                "Document below size threshold"
-            );
-            return Ok(ChunkingDecision::NoChunking {
-                reason: NoChunkingReason::SmallFile {
-                    size_bytes: metadata.size_bytes,
-                    threshold_bytes: config.file_size_threshold_bytes,
-                },
-            });
-        }
+    if let Some(decision) = below_threshold_decision(metadata, config) {
+        return Ok(decision);
     }
 
     let is_pdf = is_pdf_mime_type(&metadata.mime_type);
@@ -163,6 +123,63 @@ pub fn analyze_document(
     );
 
     Ok(ChunkingDecision::Chunk(plan))
+}
+
+/// The decision the caller's explicit chunk configuration forces, if any.
+fn user_override_decision(metadata: &DocumentMetadata) -> Option<ChunkingDecision> {
+    let user_config = metadata.user_chunk_config.as_ref()?;
+
+    if user_config.disable_chunking {
+        debug!("Chunking disabled by user configuration");
+        return Some(ChunkingDecision::NoChunking {
+            reason: NoChunkingReason::ChunkingDisabled,
+        });
+    }
+
+    let page_ranges = user_config.page_ranges.as_ref()?;
+    debug!(num_ranges = page_ranges.len(), "Using user-provided page ranges");
+    Some(ChunkingDecision::UseOverrides {
+        user_chunks: page_ranges.clone(),
+    })
+}
+
+/// The decision the size and page-count thresholds force, if any.
+fn below_threshold_decision(metadata: &DocumentMetadata, config: &HeuristicsConfig) -> Option<ChunkingDecision> {
+    let force_chunking = metadata.user_chunk_config.as_ref().is_some_and(|c| c.force_chunking);
+
+    if force_chunking || metadata.size_bytes >= config.file_size_threshold_bytes {
+        return None;
+    }
+
+    let Some(page_count) = metadata.page_count else {
+        debug!(
+            size_bytes = metadata.size_bytes,
+            threshold = config.file_size_threshold_bytes,
+            "Document below size threshold"
+        );
+        return Some(ChunkingDecision::NoChunking {
+            reason: NoChunkingReason::SmallFile {
+                size_bytes: metadata.size_bytes,
+                threshold_bytes: config.file_size_threshold_bytes,
+            },
+        });
+    };
+
+    if page_count >= config.page_count_threshold {
+        return None;
+    }
+
+    debug!(
+        size_bytes = metadata.size_bytes,
+        page_count = page_count,
+        "Document below thresholds, no chunking needed"
+    );
+    Some(ChunkingDecision::NoChunking {
+        reason: NoChunkingReason::FewPages {
+            page_count,
+            threshold: config.page_count_threshold,
+        },
+    })
 }
 
 /// Analyze a document with user-specified chunk ranges.

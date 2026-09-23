@@ -191,45 +191,56 @@ pub(crate) fn split_into_words(text: &str) -> Vec<String> {
         }
 
         let word_start = i;
-        while i < len {
-            let c = bytes[i];
-            if c.is_ascii_alphanumeric() || c > 127 {
-                i += 1;
-                while i < len && bytes[i] > 127 && bytes[i] < 192 {
-                    i += 1;
-                }
-            } else if c == b'-' && i + 1 < len && (bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] > 127) {
-                i += 1;
-            } else if c == b'\'' && i > word_start && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
-                let before = &text[word_start..i];
-                if !before.is_empty() {
-                    words.push(before.to_string());
-                }
-                i += 1;
-                while i < len && bytes[i].is_ascii_alphabetic() {
-                    i += 1;
-                }
-                continue;
-            } else {
-                break;
-            }
-        }
+        i = scan_word_end(text, word_start, &mut words);
 
         if i > word_start {
             let word = &text[word_start..i];
             if !word.is_empty() {
                 words.push(word.to_string());
             }
-        } else {
-            if i < len {
-                let ch_len = text[i..].chars().next().map_or(1, |c| c.len_utf8());
-                words.push(text[i..i + ch_len].to_string());
-                i += ch_len;
-            }
+        } else if i < len {
+            let ch_len = text[i..].chars().next().map_or(1, |c| c.len_utf8());
+            words.push(text[i..i + ch_len].to_string());
+            i += ch_len;
         }
     }
 
     words
+}
+
+/// Scan forward from `word_start` to the end of one word token, returning that offset.
+///
+/// A contraction apostrophe emits the prefix before it into `words` and keeps scanning
+/// without moving `word_start`, so the caller still emits the whole token afterwards. ~keep
+fn scan_word_end(text: &str, word_start: usize, words: &mut Vec<String>) -> usize {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = word_start;
+
+    while i < len {
+        let c = bytes[i];
+        if c.is_ascii_alphanumeric() || c > 127 {
+            i += 1;
+            while i < len && bytes[i] > 127 && bytes[i] < 192 {
+                i += 1;
+            }
+        } else if c == b'-' && i + 1 < len && (bytes[i + 1].is_ascii_alphanumeric() || bytes[i + 1] > 127) {
+            i += 1;
+        } else if c == b'\'' && i > word_start && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
+            let before = &text[word_start..i];
+            if !before.is_empty() {
+                words.push(before.to_string());
+            }
+            i += 1;
+            while i < len && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+
+    i
 }
 
 #[inline]

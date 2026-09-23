@@ -230,8 +230,6 @@ pub(crate) fn apply_execution_providers(
     accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
 ) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
     use crate::core::config::acceleration::ExecutionProviderType;
-    #[cfg(any(target_os = "macos", feature = "cuda", feature = "tensorrt"))]
-    use ort::ep::ExecutionProvider;
 
     let provider = resolve_execution_provider(accel);
     // Only read by the CUDA/TensorRT EP arms, which are cfg-gated behind their respective
@@ -239,52 +237,13 @@ pub(crate) fn apply_execution_providers(
     #[cfg_attr(not(any(feature = "cuda", feature = "tensorrt")), allow(unused_variables))]
     let device_id = accel.map(|a| a.device_id).unwrap_or(0);
 
-    #[cfg(target_os = "macos")]
-    fn build_coreml_ep() -> ort::ep::CoreML {
-        use ort::ep::coreml::{ComputeUnits, ModelFormat};
-        let mut ep = ort::ep::CoreML::default();
-        if let Ok(fmt) = std::env::var("XBERG_COREML_FORMAT") {
-            match fmt.trim().to_ascii_lowercase().as_str() {
-                "mlprogram" => ep = ep.with_model_format(ModelFormat::MLProgram),
-                "neuralnetwork" | "nn" => ep = ep.with_model_format(ModelFormat::NeuralNetwork),
-                other => tracing::warn!(value = other, "ignoring unknown XBERG_COREML_FORMAT"),
-            }
-        }
-        if let Ok(units) = std::env::var("XBERG_COREML_UNITS") {
-            match units.trim().to_ascii_lowercase().as_str() {
-                "all" => ep = ep.with_compute_units(ComputeUnits::All),
-                "cpu_and_ne" => ep = ep.with_compute_units(ComputeUnits::CPUAndNeuralEngine),
-                "cpu_and_gpu" => ep = ep.with_compute_units(ComputeUnits::CPUAndGPU),
-                "cpu_only" => ep = ep.with_compute_units(ComputeUnits::CPUOnly),
-                other => tracing::warn!(value = other, "ignoring unknown XBERG_COREML_UNITS"),
-            }
-        }
-        ep
-    }
-
     let builder = match provider {
         ExecutionProviderType::Cpu => {
             tracing::debug!("ORT session: CPU execution provider (explicit)");
             builder
         }
         #[cfg(target_os = "macos")]
-        ExecutionProviderType::CoreMl => {
-            let ep = build_coreml_ep();
-            match decide_gpu_ep_outcome(true, ep.is_available().unwrap_or(false)) {
-                GpuEpOutcome::RegisterStrict => {
-                    tracing::info!("ORT session: CoreML execution provider available, using GPU");
-                    builder
-                        .with_execution_providers([ep.build().error_on_failure()])
-                        .map_err(|e| ort::Error::new(e.message()))?
-                }
-                _ => {
-                    return Err(ort::Error::new(unavailable_gpu_ep_error_message(
-                        "CoreML",
-                        "Set ORT_DYLIB_PATH to an ONNX Runtime build that includes CoreML support.",
-                    )));
-                }
-            }
-        }
+        ExecutionProviderType::CoreMl => register_coreml_strict(builder)?,
         #[cfg(not(target_os = "macos"))]
         ExecutionProviderType::CoreMl => {
             return Err(ort::Error::new(
@@ -293,24 +252,7 @@ pub(crate) fn apply_execution_providers(
             ));
         }
         #[cfg(feature = "cuda")]
-        ExecutionProviderType::Cuda => {
-            let ep = ort::ep::CUDA::default().with_device_id(device_id as i32);
-            match decide_gpu_ep_outcome(true, ep.is_available().unwrap_or(false)) {
-                GpuEpOutcome::RegisterStrict => {
-                    tracing::info!(device_id, "ORT session: CUDA execution provider available, using GPU");
-                    builder
-                        .with_execution_providers([ep.build().error_on_failure()])
-                        .map_err(|e| ort::Error::new(e.message()))?
-                }
-                _ => {
-                    return Err(ort::Error::new(unavailable_gpu_ep_error_message(
-                        "CUDA",
-                        "Install a CUDA-enabled ONNX Runtime and set ORT_DYLIB_PATH to point at it \
-                         (see https://github.com/microsoft/onnxruntime/releases).",
-                    )));
-                }
-            }
-        }
+        ExecutionProviderType::Cuda => register_cuda_strict(builder, device_id)?,
         #[cfg(not(feature = "cuda"))]
         ExecutionProviderType::Cuda => {
             return Err(ort::Error::new(
@@ -319,27 +261,7 @@ pub(crate) fn apply_execution_providers(
             ));
         }
         #[cfg(feature = "tensorrt")]
-        ExecutionProviderType::TensorRt => {
-            let ep = ort::ep::TensorRT::default().with_device_id(device_id as i32);
-            match decide_gpu_ep_outcome(true, ep.is_available().unwrap_or(false)) {
-                GpuEpOutcome::RegisterStrict => {
-                    tracing::info!(
-                        device_id,
-                        "ORT session: TensorRT execution provider available, using GPU"
-                    );
-                    builder
-                        .with_execution_providers([ep.build().error_on_failure()])
-                        .map_err(|e| ort::Error::new(e.message()))?
-                }
-                _ => {
-                    return Err(ort::Error::new(unavailable_gpu_ep_error_message(
-                        "TensorRT",
-                        "Install a TensorRT-enabled ONNX Runtime and set ORT_DYLIB_PATH to point at it \
-                         (see https://github.com/microsoft/onnxruntime/releases).",
-                    )));
-                }
-            }
-        }
+        ExecutionProviderType::TensorRt => register_tensorrt_strict(builder, device_id)?,
         #[cfg(not(feature = "tensorrt"))]
         ExecutionProviderType::TensorRt => {
             return Err(ort::Error::new(
@@ -347,54 +269,211 @@ pub(crate) fn apply_execution_providers(
                  TensorRT support; rebuild with the `tensorrt` feature.",
             ));
         }
-        ExecutionProviderType::Auto => {
-            #[cfg(target_os = "macos")]
-            let builder = {
-                let ep = build_coreml_ep();
-                match decide_gpu_ep_outcome(false, ep.is_available().unwrap_or(false)) {
-                    GpuEpOutcome::RegisterBestEffort => {
-                        tracing::info!("ORT session: auto — CoreML available, using GPU");
-                        builder
-                            .with_execution_providers([ep.build()])
-                            .map_err(|e| ort::Error::new(e.message()))?
-                    }
-                    _ => {
-                        tracing::info!("ORT session: auto — CoreML not available, using CPU");
-                        builder
-                    }
-                }
-            };
-            #[cfg(all(target_os = "linux", feature = "cuda"))]
-            let builder = {
-                let ep = ort::ep::CUDA::default();
-                match decide_gpu_ep_outcome(false, ep.is_available().unwrap_or(false)) {
-                    GpuEpOutcome::RegisterBestEffort => {
-                        tracing::info!("ORT session: auto — CUDA available, using GPU");
-                        builder
-                            .with_execution_providers([ep.build()])
-                            .map_err(|e| ort::Error::new(e.message()))?
-                    }
-                    _ => {
-                        tracing::info!(
-                            "ORT session: auto — CUDA not available, using CPU. \
-                             For GPU support, set ORT_DYLIB_PATH to a CUDA-enabled ONNX Runtime."
-                        );
-                        builder
-                    }
-                }
-            };
-            #[cfg(all(target_os = "linux", not(feature = "cuda")))]
-            let builder = {
-                tracing::debug!("ORT session: auto — using CPU. Rebuild with the `cuda` feature for GPU support.");
-                builder
-            };
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let builder = {
-                tracing::debug!("ORT session: auto — no platform GPU EP, using CPU");
-                builder
-            };
-            builder
+        ExecutionProviderType::Auto => register_auto_providers(builder)?,
+    };
+
+    Ok(builder)
+}
+
+/// Build the CoreML execution provider, honouring the `XBERG_COREML_FORMAT` and
+/// `XBERG_COREML_UNITS` environment overrides. An unrecognised value is warned about and
+/// ignored rather than failing session creation. ~keep
+#[cfg(any(
+    feature = "layout-detection",
+    feature = "embeddings",
+    feature = "paddle-ocr-ort",
+    feature = "auto-rotate",
+    feature = "reranker",
+    feature = "onnx-runtime",
+    feature = "transcription"
+))]
+#[cfg(target_os = "macos")]
+fn build_coreml_ep() -> ort::ep::CoreML {
+    use ort::ep::coreml::{ComputeUnits, ModelFormat};
+    let mut ep = ort::ep::CoreML::default();
+    if let Ok(fmt) = std::env::var("XBERG_COREML_FORMAT") {
+        match fmt.trim().to_ascii_lowercase().as_str() {
+            "mlprogram" => ep = ep.with_model_format(ModelFormat::MLProgram),
+            "neuralnetwork" | "nn" => ep = ep.with_model_format(ModelFormat::NeuralNetwork),
+            other => tracing::warn!(value = other, "ignoring unknown XBERG_COREML_FORMAT"),
         }
+    }
+    if let Ok(units) = std::env::var("XBERG_COREML_UNITS") {
+        match units.trim().to_ascii_lowercase().as_str() {
+            "all" => ep = ep.with_compute_units(ComputeUnits::All),
+            "cpu_and_ne" => ep = ep.with_compute_units(ComputeUnits::CPUAndNeuralEngine),
+            "cpu_and_gpu" => ep = ep.with_compute_units(ComputeUnits::CPUAndGPU),
+            "cpu_only" => ep = ep.with_compute_units(ComputeUnits::CPUOnly),
+            other => tracing::warn!(value = other, "ignoring unknown XBERG_COREML_UNITS"),
+        }
+    }
+    ep
+}
+
+/// Register CoreML as an explicitly requested provider: unavailable or unloadable is an error,
+/// never a silent CPU fallback. ~keep
+#[cfg(any(
+    feature = "layout-detection",
+    feature = "embeddings",
+    feature = "paddle-ocr-ort",
+    feature = "auto-rotate",
+    feature = "reranker",
+    feature = "onnx-runtime",
+    feature = "transcription"
+))]
+#[cfg(target_os = "macos")]
+fn register_coreml_strict(
+    builder: ort::session::builder::SessionBuilder,
+) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
+    use ort::ep::ExecutionProvider;
+
+    let ep = build_coreml_ep();
+    match decide_gpu_ep_outcome(true, ep.is_available().unwrap_or(false)) {
+        GpuEpOutcome::RegisterStrict => {
+            tracing::info!("ORT session: CoreML execution provider available, using GPU");
+            builder
+                .with_execution_providers([ep.build().error_on_failure()])
+                .map_err(|e| ort::Error::new(e.message()))
+        }
+        _ => Err(ort::Error::new(unavailable_gpu_ep_error_message(
+            "CoreML",
+            "Set ORT_DYLIB_PATH to an ONNX Runtime build that includes CoreML support.",
+        ))),
+    }
+}
+
+/// Register CUDA as an explicitly requested provider: unavailable or unloadable is an error,
+/// never a silent CPU fallback. ~keep
+#[cfg(any(
+    feature = "layout-detection",
+    feature = "embeddings",
+    feature = "paddle-ocr-ort",
+    feature = "auto-rotate",
+    feature = "reranker",
+    feature = "onnx-runtime",
+    feature = "transcription"
+))]
+#[cfg(feature = "cuda")]
+fn register_cuda_strict(
+    builder: ort::session::builder::SessionBuilder,
+    device_id: u32,
+) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
+    use ort::ep::ExecutionProvider;
+
+    let ep = ort::ep::CUDA::default().with_device_id(device_id as i32);
+    match decide_gpu_ep_outcome(true, ep.is_available().unwrap_or(false)) {
+        GpuEpOutcome::RegisterStrict => {
+            tracing::info!(device_id, "ORT session: CUDA execution provider available, using GPU");
+            builder
+                .with_execution_providers([ep.build().error_on_failure()])
+                .map_err(|e| ort::Error::new(e.message()))
+        }
+        _ => Err(ort::Error::new(unavailable_gpu_ep_error_message(
+            "CUDA",
+            "Install a CUDA-enabled ONNX Runtime and set ORT_DYLIB_PATH to point at it \
+             (see https://github.com/microsoft/onnxruntime/releases).",
+        ))),
+    }
+}
+
+/// Register TensorRT as an explicitly requested provider: unavailable or unloadable is an error,
+/// never a silent CPU fallback. ~keep
+#[cfg(any(
+    feature = "layout-detection",
+    feature = "embeddings",
+    feature = "paddle-ocr-ort",
+    feature = "auto-rotate",
+    feature = "reranker",
+    feature = "onnx-runtime",
+    feature = "transcription"
+))]
+#[cfg(feature = "tensorrt")]
+fn register_tensorrt_strict(
+    builder: ort::session::builder::SessionBuilder,
+    device_id: u32,
+) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
+    use ort::ep::ExecutionProvider;
+
+    let ep = ort::ep::TensorRT::default().with_device_id(device_id as i32);
+    match decide_gpu_ep_outcome(true, ep.is_available().unwrap_or(false)) {
+        GpuEpOutcome::RegisterStrict => {
+            tracing::info!(
+                device_id,
+                "ORT session: TensorRT execution provider available, using GPU"
+            );
+            builder
+                .with_execution_providers([ep.build().error_on_failure()])
+                .map_err(|e| ort::Error::new(e.message()))
+        }
+        _ => Err(ort::Error::new(unavailable_gpu_ep_error_message(
+            "TensorRT",
+            "Install a TensorRT-enabled ONNX Runtime and set ORT_DYLIB_PATH to point at it \
+             (see https://github.com/microsoft/onnxruntime/releases).",
+        ))),
+    }
+}
+
+/// `auto`: try the platform GPU provider best-effort and fall back to CPU with an info-level log
+/// when it is unavailable or fails to load. ~keep
+#[cfg(any(
+    feature = "layout-detection",
+    feature = "embeddings",
+    feature = "paddle-ocr-ort",
+    feature = "auto-rotate",
+    feature = "reranker",
+    feature = "onnx-runtime",
+    feature = "transcription"
+))]
+fn register_auto_providers(
+    builder: ort::session::builder::SessionBuilder,
+) -> Result<ort::session::builder::SessionBuilder, ort::Error> {
+    #[cfg(any(target_os = "macos", all(target_os = "linux", feature = "cuda")))]
+    use ort::ep::ExecutionProvider;
+
+    #[cfg(target_os = "macos")]
+    let builder = {
+        let ep = build_coreml_ep();
+        match decide_gpu_ep_outcome(false, ep.is_available().unwrap_or(false)) {
+            GpuEpOutcome::RegisterBestEffort => {
+                tracing::info!("ORT session: auto — CoreML available, using GPU");
+                builder
+                    .with_execution_providers([ep.build()])
+                    .map_err(|e| ort::Error::new(e.message()))?
+            }
+            _ => {
+                tracing::info!("ORT session: auto — CoreML not available, using CPU");
+                builder
+            }
+        }
+    };
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    let builder = {
+        let ep = ort::ep::CUDA::default();
+        match decide_gpu_ep_outcome(false, ep.is_available().unwrap_or(false)) {
+            GpuEpOutcome::RegisterBestEffort => {
+                tracing::info!("ORT session: auto — CUDA available, using GPU");
+                builder
+                    .with_execution_providers([ep.build()])
+                    .map_err(|e| ort::Error::new(e.message()))?
+            }
+            _ => {
+                tracing::info!(
+                    "ORT session: auto — CUDA not available, using CPU. \
+                     For GPU support, set ORT_DYLIB_PATH to a CUDA-enabled ONNX Runtime."
+                );
+                builder
+            }
+        }
+    };
+    #[cfg(all(target_os = "linux", not(feature = "cuda")))]
+    let builder = {
+        tracing::debug!("ORT session: auto — using CPU. Rebuild with the `cuda` feature for GPU support.");
+        builder
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let builder = {
+        tracing::debug!("ORT session: auto — no platform GPU EP, using CPU");
+        builder
     };
 
     Ok(builder)

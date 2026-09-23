@@ -18,7 +18,19 @@ where
 {
     let mut router = PromptRouter::new();
 
-    router.add_route(PromptRoute::new_dyn(
+    router.add_route(extract_document_route());
+    router.add_route(extract_with_ocr_route());
+    router.add_route(semantic_search_route());
+
+    router
+}
+
+/// Route for the `extract_document` prompt: a Xberg extraction call for a document path.
+fn extract_document_route<S>() -> PromptRoute<S>
+where
+    S: Send + Sync + 'static,
+{
+    PromptRoute::new_dyn(
         Prompt::new(
             "extract_document",
             Some("Generate a Xberg extraction call for a document"),
@@ -59,9 +71,15 @@ where
                 .into())
             })
         },
-    ));
+    )
+}
 
-    router.add_route(PromptRoute::new_dyn(
+/// Route for the `extract_with_ocr` prompt: extraction with explicit OCR language configuration.
+fn extract_with_ocr_route<S>() -> PromptRoute<S>
+where
+    S: Send + Sync + 'static,
+{
+    PromptRoute::new_dyn(
         Prompt::new(
             "extract_with_ocr",
             Some("Extract a document with explicit OCR language configuration"),
@@ -117,9 +135,15 @@ where
                 .into())
             })
         },
-    ));
+    )
+}
 
-    router.add_route(PromptRoute::new_dyn(
+/// Route for the `semantic_search` prompt: preparing a document for semantic search.
+fn semantic_search_route<S>() -> PromptRoute<S>
+where
+    S: Send + Sync + 'static,
+{
+    PromptRoute::new_dyn(
         Prompt::new(
             "semantic_search",
             Some("Prepare a document for semantic search through unified extraction"),
@@ -182,9 +206,7 @@ where
                 .into())
             })
         },
-    ));
-
-    router
+    )
 }
 
 #[cfg(test)]

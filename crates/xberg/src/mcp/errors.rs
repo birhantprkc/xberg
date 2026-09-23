@@ -35,18 +35,23 @@ pub(crate) fn map_xberg_error_to_mcp(error: XbergError) -> McpError {
     }
 }
 
+/// Formats `"{prefix}: {message}"`, appending `" (caused by: <source>)"` when the error carries
+/// a source. Shared by every [`XbergError`] variant that has a message plus an optional source, so
+/// all of them render identically. ~keep
+fn with_source_suffix(prefix: &str, message: &str, source: Option<Box<dyn std::error::Error + Send + Sync>>) -> String {
+    let mut error_message = format!("{}: {}", prefix, message);
+    if let Some(src) = source {
+        let _ = write!(error_message, " (caused by: {})", src);
+    }
+    error_message
+}
+
 /// Builds the human-readable message for an [`XbergError`], as reported by the MCP error
 /// conversion. The JSON-RPC error code for the same error is selected separately, via
 /// [`XbergError::mcp_error_category`]; see [`map_xberg_error_to_mcp`].
 fn mcp_error_message(error: XbergError) -> String {
     match error {
-        XbergError::Validation { message, source } => {
-            let mut error_message = format!("Validation error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Validation { message, source } => with_source_suffix("Validation error", &message, source),
 
         XbergError::UnsupportedFormat(mime_type) => format!("Unsupported format: {}", mime_type),
 
@@ -55,56 +60,22 @@ fn mcp_error_message(error: XbergError) -> String {
             dep
         ),
 
-        XbergError::Parsing { message, source } => {
-            let mut error_message = format!("Parsing error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Parsing { message, source } => with_source_suffix("Parsing error", &message, source),
 
         // OSError/RuntimeError must bubble up - system errors need user reports ~keep
         XbergError::Io(io_err) => format!("System I/O error: {}", io_err),
 
-        XbergError::Ocr { message, source } => {
-            let mut error_message = format!("OCR processing error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Ocr { message, source } => with_source_suffix("OCR processing error", &message, source),
 
-        XbergError::Cache { message, source } => {
-            let mut error_message = format!("Cache error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Cache { message, source } => with_source_suffix("Cache error", &message, source),
 
         XbergError::ImageProcessing { message, source } => {
-            let mut error_message = format!("Image processing error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
+            with_source_suffix("Image processing error", &message, source)
         }
 
-        XbergError::Serialization { message, source } => {
-            let mut error_message = format!("Serialization error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Serialization { message, source } => with_source_suffix("Serialization error", &message, source),
 
-        XbergError::Embedding { message, source } => {
-            let mut error_message = format!("Embedding error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Embedding { message, source } => with_source_suffix("Embedding error", &message, source),
 
         XbergError::Plugin { message, plugin_name } => {
             format!("Plugin '{}' error: {}", plugin_name, message)
@@ -120,29 +91,11 @@ fn mcp_error_message(error: XbergError) -> String {
 
         XbergError::Cancelled => "Extraction cancelled".to_string(),
 
-        XbergError::Security { message, source } => {
-            let mut error_message = format!("Security violation: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Security { message, source } => with_source_suffix("Security violation", &message, source),
 
-        XbergError::Transcription { message, source } => {
-            let mut error_message = format!("Transcription error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Transcription { message, source } => with_source_suffix("Transcription error", &message, source),
 
-        XbergError::Reranking { message, source } => {
-            let mut error_message = format!("Reranking error: {}", message);
-            if let Some(src) = source {
-                let _ = write!(error_message, " (caused by: {})", src);
-            }
-            error_message
-        }
+        XbergError::Reranking { message, source } => with_source_suffix("Reranking error", &message, source),
     }
 }
 

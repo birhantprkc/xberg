@@ -48,44 +48,42 @@ pub(crate) fn parse_footnote_definitions(markdown: &str) -> Vec<FootnoteDefiniti
     let mut i = 0;
 
     while i < lines.len() {
-        let line = lines[i];
-        if let Some(caps) = FOOTNOTE_DEF_RE.captures(line) {
-            if let (Some(label_match), Some(content_match)) = (caps.get(1), caps.get(2)) {
-                let label = label_match.as_str().to_string();
-                let mut content = content_match.as_str().to_string();
-
-                let def_offset = markdown.find(&format!("[^{}]:", label)).unwrap_or(0);
-
-                let mut j = i + 1;
-                while j < lines.len() {
-                    let next_line = lines[j];
-                    if FOOTNOTE_DEF_RE.is_match(next_line) {
-                        break;
-                    }
-                    if next_line.is_empty() || next_line.starts_with(char::is_whitespace) {
-                        if !next_line.is_empty() {
-                            content.push('\n');
-                            content.push_str(next_line.trim());
-                        }
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                definitions.push(FootnoteDefinition {
-                    label,
-                    content,
-                    offset: def_offset,
-                });
-
-                i = j;
-            } else {
-                i += 1;
-            }
-        } else {
+        let Some(caps) = FOOTNOTE_DEF_RE.captures(lines[i]) else {
             i += 1;
+            continue;
+        };
+        let (Some(label_match), Some(content_match)) = (caps.get(1), caps.get(2)) else {
+            i += 1;
+            continue;
+        };
+
+        let label = label_match.as_str().to_string();
+        let mut content = content_match.as_str().to_string();
+        let def_offset = markdown.find(&format!("[^{}]:", label)).unwrap_or(0);
+
+        let mut j = i + 1;
+        while j < lines.len() {
+            let next_line = lines[j];
+            if FOOTNOTE_DEF_RE.is_match(next_line) {
+                break;
+            }
+            if !next_line.is_empty() && !next_line.starts_with(char::is_whitespace) {
+                break;
+            }
+            if !next_line.is_empty() {
+                content.push('\n');
+                content.push_str(next_line.trim());
+            }
+            j += 1;
         }
+
+        definitions.push(FootnoteDefinition {
+            label,
+            content,
+            offset: def_offset,
+        });
+
+        i = j;
     }
 
     definitions

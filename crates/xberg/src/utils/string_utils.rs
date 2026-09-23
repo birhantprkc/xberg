@@ -191,34 +191,64 @@ pub(crate) fn safe_decode_with_provenance(byte_data: &[u8], encoding: Option<&st
     if let Some(enc_name) = encoding
         && let Some(enc) = Encoding::for_label(enc_name.as_bytes())
     {
-        let (decoded, actual_encoding, had_errors) = enc.decode(byte_data);
-        return DecodeOutcome {
-            text: fix_mojibake_internal(&decoded).into_owned(),
-            fell_back: actual_encoding != encoding_rs::UTF_8,
-            replaced_characters: had_errors,
-        };
+        return decode_with(enc, byte_data);
     }
 
     let cache_key = calculate_cache_key(byte_data);
 
+    if let Some(cached_encoding) = cached_encoding(&cache_key) {
+        return decode_with(cached_encoding, byte_data);
+    }
+
+    let guessed_encoding = detect_and_cache_encoding(byte_data, cache_key);
+
+    let (decoded, actual_encoding, had_errors) = guessed_encoding.decode(byte_data);
+
+    if had_errors && let Some(outcome) = decode_with_single_byte_fallback(byte_data) {
+        return outcome;
+    }
+
+    let final_text = fix_mojibake_internal(&decoded).into_owned();
+
+    if had_errors {
+        warn_on_low_confidence_decode(&final_text, guessed_encoding);
+    }
+
+    DecodeOutcome {
+        text: final_text,
+        fell_back: actual_encoding != encoding_rs::UTF_8,
+        replaced_characters: had_errors,
+    }
+}
+
+/// Decode `byte_data` with a known `encoding` and clean up mojibake, reporting whether the decode
+/// fell back from UTF-8 and whether it had to substitute replacement characters.
+fn decode_with(encoding: &'static Encoding, byte_data: &[u8]) -> DecodeOutcome {
+    let (decoded, actual_encoding, had_errors) = encoding.decode(byte_data);
+    DecodeOutcome {
+        text: fix_mojibake_internal(&decoded).into_owned(),
+        fell_back: actual_encoding != encoding_rs::UTF_8,
+        replaced_characters: had_errors,
+    }
+}
+
+/// Look `cache_key` up in the shared encoding cache. The write lock is taken for what is logically
+/// a read because the lookup updates LRU order; a poisoned lock degrades to a miss rather than
+/// failing the decode. ~keep
+fn cached_encoding(cache_key: &str) -> Option<&'static Encoding> {
     // OSError/RuntimeError must bubble up - system errors need user reports ~keep
     match ENCODING_CACHE.write() {
-        Ok(mut cache) => {
-            if let Some(cached_encoding) = cache.get(&cache_key) {
-                let (decoded, actual_encoding, had_errors) = cached_encoding.decode(byte_data);
-                return DecodeOutcome {
-                    text: fix_mojibake_internal(&decoded).into_owned(),
-                    fell_back: actual_encoding != encoding_rs::UTF_8,
-                    replaced_characters: had_errors,
-                };
-            }
-        }
+        Ok(mut cache) => cache.get(cache_key),
         Err(e) => {
             // Lock poisoning should never happen in normal operation ~keep
             tracing::debug!(error = %e, "encoding cache read lock poisoned; continuing without cache");
+            None
         }
     }
+}
 
+/// Guess the encoding of `byte_data` with chardetng and memoise it under `cache_key`.
+fn detect_and_cache_encoding(byte_data: &[u8], cache_key: String) -> &'static Encoding {
     let mut detector = EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(byte_data, true);
     let guessed_encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
@@ -234,54 +264,56 @@ pub(crate) fn safe_decode_with_provenance(byte_data: &[u8], encoding: Option<&st
         }
     }
 
-    let (decoded, actual_encoding, had_errors) = guessed_encoding.decode(byte_data);
+    guessed_encoding
+}
 
-    if had_errors {
-        for enc_name in &[
-            "windows-1255",
-            "iso-8859-8",
-            "windows-1256",
-            "iso-8859-6",
-            "windows-1252",
-            "cp1251",
-        ] {
-            if let Some(enc) = Encoding::for_label(enc_name.as_bytes()) {
-                let (test_decoded, test_actual_encoding, test_errors) = enc.decode(byte_data);
-                if !test_errors && calculate_text_confidence_internal(&test_decoded) > 0.5 {
-                    return DecodeOutcome {
-                        text: fix_mojibake_internal(&test_decoded).into_owned(),
-                        fell_back: test_actual_encoding != encoding_rs::UTF_8,
-                        // Gated on `!test_errors` above, so this is always false --
-                        // the candidate is only accepted when it decoded cleanly.
-                        replaced_characters: false,
-                    };
-                }
+/// Single-byte encodings retried, in order, when the detected encoding decoded with errors. The
+/// first candidate that decodes cleanly and looks like readable text wins. ~keep
+const SINGLE_BYTE_FALLBACK_ENCODINGS: &[&str] = &[
+    "windows-1255",
+    "iso-8859-8",
+    "windows-1256",
+    "iso-8859-6",
+    "windows-1252",
+    "cp1251",
+];
+
+/// Retry [`SINGLE_BYTE_FALLBACK_ENCODINGS`] against `byte_data`, returning the first clean decode
+/// whose text confidence clears 0.5.
+fn decode_with_single_byte_fallback(byte_data: &[u8]) -> Option<DecodeOutcome> {
+    for enc_name in SINGLE_BYTE_FALLBACK_ENCODINGS {
+        if let Some(enc) = Encoding::for_label(enc_name.as_bytes()) {
+            let (test_decoded, test_actual_encoding, test_errors) = enc.decode(byte_data);
+            if !test_errors && calculate_text_confidence_internal(&test_decoded) > 0.5 {
+                return Some(DecodeOutcome {
+                    text: fix_mojibake_internal(&test_decoded).into_owned(),
+                    fell_back: test_actual_encoding != encoding_rs::UTF_8,
+                    // Gated on `!test_errors` above, so this is always false --
+                    // the candidate is only accepted when it decoded cleanly.
+                    replaced_characters: false,
+                });
             }
         }
     }
 
-    let final_text = fix_mojibake_internal(&decoded).into_owned();
+    None
+}
 
-    if had_errors {
-        let confidence = calculate_text_confidence_internal(&final_text);
-        if confidence < 0.6 {
-            let preview: String = final_text.chars().filter(|c| !c.is_control()).take(80).collect();
+/// Emit a debug event when a decode that needed replacement characters also produced text that
+/// scores poorly, which is the signature of a wrong encoding guess rather than a noisy source.
+fn warn_on_low_confidence_decode(final_text: &str, guessed_encoding: &'static Encoding) {
+    let confidence = calculate_text_confidence_internal(final_text);
+    if confidence < 0.6 {
+        let preview: String = final_text.chars().filter(|c| !c.is_control()).take(80).collect();
 
-            tracing::debug!(
-                target: "xberg::encoding",
-                "safe_decode produced low-confidence output after fallback attempts; encoding={}, confidence={:.3}, len={}, preview=\"{}\"",
-                guessed_encoding.name(),
-                confidence,
-                final_text.len(),
-                preview
-            );
-        }
-    }
-
-    DecodeOutcome {
-        text: final_text,
-        fell_back: actual_encoding != encoding_rs::UTF_8,
-        replaced_characters: had_errors,
+        tracing::debug!(
+            target: "xberg::encoding",
+            "safe_decode produced low-confidence output after fallback attempts; encoding={}, confidence={:.3}, len={}, preview=\"{}\"",
+            guessed_encoding.name(),
+            confidence,
+            final_text.len(),
+            preview
+        );
     }
 }
 

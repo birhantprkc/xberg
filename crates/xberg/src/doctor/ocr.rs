@@ -85,43 +85,67 @@ fn audit_ocr_capabilities_from(
             }
 
             let Some(backend) = registered.get(&name) else {
-                if name == "tesseract" && unavailable_implicit_tesseract && !required {
-                    return DoctorCheck::skip(
-                        "ocr.tesseract",
-                        "default OCR backend is not compiled in (enable `ocr` or `ocr-wasm`)",
-                    );
-                }
-                let message = if expected.contains(&name) {
-                    "compiled backend was not registered"
-                } else {
-                    "required backend is not registered"
-                };
-                return if required {
-                    DoctorCheck::fail(format!("ocr.{name}"), message)
-                } else {
-                    DoctorCheck::warn(format!("ocr.{name}"), message)
-                };
+                return unregistered_backend_check(&name, &expected, required, unavailable_implicit_tesseract);
             };
 
-            #[cfg(paddle_ocr)]
-            if backend.backend_type() == OcrBackendType::PaddleOCR && !required {
-                return optional_paddle_check();
-            }
-
-            let default_config = [EffectiveProbeConfig {
-                ordinal: 1,
-                config: backend_config(OcrConfig::default(), &name),
-            }];
-            let probe_configs = configured.map_or(default_config.as_slice(), Vec::as_slice);
-            let mut check = aggregate_probes(backend.as_ref(), probe_configs);
-            check.name = format!("ocr.{name}");
-            if check.status == super::ProbeStatus::Fail && !required {
-                check.status = super::ProbeStatus::Warn;
-                check.message = format!("optional backend probe failed: {}", check.message);
-            }
-            check
+            probe_registered_backend(backend.as_ref(), &name, configured, required)
         })
         .collect()
+}
+
+/// The check reported for a backend that is not in the registry: a skip when the default
+/// tesseract backend simply was not compiled in, otherwise a fail (when something configured
+/// demanded it) or a warn (when nothing did). ~keep
+fn unregistered_backend_check(
+    name: &str,
+    expected: &BTreeSet<String>,
+    required: bool,
+    unavailable_implicit_tesseract: bool,
+) -> DoctorCheck {
+    if name == "tesseract" && unavailable_implicit_tesseract && !required {
+        return DoctorCheck::skip(
+            "ocr.tesseract",
+            "default OCR backend is not compiled in (enable `ocr` or `ocr-wasm`)",
+        );
+    }
+    let message = if expected.contains(name) {
+        "compiled backend was not registered"
+    } else {
+        "required backend is not registered"
+    };
+    if required {
+        DoctorCheck::fail(format!("ocr.{name}"), message)
+    } else {
+        DoctorCheck::warn(format!("ocr.{name}"), message)
+    }
+}
+
+/// Probe a registered backend with every configuration that selected it, falling back to a single
+/// default configuration when nothing did. A failing probe on an optional backend is downgraded to
+/// a warning so an uninstalled extra does not fail the whole doctor run. ~keep
+fn probe_registered_backend(
+    backend: &dyn OcrBackend,
+    name: &str,
+    configured: Option<&Vec<EffectiveProbeConfig>>,
+    required: bool,
+) -> DoctorCheck {
+    #[cfg(paddle_ocr)]
+    if backend.backend_type() == OcrBackendType::PaddleOCR && !required {
+        return optional_paddle_check();
+    }
+
+    let default_config = [EffectiveProbeConfig {
+        ordinal: 1,
+        config: backend_config(OcrConfig::default(), name),
+    }];
+    let probe_configs = configured.map_or(default_config.as_slice(), Vec::as_slice);
+    let mut check = aggregate_probes(backend, probe_configs);
+    check.name = format!("ocr.{name}");
+    if check.status == super::ProbeStatus::Fail && !required {
+        check.status = super::ProbeStatus::Warn;
+        check.message = format!("optional backend probe failed: {}", check.message);
+    }
+    check
 }
 
 #[cfg(paddle_ocr)]

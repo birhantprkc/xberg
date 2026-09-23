@@ -20,7 +20,7 @@ use crate::core::config::html_output::{HtmlOutputConfig, HtmlTheme};
 use crate::plugins::{InternalRenderer, Plugin};
 use crate::rendering::common::{NestingKind, RenderState, render_annotated_text_with_plain};
 use crate::types::document_structure::{AnnotationKind, ContentLayer};
-use crate::types::internal::{ElementKind, InternalDocument};
+use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
 
 fn theme_css(theme: &HtmlTheme) -> &'static str {
     match theme {
@@ -261,159 +261,34 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
             ElementKind::Title => {
                 write!(buf, r#"<h1 class="{p}doc-title">{}</h1>"#, esc(&elem.text)).unwrap();
             }
-            ElementKind::Heading { level } => {
-                let lvl = level.clamp(1, 6);
-                write!(
-                    buf,
-                    r#"<h{lvl} class="{p}h {p}h{lvl}">{}</h{lvl}>"#,
-                    render_inline(doc, elem, p)
-                )
-                .unwrap();
-            }
+            ElementKind::Heading { level } => render_heading(doc, elem, p, buf, level),
 
             ElementKind::Paragraph | ElementKind::OcrText { .. } => {
                 write!(buf, r#"<p class="{p}p">{}</p>"#, render_inline(doc, elem, p)).unwrap();
             }
 
             ElementKind::ListStart { ordered } => {
-                list_ordered_stack.push(ordered);
-                state.push_container(NestingKind::List { ordered, item_count: 0 }, elem.depth);
-                if ordered {
-                    write!(buf, r#"<ol class="{p}list {p}ol">"#).unwrap();
-                } else {
-                    write!(buf, r#"<ul class="{p}list {p}ul">"#).unwrap();
-                }
+                render_list_start(elem, p, buf, &mut state, &mut list_ordered_stack, ordered);
             }
-            ElementKind::ListEnd => {
-                let ordered = list_ordered_stack.pop().unwrap_or(false);
-                state.pop_container(&NestingKind::List { ordered, item_count: 0 });
-                if ordered {
-                    buf.push_str("</ol>");
-                } else {
-                    buf.push_str("</ul>");
-                }
-            }
-            ElementKind::ListItem { .. } => {
-                // `<ol>`/`<ul>` only ever render an auto-incrementing decimal or a bullet
-                // glyph; a literal source label (e.g. "B.", "(a)") that shape cannot
-                // express is written out as visible leading text instead, same convention
-                // the other renderers use.
-                match elem.list_item_source_label() {
-                    Some(label) if !label.is_empty() => write!(
-                        buf,
-                        r#"<li class="{p}li"><span class="{p}list-marker">{}</span> {}</li>"#,
-                        esc(label),
-                        render_inline(doc, elem, p)
-                    )
-                    .unwrap(),
-                    _ => write!(buf, r#"<li class="{p}li">{}</li>"#, render_inline(doc, elem, p)).unwrap(),
-                }
-            }
+            ElementKind::ListEnd => render_list_end(buf, &mut state, &mut list_ordered_stack),
+            ElementKind::ListItem { .. } => render_list_item(doc, elem, p, buf),
 
-            ElementKind::QuoteStart => {
-                state.push_container(NestingKind::BlockQuote, elem.depth);
-                write!(buf, r#"<blockquote class="{p}blockquote">"#).unwrap();
-            }
-            ElementKind::QuoteEnd => {
-                state.pop_container(&NestingKind::BlockQuote);
-                buf.push_str("</blockquote>");
-            }
+            ElementKind::QuoteStart => render_quote_start(elem, p, buf, &mut state),
+            ElementKind::QuoteEnd => render_quote_end(buf, &mut state),
 
-            ElementKind::Code => {
-                let lang = elem
-                    .attributes
-                    .as_ref()
-                    .and_then(|a| a.get("language").or_else(|| a.get("lang")))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if lang.is_empty() {
-                    write!(
-                        buf,
-                        r#"<pre class="{p}pre"><code class="{p}code">{}</code></pre>"#,
-                        esc(&elem.text)
-                    )
-                    .unwrap();
-                } else {
-                    let safe_lang = esc(lang);
-                    write!(
-                        buf,
-                        r#"<pre class="{p}pre"><code class="{p}code {p}lang-{safe_lang}">{}</code></pre>"#,
-                        esc(&elem.text)
-                    )
-                    .unwrap();
-                }
-            }
+            ElementKind::Code => render_code(elem, p, buf),
 
-            ElementKind::Formula => {
-                // Math, not code: emit LaTeX in `$$...$$` display-math delimiters inside a
-                // math-classed element, matching the `dollar_math`/`display_math` convention
-                // used by the comrak and djot renderers. KaTeX/MathJax auto-render both pick
-                // up `$$...$$` by default, so this is renderable as-is once such a script is
-                // present on the page; without one it degrades to visible LaTeX source rather
-                // than a misleading monospace code block.
-                write!(
-                    buf,
-                    r#"<div class="{p}formula {p}math" data-math-style="display">$${}$$</div>"#,
-                    esc(&elem.text)
-                )
-                .unwrap();
-            }
+            ElementKind::Formula => render_formula(elem, p, buf),
 
-            ElementKind::FootnoteDefinition => {
-                let anchor = elem.anchor.as_deref().unwrap_or("");
-                write!(
-                    buf,
-                    r#"<aside class="{p}footnote" id="fn-{}">{}</aside>"#,
-                    esc(anchor),
-                    render_inline(doc, elem, p)
-                )
-                .unwrap();
-            }
-            ElementKind::FootnoteRef => {
-                let anchor = elem.anchor.as_deref().unwrap_or("");
-                write!(
-                    buf,
-                    r##"<sup class="{p}footnote-ref"><a href="#fn-{}">{}</a></sup>"##,
-                    esc(anchor),
-                    esc(&elem.text)
-                )
-                .unwrap();
-            }
-            ElementKind::CommentDefinition => {
-                let anchor = elem.anchor.as_deref().unwrap_or("");
-                write!(
-                    buf,
-                    r#"<aside class="{p}comment" id="fn-{}">{}</aside>"#,
-                    esc(anchor),
-                    render_inline(doc, elem, p)
-                )
-                .unwrap();
-            }
-            ElementKind::CommentRef => {
-                let anchor = elem.anchor.as_deref().unwrap_or("");
-                write!(
-                    buf,
-                    r##"<sup class="{p}comment-ref"><a href="#fn-{}">{}</a></sup>"##,
-                    esc(anchor),
-                    esc(&elem.text)
-                )
-                .unwrap();
-            }
+            ElementKind::FootnoteDefinition => render_footnote_definition(doc, elem, p, buf),
+            ElementKind::FootnoteRef => render_footnote_ref(elem, p, buf),
+            ElementKind::CommentDefinition => render_comment_definition(doc, elem, p, buf),
+            ElementKind::CommentRef => render_comment_ref(elem, p, buf),
             ElementKind::Citation => {
                 write!(buf, r#"<cite class="{p}citation">{}</cite>"#, esc(&elem.text)).unwrap();
             }
 
-            ElementKind::Slide { number } => {
-                // `Slide` is a marker, not a container: there is no `SlideEnd` element kind, so
-                // an unbalanced opening tag would leave every slide deck's HTML malformed. Match
-                // the djot and comrak renderers, which emit a break followed by the slide title
-                // as a level-2 heading, and keep the `slide`/`data-slide` hooks for styling.
-                write!(buf, r#"<section class="{p}slide" data-slide="{number}">"#).unwrap();
-                if !elem.text.is_empty() {
-                    write!(buf, r#"<h2 class="{p}h {p}h2">{}</h2>"#, render_inline(doc, elem, p)).unwrap();
-                }
-                buf.push_str("</section>");
-            }
+            ElementKind::Slide { number } => render_slide(doc, elem, p, buf, number),
 
             ElementKind::DefinitionTerm => {
                 write!(buf, r#"<dt class="{p}dt">{}</dt>"#, render_inline(doc, elem, p)).unwrap();
@@ -422,83 +297,257 @@ fn render_elements(doc: &InternalDocument, p: &str, buf: &mut String) {
                 write!(buf, r#"<dd class="{p}dd">{}</dd>"#, render_inline(doc, elem, p)).unwrap();
             }
 
-            ElementKind::Admonition => {
-                let kind = elem
-                    .attributes
-                    .as_ref()
-                    .and_then(|a| a.get("kind").or_else(|| a.get("type")))
-                    .map(|s| s.as_str())
-                    .unwrap_or("note");
-                let safe_kind = esc(kind);
-                write!(
-                    buf,
-                    r#"<aside class="{p}admonition {p}admonition-{safe_kind}">{}</aside>"#,
-                    render_inline(doc, elem, p)
-                )
-                .unwrap();
-            }
+            ElementKind::Admonition => render_admonition(doc, elem, p, buf),
 
-            ElementKind::RawBlock => {
-                // Only a block that declares itself HTML may be written through
-                // verbatim. Most producers of a raw block do not: `odp.rs` pushes
-                // speaker notes and master-page text as `odp-speaker-notes` /
-                // `odp-master-page`, `orgmode.rs` pushes Org source, `html/structure.rs`
-                // pushes `script`/`style` bodies, and `djot_format` pushes whatever
-                // format the source declared, including `unknown`. Emitting those
-                // unescaped puts arbitrary author-typed text — a `<` in a speaker
-                // note, or LibreOffice's literal `<number>` field placeholder — into
-                // the output as if it were markup, which both corrupts the document
-                // structure and is an injection vector (#69).
-                let is_html = elem
-                    .attributes
-                    .as_ref()
-                    .and_then(|a| a.get("format"))
-                    .is_some_and(|format| format == "html");
-                if is_html {
-                    buf.push_str(&elem.text);
-                } else {
-                    write!(buf, r#"<pre class="{p}pre {p}raw">{}</pre>"#, esc(&elem.text)).unwrap();
-                }
-            }
+            ElementKind::RawBlock => render_raw_block(elem, p, buf),
             ElementKind::MetadataBlock => {
                 write!(buf, r#"<dl class="{p}metadata">{}</dl>"#, esc(&elem.text)).unwrap();
             }
 
-            ElementKind::GroupStart => {
-                state.push_container(NestingKind::Group, elem.depth);
-                write!(buf, r#"<div class="{p}group">"#).unwrap();
-            }
-            ElementKind::GroupEnd => {
-                state.pop_container(&NestingKind::Group);
-                buf.push_str("</div>");
-            }
+            ElementKind::GroupStart => render_group_start(elem, p, buf, &mut state),
+            ElementKind::GroupEnd => render_group_end(buf, &mut state),
 
-            ElementKind::Table { table_index } => {
-                if let Some(table) = doc.tables.get(table_index as usize) {
-                    render_table(table, p, buf);
-                }
-            }
+            ElementKind::Table { table_index } => render_table_element(doc, p, buf, table_index),
 
-            ElementKind::Image { image_index } => {
-                if let Some(image) = doc.images.get(image_index as usize) {
-                    let render_ocr = elem.should_render_image_ocr();
-                    render_image(
-                        image,
-                        &elem.text,
-                        p,
-                        doc.ocr_text_only && render_ocr,
-                        doc.append_ocr_text && render_ocr,
-                        buf,
-                    );
-                }
-            }
+            ElementKind::Image { image_index } => render_image_element(doc, elem, p, buf, image_index),
 
-            ElementKind::PageBreak => {
-                let page = elem.page.unwrap_or(0);
-                write!(buf, r#"<hr class="{p}page-break" data-page="{page}">"#).unwrap();
-            }
+            ElementKind::PageBreak => render_page_break(elem, p, buf),
         }
     }
+}
+
+fn render_heading(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String, level: u8) {
+    let lvl = level.clamp(1, 6);
+    write!(
+        buf,
+        r#"<h{lvl} class="{p}h {p}h{lvl}">{}</h{lvl}>"#,
+        render_inline(doc, elem, p)
+    )
+    .unwrap();
+}
+
+fn render_list_start(
+    elem: &InternalElement,
+    p: &str,
+    buf: &mut String,
+    state: &mut RenderState,
+    list_ordered_stack: &mut Vec<bool>,
+    ordered: bool,
+) {
+    list_ordered_stack.push(ordered);
+    state.push_container(NestingKind::List { ordered, item_count: 0 }, elem.depth);
+    if ordered {
+        write!(buf, r#"<ol class="{p}list {p}ol">"#).unwrap();
+    } else {
+        write!(buf, r#"<ul class="{p}list {p}ul">"#).unwrap();
+    }
+}
+
+fn render_list_end(buf: &mut String, state: &mut RenderState, list_ordered_stack: &mut Vec<bool>) {
+    let ordered = list_ordered_stack.pop().unwrap_or(false);
+    state.pop_container(&NestingKind::List { ordered, item_count: 0 });
+    if ordered {
+        buf.push_str("</ol>");
+    } else {
+        buf.push_str("</ul>");
+    }
+}
+
+fn render_list_item(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String) {
+    // `<ol>`/`<ul>` only ever render an auto-incrementing decimal or a bullet
+    // glyph; a literal source label (e.g. "B.", "(a)") that shape cannot
+    // express is written out as visible leading text instead, same convention
+    // the other renderers use.
+    match elem.list_item_source_label() {
+        Some(label) if !label.is_empty() => write!(
+            buf,
+            r#"<li class="{p}li"><span class="{p}list-marker">{}</span> {}</li>"#,
+            esc(label),
+            render_inline(doc, elem, p)
+        )
+        .unwrap(),
+        _ => write!(buf, r#"<li class="{p}li">{}</li>"#, render_inline(doc, elem, p)).unwrap(),
+    }
+}
+
+fn render_quote_start(elem: &InternalElement, p: &str, buf: &mut String, state: &mut RenderState) {
+    state.push_container(NestingKind::BlockQuote, elem.depth);
+    write!(buf, r#"<blockquote class="{p}blockquote">"#).unwrap();
+}
+
+fn render_quote_end(buf: &mut String, state: &mut RenderState) {
+    state.pop_container(&NestingKind::BlockQuote);
+    buf.push_str("</blockquote>");
+}
+
+fn render_code(elem: &InternalElement, p: &str, buf: &mut String) {
+    let lang = elem
+        .attributes
+        .as_ref()
+        .and_then(|a| a.get("language").or_else(|| a.get("lang")))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if lang.is_empty() {
+        write!(
+            buf,
+            r#"<pre class="{p}pre"><code class="{p}code">{}</code></pre>"#,
+            esc(&elem.text)
+        )
+        .unwrap();
+    } else {
+        let safe_lang = esc(lang);
+        write!(
+            buf,
+            r#"<pre class="{p}pre"><code class="{p}code {p}lang-{safe_lang}">{}</code></pre>"#,
+            esc(&elem.text)
+        )
+        .unwrap();
+    }
+}
+
+fn render_formula(elem: &InternalElement, p: &str, buf: &mut String) {
+    // Math, not code: emit LaTeX in `$$...$$` display-math delimiters inside a
+    // math-classed element, matching the `dollar_math`/`display_math` convention
+    // used by the comrak and djot renderers. KaTeX/MathJax auto-render both pick
+    // up `$$...$$` by default, so this is renderable as-is once such a script is
+    // present on the page; without one it degrades to visible LaTeX source rather
+    // than a misleading monospace code block.
+    write!(
+        buf,
+        r#"<div class="{p}formula {p}math" data-math-style="display">$${}$$</div>"#,
+        esc(&elem.text)
+    )
+    .unwrap();
+}
+
+fn render_footnote_definition(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String) {
+    let anchor = elem.anchor.as_deref().unwrap_or("");
+    write!(
+        buf,
+        r#"<aside class="{p}footnote" id="fn-{}">{}</aside>"#,
+        esc(anchor),
+        render_inline(doc, elem, p)
+    )
+    .unwrap();
+}
+
+fn render_footnote_ref(elem: &InternalElement, p: &str, buf: &mut String) {
+    let anchor = elem.anchor.as_deref().unwrap_or("");
+    write!(
+        buf,
+        r##"<sup class="{p}footnote-ref"><a href="#fn-{}">{}</a></sup>"##,
+        esc(anchor),
+        esc(&elem.text)
+    )
+    .unwrap();
+}
+
+fn render_comment_definition(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String) {
+    let anchor = elem.anchor.as_deref().unwrap_or("");
+    write!(
+        buf,
+        r#"<aside class="{p}comment" id="fn-{}">{}</aside>"#,
+        esc(anchor),
+        render_inline(doc, elem, p)
+    )
+    .unwrap();
+}
+
+fn render_comment_ref(elem: &InternalElement, p: &str, buf: &mut String) {
+    let anchor = elem.anchor.as_deref().unwrap_or("");
+    write!(
+        buf,
+        r##"<sup class="{p}comment-ref"><a href="#fn-{}">{}</a></sup>"##,
+        esc(anchor),
+        esc(&elem.text)
+    )
+    .unwrap();
+}
+
+fn render_slide(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String, number: u32) {
+    // `Slide` is a marker, not a container: there is no `SlideEnd` element kind, so
+    // an unbalanced opening tag would leave every slide deck's HTML malformed. Match
+    // the djot and comrak renderers, which emit a break followed by the slide title
+    // as a level-2 heading, and keep the `slide`/`data-slide` hooks for styling.
+    write!(buf, r#"<section class="{p}slide" data-slide="{number}">"#).unwrap();
+    if !elem.text.is_empty() {
+        write!(buf, r#"<h2 class="{p}h {p}h2">{}</h2>"#, render_inline(doc, elem, p)).unwrap();
+    }
+    buf.push_str("</section>");
+}
+
+fn render_admonition(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String) {
+    let kind = elem
+        .attributes
+        .as_ref()
+        .and_then(|a| a.get("kind").or_else(|| a.get("type")))
+        .map(|s| s.as_str())
+        .unwrap_or("note");
+    let safe_kind = esc(kind);
+    write!(
+        buf,
+        r#"<aside class="{p}admonition {p}admonition-{safe_kind}">{}</aside>"#,
+        render_inline(doc, elem, p)
+    )
+    .unwrap();
+}
+
+fn render_raw_block(elem: &InternalElement, p: &str, buf: &mut String) {
+    // Only a block that declares itself HTML may be written through
+    // verbatim. Most producers of a raw block do not: `odp.rs` pushes
+    // speaker notes and master-page text as `odp-speaker-notes` /
+    // `odp-master-page`, `orgmode.rs` pushes Org source, `html/structure.rs`
+    // pushes `script`/`style` bodies, and `djot_format` pushes whatever
+    // format the source declared, including `unknown`. Emitting those
+    // unescaped puts arbitrary author-typed text — a `<` in a speaker
+    // note, or LibreOffice's literal `<number>` field placeholder — into
+    // the output as if it were markup, which both corrupts the document
+    // structure and is an injection vector (#69).
+    let is_html = elem
+        .attributes
+        .as_ref()
+        .and_then(|a| a.get("format"))
+        .is_some_and(|format| format == "html");
+    if is_html {
+        buf.push_str(&elem.text);
+    } else {
+        write!(buf, r#"<pre class="{p}pre {p}raw">{}</pre>"#, esc(&elem.text)).unwrap();
+    }
+}
+
+fn render_group_start(elem: &InternalElement, p: &str, buf: &mut String, state: &mut RenderState) {
+    state.push_container(NestingKind::Group, elem.depth);
+    write!(buf, r#"<div class="{p}group">"#).unwrap();
+}
+
+fn render_group_end(buf: &mut String, state: &mut RenderState) {
+    state.pop_container(&NestingKind::Group);
+    buf.push_str("</div>");
+}
+
+fn render_table_element(doc: &InternalDocument, p: &str, buf: &mut String, table_index: u32) {
+    if let Some(table) = doc.tables.get(table_index as usize) {
+        render_table(table, p, buf);
+    }
+}
+
+fn render_image_element(doc: &InternalDocument, elem: &InternalElement, p: &str, buf: &mut String, image_index: u32) {
+    if let Some(image) = doc.images.get(image_index as usize) {
+        let render_ocr = elem.should_render_image_ocr();
+        render_image(
+            image,
+            &elem.text,
+            p,
+            doc.ocr_text_only && render_ocr,
+            doc.append_ocr_text && render_ocr,
+            buf,
+        );
+    }
+}
+
+fn render_page_break(elem: &InternalElement, p: &str, buf: &mut String) {
+    let page = elem.page.unwrap_or(0);
+    write!(buf, r#"<hr class="{p}page-break" data-page="{page}">"#).unwrap();
 }
 
 fn render_inline(_doc: &InternalDocument, elem: &crate::types::internal::InternalElement, p: &str) -> String {

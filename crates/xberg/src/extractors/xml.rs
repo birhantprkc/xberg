@@ -31,6 +31,145 @@ fn wants_dot_output(config: &ExtractionConfig) -> bool {
     matches!(&config.output_format, crate::core::config::OutputFormat::Custom(name) if name == "dot")
 }
 
+/// Mutable cursor state for walking a `quick_xml` event stream into an `InternalDocument`.
+///
+/// Each `on_*` method carries the body of one match arm from the original event loop in
+/// `build_internal_document`, so element order, indices, and depth bookkeeping are unchanged.
+struct XmlTreeBuilder {
+    doc: InternalDocument,
+    element_stack: Vec<String>,
+    depth: u16,
+    index: u32,
+    is_svg: bool,
+}
+
+impl XmlTreeBuilder {
+    fn new(doc: InternalDocument, is_svg: bool) -> Self {
+        Self {
+            doc,
+            element_stack: Vec::new(),
+            depth: 0,
+            index: 0,
+            is_svg,
+        }
+    }
+
+    /// Collect an element's attributes, applying the security budget and trimming rules
+    /// shared by `Start` and `Empty` events.
+    fn collect_attributes(
+        budget: &mut SecurityBudget,
+        element: &quick_xml::events::BytesStart<'_>,
+    ) -> Result<AHashMap<String, String>> {
+        let mut attrs = AHashMap::new();
+        for attr in element.attributes().flatten() {
+            let key: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
+            let val: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
+            budget.check_attr(&key, &val)?;
+            let trimmed_val = val.trim();
+            if !trimmed_val.is_empty() {
+                attrs.insert(key.to_string(), trimmed_val.to_string());
+            }
+        }
+        Ok(attrs)
+    }
+
+    fn on_start(&mut self, e: &quick_xml::events::BytesStart<'_>, budget: &mut SecurityBudget) -> Result<()> {
+        budget.enter()?;
+        let name_owned = e.name().as_ref().to_string();
+        let attrs = Self::collect_attributes(budget, e)?;
+
+        let level = heading_level(self.depth);
+        let mut elem =
+            InternalElement::text(ElementKind::Heading { level }, &name_owned, self.depth).with_index(self.index);
+        if !attrs.is_empty() {
+            elem = elem.with_attributes(attrs);
+        }
+        self.doc.push_element(elem);
+        self.index += 1;
+
+        self.element_stack.push(name_owned);
+        self.depth = self.depth.saturating_add(1);
+        Ok(())
+    }
+
+    fn on_end(&mut self, budget: &mut SecurityBudget) {
+        budget.leave();
+        self.element_stack.pop();
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn on_text(&mut self, e: &quick_xml::events::BytesText<'_>, budget: &mut SecurityBudget) -> Result<()> {
+        if self.is_svg {
+            let in_text_elem = self
+                .element_stack
+                .iter()
+                .any(|n| matches!(n.as_str(), "text" | "tspan" | "title" | "desc" | "textPath"));
+            if !in_text_elem {
+                return Ok(());
+            }
+        }
+        let text: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
+        budget.check_entity(&text)?;
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            budget.account_text(trimmed.len())?;
+            let text_depth = if self.depth > 0 { self.depth - 1 } else { 0 };
+            let elem = InternalElement::text(ElementKind::Paragraph, trimmed, text_depth).with_index(self.index);
+            self.doc.push_element(elem);
+            self.index += 1;
+        }
+        Ok(())
+    }
+
+    fn on_empty(&mut self, e: &quick_xml::events::BytesStart<'_>, budget: &mut SecurityBudget) -> Result<()> {
+        let name = e.name().as_ref().to_string();
+        let attrs = Self::collect_attributes(budget, e)?;
+
+        let level = heading_level(self.depth);
+        let mut elem = InternalElement::text(ElementKind::Heading { level }, &name, self.depth).with_index(self.index);
+        if !attrs.is_empty() {
+            elem = elem.with_attributes(attrs);
+        }
+        self.doc.push_element(elem);
+        self.index += 1;
+        Ok(())
+    }
+
+    fn on_cdata(&mut self, e: &quick_xml::events::BytesCData<'_>, budget: &mut SecurityBudget) -> Result<()> {
+        let text: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
+        budget.check_entity(&text)?;
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            budget.account_text(trimmed.len())?;
+            let elem = InternalElement::text(ElementKind::Paragraph, trimmed, self.depth).with_index(self.index);
+            self.doc.push_element(elem);
+            self.index += 1;
+        }
+        Ok(())
+    }
+
+    fn record_truncated_parse(&mut self, cause: &quick_xml::Error) {
+        crate::core::diagnostics::push_truncated_parse_warning(
+            &mut self.doc.processing_warnings,
+            XML_WARNING_SOURCE,
+            "the XML element tree",
+            cause,
+        );
+    }
+
+    fn finish(mut self) -> InternalDocument {
+        // `check_end_names` is off, so a document cut off mid-tree never raises a parser
+        // error — it just reaches EOF with elements still on the stack. Report that rather
+        // than handing back a truncated tree that looks complete (#134).
+        crate::core::diagnostics::push_unclosed_elements_warning(
+            &mut self.doc.processing_warnings,
+            XML_WARNING_SOURCE,
+            &self.element_stack,
+        );
+        self.doc
+    }
+}
+
 /// Build an `InternalDocument` from XML content by parsing element hierarchy.
 ///
 /// Maps XML elements to headings (for parent elements with children) and
@@ -43,7 +182,6 @@ fn wants_dot_output(config: &ExtractionConfig) -> bool {
 fn build_internal_document(content: &[u8], mime_type: &str, budget: &mut SecurityBudget) -> Result<InternalDocument> {
     use crate::utils::xml_utils::EntityReader;
     use quick_xml::events::Event;
-    use std::borrow::Cow;
 
     let mut doc = InternalDocument::new("xml");
     let is_svg = mime_type == "image/svg+xml";
@@ -62,124 +200,28 @@ fn build_internal_document(content: &[u8], mime_type: &str, budget: &mut Securit
     let mut reader = EntityReader::from_bytes(decoded.as_bytes());
     reader.config_mut().check_end_names = false;
 
-    let mut depth: u16 = 0;
-    let mut element_stack: Vec<String> = Vec::new();
-    let mut index: u32 = 0;
+    let mut builder = XmlTreeBuilder::new(doc, is_svg);
 
     loop {
         budget.step()?;
         match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                budget.enter()?;
-                let name_owned = e.name().as_ref().to_string();
-
-                let mut attrs = AHashMap::new();
-                for attr in e.attributes().flatten() {
-                    let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
-                    let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
-                    budget.check_attr(&key, &val)?;
-                    let trimmed_val = val.trim();
-                    if !trimmed_val.is_empty() {
-                        attrs.insert(key.to_string(), trimmed_val.to_string());
-                    }
-                }
-
-                let level = heading_level(depth);
-                let mut elem =
-                    InternalElement::text(ElementKind::Heading { level }, &name_owned, depth).with_index(index);
-                if !attrs.is_empty() {
-                    elem = elem.with_attributes(attrs);
-                }
-                doc.push_element(elem);
-                index += 1;
-
-                element_stack.push(name_owned);
-                depth = depth.saturating_add(1);
-            }
-            Ok(Event::End(_)) => {
-                budget.leave();
-                element_stack.pop();
-                depth = depth.saturating_sub(1);
-            }
-            Ok(Event::Text(e)) => {
-                if is_svg {
-                    let in_text_elem = element_stack
-                        .iter()
-                        .any(|n| matches!(n.as_str(), "text" | "tspan" | "title" | "desc" | "textPath"));
-                    if !in_text_elem {
-                        continue;
-                    }
-                }
-                let text: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
-                budget.check_entity(&text)?;
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    budget.account_text(trimmed.len())?;
-                    let text_depth = if depth > 0 { depth - 1 } else { 0 };
-                    let elem = InternalElement::text(ElementKind::Paragraph, trimmed, text_depth).with_index(index);
-                    doc.push_element(elem);
-                    index += 1;
-                }
-            }
-            Ok(Event::Empty(e)) => {
-                let name = e.name().as_ref().to_string();
-
-                let mut attrs = AHashMap::new();
-                for attr in e.attributes().flatten() {
-                    let key: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
-                    let val: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
-                    budget.check_attr(&key, &val)?;
-                    let trimmed_val = val.trim();
-                    if !trimmed_val.is_empty() {
-                        attrs.insert(key.to_string(), trimmed_val.to_string());
-                    }
-                }
-
-                let level = heading_level(depth);
-                let mut elem = InternalElement::text(ElementKind::Heading { level }, &name, depth).with_index(index);
-                if !attrs.is_empty() {
-                    elem = elem.with_attributes(attrs);
-                }
-                doc.push_element(elem);
-                index += 1;
-            }
-            Ok(Event::CData(e)) => {
-                let text: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
-                budget.check_entity(&text)?;
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    budget.account_text(trimmed.len())?;
-                    let elem = InternalElement::text(ElementKind::Paragraph, trimmed, depth).with_index(index);
-                    doc.push_element(elem);
-                    index += 1;
-                }
-            }
+            Ok(Event::Start(e)) => builder.on_start(&e, budget)?,
+            Ok(Event::End(_)) => builder.on_end(budget),
+            Ok(Event::Text(e)) => builder.on_text(&e, budget)?,
+            Ok(Event::Empty(e)) => builder.on_empty(&e, budget)?,
+            Ok(Event::CData(e)) => builder.on_cdata(&e, budget)?,
             Ok(Event::Eof) => break,
             // A malformed event ends the parse; everything after it is lost, so
             // say so rather than returning a silently truncated document (#134).
             Err(e) => {
-                crate::core::diagnostics::push_truncated_parse_warning(
-                    &mut doc.processing_warnings,
-                    XML_WARNING_SOURCE,
-                    "the XML element tree",
-                    &e,
-                );
+                builder.record_truncated_parse(&e);
                 break;
             }
             _ => {}
         }
     }
 
-    // `check_end_names` is off, so a document cut off mid-tree never raises a parser
-    // error — it just reaches EOF with elements still on the stack. Report that rather
-    // than handing back a truncated tree that looks complete (#134).
-    crate::core::diagnostics::push_unclosed_elements_warning(
-        &mut doc.processing_warnings,
-        XML_WARNING_SOURCE,
-        &element_stack,
-    );
-
-    Ok(doc)
+    Ok(builder.finish())
 }
 #[cfg_attr(alef, alef(skip))]
 /// XML extractor.

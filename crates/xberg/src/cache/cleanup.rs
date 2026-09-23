@@ -8,20 +8,62 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::core::{CacheEntry, CacheScanResult, CacheStats};
 use super::utilities::get_available_disk_space;
 
+/// Result for a cache directory that does not exist: zero files, but still reporting the live
+/// available disk space so callers can distinguish "no cache yet" from "no disk". ~keep
+fn empty_scan_result(cache_dir: &str) -> Result<CacheScanResult> {
+    Ok(CacheScanResult {
+        stats: CacheStats {
+            total_files: 0,
+            total_size_mb: 0.0,
+            available_space_mb: get_available_disk_space(cache_dir)?,
+            oldest_file_age_days: 0.0,
+            newest_file_age_days: 0.0,
+        },
+        entries: Vec::new(),
+    })
+}
+
+/// Turn one `read_dir` item into a [`CacheEntry`], returning `None` for anything that is not a
+/// readable `.msgpack` file with a usable modification time.
+fn read_cache_entry(entry: std::io::Result<fs::DirEntry>) -> Option<CacheEntry> {
+    let entry = match entry {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!("Error reading cache entry: {}", e);
+            return None;
+        }
+    };
+
+    let metadata = match entry.metadata() {
+        Ok(m) if m.is_file() => m,
+        _ => return None,
+    };
+
+    let path = entry.path();
+    if path.extension().and_then(|s| s.to_str()) != Some("msgpack") {
+        return None;
+    }
+
+    let modified = match metadata.modified() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!("Error getting modification time for {:?}: {}", path, e);
+            return None;
+        }
+    };
+
+    Some(CacheEntry {
+        path,
+        size: metadata.len(),
+        modified,
+    })
+}
+
 pub(super) fn scan_cache_directory(cache_dir: &str) -> Result<CacheScanResult> {
     let dir_path = Path::new(cache_dir);
 
     if !dir_path.exists() {
-        return Ok(CacheScanResult {
-            stats: CacheStats {
-                total_files: 0,
-                total_size_mb: 0.0,
-                available_space_mb: get_available_disk_space(cache_dir)?,
-                oldest_file_age_days: 0.0,
-                newest_file_age_days: 0.0,
-            },
-            entries: Vec::new(),
-        });
+        return empty_scan_result(cache_dir);
     }
 
     let current_time = SystemTime::now()
@@ -38,42 +80,19 @@ pub(super) fn scan_cache_directory(cache_dir: &str) -> Result<CacheScanResult> {
     let mut entries = Vec::new();
 
     for entry in read_dir {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::debug!("Error reading cache entry: {}", e);
-                continue;
-            }
-        };
-
-        let metadata = match entry.metadata() {
-            Ok(m) if m.is_file() => m,
-            _ => continue,
-        };
-
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("msgpack") {
+        let Some(cache_entry) = read_cache_entry(entry) else {
             continue;
-        }
-
-        let modified = match metadata.modified() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!("Error getting modification time for {:?}: {}", path, e);
-                continue;
-            }
         };
 
-        let size = metadata.len();
-        total_size += size;
+        total_size += cache_entry.size;
 
-        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+        if let Ok(duration) = cache_entry.modified.duration_since(UNIX_EPOCH) {
             let age_days = (current_time - duration.as_secs() as f64) / (24.0 * 3600.0);
             oldest_age = oldest_age.max(age_days);
             newest_age = newest_age.min(age_days);
         }
 
-        entries.push(CacheEntry { path, size, modified });
+        entries.push(cache_entry);
     }
 
     if entries.is_empty() {

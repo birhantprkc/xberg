@@ -144,28 +144,57 @@ pub(crate) fn render_markdown(doc: &InternalDocument) -> String {
     let mut output = String::new();
     format_commonmark(root, &options, &mut output).expect("comrak formatting should not fail");
 
-    if output.contains("<!--") {
-        let marker_re = doc
-            .page_marker_format
-            .as_deref()
-            .map(crate::core::config::page::marker_line_regex);
-        output = output
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim();
-                !trimmed.starts_with("<!--")
-                    || !trimmed.ends_with("-->")
-                    || marker_re.as_ref().is_some_and(|re| re.is_match(trimmed))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
+    output = filter_page_marker_comments(output, doc.page_marker_format.as_deref());
 
     if let Cow::Owned(s) = replace_html_entities(&output) {
         output = s;
     }
 
-    if doc.escape_markdown {
+    output = unescape_markdown_output(output, doc.escape_markdown);
+
+    if let Cow::Owned(s) = collapse_excess_newlines(&output) {
+        output = s;
+    }
+
+    if !doc.include_watermarks {
+        output = strip_arxiv_watermark_noise(output);
+    }
+
+    output = append_annotations_section(output, doc.annotations.as_deref());
+
+    let trimmed_len = output.trim_end().len();
+    if trimmed_len == 0 {
+        return String::new();
+    }
+    output.truncate(trimmed_len);
+    output.push('\n');
+    tracing::debug!(output_length = output.len(), "markdown rendering complete");
+    output
+}
+
+/// Drop HTML comment lines from rendered output, except page-marker comments
+/// that match `page_marker_format` (when configured).
+fn filter_page_marker_comments(output: String, page_marker_format: Option<&str>) -> String {
+    if !output.contains("<!--") {
+        return output;
+    }
+
+    let marker_re = page_marker_format.map(crate::core::config::page::marker_line_regex);
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("<!--")
+                || !trimmed.ends_with("-->")
+                || marker_re.as_ref().is_some_and(|re| re.is_match(trimmed))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Apply the `escape_markdown`-dependent unescape pass to rendered output.
+fn unescape_markdown_output(mut output: String, escape_markdown: bool) -> String {
+    if escape_markdown {
         const UNESCAPE_TARGETS: &[char] = &['_', '[', ']', '(', ')', '*', '='];
         let cow = unescape_backslash_sequences(&output, UNESCAPE_TARGETS);
         if let Cow::Owned(s) = cow {
@@ -193,16 +222,12 @@ pub(crate) fn render_markdown(doc: &InternalDocument) -> String {
             output = s;
         }
     }
+    output
+}
 
-    if let Cow::Owned(s) = collapse_excess_newlines(&output) {
-        output = s;
-    }
-
-    if !doc.include_watermarks {
-        output = strip_arxiv_watermark_noise(output);
-    }
-
-    if let Some(annotations) = doc.annotations.as_deref() {
+/// Append the `## Annotations` section to rendered output, when present.
+fn append_annotations_section(mut output: String, annotations: Option<&[PdfAnnotation]>) -> String {
+    if let Some(annotations) = annotations {
         let block = render_annotations_markdown(annotations);
         if !block.is_empty() {
             if !output.trim_end().is_empty() {
@@ -211,14 +236,6 @@ pub(crate) fn render_markdown(doc: &InternalDocument) -> String {
             output.push_str(&block);
         }
     }
-
-    let trimmed_len = output.trim_end().len();
-    if trimmed_len == 0 {
-        return String::new();
-    }
-    output.truncate(trimmed_len);
-    output.push('\n');
-    tracing::debug!(output_length = output.len(), "markdown rendering complete");
     output
 }
 

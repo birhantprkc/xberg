@@ -292,28 +292,12 @@ pub(crate) fn collapse_scattered_ascii(text: &str) -> Option<String> {
 
     while i < bytes.len() {
         if bytes[i].is_ascii_alphabetic() {
-            let mut j = i + 1;
-            let mut count = 1;
-            while j < bytes.len() {
-                if bytes[j].is_ascii_alphabetic() {
-                    count += 1;
-                    j += 1;
-                } else if bytes[j].is_ascii_whitespace() {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
+            let (end, count) = scattered_ascii_run(bytes, i);
 
-            if count >= 3 && j - i >= (count * 2 - 1) {
+            if count >= 3 && end - i >= (count * 2 - 1) {
                 changed = true;
-                for &byte in &bytes[i..j] {
-                    if byte.is_ascii_alphabetic() {
-                        result.push(byte.to_ascii_lowercase());
-                    }
-                }
-                result.push(b' ');
-                i = j;
+                push_collapsed_run(&mut result, &bytes[i..end]);
+                i = end;
                 continue;
             }
         }
@@ -327,6 +311,36 @@ pub(crate) fn collapse_scattered_ascii(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Scan the run of alphabetic bytes (optionally separated by ASCII whitespace) that
+/// starts at `start`, returning the byte offset just past it and the letter count.
+fn scattered_ascii_run(bytes: &[u8], start: usize) -> (usize, usize) {
+    let mut j = start + 1;
+    let mut count = 1;
+
+    while j < bytes.len() {
+        if bytes[j].is_ascii_alphabetic() {
+            count += 1;
+            j += 1;
+        } else if bytes[j].is_ascii_whitespace() {
+            j += 1;
+        } else {
+            break;
+        }
+    }
+
+    (j, count)
+}
+
+/// Emit a scattered run as one lowercased word followed by a single space.
+fn push_collapsed_run(result: &mut Vec<u8>, run: &[u8]) {
+    for &byte in run {
+        if byte.is_ascii_alphabetic() {
+            result.push(byte.to_ascii_lowercase());
+        }
+    }
+    result.push(b' ');
 }
 
 fn chain_replacements<'a>(mut text: Cow<'a, str>, replacements: &[(&Regex, &str)]) -> Cow<'a, str> {

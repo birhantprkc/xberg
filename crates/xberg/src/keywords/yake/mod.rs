@@ -201,12 +201,7 @@ impl<'a> Yake<'a> {
                 words.entry(term.as_str()).or_default().push(occurrence);
 
                 if tag != Tag::Digit && tag != Tag::Unparsable {
-                    for &(left_uterm, left_tag) in window.iter() {
-                        if left_tag == Tag::Digit || left_tag == Tag::Unparsable {
-                            continue;
-                        }
-                        ctx.track(left_uterm, term.as_str());
-                    }
+                    track_left_context(&mut ctx, &window, term.as_str());
                 }
 
                 if window.len() == self.config.window_size {
@@ -298,25 +293,16 @@ impl<'a> Yake<'a> {
 
             for (j, (lc, uq)) in lc_terms.iter().zip(uq_terms).enumerate() {
                 if self.is_stopword(lc) {
-                    let prob_prev = if j == 0 {
-                        0.0
-                    } else {
-                        match uq_terms.get(j - 1) {
-                            None => 0.0,
-                            Some(prev_uq) => {
-                                let tf = features.get(prev_uq.as_str()).map_or(1.0, |f| f.tf);
-                                ctx.cases_term_is_followed(prev_uq.as_str(), uq.as_str()) as f64 / tf
-                            }
-                        }
-                    };
+                    let prob_prev = j
+                        .checked_sub(1)
+                        .and_then(|prev| uq_terms.get(prev))
+                        .map_or(0.0, |prev_uq| {
+                            transition_prob(features, ctx, prev_uq.as_str(), uq.as_str(), prev_uq.as_str())
+                        });
 
-                    let prob_succ = match uq_terms.get(j + 1) {
-                        None => 0.0,
-                        Some(next_uq) => {
-                            let tf = features.get(next_uq.as_str()).map_or(1.0, |f| f.tf);
-                            ctx.cases_term_is_followed(uq.as_str(), next_uq.as_str()) as f64 / tf
-                        }
-                    };
+                    let prob_succ = uq_terms.get(j + 1).map_or(0.0, |next_uq| {
+                        transition_prob(features, ctx, uq.as_str(), next_uq.as_str(), next_uq.as_str())
+                    });
 
                     let prob = prob_prev * prob_succ;
                     prod_ *= 1.0 + (1.0 - prob);
@@ -365,21 +351,22 @@ impl<'a> Yake<'a> {
                 for k in (j + 1..length + 1).take(n) {
                     let lc_terms = &sentence.lc_terms[j..k];
 
-                    if !ignored.contains(lc_terms) {
-                        if !self.is_candidate(lc_terms, &sentence.tags[j..k]) {
-                            ignored.insert(lc_terms);
-                        } else {
-                            candidates
-                                .entry(lc_terms)
-                                .or_insert_with(|| Candidate {
-                                    lc_terms,
-                                    uq_terms: &sentence.uq_terms[j..k],
-                                    raw: &sentence.words[j..k],
-                                    ..Default::default()
-                                })
-                                .occurrences += 1;
-                        }
+                    if ignored.contains(lc_terms) {
+                        continue;
                     }
+                    if !self.is_candidate(lc_terms, &sentence.tags[j..k]) {
+                        ignored.insert(lc_terms);
+                        continue;
+                    }
+                    candidates
+                        .entry(lc_terms)
+                        .or_insert_with(|| Candidate {
+                            lc_terms,
+                            uq_terms: &sentence.uq_terms[j..k],
+                            raw: &sentence.words[j..k],
+                            ..Default::default()
+                        })
+                        .occurrences += 1;
                 }
             }
         }
@@ -438,6 +425,22 @@ pub(crate) fn extract_keywords_yake(text: &str, config: &KeywordConfig) -> Resul
     keywords.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     Ok(keywords)
+}
+
+/// Record every non-digit, non-unparsable term still in the window as preceding `term`.
+fn track_left_context<'s>(ctx: &mut Contexts<'s>, window: &VecDeque<(&'s str, Tag)>, term: &'s str) {
+    for &(left_uterm, left_tag) in window.iter() {
+        if left_tag == Tag::Digit || left_tag == Tag::Unparsable {
+            continue;
+        }
+        ctx.track(left_uterm, term);
+    }
+}
+
+/// How often `left` is followed by `right`, normalised by `neighbour`'s term frequency.
+fn transition_prob(features: &Features<'_>, ctx: &Contexts<'_>, left: &str, right: &str, neighbour: &str) -> f64 {
+    let tf = features.get(neighbour).map_or(1.0, |f| f.tf);
+    ctx.cases_term_is_followed(left, right) as f64 / tf
 }
 
 #[cfg(test)]
