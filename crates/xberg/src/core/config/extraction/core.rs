@@ -1138,8 +1138,15 @@ impl ExtractionConfig {
     /// [`Self::ocr_embedded_images`] is the caller's explicit answer to the OCR half;
     /// `None` derives it from whether an `ocr` block is present, which is what this
     /// condition was before GH#1752 gave the behaviour a setting of its own.
+    ///
+    /// `disable_ocr` still wins regardless: it is documented as skipping OCR "for all
+    /// document types", and `ocr_embedded_images` (like the plain presence of an `ocr`
+    /// block before it) is an AUTOMATIC trigger, not an explicit request like `force_ocr` --
+    /// see [`Self::effective_disable_ocr`]'s callers elsewhere (`needs_image_processing`,
+    /// `extractors/image.rs`, `engine/extract_impl.rs`) for the same precedent.
     pub fn runs_ocr_on_embedded_images(&self) -> bool {
-        self.ocr_embedded_images.unwrap_or(self.ocr.is_some())
+        !self.effective_disable_ocr()
+            && self.ocr_embedded_images.unwrap_or(self.ocr.is_some())
             && self.images.as_ref().map(|i| i.run_ocr_on_images).unwrap_or(true)
     }
 
@@ -2000,6 +2007,28 @@ mod tests {
         assert!(
             !on_but_images_opted_out.runs_ocr_on_embedded_images(),
             "`images.run_ocr_on_images: false` still wins: the two settings are independent"
+        );
+    }
+
+    /// `disable_ocr: true` is documented as skipping OCR "for all document types" and must
+    /// win over `ocr_embedded_images: Some(true)`, the same way it already wins over a plain
+    /// `ocr` block elsewhere (`needs_image_processing`'s `ocr_enabled`, `extractors/image.rs`,
+    /// `engine/extract_impl.rs`).
+    #[test]
+    fn disable_ocr_suppresses_embedded_image_ocr_even_when_opted_in() {
+        let config = ExtractionConfig {
+            ocr: None,
+            ocr_embedded_images: Some(true),
+            disable_ocr: true,
+            ..Default::default()
+        };
+        assert!(
+            !config.runs_ocr_on_embedded_images(),
+            "disable_ocr must suppress embedded-image OCR even when explicitly opted in"
+        );
+        assert!(
+            !config.needs_image_data(),
+            "and the container must not pay for reading bytes only embedded-image OCR wanted"
         );
     }
 
