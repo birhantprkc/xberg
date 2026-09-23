@@ -29,11 +29,24 @@ impl ImageDecodeBudget {
         }
     }
 
+    /// Reject an image whose dimensions are degenerate or whose live
+    /// image-processing footprint exceeds the budget.
+    ///
+    /// `decoded_bytes` and the budget are both byte counts. GH#1761: the
+    /// pixel count `width * height` used to be compared against the byte
+    /// budget as well — different units. It decided nothing, because every
+    /// caller passes a byte count at least as large as the pixel count and
+    /// the byte clause therefore always rejected first, but it would have
+    /// become wrong the moment either side changed. Callers that only have
+    /// a byte count to check pass `1, 1` for the dimensions. ~keep
     pub(crate) fn validate(self, width: u32, height: u32, decoded_bytes: u64) -> Result<()> {
-        let pixels = u64::from(width)
+        // A backstop for a future widening of the dimension types: with
+        // u32 extents widened to u64 the product cannot overflow, since
+        // u32::MAX squared is just under u64::MAX. ~keep
+        u64::from(width)
             .checked_mul(u64::from(height))
             .ok_or_else(|| image_dimension_error(width, height, decoded_bytes, self.max_decoded_bytes))?;
-        if width == 0 || height == 0 || pixels > self.max_decoded_bytes || decoded_bytes > self.max_decoded_bytes {
+        if width == 0 || height == 0 || decoded_bytes > self.max_decoded_bytes {
             return Err(image_dimension_error(
                 width,
                 height,
