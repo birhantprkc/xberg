@@ -229,24 +229,12 @@ fn extract_blocking(
     extract_blocking_serialized(content, mime_type, passwords, extract_metadata, margins)
 }
 
-fn extract_blocking_serialized(
-    content: &[u8],
-    mime_type: &str,
-    passwords: &[String],
-    extract_metadata: bool,
+/// Concatenate every page's in-margin text, recording each page's byte range.
+fn collect_page_text(
+    document: &PdfDocument<'_>,
+    page_count: u32,
     margins: PageMarginFractions,
-) -> Result<InternalDocument> {
-    let pdfium = Pdfium;
-    let document = open_document(&pdfium, content, passwords)?;
-
-    let page_count = document.pages().len();
-    if page_count <= 0 {
-        return Err(XbergError::parsing(
-            "pdfium opened the document but it reports zero pages",
-        ));
-    }
-    let page_count = page_count as u32;
-
+) -> Result<(String, Vec<PageBoundary>)> {
     let mut joined_text = String::new();
     let mut boundaries: Vec<PageBoundary> = Vec::with_capacity(page_count as usize);
 
@@ -269,6 +257,29 @@ fn extract_blocking_serialized(
             page_number,
         });
     }
+
+    Ok((joined_text, boundaries))
+}
+
+fn extract_blocking_serialized(
+    content: &[u8],
+    mime_type: &str,
+    passwords: &[String],
+    extract_metadata: bool,
+    margins: PageMarginFractions,
+) -> Result<InternalDocument> {
+    let pdfium = Pdfium;
+    let document = open_document(&pdfium, content, passwords)?;
+
+    let page_count = document.pages().len();
+    if page_count <= 0 {
+        return Err(XbergError::parsing(
+            "pdfium opened the document but it reports zero pages",
+        ));
+    }
+    let page_count = page_count as u32;
+
+    let (joined_text, boundaries) = collect_page_text(&document, page_count, margins)?;
 
     let mut doc = super::flat_pdf_document(&joined_text, mime_type, Some(&boundaries));
 

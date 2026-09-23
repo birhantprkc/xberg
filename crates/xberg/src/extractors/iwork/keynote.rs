@@ -92,6 +92,40 @@ fn enforce_slide_limit(slide_count: usize, max_pages: Option<usize>) -> Result<(
     Ok(crate::extractors::security::enforce_page_count(slide_count, max_pages)?)
 }
 
+/// Read and dedupe the text of every slide IWA, in `slide_paths` order.
+///
+/// Each slide keeps its own text, deduped only within itself (#101): a
+/// footer or title legitimately repeated across slides must survive on
+/// every slide it appears on, not just the first.
+fn collect_slide_texts(
+    content: &[u8],
+    slide_paths: &[&String],
+    budget: &mut SecurityBudget,
+    expansion: &mut IwaExpansionBudget,
+    warnings: &mut Vec<ProcessingWarning>,
+) -> Result<Vec<Vec<String>>> {
+    let mut slide_texts: Vec<Vec<String>> = Vec::new();
+
+    for path in slide_paths {
+        match read_iwa_file(content, path, expansion) {
+            Ok(decompressed) => {
+                let texts = extract_text_from_proto(&decompressed, budget)?;
+                let deduped = dedup_text(texts);
+                if !deduped.is_empty() {
+                    slide_texts.push(deduped);
+                }
+            }
+            Err(error) if matches!(&error, crate::error::XbergError::Security { .. }) => return Err(error),
+            Err(error) => {
+                tracing::debug!(%error, "Skipping IWA file (decompression failed): {path}");
+                push_member_parse_warning(warnings, path, &error);
+            }
+        }
+    }
+
+    Ok(slide_texts)
+}
+
 fn parse_keynote(content: &[u8], limits: &SecurityLimits) -> Result<KeynoteData> {
     validate_iwork_zip(content, limits)?;
     let mut budget = SecurityBudget::for_iwork(limits);
@@ -119,27 +153,7 @@ fn parse_keynote(content: &[u8], limits: &SecurityLimits) -> Result<KeynoteData>
         .collect();
 
     let mut warnings: Vec<ProcessingWarning> = Vec::new();
-    let mut slide_texts: Vec<Vec<String>> = Vec::new();
-
-    // Each slide keeps its own text, deduped only within itself (#101): a
-    // footer or title legitimately repeated across slides must survive on
-    // every slide it appears on, not just the first.
-    for path in &slide_paths {
-        match read_iwa_file(content, path, &mut expansion) {
-            Ok(decompressed) => {
-                let texts = extract_text_from_proto(&decompressed, &mut budget)?;
-                let deduped = dedup_text(texts);
-                if !deduped.is_empty() {
-                    slide_texts.push(deduped);
-                }
-            }
-            Err(error) if matches!(&error, crate::error::XbergError::Security { .. }) => return Err(error),
-            Err(error) => {
-                tracing::debug!(%error, "Skipping IWA file (decompression failed): {path}");
-                push_member_parse_warning(&mut warnings, path, &error);
-            }
-        }
-    }
+    let slide_texts = collect_slide_texts(content, &slide_paths, &mut budget, &mut expansion, &mut warnings)?;
 
     // Text already shown on a slide is only worth repeating in "Additional
     // Content" if it says something new; text unique to a slide's own repeats

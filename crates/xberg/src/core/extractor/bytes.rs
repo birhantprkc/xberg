@@ -70,8 +70,6 @@ pub(crate) async fn extract_bytes(
     mime_type: &str,
     config: &ExtractionConfig,
 ) -> Result<ExtractedDocument> {
-    use crate::core::mime;
-
     // `token.cancel()` below needs a token to signal, but `config.cancel_token` is
     // `None` on every binding-driven and CLI-driven call (see
     // `ExtractionConfig::ensure_cancel_token`) — install an internal fallback so a
@@ -92,75 +90,7 @@ pub(crate) async fn extract_bytes(
         config
     };
 
-    let extraction_future = Box::pin(async {
-        if config.force_ocr && config.effective_disable_ocr() {
-            return Err(crate::XbergError::Validation {
-                message: "force_ocr and disable_ocr cannot both be true".to_string(),
-                source: None,
-            });
-        }
-
-        if matches!(
-            config.ocr_strategy,
-            crate::core::config::OcrStrategy::ScannedPages { .. }
-        ) && config.effective_disable_ocr()
-        {
-            return Err(crate::XbergError::Validation {
-                message: "ocr_strategy selects scanned pages for OCR, but disable_ocr is true".to_string(),
-                source: None,
-            });
-        }
-
-        let validated_mime = if mime_type == "application/octet-stream" {
-            #[cfg(feature = "tree-sitter")]
-            {
-                if config.tree_sitter.is_some() {
-                    if let Ok(text) = std::str::from_utf8(content) {
-                        let trimmed = text.trim_start();
-                        if tree_sitter_language_pack::detect_language_from_content(trimmed).is_some() {
-                            mime::SOURCE_CODE_MIME_TYPE.to_string()
-                        } else {
-                            mime::detect_mime_type_from_bytes(content)?
-                        }
-                    } else {
-                        mime::detect_mime_type_from_bytes(content)?
-                    }
-                } else {
-                    mime::detect_mime_type_from_bytes(content)?
-                }
-            }
-            #[cfg(not(feature = "tree-sitter"))]
-            {
-                let _ = config;
-                mime::detect_mime_type_from_bytes(content)?
-            }
-        } else {
-            mime::validate_mime_type(mime_type)?
-        };
-
-        #[cfg(not(feature = "office"))]
-        match validated_mime.as_str() {
-            LEGACY_WORD_MIME_TYPE => {
-                return Err(XbergError::UnsupportedFormat(
-                    "Legacy Word extraction requires the `office` feature".to_string(),
-                ));
-            }
-            LEGACY_POWERPOINT_MIME_TYPE => {
-                return Err(XbergError::UnsupportedFormat(
-                    "Legacy PowerPoint extraction requires the `office` feature".to_string(),
-                ));
-            }
-            _ => {}
-        }
-
-        #[cfg(feature = "office")]
-        {
-            let _ = LEGACY_WORD_MIME_TYPE;
-            let _ = LEGACY_POWERPOINT_MIME_TYPE;
-        }
-
-        Box::pin(extract_bytes_with_extractor(content, &validated_mime, config)).await
-    });
+    let extraction_future = Box::pin(run_byte_extraction(content, mime_type, config));
 
     // without a JS/WASI shim), which aborts the whole module with an uncatchable
     // `unreachable` trap. `tokio-runtime` can be enabled transitively on that target
@@ -206,4 +136,90 @@ pub(crate) async fn extract_bytes(
     }
 
     result
+}
+
+/// Resolve the MIME type extraction should run under.
+///
+/// A caller-supplied `application/octet-stream` carries no information, so the
+/// bytes are sniffed instead; anything else is validated as given.
+fn resolve_validated_mime(content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<String> {
+    use crate::core::mime;
+
+    let validated_mime = if mime_type == "application/octet-stream" {
+        #[cfg(feature = "tree-sitter")]
+        {
+            if config.tree_sitter.is_some() {
+                if let Ok(text) = std::str::from_utf8(content) {
+                    let trimmed = text.trim_start();
+                    if tree_sitter_language_pack::detect_language_from_content(trimmed).is_some() {
+                        mime::SOURCE_CODE_MIME_TYPE.to_string()
+                    } else {
+                        mime::detect_mime_type_from_bytes(content)?
+                    }
+                } else {
+                    mime::detect_mime_type_from_bytes(content)?
+                }
+            } else {
+                mime::detect_mime_type_from_bytes(content)?
+            }
+        }
+        #[cfg(not(feature = "tree-sitter"))]
+        {
+            let _ = config;
+            mime::detect_mime_type_from_bytes(content)?
+        }
+    } else {
+        mime::validate_mime_type(mime_type)?
+    };
+
+    Ok(validated_mime)
+}
+
+/// Validate the configuration, resolve the MIME type, and run the extractor chain.
+///
+/// Split out of [`extract_bytes`] so the timeout and cancellation wrapper there stays
+/// readable; the returned future is still only polled at the original await point.
+async fn run_byte_extraction(content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<ExtractedDocument> {
+    if config.force_ocr && config.effective_disable_ocr() {
+        return Err(crate::XbergError::Validation {
+            message: "force_ocr and disable_ocr cannot both be true".to_string(),
+            source: None,
+        });
+    }
+
+    if matches!(
+        config.ocr_strategy,
+        crate::core::config::OcrStrategy::ScannedPages { .. }
+    ) && config.effective_disable_ocr()
+    {
+        return Err(crate::XbergError::Validation {
+            message: "ocr_strategy selects scanned pages for OCR, but disable_ocr is true".to_string(),
+            source: None,
+        });
+    }
+
+    let validated_mime = resolve_validated_mime(content, mime_type, config)?;
+
+    #[cfg(not(feature = "office"))]
+    match validated_mime.as_str() {
+        LEGACY_WORD_MIME_TYPE => {
+            return Err(XbergError::UnsupportedFormat(
+                "Legacy Word extraction requires the `office` feature".to_string(),
+            ));
+        }
+        LEGACY_POWERPOINT_MIME_TYPE => {
+            return Err(XbergError::UnsupportedFormat(
+                "Legacy PowerPoint extraction requires the `office` feature".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    #[cfg(feature = "office")]
+    {
+        let _ = LEGACY_WORD_MIME_TYPE;
+        let _ = LEGACY_POWERPOINT_MIME_TYPE;
+    }
+
+    Box::pin(extract_bytes_with_extractor(content, &validated_mime, config)).await
 }
