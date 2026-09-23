@@ -326,3 +326,50 @@ fn test_oc_layer_effective_is_o1_top_of_stack() {
     ext.pop_oc_layer();
     assert_eq!(ext.current_layer(), None);
 }
+
+#[test]
+fn trailing_move_to_does_not_extend_the_bounding_box_to_the_page() {
+    // GH#1759 carrier, as it arrives from the content stream:
+    // `0 42.63 595.28 -28.35 re  0 842 m  f*`. The negative-height `re`
+    // must be normalised and the lone trailing `m` — a subpath no segment
+    // follows, which paints nothing — must not stretch the box to the
+    // whole page. ~keep
+    let mut extractor = PathExtractor::new();
+    extractor.rectangle(0.0, 42.63, 595.28, -28.35);
+    extractor.move_to(0.0, 842.0);
+    extractor.fill(FillRule::EvenOdd);
+
+    let paths = extractor.finish();
+    assert_eq!(paths.len(), 1);
+
+    let bbox = &paths[0].bbox;
+    assert!(
+        (bbox.y - 14.28).abs() < 1e-2,
+        "expected the footer band's own y (14.28), got {}",
+        bbox.y
+    );
+    assert!(
+        (bbox.height - 28.35).abs() < 1e-2,
+        "expected the footer band's own height (28.35), got {}",
+        bbox.height
+    );
+}
+
+#[test]
+fn move_to_followed_by_a_segment_still_contributes_both_points() {
+    // Control for GH#1759: a `MoveTo` that begins a real subpath is
+    // painted and must keep contributing its point. ~keep
+    let mut extractor = PathExtractor::new();
+    extractor.move_to(10.0, 20.0);
+    extractor.line_to(110.0, 120.0);
+    extractor.stroke();
+
+    let paths = extractor.finish();
+    assert_eq!(paths.len(), 1);
+
+    let bbox = &paths[0].bbox;
+    assert_eq!(bbox.x, 10.0);
+    assert_eq!(bbox.y, 20.0);
+    assert_eq!(bbox.width, 100.0);
+    assert_eq!(bbox.height, 100.0);
+}

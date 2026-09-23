@@ -36,6 +36,7 @@ mod table;
 mod text;
 
 pub use image::{ColorSpace, ImageContent, ImageFormat};
+pub(crate) use path::path_operations_bbox;
 pub use path::{LineCap, LineJoin, PathContent, PathOperation};
 pub use table::{
     TableCellAlign, TableCellContent, TableCellVAlign, TableContent, TableContentStyle, TableDetectionInfo,

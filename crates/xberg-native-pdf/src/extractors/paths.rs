@@ -39,8 +39,8 @@
 //! ```
 
 use crate::content::graphics_state::{GraphicsState, Matrix};
-use crate::elements::{LineCap, LineJoin, PathContent, PathOperation};
-use crate::geometry::{Point, Rect};
+use crate::elements::{LineCap, LineJoin, PathContent, PathOperation, path_operations_bbox};
+use crate::geometry::Point;
 use crate::layout::Color;
 
 /// Copy-only graphics state for path extraction (no String/Vec fields).
@@ -596,7 +596,7 @@ impl PathExtractor {
             return;
         }
 
-        let bbox = Self::compute_bbox(&self.current_operations);
+        let bbox = path_operations_bbox(&self.current_operations);
 
         let mut path = PathContent::new(bbox);
         path.operations = std::mem::take(&mut self.current_operations);
@@ -630,46 +630,6 @@ impl PathExtractor {
 
         self.current_point = None;
         self.subpath_start = None;
-    }
-
-    /// Compute bounding box from path operations.
-    fn compute_bbox(operations: &[PathOperation]) -> Rect {
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-
-        for op in operations {
-            match op {
-                PathOperation::MoveTo(x, y) | PathOperation::LineTo(x, y) => {
-                    min_x = min_x.min(*x);
-                    min_y = min_y.min(*y);
-                    max_x = max_x.max(*x);
-                    max_y = max_y.max(*y);
-                }
-                PathOperation::CurveTo(x1, y1, x2, y2, x3, y3) => {
-                    for (x, y) in [(*x1, *y1), (*x2, *y2), (*x3, *y3)] {
-                        min_x = min_x.min(x);
-                        min_y = min_y.min(y);
-                        max_x = max_x.max(x);
-                        max_y = max_y.max(y);
-                    }
-                }
-                PathOperation::Rectangle(x, y, w, h) => {
-                    min_x = min_x.min(*x);
-                    min_y = min_y.min(*y);
-                    max_x = max_x.max(*x + *w);
-                    max_y = max_y.max(*y + *h);
-                }
-                PathOperation::ClosePath => {}
-            }
-        }
-
-        if min_x == f32::MAX {
-            Rect::new(0.0, 0.0, 0.0, 0.0)
-        } else {
-            Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
-        }
     }
 
     /// Finish extraction and return all extracted paths.
