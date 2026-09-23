@@ -582,6 +582,144 @@ mod tests {
         assert!((0.0..=1.0).contains(&score), "score {score} escaped [0,1]");
     }
 
+    /// Every distinct score `score_page` can return, over the whole signal matrix.
+    ///
+    /// The score is a sum of four independent weights, so the reachable set is small and
+    /// fixed, and the gap between `0.65` and `0.85` is what gives
+    /// [`DEFAULT_SCANNED_MIN_CONFIDENCE`] its meaning: any threshold in `(0.65, 0.85]`
+    /// selects exactly the same pages as `0.70` does, so moving it within that interval is
+    /// a no-op dressed as a behaviour change. Pinned so that stays visible to whoever
+    /// proposes the move. ~keep
+    /// Every `(codec, producer_prior)` score for one `(image_coverage, glyph_count,
+    /// invisible_text_ratio)` combination, for [`score_page_reaches_exactly_the_documented_set_of_scores`].
+    fn scores_over_codec_and_producer(image_coverage: f32, glyph_count: usize, invisible_text_ratio: f32) -> Vec<f32> {
+        let codecs = [
+            ImageCodecClass::Dct,
+            ImageCodecClass::Other,
+            ImageCodecClass::Ccitt,
+            ImageCodecClass::Jbig2,
+        ];
+        let producers = [ProducerPrior::Unknown, ProducerPrior::Authoring, ProducerPrior::Scanner];
+        codecs
+            .into_iter()
+            .flat_map(|codec| {
+                producers.into_iter().map(move |producer_prior| {
+                    score_page(&PageScanSignals {
+                        image_coverage,
+                        invisible_text_ratio,
+                        glyph_count,
+                        codec,
+                        producer_prior,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn score_page_reaches_exactly_the_documented_set_of_scores() {
+        let mut reachable: Vec<f32> = Vec::new();
+        for image_coverage in [0.0, IMAGE_COVERAGE_MIN - 0.01, IMAGE_COVERAGE_MIN, 1.0] {
+            for (glyph_count, invisible_text_ratio) in [(0, 0.0), (250, 0.0), (250, INVISIBLE_TEXT_MIN), (250, 1.0)] {
+                for score in scores_over_codec_and_producer(image_coverage, glyph_count, invisible_text_ratio) {
+                    if !reachable.iter().any(|seen| (seen - score).abs() < 1e-5) {
+                        reachable.push(score);
+                    }
+                }
+            }
+        }
+        reachable.sort_by(|left, right| left.partial_cmp(right).expect("scores are finite"));
+
+        let expected = [0.0, 0.50, 0.55, 0.60, 0.65, 0.85, 0.90, 0.95, 1.00];
+        assert_eq!(
+            reachable.len(),
+            expected.len(),
+            "reachable score set changed: got {reachable:?}, expected {expected:?}"
+        );
+        for (actual, expected) in reachable.iter().zip(expected) {
+            assert_score(*actual, expected);
+        }
+    }
+
+    /// `0.65` -- the ceiling a full-page raster with a visible text layer is said to hit --
+    /// needs a bilevel codec *and* a scanner producer *and* visible text simultaneously.
+    ///
+    /// Drop any one of the three and the page scores at most `0.60`. That conjunction is
+    /// why the value is unreached in practice: a CCITT/JBIG2 page written by scanner
+    /// software does not also carry *visible* native glyphs -- if it carries a text layer at
+    /// all it is an invisible OCR sidecar, which takes [`SCORE_NO_VISIBLE_TEXT`] and lands
+    /// at `0.85` or above instead. Measured over the 12,526-page PDF corpus, no page scored
+    /// `0.55`, `0.60` or `0.65`; all 30 pages of the full-page-raster-with-visible-text
+    /// class scored exactly [`SCORE_FULL_PAGE_RASTER`] (issue #1752). ~keep
+    #[test]
+    fn a_score_of_0_65_requires_bilevel_codec_and_scanner_producer_and_visible_text_at_once() {
+        let all_three = PageScanSignals {
+            image_coverage: 1.0,
+            invisible_text_ratio: 0.0,
+            glyph_count: 250,
+            codec: ImageCodecClass::Ccitt,
+            producer_prior: ProducerPrior::Scanner,
+        };
+        assert_score(score_page(&all_three), 0.65);
+
+        assert_score(
+            score_page(&PageScanSignals {
+                codec: ImageCodecClass::Dct,
+                ..all_three
+            }),
+            0.55,
+        );
+        assert_score(
+            score_page(&PageScanSignals {
+                producer_prior: ProducerPrior::Authoring,
+                ..all_three
+            }),
+            0.60,
+        );
+        // Hiding the text layer takes the larger `SCORE_NO_VISIBLE_TEXT` instead, which is
+        // why the sidecar case never sits in the 0.50..=0.65 band at all. ~keep
+        assert_score(
+            score_page(&PageScanSignals {
+                invisible_text_ratio: 1.0,
+                ..all_three
+            }),
+            1.0,
+        );
+    }
+
+    /// The shape the corpus actually produces: a born-digital page whose figure covers the
+    /// sheet, carrying a small but *visible* text layer -- a caption, a heading, a running
+    /// footer. Every such page scores [`SCORE_FULL_PAGE_RASTER`] regardless of how little
+    /// text it carries, because nothing in the matrix reads "few visible glyphs".
+    ///
+    /// The three smallest in the corpus were a 4-glyph section heading over two screenshots,
+    /// a 27-glyph figure caption, and a 47-glyph newspaper footer over a full-page
+    /// advertisement; the counts run from there to 2698 with no gap to cut at (issue #1752).
+    /// ~keep
+    #[test]
+    fn a_full_bleed_page_scores_the_same_however_little_visible_text_it_carries() {
+        let scores: Vec<f32> = [4, 27, 47, 133, 687, 2698]
+            .into_iter()
+            .map(|glyph_count| {
+                score_page(&PageScanSignals {
+                    image_coverage: 1.0,
+                    invisible_text_ratio: 0.0,
+                    glyph_count,
+                    codec: ImageCodecClass::Dct,
+                    producer_prior: ProducerPrior::Authoring,
+                })
+            })
+            .collect();
+
+        for score in &scores {
+            assert_score(*score, SCORE_FULL_PAGE_RASTER);
+            assert!(
+                f64::from(*score) < DEFAULT_SCANNED_MIN_CONFIDENCE,
+                "a full-bleed page scored {score}, at or above the default threshold"
+            );
+        }
+    }
+
     #[test]
     fn scanned_page_indices_selects_only_pages_at_or_above_the_threshold() {
         let detection = ScanDetection {
