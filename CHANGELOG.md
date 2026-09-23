@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **(pdf): Merged cells and zebra-striped rows stay in their ruled table.** The GH#1601 check that keeps a phantom cell out of the empty gap between two grids required a drawn rule on both sides of every cell, so a cell with an edge that has no line of its own in that row was dropped and its text spilled into paragraphs after the table: horizontally merged cells and full-width section rows, whose inner column rules stop at the row, and the unshaded rows of an alternately shaded table, whose outer edges exist only as the shaded neighbours' fill sides. A cell now also forms when its band between its own top and bottom rules belongs to a grid: a drawn rule crosses the band strictly inside those rules' ends, or drawn rules close both ends. The GH#1601 gap has neither, and a rule at one end only (an enclosing table's column rule) or beyond them (a page frame) still does not count. (GH#1765)
+
 ## [1.2.8] - 2026-09-23
 
 ### Fixed

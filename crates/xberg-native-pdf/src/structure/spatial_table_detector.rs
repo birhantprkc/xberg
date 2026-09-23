@@ -2355,7 +2355,7 @@ const CELL_RULE_SPAN_TOL: f32 = 6.0;
 /// Build cells from intersection points.
 /// A cell exists when all four corners (x1,y1), (x2,y1), (x1,y2), (x2,y2) are present
 /// and there is no intermediate intersection between them on either axis.
-fn build_cells_from_intersections(pts: &[Intersection], v_edges: &[Edge]) -> Vec<IntersectionCell> {
+fn build_cells_from_intersections(pts: &[Intersection], h_edges: &[Edge], v_edges: &[Edge]) -> Vec<IntersectionCell> {
     use std::collections::BTreeSet;
 
     let mut xs: Vec<f32> = pts.iter().map(|p| p.x).collect();
@@ -2379,25 +2379,42 @@ fn build_cells_from_intersections(pts: &[Intersection], v_edges: &[Edge]) -> Vec
 
     let has = |xi: usize, yi: usize| -> bool { present.contains(&(yi * nx + xi)) };
 
-    // A candidate cell's LEFT and RIGHT sides must each be a drawn V edge that
-    // actually spans the cell's Y-range, not merely two independently-existing
-    // crossing points at its top and bottom. Without this, two unrelated ruled
-    // grids that happen to share column X-positions (a common shape: the same
-    // field layout repeated after a section heading) produce a phantom cell
-    // bridging any graphics-free gap between them — wide enough to swallow
-    // whatever text sits in the gap (xberg-io/xberg#1601). This is the same
-    // "four corners are not four sides" containment principle
-    // `band_column_groups`/`BAND_RULE_SPAN_TOL` already applies on the X axis
-    // (xberg-io/xberg#1580) — applied here on the Y axis at cell-construction
-    // time, before a phantom cell can ever reach that later check, but with its
-    // OWN tolerance (`CELL_RULE_SPAN_TOL`, see its doc comment for why the two
-    // axes cannot share a constant). ~keep
+    // Four corners are not four sides. Two unrelated ruled grids that share column X-positions
+    // (the same field layout repeated after a section heading) put crossing points at all four
+    // corners of the graphics-free gap between them, and a cell there swallows whatever text
+    // sits in the gap (xberg-io/xberg#1601). So a cell forms only when each side is a drawn V
+    // edge spanning its Y-range, or when the band between the cell's own top and bottom H rules
+    // is part of a grid: a drawn rule crosses it strictly inside those rules' ends, or drawn
+    // rules close both ends. That keeps rows whose sides are not drawn in that row: merged cells
+    // and full-width section rows, and a zebra-shaded table's unshaded rows, where the only edges
+    // at the outer x are the shaded neighbours' fill sides. A rule at one end only (an enclosing
+    // table's column rule) or past them (a page frame) runs alongside a gap without closing it.
+    // `band_column_groups` (xberg-io/xberg#1580) then merges any boundary no rule divides.
+    // `CELL_RULE_SPAN_TOL`'s doc comment says why this axis does not share
+    // `BAND_RULE_SPAN_TOL`. ~keep
+    let spans_band = |edge: &Edge, y_lo: f32, y_hi: f32| -> bool {
+        edge.start <= y_lo + CELL_RULE_SPAN_TOL && edge.end >= y_hi - CELL_RULE_SPAN_TOL
+    };
     let v_edge_spans = |x: f32, y_lo: f32, y_hi: f32| -> bool {
-        v_edges.iter().any(|edge| {
-            (edge.coord - x).abs() <= SNAP_TOL
-                && edge.start <= y_lo + CELL_RULE_SPAN_TOL
-                && edge.end >= y_hi - CELL_RULE_SPAN_TOL
-        })
+        v_edges
+            .iter()
+            .any(|edge| (edge.coord - x).abs() <= SNAP_TOL && spans_band(edge, y_lo, y_hi))
+    };
+
+    let h_edge_across = |y: f32, x1: f32, x2: f32| -> Option<&Edge> {
+        h_edges
+            .iter()
+            .find(|edge| (edge.coord - y).abs() <= SNAP_TOL && edge.start <= x1 + SNAP_TOL && edge.end >= x2 - SNAP_TOL)
+    };
+    let band_is_ruled = |x1: f32, x2: f32, y_lo: f32, y_hi: f32| -> bool {
+        let (Some(top), Some(bottom)) = (h_edge_across(y_lo, x1, x2), h_edge_across(y_hi, x1, x2)) else {
+            return false;
+        };
+        let (from, to) = (top.start.max(bottom.start), top.end.min(bottom.end));
+        (v_edge_spans(from, y_lo, y_hi) && v_edge_spans(to, y_lo, y_hi))
+            || v_edges
+                .iter()
+                .any(|edge| edge.coord > from + SNAP_TOL && edge.coord < to - SNAP_TOL && spans_band(edge, y_lo, y_hi))
     };
 
     let mut cells = Vec::new();
@@ -2406,12 +2423,17 @@ fn build_cells_from_intersections(pts: &[Intersection], v_edges: &[Edge]) -> Vec
             if !has(xi, yi) {
                 continue;
             }
-            let next_xi = ((xi + 1)..nx).find(|&nxi| has(nxi, yi));
-            let next_yi = ((yi + 1)..ny).find(|&nyi| has(xi, nyi) && v_edge_spans(xs[xi], ys[yi], ys[nyi]));
+            let Some(nxi) = ((xi + 1)..nx).find(|&nxi| has(nxi, yi)) else {
+                continue;
+            };
+            let side_closes = |x: f32, nyi: usize| -> bool {
+                v_edge_spans(x, ys[yi], ys[nyi]) || band_is_ruled(xs[xi], xs[nxi], ys[yi], ys[nyi])
+            };
+            let next_yi = ((yi + 1)..ny).find(|&nyi| has(xi, nyi) && side_closes(xs[xi], nyi));
 
-            if let (Some(nxi), Some(nyi)) = (next_xi, next_yi)
+            if let Some(nyi) = next_yi
                 && has(nxi, nyi)
-                && v_edge_spans(xs[nxi], ys[yi], ys[nyi])
+                && side_closes(xs[nxi], nyi)
             {
                 cells.push(IntersectionCell {
                     x1: xs[xi],
@@ -2940,7 +2962,7 @@ fn build_grid_from_lines(
     // (xberg-io/xberg#1580) — an extended grid has no V edge that ever spans any band, so
     // merging there would collapse every row to one cell instead of narrowing a phantom cut.
     let (cells, cells_are_intersections) = if intersections.len() >= 4 {
-        let c = build_cells_from_intersections(&intersections, &v_edges);
+        let c = build_cells_from_intersections(&intersections, &h_edges, &v_edges);
         if c.is_empty() {
             // Lines exist but don't form real intersection cells — try extended grid. ~keep
             (build_extended_grid_cells(&h_edges, &v_edges), false)
@@ -5756,7 +5778,7 @@ mod tests {
                 end: 100.0,
             },
         ];
-        let cells = build_cells_from_intersections(&pts, &v_edges);
+        let cells = build_cells_from_intersections(&pts, &[], &v_edges);
         assert_eq!(cells.len(), 1, "4 corners should produce 1 cell");
     }
 
@@ -5959,7 +5981,7 @@ mod tests {
                 end: 17.0,
             },
         ];
-        let cells = build_cells_from_intersections(&pts, &v_edges);
+        let cells = build_cells_from_intersections(&pts, &[], &v_edges);
         assert_eq!(
             cells.len(),
             1,
@@ -6006,11 +6028,127 @@ mod tests {
                 end: 40.0,
             },
         ];
-        let cells = build_cells_from_intersections(&pts, &v_edges);
+        let cells = build_cells_from_intersections(&pts, &[], &v_edges);
         assert!(
             cells.is_empty(),
             "a 40pt graphics-free gap must still be rejected under the looser CELL_RULE_SPAN_TOL, got: {cells:?}"
         );
+    }
+
+    /// Zebra shading: fill-only rectangles on rows 0, 2 and 4 plus two full-height rules between
+    /// column groups. Rows 1 and 3 have no side edge at the table's outer x (only the shaded
+    /// neighbours' fill sides reach it), but the rules run through them, so they are rows of the
+    /// grid and must keep their outer cells.
+    #[test]
+    fn zebra_unshaded_rows_keep_their_outer_cells() {
+        let mut lines: Vec<crate::elements::PathContent> = [0.0, 40.0, 80.0]
+            .into_iter()
+            .map(|y| make_rect_path(10.0, y, 150.0, 20.0))
+            .collect();
+        lines.push(make_v_line(60.0, 0.0, 100.0));
+        lines.push(make_v_line(110.0, 0.0, 100.0));
+        let mut spans = Vec::new();
+        for row in 0..5 {
+            let y = 85.0 - row as f32 * 20.0;
+            spans.push(create_test_span(&format!("L{row}"), 12.0, y, 8.0, 10.0));
+            spans.push(create_test_span(&format!("M{row}"), 70.0, y, 8.0, 10.0));
+            spans.push(create_test_span(&format!("R{row}"), 120.0, y, 8.0, 10.0));
+        }
+        let config = TableDetectionConfig {
+            horizontal_strategy: TableStrategy::Lines,
+            vertical_strategy: TableStrategy::Lines,
+            min_table_cells: 2,
+            min_table_columns: 2,
+            ..TableDetectionConfig::default()
+        };
+
+        let tables = detect_tables_from_intersections(&spans, &lines, &config);
+
+        assert_eq!(tables.len(), 1, "got: {tables:?}");
+        let texts: Vec<Vec<&str>> = tables[0]
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.text.trim()).collect())
+            .collect();
+        for row in 0..5 {
+            let want = [format!("L{row}"), format!("M{row}"), format!("R{row}")];
+            assert!(
+                texts.iter().any(|cells| cells == &want),
+                "row {row} must keep all three cells, got: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_with_undrawn_sides_forms_when_a_rule_runs_through_its_band() {
+        let edge = |coord, start, end| Edge { coord, start, end };
+        let pts = vec![
+            Intersection { x: 0.0, y: 0.0 },
+            Intersection { x: 50.0, y: 0.0 },
+            Intersection { x: 100.0, y: 0.0 },
+            Intersection { x: 0.0, y: 20.0 },
+            Intersection { x: 50.0, y: 20.0 },
+            Intersection { x: 100.0, y: 20.0 },
+        ];
+        let h_edges = [edge(0.0, 0.0, 100.0), edge(20.0, 0.0, 100.0)];
+        // The outer sides only reach the band's corners from the rows above and below. ~keep
+        let v_edges = [
+            edge(0.0, -20.0, 0.0),
+            edge(0.0, 20.0, 40.0),
+            edge(100.0, -20.0, 0.0),
+            edge(100.0, 20.0, 40.0),
+            edge(50.0, -20.0, 40.0),
+        ];
+        let cells = build_cells_from_intersections(&pts, &h_edges, &v_edges);
+        assert_eq!(cells.len(), 2, "got: {cells:?}");
+    }
+
+    /// A full-width section row: the inner column rule stops at the row, and only the row's own
+    /// outer rules span it.
+    #[test]
+    fn cell_with_an_undrawn_side_forms_when_rules_close_both_ends_of_its_band() {
+        let edge = |coord, start, end| Edge { coord, start, end };
+        let pts = vec![
+            Intersection { x: 0.0, y: 0.0 },
+            Intersection { x: 50.0, y: 0.0 },
+            Intersection { x: 100.0, y: 0.0 },
+            Intersection { x: 0.0, y: 20.0 },
+            Intersection { x: 50.0, y: 20.0 },
+            Intersection { x: 100.0, y: 20.0 },
+        ];
+        let h_edges = [edge(0.0, 0.0, 100.0), edge(20.0, 0.0, 100.0)];
+        let v_edges = [
+            edge(0.0, -20.0, 40.0),
+            edge(100.0, -20.0, 40.0),
+            edge(50.0, -20.0, 0.0),
+            edge(50.0, 20.0, 40.0),
+        ];
+        let cells = build_cells_from_intersections(&pts, &h_edges, &v_edges);
+        assert_eq!(cells.len(), 2, "got: {cells:?}");
+    }
+
+    #[test]
+    fn cell_with_undrawn_sides_ignores_a_rule_at_or_past_the_ends_of_its_h_rules() {
+        let edge = |coord, start, end| Edge { coord, start, end };
+        let pts = vec![
+            Intersection { x: 0.0, y: 0.0 },
+            Intersection { x: 100.0, y: 0.0 },
+            Intersection { x: 0.0, y: 40.0 },
+            Intersection { x: 100.0, y: 40.0 },
+        ];
+        let h_edges = [edge(0.0, 0.0, 100.0), edge(40.0, 0.0, 100.0)];
+        // Both rules span the gap without crossing it: an enclosing table's column rule 2.5pt
+        // outside the H rules' left end (within SNAP_TOL), and a page frame at x=150. ~keep
+        let v_edges = [
+            edge(0.0, -20.0, 0.0),
+            edge(0.0, 40.0, 60.0),
+            edge(100.0, -20.0, 0.0),
+            edge(100.0, 40.0, 60.0),
+            edge(-2.5, -100.0, 200.0),
+            edge(150.0, -100.0, 200.0),
+        ];
+        let cells = build_cells_from_intersections(&pts, &h_edges, &v_edges);
+        assert!(cells.is_empty(), "got: {cells:?}");
     }
 
     #[test]
@@ -6052,7 +6190,7 @@ mod tests {
                 end: 100.0,
             },
         ];
-        let cells = build_cells_from_intersections(&pts, &v_edges);
+        let cells = build_cells_from_intersections(&pts, &[], &v_edges);
         assert_eq!(cells.len(), 4, "3x3 grid should produce 4 cells");
         let groups = group_cells_into_tables(&cells);
         assert_eq!(groups.len(), 1, "All 4 cells should form 1 table");
