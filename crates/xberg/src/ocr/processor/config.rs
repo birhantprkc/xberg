@@ -450,8 +450,41 @@ mod tests {
         let baseline = create_test_config();
         let baseline_hash = hash_config(&baseline);
 
-        #[allow(clippy::type_complexity)]
-        let flips: Vec<(&str, Box<dyn Fn(&mut TesseractConfig)>)> = vec![
+        let flips = cache_key_flip_cases();
+
+        for (name, flip) in &flips {
+            let mut mutated = baseline.clone();
+            flip(&mut mutated);
+            assert_ne!(
+                hash_config(&mutated),
+                baseline_hash,
+                "changing the config field behind the `{name}` engine variable must change the \
+                 OCR cache key, or a run with a different value is served the previous result"
+            );
+        }
+
+        let names: Vec<&str> = tesseract_variable_set(&baseline)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for (name, _) in &flips {
+            assert!(
+                names.contains(name),
+                "`{name}` is hashed but no longer applied to the engine, so the two have drifted"
+            );
+        }
+        assert!(
+            names.contains(&"hocr_font_info"),
+            "hocr_font_info must stay in the shared variable set: it is applied unconditionally, \
+             so the set is the only thing that can carry it into the cache key (#687)"
+        );
+    }
+
+    /// One `(engine variable name, config-field mutation)` pair per config field that backs
+    /// a variable `apply_tesseract_variables` sets on the engine.
+    #[allow(clippy::type_complexity)]
+    fn cache_key_flip_cases() -> Vec<(&'static str, Box<dyn Fn(&mut TesseractConfig)>)> {
+        vec![
             (
                 "classify_use_pre_adapted_templates",
                 Box::new(|c: &mut TesseractConfig| {
@@ -500,34 +533,7 @@ mod tests {
                 "thresholding_method",
                 Box::new(|c: &mut TesseractConfig| c.thresholding_method = !c.thresholding_method),
             ),
-        ];
-
-        for (name, flip) in &flips {
-            let mut mutated = baseline.clone();
-            flip(&mut mutated);
-            assert_ne!(
-                hash_config(&mutated),
-                baseline_hash,
-                "changing the config field behind the `{name}` engine variable must change the \
-                 OCR cache key, or a run with a different value is served the previous result"
-            );
-        }
-
-        let names: Vec<&str> = tesseract_variable_set(&baseline)
-            .iter()
-            .map(|(name, _)| *name)
-            .collect();
-        for (name, _) in &flips {
-            assert!(
-                names.contains(name),
-                "`{name}` is hashed but no longer applied to the engine, so the two have drifted"
-            );
-        }
-        assert!(
-            names.contains(&"hocr_font_info"),
-            "hocr_font_info must stay in the shared variable set: it is applied unconditionally, \
-             so the set is the only thing that can carry it into the cache key (#687)"
-        );
+        ]
     }
 
     /// `tesseract_variable_set` must be deterministic and sorted by name, so the

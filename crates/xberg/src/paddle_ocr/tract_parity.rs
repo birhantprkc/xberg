@@ -49,7 +49,7 @@ use xberg_paddle_ocr::crnn_net::CrnnNet;
 use xberg_paddle_ocr::db_net::DbNet;
 use xberg_paddle_ocr::ocr_utils::OcrUtils;
 use xberg_paddle_ocr::scale_param::ScaleParam;
-use xberg_paddle_ocr::{InferenceBackend, PaddleOcrEngine, TextBox};
+use xberg_paddle_ocr::{Angle, InferenceBackend, PaddleOcrEngine, TextBox};
 
 use crate::inference::tract_backend::{PARITY_REPO, parity_required, resolve_model};
 use crate::paddle_ocr::model_manager::HF_REPO_REVISION;
@@ -402,6 +402,36 @@ fn should_decode_identical_text_on_both_engines_for_every_generation() {
     );
 }
 
+/// Compare one page's per-crop orientation predictions: every crop must carry an angle, the
+/// predicted class index must match exactly, and only the softmax confidence may drift.
+fn assert_orientation_angles_agree(scope: &str, crop_count: usize, ort_angles: &[Angle], tract_angles: &[Angle]) {
+    assert_eq!(
+        ort_angles.len(),
+        crop_count,
+        "{scope}: classification must return one angle per crop"
+    );
+    assert_eq!(
+        tract_angles.len(),
+        ort_angles.len(),
+        "{scope}: engines returned different angle counts"
+    );
+
+    for (index, (ort_angle, tract_angle)) in ort_angles.iter().zip(tract_angles).enumerate() {
+        assert_eq!(
+            ort_angle.index, tract_angle.index,
+            "{scope}: crop {index} predicted orientation class diverged (ORT {} vs tract {})",
+            ort_angle.index, tract_angle.index
+        );
+        let score_delta = (ort_angle.score - tract_angle.score).abs();
+        assert!(
+            score_delta < CONFIDENCE_TOLERANCE,
+            "{scope}: crop {index} orientation confidence diverged by {score_delta} (ORT {} vs tract {})",
+            ort_angle.score,
+            tract_angle.score
+        );
+    }
+}
+
 /// The text-line orientation classifier is a fixed-shape PP-LCNet loaded unpinned on both
 /// engines: the predicted class must match exactly, and only the softmax confidence is allowed
 /// to drift within float tolerance.
@@ -455,31 +485,7 @@ fn should_predict_the_same_textline_orientation_class_on_both_engines() {
             crops.len()
         );
 
-        assert_eq!(
-            ort_angles.len(),
-            crops.len(),
-            "{scope}: classification must return one angle per crop"
-        );
-        assert_eq!(
-            tract_angles.len(),
-            ort_angles.len(),
-            "{scope}: engines returned different angle counts"
-        );
-
-        for (index, (ort_angle, tract_angle)) in ort_angles.iter().zip(&tract_angles).enumerate() {
-            assert_eq!(
-                ort_angle.index, tract_angle.index,
-                "{scope}: crop {index} predicted orientation class diverged (ORT {} vs tract {})",
-                ort_angle.index, tract_angle.index
-            );
-            let score_delta = (ort_angle.score - tract_angle.score).abs();
-            assert!(
-                score_delta < CONFIDENCE_TOLERANCE,
-                "{scope}: crop {index} orientation confidence diverged by {score_delta} (ORT {} vs tract {})",
-                ort_angle.score,
-                tract_angle.score
-            );
-        }
+        assert_orientation_angles_agree(scope, crops.len(), &ort_angles, &tract_angles);
         compared += 1;
     }
 
