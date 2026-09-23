@@ -6359,7 +6359,12 @@ mod tests {
     /// call proves the second read did not happen, not just that the final numbers happen to
     /// agree. The expected page list is computed independently, on its own document handle,
     /// before the counter is reset, so computing it cannot mask a regression. ~keep
+    ///
+    /// `#[serial]` because the counter is process-global: `both_page_passes_match_a_page_by_page_run`
+    /// (`pdf/scan_detect.rs`) also drives `fabricated_provenance_page_indices` and increments it,
+    /// so running beside this test made the zero assertion below fail spuriously. ~keep
     #[test]
+    #[serial_test::serial]
     fn provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/non_ascii_text.pdf");
         let bytes = std::fs::read(&path).expect("corpus document must read");

@@ -391,7 +391,16 @@ mod tests {
     /// has already walked has every font and page object cached, so a concurrent read
     /// through it never races a cold load, which is the shape #1737 exists to make
     /// order-independent. ~keep
+    ///
+    /// `#[serial]` because this test calls `fabricated_provenance_page_indices`, which
+    /// increments the process-global `FABRICATED_PROVENANCE_SECOND_PASS_CALLS`. That counter
+    /// is what `provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers`
+    /// (`pdf/native/text.rs`) zeroes and then asserts is still zero, so the two running
+    /// concurrently made that assertion fail spuriously. Both carry the marker; `#[serial]`
+    /// excludes only other `#[serial]` tests, so a future test that reaches this function
+    /// needs the marker too. ~keep
     #[test]
+    #[serial_test::serial]
     fn both_page_passes_match_a_page_by_page_run() {
         let thresholds = crate::core::config::OcrQualityThresholds::default();
         let min_ratio = thresholds.min_provenance_fallback_ratio;
