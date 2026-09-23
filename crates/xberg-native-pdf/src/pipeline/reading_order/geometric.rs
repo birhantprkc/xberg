@@ -192,6 +192,54 @@ fn is_likely_columnar(spans: &[TextSpan]) -> bool {
     gutters >= 3
 }
 
+/// Split each column group by large Y-gaps into sub-groups.
+///
+/// When a column has spans far apart vertically (e.g., header at y=651
+/// and content at y=119), they should be separate groups. ~keep
+fn split_columns_at_y_gaps(spans: &[TextSpan], column_indices: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut sub_groups: Vec<Vec<usize>> = Vec::new();
+    for column in column_indices {
+        if column.is_empty() {
+            continue;
+        }
+        let mut sorted = column.clone();
+        sorted.sort_by(|&a, &b| crate::utils::safe_float_cmp(spans[b].bbox.y, spans[a].bbox.y));
+
+        if sorted.len() == 1 {
+            sub_groups.push(sorted);
+            continue;
+        }
+
+        let mut gaps: Vec<f32> = Vec::new();
+        for i in 1..sorted.len() {
+            let gap = spans[sorted[i - 1]].bbox.y - spans[sorted[i]].bbox.y;
+            if gap > 0.0 {
+                gaps.push(gap);
+            }
+        }
+
+        let threshold = if gaps.is_empty() {
+            spans[sorted[0]].font_size * 4.5
+        } else {
+            let avg = gaps.iter().sum::<f32>() / gaps.len() as f32;
+            avg * 3.0
+        };
+
+        let mut current_sub = vec![sorted[0]];
+        for i in 1..sorted.len() {
+            let gap = spans[sorted[i - 1]].bbox.y - spans[sorted[i]].bbox.y;
+            if gap > threshold {
+                sub_groups.push(current_sub);
+                current_sub = vec![sorted[i]];
+            } else {
+                current_sub.push(sorted[i]);
+            }
+        }
+        sub_groups.push(current_sub);
+    }
+    sub_groups
+}
+
 impl ReadingOrderStrategy for GeometricStrategy {
     fn apply(&self, spans: Vec<TextSpan>, _context: &ReadingOrderContext) -> Result<Vec<OrderedTextSpan>> {
         if spans.is_empty() {
@@ -227,49 +275,7 @@ impl ReadingOrderStrategy for GeometricStrategy {
             column_indices[column_idx].push(idx);
         }
 
-        // Split each column group by large Y-gaps into sub-groups.
-        // When a column has spans far apart vertically (e.g., header at y=651
-        // and content at y=119), they should be separate groups. ~keep
-        let mut sub_groups: Vec<Vec<usize>> = Vec::new();
-        for column in &column_indices {
-            if column.is_empty() {
-                continue;
-            }
-            let mut sorted = column.clone();
-            sorted.sort_by(|&a, &b| crate::utils::safe_float_cmp(spans[b].bbox.y, spans[a].bbox.y));
-
-            if sorted.len() == 1 {
-                sub_groups.push(sorted);
-                continue;
-            }
-
-            let mut gaps: Vec<f32> = Vec::new();
-            for i in 1..sorted.len() {
-                let gap = spans[sorted[i - 1]].bbox.y - spans[sorted[i]].bbox.y;
-                if gap > 0.0 {
-                    gaps.push(gap);
-                }
-            }
-
-            let threshold = if gaps.is_empty() {
-                spans[sorted[0]].font_size * 4.5
-            } else {
-                let avg = gaps.iter().sum::<f32>() / gaps.len() as f32;
-                avg * 3.0
-            };
-
-            let mut current_sub = vec![sorted[0]];
-            for i in 1..sorted.len() {
-                let gap = spans[sorted[i - 1]].bbox.y - spans[sorted[i]].bbox.y;
-                if gap > threshold {
-                    sub_groups.push(current_sub);
-                    current_sub = vec![sorted[i]];
-                } else {
-                    current_sub.push(sorted[i]);
-                }
-            }
-            sub_groups.push(current_sub);
-        }
+        let sub_groups = split_columns_at_y_gaps(&spans, &column_indices);
 
         let mut ordered = Vec::new();
         let mut order = 0;
