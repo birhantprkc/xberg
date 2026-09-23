@@ -283,11 +283,14 @@ impl PdfDocument {
     }
 
     /// Recursively count pages in the page tree
-    pub(super) fn count_pages_recursive(&self, node_ref: ObjectRef, depth: usize) -> Result<usize> {
-        const MAX_DEPTH: usize = 50;
-        if depth > MAX_DEPTH {
-            tracing::warn!(target: LOG_TARGET, "Page tree depth exceeded {} levels, stopping", MAX_DEPTH);
-            return Ok(0);
+    pub(super) fn count_pages_recursive(&self, node_ref: ObjectRef, depth: u32) -> Result<usize> {
+        if depth >= MAX_PAGE_TREE_DEPTH {
+            tracing::warn!(target: LOG_TARGET,
+                object_id = node_ref.id,
+                max_depth = MAX_PAGE_TREE_DEPTH,
+                "page tree depth limit exceeded while counting pages"
+            );
+            return Err(Error::RecursionLimitExceeded(MAX_PAGE_TREE_DEPTH));
         }
 
         let node = match self.load_object(node_ref) {
@@ -493,7 +496,7 @@ impl PdfDocument {
 
         let mut page_index = 0usize;
         let mut inherited = HashMap::new();
-        self.collect_all_pages(pages_ref, &mut page_index, &mut inherited, &mut HashSet::new())?;
+        self.collect_all_pages(pages_ref, &mut page_index, &mut inherited, &mut HashSet::new(), 0)?;
         tracing::debug!(target: LOG_TARGET, "Populated page cache with {} pages", page_index);
         Ok(())
     }
@@ -572,7 +575,16 @@ impl PdfDocument {
         page_index: &mut usize,
         inherited: &mut HashMap<String, Object>,
         visited: &mut HashSet<ObjectRef>,
+        depth: u32,
     ) -> Result<()> {
+        if depth >= MAX_PAGE_TREE_DEPTH {
+            tracing::warn!(target: LOG_TARGET,
+                object_id = node_ref.id,
+                max_depth = MAX_PAGE_TREE_DEPTH,
+                "page tree depth limit exceeded while collecting pages"
+            );
+            return Err(Error::RecursionLimitExceeded(MAX_PAGE_TREE_DEPTH));
+        }
         if !visited.insert(node_ref) {
             return Err(Error::CircularReference(node_ref));
         }
@@ -630,7 +642,8 @@ impl PdfDocument {
                 if let Some(kids) = node_dict.get("Kids").and_then(|obj| obj.as_array()) {
                     for kid in kids {
                         if let Some(kid_ref) = kid.as_reference()
-                            && let Err(error) = self.collect_all_pages(kid_ref, page_index, inherited, visited)
+                            && let Err(error) =
+                                self.collect_all_pages(kid_ref, page_index, inherited, visited, depth + 1)
                         {
                             tracing::warn!(target: LOG_TARGET,
                                 error_code = error.telemetry_code(),
@@ -785,7 +798,7 @@ impl PdfDocument {
         current_index: &mut usize,
         inherited: &mut HashMap<String, Object>,
     ) -> Result<Object> {
-        self.get_page_from_tree_inner(node_ref, target_index, current_index, inherited, &mut HashSet::new())
+        self.get_page_from_tree_inner(node_ref, target_index, current_index, inherited, &mut HashSet::new(), 0)
     }
 
     fn get_page_from_tree_inner(
@@ -795,7 +808,16 @@ impl PdfDocument {
         current_index: &mut usize,
         inherited: &mut HashMap<String, Object>,
         visited: &mut HashSet<ObjectRef>,
+        depth: u32,
     ) -> Result<Object> {
+        if depth >= MAX_PAGE_TREE_DEPTH {
+            tracing::warn!(target: LOG_TARGET,
+                object_id = node_ref.id,
+                max_depth = MAX_PAGE_TREE_DEPTH,
+                "page tree depth limit exceeded while resolving a page"
+            );
+            return Err(Error::RecursionLimitExceeded(MAX_PAGE_TREE_DEPTH));
+        }
         if !visited.insert(node_ref) {
             return Err(Error::CircularReference(node_ref));
         }
@@ -905,7 +927,14 @@ impl PdfDocument {
                         .as_reference()
                         .ok_or_else(|| Error::InvalidPdf("Kid in /Kids array is not a reference".to_string()))?;
 
-                    match self.get_page_from_tree_inner(kid_ref, target_index, current_index, inherited, visited) {
+                    match self.get_page_from_tree_inner(
+                        kid_ref,
+                        target_index,
+                        current_index,
+                        inherited,
+                        visited,
+                        depth + 1,
+                    ) {
                         Ok(page) => return Ok(page),
                         Err(Error::CircularReference(obj_ref)) => {
                             tracing::warn!(target: LOG_TARGET, "Circular reference in page tree at object {}, skipping", obj_ref);
@@ -941,7 +970,7 @@ impl PdfDocument {
             .as_reference()
             .ok_or_else(|| Error::InvalidPdf("/Pages is not a reference".to_string()))?;
 
-        self.get_page_ref_recursive(pages_ref, page_index, &mut 0, &mut HashSet::new())
+        self.get_page_ref_recursive(pages_ref, page_index, &mut 0, &mut HashSet::new(), 0)
     }
 
     /// Recursively find page reference in the page tree.
@@ -951,7 +980,16 @@ impl PdfDocument {
         target_index: usize,
         current_index: &mut usize,
         visited: &mut HashSet<ObjectRef>,
+        depth: u32,
     ) -> Result<ObjectRef> {
+        if depth >= MAX_PAGE_TREE_DEPTH {
+            tracing::warn!(target: LOG_TARGET,
+                object_id = node_ref.id,
+                max_depth = MAX_PAGE_TREE_DEPTH,
+                "page tree depth limit exceeded while resolving a page reference"
+            );
+            return Err(Error::RecursionLimitExceeded(MAX_PAGE_TREE_DEPTH));
+        }
         if !visited.insert(node_ref) {
             return Err(Error::CircularReference(node_ref));
         }
@@ -993,7 +1031,7 @@ impl PdfDocument {
 
                 for kid_obj in kids {
                     if let Some(kid_ref) = kid_obj.as_reference() {
-                        match self.get_page_ref_recursive(kid_ref, target_index, current_index, visited) {
+                        match self.get_page_ref_recursive(kid_ref, target_index, current_index, visited, depth + 1) {
                             Ok(page_ref) => return Ok(page_ref),
                             Err(_) => continue,
                         }

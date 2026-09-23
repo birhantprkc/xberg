@@ -450,3 +450,65 @@ pub(super) fn donor_and_recipient_font_resources(doc: &PdfDocument) -> (ObjectRe
     let resources = Object::Dictionary(HashMap::from([("Font".to_string(), Object::Reference(font_dict_ref))]));
     (font_dict_ref, resources)
 }
+
+/// Build a PDF whose page tree is a chain of `levels` `/Pages` nodes, each with a
+/// single kid, ending in one `/Page`. The root node carries the inheritable
+/// `/MediaBox` and `/Resources`, so a walk that reaches the leaf can be told apart
+/// from one that recovered it by scanning: only the former merges those in.
+///
+/// No node carries `/Count`. That is what forces every walker to actually descend
+/// — `get_page_count_standard` bails without it, and `collect_page_refs` skips its
+/// flat-subtree fast path — which is the shape GH#1755 reports.
+pub(super) fn build_page_tree_chain_pdf(levels: usize) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<usize> = Vec::new();
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    for level in 0..levels {
+        let id = 2 + level;
+        offsets.push(pdf.len());
+        let inheritable = if level == 0 {
+            " /MediaBox [0 0 612 792] /Resources << >>"
+        } else {
+            ""
+        };
+        pdf.extend_from_slice(
+            format!(
+                "{} 0 obj\n<< /Type /Pages /Kids [{} 0 R]{} >>\nendobj\n",
+                id,
+                id + 1,
+                inheritable
+            )
+            .as_bytes(),
+        );
+    }
+
+    let page_id = 2 + levels;
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        format!(
+            "{} 0 obj\n<< /Type /Page /Parent {} 0 R >>\nendobj\n",
+            page_id,
+            page_id - 1
+        )
+        .as_bytes(),
+    );
+
+    let size = page_id + 1;
+    let xref_off = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", size).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        pdf.extend_from_slice(format!("{:010} 00000 n \n", off).as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            size, xref_off
+        )
+        .as_bytes(),
+    );
+    pdf
+}
