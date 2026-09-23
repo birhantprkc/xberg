@@ -178,7 +178,6 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          version: "0.12.5"
           python-version: "3.11"
       # Static check: every readme/docs path alef.toml points at (templates,
       # snippets_dir + snippet_language overrides, CLI/MCP doc sources, skills
@@ -374,7 +373,6 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          version: "0.12.5"
           python-version: "3.11"
       - name: Install E2E formatter
         run: uv sync --locked --only-group dev --no-install-workspace
