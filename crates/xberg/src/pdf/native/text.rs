@@ -1305,6 +1305,56 @@ fn lines_with_internal_gap_at(
         .count()
 }
 
+/// The lines of the one content band that carries the split's own inside-a-table-gap
+/// population, or `None` when no single band carries `MIN_DENSE_COLUMN_SPLIT_LINES` of
+/// them.
+///
+/// GH#1762: the corridor search `redirect_split_out_of_content` runs is page-wide, but
+/// the split it rescues is applied *per band*. `build_bands` already sets a full-width
+/// table apart -- every one of its rows straddles a split that sits inside a column
+/// below it, so every one is a boundary line -- and yet those same rows still close the
+/// gutter for the band beneath them, where nothing is written across it at all. On the
+/// reporter's page a five-row table at the top of the page left `page_whitespace_
+/// corridors` and `page_low_occupancy_corridors` both empty, so a split sitting between
+/// two columns of a four-column table lower down had nowhere to be moved to and stayed
+/// there; removing that table (their page 2) or moving its columns clear of the gutter
+/// (their page 3) makes the same page-wide search find the corridor at once.
+///
+/// The band is chosen by the population that made the split wrong in the first place:
+/// the lines with the split inside one of their own multi-column cell gaps
+/// (`line_has_internal_gap_at`, the GH#1742 signal). Requiring one band to carry
+/// `MIN_DENSE_COLUMN_SPLIT_LINES` of them applies the same bar the page-wide count
+/// applies, to the band rather than to the page, so a page whose evidence is spread
+/// thinly across several bands keeps the page-wide search it has always had. ~keep
+fn band_lines_around_table_gap_split(
+    spans: &[xberg_native_pdf::layout::TextSpan],
+    lines: &[SpanLine],
+    furniture_width: f32,
+    min_gutter: f32,
+    split_x: f32,
+) -> Option<Vec<SpanLine>> {
+    let mut bands: Vec<(usize, Vec<SpanLine>)> = vec![(0, Vec::new())];
+    for line in lines {
+        let (population, band) = bands.last_mut().expect("bands always holds the band being accumulated");
+        if line_is_boundary(spans, line, furniture_width, split_x) {
+            // A boundary line is emitted *between* the band above it and the band
+            // below it, so it is context for both: the caption over a table, the
+            // introductory line before it. Only a band separated from this one by such
+            // a line is out of scope. ~keep
+            band.push(line.clone());
+            bands.push((0, vec![line.clone()]));
+            continue;
+        }
+        *population += usize::from(line_has_internal_gap_at(spans, line, min_gutter, split_x));
+        band.push(line.clone());
+    }
+    bands
+        .into_iter()
+        .max_by_key(|&(population, _)| population)
+        .filter(|&(population, _)| population >= MIN_DENSE_COLUMN_SPLIT_LINES)
+        .map(|(_, band)| band)
+}
+
 /// Establish the page's gutter x-position from independent per-line evidence.
 ///
 /// Each line is checked in isolation for an internal gap at least
@@ -1437,6 +1487,12 @@ fn redirect_split_out_of_content(
     if !cuts_a_span && !split_inside_a_table_gap {
         return split_x;
     }
+    // GH#1762: ask the corridor question of the band the split is wrong in, not of the
+    // whole page -- a table in another band, already set apart by its own boundary
+    // lines, must not close this band's gutter. Falls back to the page when no single
+    // band carries the evidence. ~keep
+    let band = band_lines_around_table_gap_split(spans, lines, furniture_width, min_gutter, split_x);
+    let search_lines: &[SpanLine] = band.as_deref().unwrap_or(lines);
     let max_redirect_distance = page_width * MAX_REDIRECT_DISTANCE_FRACTION;
     let widest_within_reach = |corridors: Vec<(f32, f32)>| {
         corridors
@@ -1445,7 +1501,12 @@ fn redirect_split_out_of_content(
             .map(|(left, right)| (left + right) / 2.0)
             .filter(|candidate| (candidate - split_x).abs() <= max_redirect_distance)
     };
-    if let Some(candidate) = widest_within_reach(page_whitespace_corridors(spans, lines, furniture_width, min_gutter)) {
+    if let Some(candidate) = widest_within_reach(page_whitespace_corridors(
+        spans,
+        search_lines,
+        furniture_width,
+        min_gutter,
+    )) {
         return candidate;
     }
 
@@ -1464,11 +1525,17 @@ fn redirect_split_out_of_content(
         return split_x;
     }
     let max_label_width = page_width * MAX_DENSE_COLUMN_SPLIT_SNAP_SPAN_FRACTION;
-    let corridors = page_low_occupancy_corridors(spans, lines, furniture_width, min_gutter, MAX_GUTTER_CROSSING_LINES)
-        .into_iter()
-        .filter(|&corridor| !corridor_is_hanging_label_indent(spans, lines, max_label_width, corridor))
-        .filter(|&(left, right)| both_sides_are_columns(spans, lines, furniture_width, (left + right) / 2.0))
-        .collect();
+    let corridors = page_low_occupancy_corridors(
+        spans,
+        search_lines,
+        furniture_width,
+        min_gutter,
+        MAX_GUTTER_CROSSING_LINES,
+    )
+    .into_iter()
+    .filter(|&corridor| !corridor_is_hanging_label_indent(spans, search_lines, max_label_width, corridor))
+    .filter(|&(left, right)| both_sides_are_columns(spans, search_lines, furniture_width, (left + right) / 2.0))
+    .collect();
     widest_within_reach(corridors).unwrap_or(split_x)
 }
 
@@ -5521,6 +5588,314 @@ mod tests {
             .map(|span| (span.text.clone(), span.bbox.x, span.bbox.y))
             .collect();
         assert_eq!(after, original, "a declined repair must leave the page untouched");
+    }
+
+    const GH1762_PAGE_WIDTH: f32 = 595.28;
+    /// The page's real gutter: the left column's widest line ends at 288.16, the right
+    /// column starts at 307.0 -- the whitespace corridor pages 2 and 3 of the reporter's
+    /// own reproducer find, and redirect into, at 297.6.
+    const GH1762_GUTTER_CORRIDOR: (f32, f32) = (288.15894, 307.0);
+    /// The baseline of Table 2's last row: everything above this belongs to the
+    /// full-width table's own band.
+    const GH1762_TABLE_2_BOTTOM_Y: f32 = 644.15;
+
+    /// GH#1762, the reporter's reproducer page 1, transcribed from the attached PDF:
+    /// one `span_with_width` per span `PdfDocument::extract_spans` returns, x / y /
+    /// width / height / font size unmodified. The one edit is the left table's first
+    /// header cell, whose Latin the repository's spell check reads as a misspelled
+    /// English word; the replacement keeps the cell's advance width and its length.
+    ///
+    /// A full-width `Table 2` occupies the top of the page, its third column running
+    /// x 205..~390 straight across the page's gutter. Below it the page is two columns:
+    /// the left is `Table 3`, four columns (a description at x 44 and three numeric
+    /// columns at 190 / 228 / 262) on its own 8.05pt leading; the right is prose on the
+    /// body's 10.45pt leading, opening with `4.1. Lorem ipsum dolor sit amet`.
+    ///
+    /// Measured on this fixture before the fix, matching the issue's own trace:
+    /// `detect_split_x` returns 216.784 -- between Table 3's second and third numeric
+    /// columns, because the table's rows never share a line with the right column
+    /// (different leading) so every vote is one of the table's own cell gaps, and a
+    /// four-column row opens three internal gaps, one short of
+    /// `MIN_GRID_ROW_GAP_COUNT`. `redirect_split_out_of_content` then finds
+    /// `cuts_a_span`, 16 lines with the split inside their own cell gap, and *no*
+    /// corridor at all -- neither empty nor low-occupancy -- because every row of
+    /// Table 2 is written across the gutter. The split stays at 216.784 and the band
+    /// below Table 2 is reordered around it, welding the table's numbers to the right
+    /// column's prose.
+    fn gh1762_p1_real_reproducer_spans() -> Vec<TextSpan> {
+        #[rustfmt::skip]
+        let spans = vec![
+            span_with_width("Table 2", 38.00, 795.00, 23.34, 7.00, 7.00),
+            span_with_width("consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi", 38.00, 786.95, 499.92, 7.00, 7.00),
+            span_with_width("Comparatio", 44.00, 776.90, 36.18, 7.00, 7.00),
+            span_with_width("Numerus", 120.00, 776.90, 28.39, 7.00, 7.00),
+            span_with_width("Summa superior", 205.00, 776.90, 51.35, 7.00, 7.00),
+            span_with_width("Summa inferior", 400.00, 776.90, 47.45, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 768.85, 51.35, 7.00, 7.00),
+            span_with_width("80", 120.00, 768.85, 7.78, 7.00, 7.00),
+            span_with_width("lorem ipsum dolor sit amet consectetur adipiscing elit sed", 205.00, 768.85, 177.39, 7.00, 7.00),
+            span_with_width("lorem ipsum dolor sit amet", 400.00, 768.85, 82.07, 7.00, 7.00),
+            span_with_width("ipsum dolor sit amet consectetur adipiscing elit sed do", 205.00, 760.80, 167.68, 7.00, 7.00),
+            span_with_width("ipsum dolor sit amet consectetur", 400.00, 760.80, 100.76, 7.00, 7.00),
+            span_with_width("dolor sit amet consectetur adipiscing elit sed do eiusmod", 205.00, 752.75, 175.46, 7.00, 7.00),
+            span_with_width("dolor sit amet consectetur", 400.00, 752.75, 80.14, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 741.70, 51.35, 7.00, 7.00),
+            span_with_width("69", 120.00, 741.70, 7.78, 7.00, 7.00),
+            span_with_width("elit sed do eiusmod tempor incididunt ut labore et dolore", 205.00, 741.70, 173.91, 7.00, 7.00),
+            span_with_width("do eiusmod tempor incididunt ut", 400.00, 741.70, 99.21, 7.00, 7.00),
+            span_with_width("sed do eiusmod tempor incididunt ut labore et dolore", 205.00, 733.65, 163.02, 7.00, 7.00),
+            span_with_width("eiusmod tempor incididunt ut", 400.00, 733.65, 89.48, 7.00, 7.00),
+            span_with_width("do eiusmod tempor incididunt ut labore et dolore magna", 205.00, 725.60, 173.14, 7.00, 7.00),
+            span_with_width("tempor incididunt ut labore et", 400.00, 725.60, 90.26, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 714.55, 51.35, 7.00, 7.00),
+            span_with_width("58", 120.00, 714.55, 7.78, 7.00, 7.00),
+            span_with_width("labore et dolore magna aliqua enim ad minim veniam quis", 205.00, 714.55, 179.35, 7.00, 7.00),
+            span_with_width("aliqua enim ad minim veniam quis", 400.00, 714.55, 105.42, 7.00, 7.00),
+            span_with_width("et dolore magna aliqua enim ad minim veniam quis nostrud", 205.00, 706.50, 183.24, 7.00, 7.00),
+            span_with_width("enim ad minim veniam quis", 400.00, 706.50, 84.80, 7.00, 7.00),
+            span_with_width("dolore magna aliqua enim ad minim veniam quis nostrud", 205.00, 698.45, 175.45, 7.00, 7.00),
+            span_with_width("ad minim veniam quis nostrud", 400.00, 698.45, 92.97, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 687.40, 51.35, 7.00, 7.00),
+            span_with_width("47", 120.00, 687.40, 7.78, 7.00, 7.00),
+            span_with_width("minim veniam quis nostrud exercitation ullamco laboris nisi", 205.00, 687.40, 182.05, 7.00, 7.00),
+            span_with_width("laboris nisi aliquip ex ea commodo", 400.00, 687.40, 106.98, 7.00, 7.00),
+            span_with_width("veniam quis nostrud exercitation ullamco laboris nisi aliquip", 205.00, 679.35, 183.62, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo", 400.00, 679.35, 84.42, 7.00, 7.00),
+            span_with_width("quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 205.00, 671.30, 178.18, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat", 400.00, 671.30, 106.22, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 660.25, 51.35, 7.00, 7.00),
+            span_with_width("36", 120.00, 660.25, 7.78, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo consequat duis aute irure in", 205.00, 660.25, 172.35, 7.00, 7.00),
+            span_with_width("irure in reprehenderit voluptate velit", 400.00, 660.25, 109.71, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in", 205.00, 652.20, 159.91, 7.00, 7.00),
+            span_with_width("in reprehenderit voluptate velit", 400.00, 652.20, 93.76, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure in reprehenderit", 205.00, 644.15, 181.31, 7.00, 7.00),
+            span_with_width("reprehenderit voluptate velit esse", 400.00, 644.15, 103.10, 7.00, 7.00),
+            span_with_width("Table 3", 38.00, 613.25, 23.34, 7.00, 7.00),
+            span_with_width("4.1. Lorem ipsum dolor sit amet", 307.00, 613.25, 133.05, 9.50, 9.50),
+            span_with_width("ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation", 38.00, 605.20, 250.16, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate velit", 38.00, 597.15, 248.23, 7.00, 7.00),
+            span_with_width("veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 307.00, 592.35, 246.12, 8.50, 8.50),
+            span_with_width("Designatio", 44.00, 587.10, 31.12, 7.00, 7.00),
+            span_with_width("Primus", 190.00, 587.10, 21.78, 7.00, 7.00),
+            span_with_width("Secundus Tertius", 228.00, 587.10, 55.39, 7.00, 7.00),
+            span_with_width("quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 307.00, 581.90, 216.36, 8.50, 8.50),
+            span_with_width("lorem ipsum dolor sit amet consectetur", 44.00, 579.05, 120.20, 7.00, 7.00),
+            span_with_width("21.00", 190.00, 579.05, 17.51, 7.00, 7.00),
+            span_with_width("20.48", 228.00, 579.05, 17.51, 7.00, 7.00),
+            span_with_width("18.23", 262.00, 579.05, 17.51, 7.00, 7.00),
+            span_with_width("nostrud exercitation ullamco laboris nisi aliquip ex ea commodo", 307.00, 571.45, 238.08, 8.50, 8.50),
+            span_with_width("sit amet consectetur adipiscing elit sed do", 44.00, 571.00, 129.56, 7.00, 7.00),
+            span_with_width("18.96", 190.00, 571.00, 17.51, 7.00, 7.00),
+            span_with_width("18.32", 228.00, 571.00, 17.51, 7.00, 7.00),
+            span_with_width("21.04", 262.00, 571.00, 17.51, 7.00, 7.00),
+            span_with_width("adipiscing elit sed do eiusmod tempor", 44.00, 562.95, 117.10, 7.00, 7.00),
+            span_with_width("20.85", 190.00, 562.95, 17.51, 7.00, 7.00),
+            span_with_width("19.10", 228.00, 562.95, 17.51, 7.00, 7.00),
+            span_with_width("6.10", 262.00, 562.95, 13.62, 7.00, 7.00),
+            span_with_width("exercitation ullamco laboris nisi aliquip ex ea commodo consequat", 307.00, 561.00, 248.96, 8.50, 8.50),
+            span_with_width("do eiusmod tempor incididunt ut labore et", 44.00, 554.90, 128.39, 7.00, 7.00),
+            span_with_width("20.48", 190.00, 554.90, 17.51, 7.00, 7.00),
+            span_with_width("18.23", 228.00, 554.90, 17.51, 7.00, 7.00),
+            span_with_width("20.27", 262.00, 554.90, 17.51, 7.00, 7.00),
+            span_with_width("ullamco laboris nisi aliquip ex ea commodo consequat duis aute", 307.00, 550.55, 239.99, 8.50, 8.50),
+            span_with_width("incididunt ut labore et dolore magna aliqua", 44.00, 546.85, 131.90, 7.00, 7.00),
+            span_with_width("18.32", 190.00, 546.85, 17.51, 7.00, 7.00),
+            span_with_width("21.04", 228.00, 546.85, 17.51, 7.00, 7.00),
+            span_with_width("19.61", 262.00, 546.85, 17.51, 7.00, 7.00),
+            span_with_width("laboris nisi aliquip ex ea commodo consequat duis aute irure in", 307.00, 540.10, 236.68, 8.50, 8.50),
+            span_with_width("et dolore magna aliqua enim ad minim", 44.00, 538.80, 118.66, 7.00, 7.00),
+            span_with_width("19.10", 190.00, 538.80, 17.51, 7.00, 7.00),
+            span_with_width("6.10", 228.00, 538.80, 13.62, 7.00, 7.00),
+            span_with_width("19.24", 262.00, 538.80, 17.51, 7.00, 7.00),
+            span_with_width("aliqua enim ad minim veniam quis nostrud", 44.00, 530.75, 130.71, 7.00, 7.00),
+            span_with_width("18.23", 190.00, 530.75, 17.51, 7.00, 7.00),
+            span_with_width("20.27", 228.00, 530.75, 17.51, 7.00, 7.00),
+            span_with_width("16.63", 262.00, 530.75, 17.51, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo consequat duis aute irure in", 307.00, 529.65, 209.29, 8.50, 8.50),
+            span_with_width("minim veniam quis nostrud exercitation", 44.00, 522.70, 120.98, 7.00, 7.00),
+            span_with_width("21.04", 190.00, 522.70, 17.51, 7.00, 7.00),
+            span_with_width("19.61", 228.00, 522.70, 17.51, 7.00, 7.00),
+            span_with_width("21.42", 262.00, 522.70, 17.51, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in reprehenderit", 307.00, 519.20, 247.09, 8.50, 8.50),
+            span_with_width("nostrud exercitation ullamco laboris nisi", 44.00, 514.65, 122.15, 7.00, 7.00),
+            span_with_width("6.10", 190.00, 514.65, 13.62, 7.00, 7.00),
+            span_with_width("19.24", 228.00, 514.65, 17.51, 7.00, 7.00),
+            span_with_width("5.81", 262.00, 514.65, 13.62, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure in reprehenderit", 307.00, 508.75, 220.16, 8.50, 8.50),
+            span_with_width("laboris nisi aliquip ex ea commodo", 44.00, 506.60, 106.98, 7.00, 7.00),
+            span_with_width("20.27", 190.00, 506.60, 17.51, 7.00, 7.00),
+            span_with_width("16.63", 228.00, 506.60, 17.51, 7.00, 7.00),
+            span_with_width("21.00", 262.00, 506.60, 17.51, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure", 44.00, 498.55, 130.34, 7.00, 7.00),
+            span_with_width("19.61", 190.00, 498.55, 17.51, 7.00, 7.00),
+            span_with_width("21.42", 228.00, 498.55, 17.51, 7.00, 7.00),
+            span_with_width("18.96", 262.00, 498.55, 17.51, 7.00, 7.00),
+            span_with_width("ea commodo consequat duis aute irure in reprehenderit voluptate", 307.00, 498.30, 245.68, 8.50, 8.50),
+            span_with_width("consequat duis aute irure in reprehenderit", 44.00, 490.50, 129.56, 7.00, 7.00),
+            span_with_width("19.24", 190.00, 490.50, 17.51, 7.00, 7.00),
+            span_with_width("5.81", 228.00, 490.50, 13.62, 7.00, 7.00),
+            span_with_width("20.85", 262.00, 490.50, 17.51, 7.00, 7.00),
+            span_with_width("commodo consequat duis aute irure in reprehenderit voluptate velit", 307.00, 487.85, 251.34, 8.50, 8.50),
+            span_with_width("irure in reprehenderit voluptate velit esse", 44.00, 482.45, 126.44, 7.00, 7.00),
+            span_with_width("16.63", 190.00, 482.45, 17.51, 7.00, 7.00),
+            span_with_width("21.00", 228.00, 482.45, 17.51, 7.00, 7.00),
+            span_with_width("20.48", 262.00, 482.45, 17.51, 7.00, 7.00),
+            span_with_width("consequat duis aute irure in reprehenderit voluptate velit esse", 307.00, 477.40, 231.97, 8.50, 8.50),
+            span_with_width("voluptate velit esse cillum fugiat nulla", 44.00, 474.40, 115.16, 7.00, 7.00),
+            span_with_width("21.42", 190.00, 474.40, 17.51, 7.00, 7.00),
+            span_with_width("18.96", 228.00, 474.40, 17.51, 7.00, 7.00),
+            span_with_width("18.32", 262.00, 474.40, 17.51, 7.00, 7.00),
+            span_with_width("duis aute irure in reprehenderit voluptate velit esse cillum fugiat", 307.00, 466.95, 237.63, 8.50, 8.50),
+            span_with_width("cillum fugiat nulla pariatur excepteur sint", 44.00, 466.35, 124.88, 7.00, 7.00),
+            span_with_width("5.81", 190.00, 466.35, 13.62, 7.00, 7.00),
+            span_with_width("20.85", 228.00, 466.35, 17.51, 7.00, 7.00),
+            span_with_width("19.10", 262.00, 466.35, 17.51, 7.00, 7.00),
+            span_with_width("aute irure in reprehenderit voluptate velit esse cillum fugiat nulla", 307.00, 456.50, 239.99, 8.50, 8.50),
+            span_with_width("irure in reprehenderit voluptate velit esse cillum fugiat nulla pariatur", 307.00, 446.05, 252.26, 8.50, 8.50),
+            span_with_width("in reprehenderit voluptate velit esse cillum fugiat nulla pariatur", 307.00, 435.60, 232.90, 8.50, 8.50),
+            span_with_width("reprehenderit voluptate velit esse cillum fugiat nulla pariatur", 307.00, 425.15, 223.92, 8.50, 8.50),
+            span_with_width("voluptate velit esse cillum fugiat nulla pariatur excepteur sint", 307.00, 414.70, 226.29, 8.50, 8.50),
+            span_with_width("velit esse cillum fugiat nulla pariatur excepteur sint occaecat", 307.00, 404.25, 225.81, 8.50, 8.50),
+            span_with_width("esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat", 307.00, 393.80, 245.19, 8.50, 8.50),
+            span_with_width("cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non", 307.00, 383.35, 241.42, 8.50, 8.50),
+            span_with_width("fugiat nulla pariatur excepteur sint occaecat cupidatat non proident", 307.00, 372.90, 250.41, 8.50, 8.50),
+        ];
+        spans
+    }
+
+    fn gh1762_snapped_split(spans: &[TextSpan]) -> (Vec<SpanLine>, f32) {
+        let order = spans_sorted_top_to_bottom(spans);
+        let lines = group_into_lines(spans, &order);
+        let detected = detect_split_x(spans, &lines, GH1762_PAGE_WIDTH)
+            .expect("the left table's own cell gaps meet the quorum on their own");
+        let snapped = snap_split_left_of_hanging_labels(spans, &lines, GH1762_PAGE_WIDTH, detected);
+        (lines, snapped)
+    }
+
+    /// GH#1762: the corridor search is page-wide, but the split it rescues is applied
+    /// per band. `build_bands` has already set Table 2 apart -- every one of its rows
+    /// is a boundary line, because the split runs through it -- yet the same rows still
+    /// close the gutter for the band below, where nothing is written across it at all.
+    /// Asking the corridor question of that band alone finds the gutter, exactly as the
+    /// whole-page question finds it on the reporter's pages 2 and 3 once Table 2 is
+    /// gone or moved clear of it.
+    #[test]
+    fn redirect_escapes_a_table_when_another_bands_table_closes_the_gutter_gh1762() {
+        let spans = gh1762_p1_real_reproducer_spans();
+        let (lines, snapped) = gh1762_snapped_split(&spans);
+
+        let redirected = redirect_split_out_of_content(&spans, &lines, GH1762_PAGE_WIDTH, snapped);
+        assert!(
+            redirected > GH1762_GUTTER_CORRIDOR.0 && redirected < GH1762_GUTTER_CORRIDOR.1,
+            "a split sitting inside a table's own cell gap must be redirected to the \
+             gutter of the band it will be applied to; expected a split inside \
+             {GH1762_GUTTER_CORRIDOR:?}, got {redirected} (incoming {snapped})"
+        );
+    }
+
+    /// GH#1762: the page-wide corridor search must still see nothing, so the fixture's
+    /// own failure mode is exactly the one the issue describes -- no corridor anywhere
+    /// on the page -- and the band-scoped search is demonstrably what finds the gutter,
+    /// not some incidental change to the page-wide one.
+    #[test]
+    fn the_page_wide_corridor_search_still_finds_nothing_gh1762() {
+        let spans = gh1762_p1_real_reproducer_spans();
+        let (lines, snapped) = gh1762_snapped_split(&spans);
+        let min_gutter = (GH1762_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1762_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+
+        assert_eq!(
+            snapped, 216.7825,
+            "the four-column table's own cell gap still wins the vote"
+        );
+        assert!(
+            page_whitespace_corridors(&spans, &lines, furniture_width, min_gutter).is_empty(),
+            "Table 2's rows close every page-wide whitespace corridor"
+        );
+        assert!(
+            page_low_occupancy_corridors(&spans, &lines, furniture_width, min_gutter, MAX_GUTTER_CROSSING_LINES)
+                .is_empty(),
+            "Table 2 crosses the gutter on far more than MAX_GUTTER_CROSSING_LINES lines"
+        );
+    }
+
+    /// GH#1762: the band the corridor question is asked of must be a proper part of the
+    /// page that leaves Table 2 out, and the gutter must be empty inside it. Without
+    /// this the redirect could reach the right answer by some unrelated route and the
+    /// scoping itself would never be shown to have done anything.
+    #[test]
+    fn the_corridor_search_is_scoped_to_the_band_under_the_full_width_table_gh1762() {
+        let spans = gh1762_p1_real_reproducer_spans();
+        let (lines, snapped) = gh1762_snapped_split(&spans);
+        let min_gutter = (GH1762_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1762_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+
+        let band = band_lines_around_table_gap_split(&spans, &lines, furniture_width, min_gutter, snapped)
+            .expect("one band carries every line the split sits inside the cell gap of");
+        assert_eq!(
+            band.len(),
+            37,
+            "the band is the 36 lines under Table 3's caption, plus the boundary line above them"
+        );
+        assert!(
+            band.iter()
+                .flatten()
+                .all(|&index| spans[index].bbox.y < GH1762_TABLE_2_BOTTOM_Y),
+            "Table 2's own rows must be out of scope: they are a band of their own, \
+             separated from this one by boundary lines"
+        );
+        assert_eq!(
+            page_whitespace_corridors(&spans, &band, furniture_width, min_gutter),
+            [(286.22998, 307.0)],
+            "inside that band the page's real gutter is the one and only empty corridor"
+        );
+    }
+
+    /// GH#1762 end to end: the band below Table 2 must read column-major -- the whole of
+    /// Table 3 (its caption, its description lines, then its rows) before the right
+    /// column's `4.1.` heading and its body. Before the fix the band is reordered around
+    /// 216.784 instead: `Secundus`/`Tertius` and every value under them land on the
+    /// right of the split and are emitted after -- and interleaved with -- the right
+    /// column's prose.
+    #[test]
+    fn dense_two_column_page_reorders_below_a_full_width_table_gh1762() {
+        let mut spans = gh1762_p1_real_reproducer_spans();
+
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1762_PAGE_WIDTH),
+            "a two-column band under a full-width table must still be reordered"
+        );
+
+        let order: Vec<&str> = spans.iter().map(|span| span.text.as_str()).collect();
+        let position = |text: &str| {
+            order
+                .iter()
+                .position(|&candidate| candidate == text)
+                .unwrap_or_else(|| panic!("`{text}` must survive the reorder"))
+        };
+
+        let heading = position("4.1. Lorem ipsum dolor sit amet");
+        assert!(
+            position("Table 3") < heading,
+            "Table 3's caption belongs to the left column and must precede the right \
+             column's heading"
+        );
+        assert!(
+            position("Secundus Tertius") < heading,
+            "Table 3's own column labels must stay in the left column, not be pushed \
+             past the right column's heading by a split inside the table"
+        );
+        assert!(
+            position("5.81") < heading,
+            "the last cell of Table 3's last row must precede the right column's heading"
+        );
+        assert_eq!(
+            order[heading + 1],
+            "veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea",
+            "the right column's heading must be followed by its own first body line, \
+             not by a table cell"
+        );
     }
 
     const GH1655_PAGE_WIDTH: f32 = 595.28;
