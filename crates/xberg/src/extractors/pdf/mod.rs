@@ -222,30 +222,8 @@ fn failed_ocr_fallback_is_total_loss(native_text: &str) -> bool {
     native_text.trim().is_empty()
 }
 
-/// Whether the OCR backend an AUTOMATIC trigger would use is actually registered.
-///
-/// `ocr-pipeline` can be enabled with no backend at all -- `ocr` implies
-/// `ocr-pipeline`, not the reverse -- and a host application can clear the registry at
-/// runtime. In such a build an automatic trigger has nothing to run, and attempting it
-/// turned an ordinary extraction that never requested OCR into a hard `Plugin` error
-/// naming a backend the caller never chose.
-///
-/// EXPLICIT requests deliberately do not consult this. `force_ocr`, `force_ocr_pages`,
-/// `ocr_inline_images` and a caller-supplied `ocr` config all asked for something this
-/// build cannot do, and must be told so rather than silently given native text.
-///
-/// A configured pipeline resolves each of its own stage backends internally, so this
-/// reports available for it and leaves that route's behaviour unchanged. See GH#1610. ~keep
 #[cfg(feature = "ocr-pipeline")]
-fn automatic_ocr_backend_is_registered() -> bool {
-    let ocr_config = crate::core::config::OcrConfig::default();
-    if ocr_config.pipeline.is_some() {
-        return true;
-    }
-    let registry = crate::plugins::registry::get_ocr_backend_registry();
-    let registry = registry.read();
-    registry.get(&ocr_config.backend).is_ok()
-}
+use crate::plugins::registry::automatic_ocr_backend_is_registered;
 
 /// Page count via `xberg_native_pdf`. `None` when it cannot open or count the document,
 /// in which case the caller falls back to [`lopdf_page_count`].
@@ -673,7 +651,10 @@ fn inject_unrepresented_form_field_elements(doc: &mut InternalDocument, form_fie
 /// caller configured OCR explicitly. When no explicit `ocr` config is present, `Auto` itself
 /// will not act on the signal (`apply_flagged_pages` still requires it below, per #1338's
 /// "explicit OCR config" rule) so a deduped warning is pushed instead, keeping the defect
-/// visible rather than silently discarded. ~keep
+/// visible rather than silently discarded. `ocr_near_empty_fallback: Some(true)` opts back
+/// into that branch without an `ocr` block (GH#1752), so the warning is suppressed there --
+/// it would otherwise tell the caller the pages were dropped on the floor while `Auto` was
+/// in fact about to route them. ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 fn record_implausible_text_pages(
     config: &ExtractionConfig,
@@ -729,7 +710,7 @@ fn record_implausible_text_pages(
     merged.dedup();
     pdf_metadata.pdf_specific.scanned_pages = Some(merged);
 
-    if config.ocr.is_none() {
+    if config.ocr.is_none() && config.ocr_near_empty_fallback != Some(true) {
         crate::core::diagnostics::push_warning_deduped(
             warnings,
             crate::types::ProcessingWarning {
@@ -745,10 +726,43 @@ fn record_implausible_text_pages(
     }
 }
 
+/// Whether `OcrStrategy::ScannedPages` folds the per-page text-quality gate into its page
+/// selection, on top of the pages scan detection flagged.
+///
+/// `ExtractionConfig::ocr_scanned_page_quality_gate` is the caller's explicit answer;
+/// `None` derives it from whether an `ocr` block is present, which is what this condition
+/// was before GH#1752 gave the behaviour a setting of its own. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn scanned_page_quality_gate_enabled(config: &ExtractionConfig) -> bool {
+    config.ocr_scanned_page_quality_gate.unwrap_or(config.ocr.is_some())
+}
+
+/// Whether the `Auto` near-empty fallback branch runs for this document.
+///
+/// `ExtractionConfig::ocr_near_empty_fallback` is the caller's explicit answer:
+///
+/// - `Some(true)` runs the branch whenever there is something to run it with, so the
+///   text-quality gate inside it -- not the much narrower "no text at all" test -- decides.
+///   An automatic OCR backend must be registered, exactly as #1338's carve-out requires.
+/// - `Some(false)` never runs it, even with an explicit `ocr` block.
+/// - `None` derives the answer the way this condition did before GH#1752 gave the behaviour
+///   a setting of its own: always with an `ocr` block, and otherwise only for genuinely
+///   absent native text, so a legitimately sparse PDF stays native under a default config.
+///   ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn near_empty_ocr_fallback_applies(config: &ExtractionConfig, native_text: &str) -> bool {
+    match config.ocr_near_empty_fallback {
+        Some(false) => false,
+        Some(true) => config.ocr.is_some() || automatic_ocr_backend_is_registered(),
+        None => config.ocr.is_some() || (native_text.trim().is_empty() && automatic_ocr_backend_is_registered()),
+    }
+}
+
 /// Pages to OCR under `OcrStrategy::ScannedPages`, 1-indexed.
 ///
 /// The union of detected scans and pages failing the text-quality gate, so never
-/// a subset of what `Auto` would OCR.
+/// a subset of what `Auto` would OCR -- unless the gate is off, in which case only
+/// detected scans are selected. See [`scanned_page_quality_gate_enabled`].
 ///
 /// `None` means fall through to the `Auto` gate: wrong strategy, no page
 /// qualifies, or the gate wants the whole document rather than a page subset.
@@ -767,7 +781,12 @@ fn scanned_pages_to_ocr(
 
     let mut pages = pdf_metadata.pdf_specific.scanned_pages.clone()?;
 
-    if let Some(ocr_config) = config.ocr.as_ref() {
+    if scanned_page_quality_gate_enabled(config) {
+        // Thresholds come from the caller's `ocr` block when there is one; the gate can now
+        // be switched on without one, and then reads the same defaults every other
+        // no-explicit-block OCR route reads. ~keep
+        let default_ocr_config = crate::core::config::OcrConfig::default();
+        let ocr_config = config.ocr.as_ref().unwrap_or(&default_ocr_config);
         let decision = ocr::evaluate_per_page_ocr(
             native_text,
             boundaries,
@@ -2175,7 +2194,7 @@ impl PdfExtractor {
                 tracing::warn!("scanned pages detected but no page boundaries available; using native text");
                 (native_text, ExtractionMethod::Native)
             }
-        } else if config.ocr.is_some() || (native_text.trim().is_empty() && automatic_ocr_backend_is_registered()) {
+        } else if near_empty_ocr_fallback_applies(config, &native_text) {
             // Under `Auto`, a PDF with NO native text at all (a scan / missing text layer)
             // must reach OCR even when no explicit `ocr` config was given — the default
             // `ocr: None` ("OCR disabled") otherwise silently discarded the detected scan
@@ -2183,6 +2202,8 @@ impl PdfExtractor {
             // a legitimately sparse/short PDF must stay native under a default config, and
             // heuristic quality failures still require an explicit `ocr` config to trigger
             // OCR. An explicit `ocr` config keeps its full per-page gate behavior.
+            // `ocr_near_empty_fallback` overrides that derivation in either direction
+            // (GH#1752); see `near_empty_ocr_fallback_applies`. ~keep
             let default_ocr_config = crate::core::config::OcrConfig::default();
             let ocr_config = config.ocr.as_ref().unwrap_or(&default_ocr_config);
             let thresholds = ocr_config.effective_thresholds();
@@ -5866,6 +5887,210 @@ mod tests {
         let pages = scanned_pages_to_ocr(&config, &pdf_metadata, "", None);
 
         assert_eq!(pages, None);
+    }
+
+    /// Metadata for a `ScannedPages` routing test: `page_count` pages, of which
+    /// `scanned_pages` were flagged by scan detection.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    fn scanned_pages_metadata(
+        page_count: Option<u32>,
+        scanned_pages: Vec<u32>,
+    ) -> crate::pdf::metadata::PdfExtractionMetadata {
+        use crate::pdf::metadata::{PdfExtractionMetadata, PdfMetadata};
+
+        PdfExtractionMetadata {
+            title: None,
+            subject: None,
+            authors: None,
+            keywords: None,
+            created_at: None,
+            modified_at: None,
+            created_by: None,
+            pdf_specific: PdfMetadata {
+                page_count,
+                scanned_pages: Some(scanned_pages),
+                ..Default::default()
+            },
+            page_structure: None,
+        }
+    }
+
+    /// GH#1752. Leaving `ocr_scanned_page_quality_gate` unset must reproduce the derived
+    /// answer for every shape of `ocr` block.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn scanned_page_quality_gate_unset_reproduces_the_presence_of_an_ocr_block() {
+        use crate::core::config::OcrConfig;
+
+        for ocr in [None, Some(OcrConfig::default())] {
+            let config = ExtractionConfig {
+                ocr: ocr.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                config.ocr_scanned_page_quality_gate, None,
+                "the setting must default to None"
+            );
+            assert_eq!(
+                scanned_page_quality_gate_enabled(&config),
+                ocr.is_some(),
+                "with the setting unset the gate must follow the presence of an `ocr` block"
+            );
+        }
+    }
+
+    /// The same input the whole-document-failure test uses, but with the gate explicitly off:
+    /// only the pages scan detection flagged may be selected. This is the setting that avoids
+    /// paying for recognition across a whole mixed document.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn scanned_page_quality_gate_off_selects_detected_scans_only_despite_an_ocr_block() {
+        use crate::core::config::{OcrConfig, OcrStrategy};
+
+        let config = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: Some(OcrConfig::default()),
+            ocr_scanned_page_quality_gate: Some(false),
+            ..Default::default()
+        };
+        let pdf_metadata = scanned_pages_metadata(Some(3), vec![2]);
+
+        // Empty native text would trigger `whole_doc_failure` and select all three pages if
+        // the gate were running. ~keep
+        assert_eq!(
+            scanned_pages_to_ocr(&config, &pdf_metadata, "", None),
+            Some(vec![2]),
+            "with the gate off only detected scans may be selected"
+        );
+    }
+
+    /// The mirror image: the gate on with no `ocr` block must behave exactly like the gate on
+    /// with one, reading `OcrConfig::default()`'s thresholds.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn scanned_page_quality_gate_on_without_an_ocr_block_matches_the_gate_with_one() {
+        use crate::core::config::{OcrConfig, OcrStrategy};
+
+        let pdf_metadata = scanned_pages_metadata(Some(3), Vec::new());
+
+        let with_block = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+        let without_block = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: None,
+            ocr_scanned_page_quality_gate: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scanned_pages_to_ocr(&without_block, &pdf_metadata, "", None),
+            Some(vec![1, 2, 3]),
+            "the gate must run on default thresholds when switched on without an `ocr` block"
+        );
+        assert_eq!(
+            scanned_pages_to_ocr(&without_block, &pdf_metadata, "", None),
+            scanned_pages_to_ocr(&with_block, &pdf_metadata, "", None),
+            "and must reach the same answer as the same gate with a default `ocr` block"
+        );
+    }
+
+    /// The pre-GH#1752 pin: with the setting unset and no `ocr` block, `ScannedPages` selects
+    /// detected scans only, even on input that would fail the gate outright.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn scanned_page_quality_gate_unset_without_an_ocr_block_selects_detected_scans_only() {
+        use crate::core::config::OcrStrategy;
+
+        let config = ExtractionConfig {
+            ocr_strategy: OcrStrategy::ScannedPages { min_confidence: 0.7 },
+            ocr: None,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scanned_pages_to_ocr(&config, &scanned_pages_metadata(Some(3), vec![2]), "", None),
+            Some(vec![2]),
+        );
+        assert_eq!(
+            scanned_pages_to_ocr(&config, &scanned_pages_metadata(Some(3), Vec::new()), "", None),
+            None,
+            "no detected scan and no gate means nothing to select"
+        );
+    }
+
+    /// GH#1752 / #1338. `ocr_near_empty_fallback` unset must reproduce the derived condition:
+    /// always with an `ocr` block, and without one only for genuinely absent native text.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn near_empty_fallback_unset_reproduces_the_1338_carve_out() {
+        use crate::core::config::OcrConfig;
+
+        let with_block = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            ..Default::default()
+        };
+        let without_block = ExtractionConfig::default();
+
+        assert_eq!(with_block.ocr_near_empty_fallback, None);
+        assert_eq!(without_block.ocr_near_empty_fallback, None);
+
+        assert!(
+            near_empty_ocr_fallback_applies(&with_block, "a page with plenty of real native text"),
+            "an explicit `ocr` block keeps its full per-page gate behaviour"
+        );
+        assert!(
+            !near_empty_ocr_fallback_applies(&without_block, "a page with plenty of real native text"),
+            "without a block, a legitimately sparse or short PDF must stay native (#1338)"
+        );
+        assert_eq!(
+            near_empty_ocr_fallback_applies(&without_block, "   \n  "),
+            automatic_ocr_backend_is_registered(),
+            "without a block, genuinely absent native text reaches OCR iff a backend is registered"
+        );
+    }
+
+    /// Switched on, the fallback stops requiring *completely* empty text -- that is the whole
+    /// point: a scanned page carrying only a page label or scanner stamp must reach OCR. It
+    /// still consults the backend registry exactly as the derived condition does.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn near_empty_fallback_on_without_an_ocr_block_drops_the_empty_text_requirement() {
+        let opted_in = ExtractionConfig {
+            ocr: None,
+            ocr_near_empty_fallback: Some(true),
+            ..Default::default()
+        };
+        let derived = ExtractionConfig::default();
+
+        assert_eq!(
+            near_empty_ocr_fallback_applies(&opted_in, "Page 3 of 412"),
+            automatic_ocr_backend_is_registered(),
+            "the stamp-only page must now be judged by the quality gate, not by the empty-text test"
+        );
+        assert_eq!(
+            near_empty_ocr_fallback_applies(&opted_in, "Page 3 of 412"),
+            near_empty_ocr_fallback_applies(&derived, ""),
+            "and the backend requirement is unchanged: only the text test widened"
+        );
+    }
+
+    /// Switched off, the fallback never runs, even with an explicit `ocr` block.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn near_empty_fallback_off_suppresses_the_branch_even_with_an_ocr_block() {
+        use crate::core::config::OcrConfig;
+
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig::default()),
+            ocr_near_empty_fallback: Some(false),
+            ..Default::default()
+        };
+
+        assert!(!near_empty_ocr_fallback_applies(&config, ""));
+        assert!(!near_empty_ocr_fallback_applies(&config, "real native text"));
     }
 
     #[tokio::test]

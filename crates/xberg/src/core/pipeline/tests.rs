@@ -2560,3 +2560,33 @@ mod document_counts {
         assert_eq!(result.counts.pages, 2);
     }
 }
+
+/// GH#1662, GH#1752: `ExtractionConfig::runs_ocr_on_embedded_images` must be the ONLY
+/// expression of "do embedded images get OCR'd". This module used to re-derive it from
+/// `images.run_ocr_on_images` and `ocr.is_some()`, while `needs_image_data` -- the READ gate a
+/// container consults before it reads an embedded image's bytes at all -- was defined against
+/// the method. The two copies drifted, a container attached an image with an empty buffer, and
+/// the OCR path reported `Could not determine image format` on the zero bytes. A comment did
+/// not prevent that, so assert the structural property: no executable line of this module
+/// mentions `run_ocr_on_images` at all, and the method is still called. ~keep
+#[test]
+fn embedded_image_ocr_gate_has_no_second_copy() {
+    const PIPELINE_SOURCE: &str = include_str!("mod.rs");
+
+    let rederived: Vec<(usize, &str)> = PIPELINE_SOURCE
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with("//") && line.contains("run_ocr_on_images"))
+        .map(|(index, line)| (index + 1, line.trim()))
+        .collect();
+    assert!(
+        rederived.is_empty(),
+        "core/pipeline/mod.rs must call ExtractionConfig::runs_ocr_on_embedded_images() rather than \
+         re-deriving the embedded-image OCR gate (GH#1662); found {rederived:?}"
+    );
+
+    assert!(
+        PIPELINE_SOURCE.contains("config.runs_ocr_on_embedded_images()"),
+        "core/pipeline/mod.rs must still gate embedded-image OCR on runs_ocr_on_embedded_images()"
+    );
+}
