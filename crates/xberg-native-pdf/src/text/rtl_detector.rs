@@ -292,6 +292,20 @@ pub fn should_split_at_rtl_boundary(
         return None;
     }
 
+    rtl_script_boundary(prev_char, curr_char, prev_is_rtl, curr_is_rtl)
+}
+
+/// Rules 3-9 of [`should_split_at_rtl_boundary`], applied in the same order
+/// once at least one side of the pair is known to be RTL.
+fn rtl_script_boundary(
+    prev_char: &CharacterInfo,
+    curr_char: &CharacterInfo,
+    prev_is_rtl: bool,
+    curr_is_rtl: bool,
+) -> Option<bool> {
+    let prev_code = prev_char.code;
+    let curr_code = curr_char.code;
+
     if curr_code == 0x0640 || prev_code == 0x0640 {
         return Some(false);
     }
@@ -316,6 +330,12 @@ pub fn should_split_at_rtl_boundary(
         return Some(true);
     }
 
+    rtl_same_script_boundary(prev_code, curr_code, prev_is_rtl, curr_is_rtl)
+}
+
+/// Rules 7-9: punctuation, same-script letter runs, and the same-script RTL
+/// fallthrough. Reached only once the transition rules above have declined.
+fn rtl_same_script_boundary(prev_code: u32, curr_code: u32, prev_is_rtl: bool, curr_is_rtl: bool) -> Option<bool> {
     if is_arabic_punctuation(curr_code) || is_hebrew_punctuation(curr_code) {
         return Some(true);
     }
