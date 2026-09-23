@@ -7160,6 +7160,145 @@ Name: ___
         );
     }
 
+    /// #1753 — the `source_dpi` hint, unlike the `/Rotate` hint above, was still derived only
+    /// from `lazy_pdf_render_state`, which the images-driven route never opens. A layout pass
+    /// renders its page rasters at the same 150 DPI the OCR route would have used, but with
+    /// the hint absent the preprocessor falls back to assuming 72 DPI and upscales an already
+    /// correctly-sampled raster by ~4.2x instead of the intended ~2x.
+    ///
+    /// Fails on unfixed code: `backend_options` carries no `source_dpi` key at all, because
+    /// the only derivation site is gated on `lazy_pdf_render_state`, which is `None` whenever
+    /// `images` is supplied.
+    #[cfg(feature = "pdf")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn should_derive_source_dpi_for_pre_rendered_layout_page_images() {
+        use crate::core::config::OcrConfig;
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Mutex;
+
+        const BACKEND_NAME: &str = "source-dpi-capturing-mock";
+        const LETTER_WIDTH_PT: f32 = 612.0;
+        const LETTER_HEIGHT_PT: f32 = 792.0;
+        const RENDER_DPI: f64 = 150.0;
+        const RASTER_WIDTH_PX: u32 = 1275;
+        const RASTER_HEIGHT_PX: u32 = 1650;
+
+        struct SourceDpiCapturingBackend {
+            captured_backend_options: Mutex<Vec<Option<serde_json::Value>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl OcrBackend for SourceDpiCapturingBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, _: &[u8], config: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                self.captured_backend_options
+                    .lock()
+                    .unwrap()
+                    .push(config.backend_options.clone());
+                Ok(ExtractedDocument {
+                    content: "text".to_string(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        impl Plugin for SourceDpiCapturingBackend {
+            fn name(&self) -> &str {
+                BACKEND_NAME
+            }
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        let backend = std::sync::Arc::new(SourceDpiCapturingBackend {
+            captured_backend_options: Mutex::new(Vec::new()),
+        });
+        crate::plugins::register_ocr_backend(backend.clone()).unwrap();
+
+        let content = crate::pdf::render::build_minimal_pdf_with_mediabox(LETTER_WIDTH_PT, LETTER_HEIGHT_PT);
+        let images = vec![image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            RASTER_WIDTH_PX,
+            RASTER_HEIGHT_PX,
+            image::Rgb([255; 3]),
+        ))];
+
+        let config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: BACKEND_NAME.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extract_with_ocr(
+            Some(&content),
+            Some(&images),
+            #[cfg(feature = "layout-detection")]
+            None,
+            &config,
+            None,
+        )
+        .await;
+
+        crate::plugins::unregister_ocr_backend(BACKEND_NAME).unwrap();
+
+        assert!(result.is_ok(), "extract_with_ocr should succeed: {:?}", result.err());
+
+        let captured = backend.captured_backend_options.lock().unwrap();
+        assert_eq!(captured.len(), 1, "backend should have been called exactly once");
+        let source_dpi = captured[0]
+            .as_ref()
+            .and_then(|opts| opts.get("source_dpi"))
+            .and_then(serde_json::Value::as_f64);
+        assert_eq!(
+            source_dpi,
+            Some(RENDER_DPI),
+            "a {RASTER_WIDTH_PX}px-wide raster of a {LETTER_WIDTH_PT}pt-wide page is {RENDER_DPI} DPI, \
+             and the images-driven route must say so instead of leaving the preprocessor on its \
+             72-DPI assumption (#1753); got backend_options = {:?}",
+            captured[0]
+        );
+    }
+
+    /// The guard on the #1753 derivation: a pre-rendered raster is only trusted to report its
+    /// own DPI when both axes agree, so a display-oriented render of a rotated page (axes
+    /// swapped relative to the MediaBox) stays hint-free instead of claiming a wrong DPI.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn should_only_trust_a_pre_rendered_page_dpi_when_both_axes_agree() {
+        let letter_pt = (612.0, 792.0);
+
+        assert_eq!(
+            super::super::rendering::pre_rendered_page_source_dpi(letter_pt, 1275, 1650),
+            Some(150.0),
+            "a whole-page MediaBox-oriented render must report its true DPI"
+        );
+        assert_eq!(
+            super::super::rendering::pre_rendered_page_source_dpi(letter_pt, 1650, 1275),
+            None,
+            "axes swapped by a display-oriented render of a rotated page must yield no hint"
+        );
+        assert_eq!(
+            super::super::rendering::pre_rendered_page_source_dpi(letter_pt, 600, 800),
+            None,
+            "a crop or otherwise non-whole-page raster must yield no hint"
+        );
+    }
+
     /// #643 — a backend that declares `PageOrientationHandling::RequiresUpright` must receive
     /// an upright raster on a rotated page, not the same MediaBox-oriented (sideways) raster
     /// every other backend gets. `normalize_rendered_page_for_ocr` deliberately hands every

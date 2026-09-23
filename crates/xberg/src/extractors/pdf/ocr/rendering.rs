@@ -50,6 +50,75 @@ pub(super) fn page_dimensions_pt(doc: &xberg_native_pdf::PdfDocument, page_index
         .map(|(llx, lly, urx, ury)| ((urx - llx).abs(), (ury - lly).abs()))
         .unwrap_or((612.0, 792.0))
 }
+/// Per-page `/Rotate` values and MediaBox dimensions (points) for a document whose page
+/// rasters were rendered by someone else and handed to OCR pre-rendered — in practice the
+/// layout-detection pass, which always has the original PDF bytes alongside its rasters.
+///
+/// One open serves both hints `ocr_config_with_page_rotation_hint` takes: the rotation and the
+/// `source_dpi` the raster width implies (#1753). An unreadable document yields the same
+/// hint-free result the route had before, not an error: neither hint is load-bearing. ~keep
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+pub(super) struct PreRenderedPageGeometry {
+    /// One `/Rotate` value per page, zero-filled for a document that would not open.
+    pub(super) rotations: Vec<u32>,
+    /// One `(width, height)` MediaBox pair in points per page, empty for a document that
+    /// would not open. Callers index it with `get`, so the empty case needs no separate
+    /// branch. ~keep
+    pub(super) dimensions_pt: Vec<(f32, f32)>,
+}
+
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+pub(super) fn pre_rendered_page_geometry(content: &[u8], page_count: usize) -> PreRenderedPageGeometry {
+    match xberg_native_pdf::PdfDocument::from_bytes(content.to_vec()) {
+        Ok(doc) => PreRenderedPageGeometry {
+            rotations: crate::pdf::render::get_page_rotations(&doc, page_count),
+            dimensions_pt: (0..page_count).map(|page| page_dimensions_pt(&doc, page)).collect(),
+        },
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to open PDF to read pre-rendered page geometry; continuing without rotation or DPI hints"
+            );
+            PreRenderedPageGeometry {
+                rotations: vec![0; page_count],
+                dimensions_pt: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Derive the [`super::pipeline::ocr_config_with_page_rotation_hint`] `source_dpi` value for a
+/// page raster this route did not render itself.
+///
+/// Both axes must agree on the implied resolution before the hint is trusted. A raster that is
+/// not a whole-page, MediaBox-oriented render of this page — a display-oriented render of a
+/// 90/270-rotated page, or a crop — disagrees on a non-square page and gets no hint at all,
+/// which leaves it on the preprocessor's 72-DPI assumption rather than a confidently wrong
+/// number. ~keep
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+pub(super) fn pre_rendered_page_source_dpi(
+    page_dimensions_pt: (f32, f32),
+    rendered_width_px: u32,
+    rendered_height_px: u32,
+) -> Option<f64> {
+    /// Largest relative disagreement between the two axes' implied DPI still attributable to a
+    /// renderer rounding each axis independently to a whole pixel.
+    const AXIS_DPI_AGREEMENT_TOLERANCE: f64 = 0.02;
+
+    let (width_pt, height_pt) = page_dimensions_pt;
+    let width_dpi = crate::pdf::render::rendered_page_dpi(rendered_width_px, width_pt)?;
+    let height_dpi = crate::pdf::render::rendered_page_dpi(rendered_height_px, height_pt)?;
+    if (width_dpi - height_dpi).abs() > width_dpi * AXIS_DPI_AGREEMENT_TOLERANCE {
+        tracing::debug!(
+            width_dpi,
+            height_dpi,
+            "pre-rendered page raster axes disagree on resolution; leaving source_dpi unknown"
+        );
+        return None;
+    }
+    Some(width_dpi)
+}
+
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 pub(super) fn open_pdf_for_full_ocr(content: &[u8]) -> crate::Result<(xberg_native_pdf::PdfDocument, usize, Vec<u32>)> {
     let doc = xberg_native_pdf::PdfDocument::from_bytes(content.to_vec()).map_err(|e| crate::XbergError::Parsing {

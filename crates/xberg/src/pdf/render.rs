@@ -590,12 +590,13 @@ pub(crate) fn get_page_rotations(doc: &xberg_native_pdf::PdfDocument, page_count
 
 /// Prefer the document-taking form wherever a `PdfDocument` is already open — three call
 /// sites were re-parsing the same bytes a second time purely to read `/Rotate`. This exists
-/// for the two routes that genuinely have no document in scope, and it opens one so the
-/// extra parse is at least explicit at the call site rather than hidden inside the lookup.
+/// for the markdown-layout reuse gate, which genuinely has no document in scope, and it opens
+/// one so the extra parse is at least explicit at the call site rather than hidden inside the
+/// lookup.
 ///
 /// Returns all-zero rotations if the document cannot be opened: this is a rendering hint,
 /// and a document that will not open fails for better reasons elsewhere.
-#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "layout-detection"))]
 pub(crate) fn get_page_rotations_from_bytes(content: &[u8], page_count: usize) -> Vec<u32> {
     match xberg_native_pdf::PdfDocument::from_bytes(content.to_vec()) {
         Ok(doc) => get_page_rotations(&doc, page_count),

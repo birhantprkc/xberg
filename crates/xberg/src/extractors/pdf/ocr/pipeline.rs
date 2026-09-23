@@ -55,11 +55,11 @@ use super::document::{
 use super::rendering::EncodedPage;
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 use super::rendering::{
-    OCR_PNG_ENCODE_BYTES_PER_PIXEL, OCR_PNG_ENCODE_FIXED_BYTES, XObjectRecoveryOutcome, clone_rgb_for_png_encode,
-    fallback_render_document, open_pdf_for_full_ocr, open_pdf_for_page_ocr, page_dimensions_pt,
-    page_needs_xobject_fallback, recover_page_text_from_image_xobjects, render_full_pdf_ocr_batch,
-    render_selected_pages_from_document, share_rendered_page_images, valid_page_indices,
-    validate_png_encode_pages_individually, xobject_fallback_warning,
+    OCR_PNG_ENCODE_BYTES_PER_PIXEL, OCR_PNG_ENCODE_FIXED_BYTES, PreRenderedPageGeometry, XObjectRecoveryOutcome,
+    clone_rgb_for_png_encode, fallback_render_document, open_pdf_for_full_ocr, open_pdf_for_page_ocr,
+    page_dimensions_pt, page_needs_xobject_fallback, pre_rendered_page_geometry, pre_rendered_page_source_dpi,
+    recover_page_text_from_image_xobjects, render_full_pdf_ocr_batch, render_selected_pages_from_document,
+    share_rendered_page_images, valid_page_indices, validate_png_encode_pages_individually, xobject_fallback_warning,
 };
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 use super::scoring::{
@@ -1462,12 +1462,23 @@ pub(super) async fn extract_with_ocr_for_page(
     // `ocr_config_with_page_rotation_hint` get a real hint too (see #530 / 972d2269f7).
     // `content` is `None` on some image-only callers (e.g. the image extractor's own OCR
     // path with no source PDF); there is genuinely no rotation to read in that case.
+    // The same open also yields each page's MediaBox dimensions, which are what turns a
+    // pre-rendered raster's pixel width into the `source_dpi` hint this route used to derive
+    // only when it rendered the pages itself (#1753).
     #[cfg(feature = "pdf")]
-    let external_image_page_rotations: Option<Vec<u32>> = if images.is_some() {
-        content.map(|c| crate::pdf::render::get_page_rotations_from_bytes(c, total_pages))
+    let external_image_page_geometry: Option<PreRenderedPageGeometry> = if images.is_some() {
+        content.map(|c| pre_rendered_page_geometry(c, total_pages))
     } else {
         None
     };
+    #[cfg(feature = "pdf")]
+    let external_image_page_rotations: Option<&[u32]> = external_image_page_geometry
+        .as_ref()
+        .map(|geometry| geometry.rotations.as_slice());
+    #[cfg(feature = "pdf")]
+    let external_image_page_dimensions: Option<&[(f32, f32)]> = external_image_page_geometry
+        .as_ref()
+        .map(|geometry| geometry.dimensions_pt.as_slice());
 
     let mut page_texts = vec![String::new(); total_pages];
     // Which pages the quality gate rejected. Kept separately from `page_texts` because an
@@ -1685,15 +1696,19 @@ pub(super) async fn extract_with_ocr_for_page(
                 };
                 #[cfg(not(feature = "pdf"))]
                 let page_rotation_degrees: u32 = 0;
-                // Only the branch that rendered the pages itself knows their resolution.
-                // `lazy_pdf_render_state` is exactly that branch's marker — it is only opened
-                // when `images.is_none()` (see its `let` above) — so when the caller supplied
-                // arbitrary pre-rendered images the hint stays absent and they keep the 72-DPI
-                // assumption, which for them is the honest answer.
+                // `lazy_pdf_render_state` marks the branch that rendered the pages itself (it is
+                // only opened when `images.is_none()`, see its `let` above). Pre-rendered images
+                // reach the same answer from the source document's MediaBox instead, and stay
+                // hint-free when they are not a whole-page render of it (#1753).
                 #[cfg(feature = "pdf")]
                 let source_dpi = lazy_pdf_render_state
                     .as_ref()
-                    .and_then(|(doc, _, _)| rendered_page_source_dpi(doc, *page_idx, *width));
+                    .and_then(|(doc, _, _)| rendered_page_source_dpi(doc, *page_idx, *width))
+                    .or_else(|| {
+                        external_image_page_dimensions
+                            .and_then(|dimensions| dimensions.get(*page_idx))
+                            .and_then(|dimensions| pre_rendered_page_source_dpi(*dimensions, *width, *height))
+                    });
                 #[cfg(not(feature = "pdf"))]
                 let source_dpi: Option<f64> = None;
                 let config_clone =
@@ -1764,11 +1779,16 @@ pub(super) async fn extract_with_ocr_for_page(
                 };
                 #[cfg(not(feature = "pdf"))]
                 let page_rotation_degrees: u32 = 0;
-                // See the JoinSet branch above: only the PDF-rendered branch knows the DPI.
+                // See the JoinSet branch above for both derivations.
                 #[cfg(feature = "pdf")]
                 let source_dpi = lazy_pdf_render_state
                     .as_ref()
-                    .and_then(|(doc, _, _)| rendered_page_source_dpi(doc, *page_idx, *width));
+                    .and_then(|(doc, _, _)| rendered_page_source_dpi(doc, *page_idx, *width))
+                    .or_else(|| {
+                        external_image_page_dimensions
+                            .and_then(|dimensions| dimensions.get(*page_idx))
+                            .and_then(|dimensions| pre_rendered_page_source_dpi(*dimensions, *width, *height))
+                    });
                 #[cfg(not(feature = "pdf"))]
                 let source_dpi: Option<f64> = None;
                 let config_for_page =
