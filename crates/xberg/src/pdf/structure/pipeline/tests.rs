@@ -6428,3 +6428,349 @@ fn test_image_index_offset_non_contiguous_pages() {
         }
     }
 }
+
+/// GH#1758's reproducer geometry: 8pt Helvetica (body) and Helvetica-Oblique
+/// (headings) in the left column of a two-column journal page, both at the same
+/// 10.45pt pitch, with 21pt between the heading's last baseline and the body's
+/// first. Every width below is the font's own advance sum for the string, so the
+/// right edges reproduce the issue's measured table exactly.
+const GH1758_MARGIN: f32 = 37.60;
+const GH1758_BODY_INDENT: f32 = 49.60;
+const GH1758_PITCH: f32 = 10.45;
+const GH1758_HEADING_TO_BODY_GAP: f32 = 21.0;
+const GH1758_FIRST_HEADING_BASELINE: f32 = 708.55;
+
+fn gh1758_seg(text: &str, x: f32, width: f32, baseline_y: f32, is_italic: bool) -> SegmentData {
+    SegmentData {
+        font_size: 8.0,
+        height: 8.0,
+        is_italic,
+        ..column_seg(text, x, width, baseline_y)
+    }
+}
+
+/// One page of the reproducer: two lead-in body lines, the heading's own lines
+/// (each `(text, advance width)`, all at the margin in the heading face), and the
+/// three body lines beneath, whose first line ends at x 281.67 -- the `beneath`
+/// edge the margin rule measures against on every page.
+fn gh1758_page(heading_lines: &[(&str, f32)]) -> Vec<SegmentData> {
+    let mut segments = vec![
+        gh1758_seg(
+            "and Fisher tests. Gene expression assay outcomes were evaluated",
+            GH1758_MARGIN,
+            238.33,
+            740.00,
+            false,
+        ),
+        gh1758_seg(
+            "using one-way ANOVA. The Tukey-Kramer post hoc test was used.",
+            GH1758_MARGIN,
+            238.76,
+            729.55,
+            false,
+        ),
+    ];
+    let mut baseline = GH1758_FIRST_HEADING_BASELINE;
+    for (text, width) in heading_lines {
+        segments.push(gh1758_seg(text, GH1758_MARGIN, *width, baseline, true));
+        baseline -= GH1758_PITCH;
+    }
+    let body_baseline = baseline + GH1758_PITCH - GH1758_HEADING_TO_BODY_GAP;
+    segments.push(gh1758_seg(
+        "Flow cytometry analysis was carried out on every isolated sample",
+        GH1758_BODY_INDENT,
+        232.07,
+        body_baseline,
+        false,
+    ));
+    segments.push(gh1758_seg(
+        "following the staining protocol of the previous trial, and the gating",
+        GH1758_MARGIN,
+        229.90,
+        body_baseline - GH1758_PITCH,
+        false,
+    ));
+    segments.push(gh1758_seg(
+        "strategy was applied identically to every animal in each of the groups",
+        GH1758_MARGIN,
+        243.66,
+        body_baseline - 2.0 * GH1758_PITCH,
+        false,
+    ));
+    segments
+}
+
+const GH1758_BODY_TEXT: &str = "Flow cytometry analysis was carried out on every isolated sample \
+     following the staining protocol of the previous trial, and the gating strategy was applied \
+     identically to every animal in each of the groups";
+
+/// Assert the reproducer page produced exactly three elements: the lead-in prose,
+/// the whole heading, and the body opening with its OWN first word.
+fn assert_gh1758_heading_whole(segments: Vec<SegmentData>, expected_heading: &str, context: &str) {
+    let paragraphs = blocks_to_paragraphs(segments, &[], &[]);
+    let texts: Vec<String> = paragraphs.iter().map(paragraph_segment_text).collect();
+    assert_eq!(
+        texts.len(),
+        3,
+        "{context}: lead-in, heading and body are three elements, got {texts:?}"
+    );
+    assert_eq!(texts[1], expected_heading, "{context}: the heading must survive whole");
+    assert_eq!(
+        texts[2], GH1758_BODY_TEXT,
+        "{context}: the body must open with its own first word, not the heading's tail"
+    );
+}
+
+/// GH#1758 page 1, defect A. The heading's first line stops 21.8pt short of the
+/// body column beneath it, but the continuation's first word (`patches`, 28.0pt of
+/// Helvetica advance) could never have fitted in that space -- this is a genuine
+/// wrap. `heading_fills_column`'s fixed two-font-size slack (16pt at 8pt) refuses
+/// it, so the heading was cut after `ileal` and `patches of ...` was welded to the
+/// body paragraph beneath.
+#[test]
+fn ragged_right_edge_keeps_the_wrapped_heading_whole_gh1758() {
+    assert_gh1758_heading_whole(
+        gh1758_page(&[
+            (
+                "2.4. Flow cytometric analysis of lymphocytes isolated from ileal",
+                222.29,
+            ),
+            ("patches of vaccinated-challenged calves", 143.62),
+        ]),
+        "2.4. Flow cytometric analysis of lymphocytes isolated from ileal patches of \
+         vaccinated-challenged calves",
+        "GH#1758 page 1 (A: 21.8pt of ragged slack)",
+    );
+}
+
+/// GH#1758 page 2, the reporter's control for A: the identical heading one word
+/// longer, so its first line stops only 8.4pt short and the existing fixed slack
+/// already accepts it. Must stay accepted.
+#[test]
+fn narrow_ragged_slack_control_still_keeps_its_wrap_gh1758() {
+    assert_gh1758_heading_whole(
+        gh1758_page(&[
+            (
+                "2.4. Flow cytometric analysis of the lymphocytes isolated from ileal",
+                235.63,
+            ),
+            ("patches of vaccinated-challenged calves", 143.62),
+        ]),
+        "2.4. Flow cytometric analysis of the lymphocytes isolated from ileal patches of \
+         vaccinated-challenged calves",
+        "GH#1758 page 2 (control: 8.4pt of slack, accepted before the fix)",
+    );
+}
+
+/// GH#1758 page 3, defect B. The heading's first line fills its column (4.0pt
+/// short of the body beneath) and the continuation keeps the heading's own italic
+/// face while the body beneath does not -- but it opens with a capital
+/// (`Peyer's`), which `heading_continuation_at_margin` refused outright.
+#[test]
+fn capital_opener_in_the_headings_own_style_keeps_the_wrap_gh1758() {
+    assert_gh1758_heading_whole(
+        gh1758_page(&[
+            (
+                "3.9. Transcriptome profiles and differentially expressed genes in the",
+                240.10,
+            ),
+            ("Peyer's patch of vaccinated-challenged calves", 163.82),
+        ]),
+        "3.9. Transcriptome profiles and differentially expressed genes in the Peyer's patch of \
+         vaccinated-challenged calves",
+        "GH#1758 page 3 (B: capital opener in the heading's style)",
+    );
+}
+
+/// GH#1758 page 4, the reporter's control for B: the same heading whose
+/// continuation opens lowercase (`ileal`). Accepted before the fix, must stay so.
+#[test]
+fn lowercase_opener_control_still_keeps_its_wrap_gh1758() {
+    assert_gh1758_heading_whole(
+        gh1758_page(&[
+            (
+                "3.9. Transcriptome profiles and differentially expressed genes in the",
+                240.10,
+            ),
+            ("ileal Peyer's patch of vaccinated-challenged calves", 180.27),
+        ]),
+        "3.9. Transcriptome profiles and differentially expressed genes in the ileal Peyer's patch \
+         of vaccinated-challenged calves",
+        "GH#1758 page 4 (control: lowercase opener, accepted before the fix)",
+    );
+}
+
+/// GH#1758 page 5, defect A at the SECOND wrap. Line 2 is accepted by
+/// `heading_wraps_onto` (8.5pt from line 1's right edge), but line 3 is refused:
+/// line 2 stops 30.6pt short of the body column, and `intestinal` is 31.6pt wide.
+#[test]
+fn ragged_right_edge_at_the_second_wrap_keeps_all_three_lines_gh1758() {
+    assert_gh1758_heading_whole(
+        gh1758_page(&[
+            ("3.2. Decreased frequency of regulatory T lymphocytes with the", 221.87),
+            ("anti-inflammatory phenotypes in the continuous and discrete", 213.43),
+            ("intestinal patches of vaccinated calves", 136.06),
+        ]),
+        "3.2. Decreased frequency of regulatory T lymphocytes with the anti-inflammatory phenotypes \
+         in the continuous and discrete intestinal patches of vaccinated calves",
+        "GH#1758 page 5 (A at the second wrap)",
+    );
+}
+
+/// GH#1758 page 6, defect C. The heading's MIDDLE line was measured against its
+/// own last line (right edge 142.1) instead of the body column beneath the run
+/// (281.7), so the `line_end <= next_right_edge` guard rejected it and the heading
+/// was cut after line 1 -- both remaining lines went to the body.
+#[test]
+fn middle_line_measured_against_the_column_keeps_all_three_lines_gh1758() {
+    assert_gh1758_heading_whole(
+        gh1758_page(&[
+            (
+                "3.2. Decreased frequency of T lymphocytes with anti-inflammatory",
+                234.30,
+            ),
+            ("phenotypes in continuous and discrete Peyer's patches of", 204.30),
+            ("vaccinated-challenged calves", 104.49),
+        ]),
+        "3.2. Decreased frequency of T lymphocytes with anti-inflammatory phenotypes in continuous \
+         and discrete Peyer's patches of vaccinated-challenged calves",
+        "GH#1758 page 6 (C: middle line measured against its own last line)",
+    );
+}
+
+/// GH#1758 negative control, the GH#1609 shape the word-fit relaxation must not
+/// re-open: a COMPLETE numbered heading stopping hundreds of points short of the
+/// body prose beneath it, with every other signal identical -- same size, same
+/// weight, same face, same left edge, and a lowercase opener. The next word could
+/// easily have fitted on the heading's line, so it did not wrap, it ended.
+#[test]
+fn complete_heading_over_body_prose_is_still_not_welded_gh1758() {
+    let segments = vec![
+        gh1758_seg(
+            "2.1. Animals",
+            GH1758_MARGIN,
+            44.03,
+            GH1758_FIRST_HEADING_BASELINE,
+            false,
+        ),
+        gh1758_seg(
+            "flow cytometry analysis was carried out on every isolated sample",
+            GH1758_MARGIN,
+            230.29,
+            GH1758_FIRST_HEADING_BASELINE - GH1758_HEADING_TO_BODY_GAP,
+            false,
+        ),
+        gh1758_seg(
+            "following the staining protocol of the previous trial, and the gating",
+            GH1758_MARGIN,
+            229.90,
+            GH1758_FIRST_HEADING_BASELINE - GH1758_HEADING_TO_BODY_GAP - GH1758_PITCH,
+            false,
+        ),
+    ];
+
+    let paragraphs = blocks_to_paragraphs(segments, &[], &[]);
+    let texts: Vec<String> = paragraphs.iter().map(paragraph_segment_text).collect();
+    assert_eq!(
+        texts.len(),
+        2,
+        "GH#1609 control: heading and body stay separate, got {texts:?}"
+    );
+    assert_eq!(texts[0], "2.1. Animals");
+    assert_eq!(
+        texts[1],
+        "flow cytometry analysis was carried out on every isolated sample following the staining \
+         protocol of the previous trial, and the gating"
+    );
+}
+
+/// GH#1758 negative control for B: the page-3 geometry with the capital-opening
+/// line set in the BODY face rather than the heading's own. A capital opener is
+/// refused unless the line keeps the heading's style while the body beneath does
+/// not -- this is the 194-case majority the lowercase rule exists to protect.
+#[test]
+fn capital_opener_without_the_headings_style_is_still_refused_gh1758() {
+    let mut segments = gh1758_page(&[
+        (
+            "3.9. Transcriptome profiles and differentially expressed genes in the",
+            240.10,
+        ),
+        ("Peyer's patch of vaccinated-challenged calves", 163.82),
+    ]);
+    segments[3].is_italic = false;
+
+    let paragraphs = blocks_to_paragraphs(segments, &[], &[]);
+    let texts: Vec<String> = paragraphs.iter().map(paragraph_segment_text).collect();
+    assert_eq!(
+        texts.len(),
+        3,
+        "the heading must not absorb a capital line in the body face, got {texts:?}"
+    );
+    assert_eq!(
+        texts[1], "3.9. Transcriptome profiles and differentially expressed genes in the",
+        "the heading keeps only its own first line"
+    );
+    assert!(
+        texts[2].starts_with("Peyer's patch of vaccinated-challenged calves Flow cytometry"),
+        "the body-face capital line stays out of the heading, got {:?}",
+        texts[2]
+    );
+}
+
+/// GH#1758, the shape that forced the column estimate to be FLOORED at the
+/// heading's own right edge. Measured on
+/// `test_documents/pdf/an_introduction_to_statistical_learning_...`: once the run
+/// skip walks past a long caption, the line it lands on can be a stub -- a panel
+/// label, a page number -- ending far short of the measure (x 69.9 against 375.2).
+/// A stub is not a column: read as one, it makes the `line_end <= column` guard
+/// reject the run's own middle line and cuts the heading after its first.
+#[test]
+fn stub_line_beneath_a_heading_run_is_not_read_as_the_column_gh1758() {
+    let segments = vec![
+        gh1758_seg(
+            "3.2. Decreased frequency of T lymphocytes with anti-inflammatory",
+            GH1758_MARGIN,
+            234.30,
+            708.55,
+            true,
+        ),
+        gh1758_seg(
+            "phenotypes in continuous and discrete Peyer's patches of",
+            GH1758_MARGIN,
+            204.30,
+            698.10,
+            true,
+        ),
+        gh1758_seg("vaccinated-challenged calves", GH1758_MARGIN, 104.49, 687.65, true),
+        gh1758_seg("Panel B", GH1758_MARGIN, 30.0, 666.65, false),
+        gh1758_seg(
+            "flow cytometry analysis was carried out on every isolated sample",
+            GH1758_MARGIN,
+            232.07,
+            656.20,
+            false,
+        ),
+        gh1758_seg(
+            "following the staining protocol of the previous trial, and the gating",
+            GH1758_MARGIN,
+            229.90,
+            645.75,
+            false,
+        ),
+    ];
+
+    let paragraphs = blocks_to_paragraphs(segments, &[], &[]);
+    let texts: Vec<String> = paragraphs.iter().map(paragraph_segment_text).collect();
+    assert_eq!(
+        texts.len(),
+        3,
+        "the heading, the stub and the body are three elements, got {texts:?}"
+    );
+    assert_eq!(
+        texts[0],
+        "3.2. Decreased frequency of T lymphocytes with anti-inflammatory phenotypes in continuous \
+         and discrete Peyer's patches of vaccinated-challenged calves",
+        "a stub beneath the run must not be mistaken for the column"
+    );
+    assert_eq!(texts[1], "Panel B", "the stub stays out of the heading");
+}
