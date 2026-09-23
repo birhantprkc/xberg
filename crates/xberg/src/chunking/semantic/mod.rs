@@ -45,51 +45,16 @@ pub(crate) fn chunk_semantic(
 
     warn_if_fallback_path(config);
 
-    let seg_size = SEGMENT_SIZE;
-    let has_markdown_headers = text.lines().any(crate::utils::markdown_utils::is_markdown_header);
-    let splitter_segments: Vec<&str> = if has_markdown_headers {
-        let splitter = MarkdownSplitter::new(seg_size);
-        splitter.chunks(text).collect()
-    } else {
-        let splitter = TextSplitter::new(seg_size);
-        splitter.chunks(text).collect()
-    };
+    let segments = split_into_segments(text);
 
-    if splitter_segments.is_empty() {
+    if segments.is_empty() {
         return Ok(ChunkingResult {
             chunks: vec![],
             chunk_count: 0,
         });
     }
 
-    let source_start = text.as_ptr() as usize;
-    let segments: Vec<Segment<'_>> = splitter_segments
-        .iter()
-        .map(|&s| {
-            let byte_start = s.as_ptr() as usize - source_start;
-            debug_assert!(
-                byte_start + s.len() <= text.len(),
-                "text_splitter segment is not a subslice of the input"
-            );
-            Segment { text: s, byte_start }
-        })
-        .collect();
-
-    let detected = detect_plain_text_boundaries(text);
-    let mut forced: Vec<bool> = vec![false; segments.len()];
-    forced[0] = true;
-
-    let mut seg_idx = 0;
-    for boundary in &detected {
-        while seg_idx < segments.len()
-            && segments[seg_idx].byte_start + segments[seg_idx].text.len() <= boundary.byte_offset
-        {
-            seg_idx += 1;
-        }
-        if seg_idx < segments.len() {
-            forced[seg_idx] = true;
-        }
-    }
+    let forced = forced_boundaries(text, &segments);
 
     for seg in &segments {
         debug_assert!(
@@ -112,16 +77,7 @@ pub(crate) fn chunk_semantic(
         let heading_ctx = resolve_heading_context(mc.byte_start, &heading_map, page_boundaries);
         let chunk_type = classify_chunk(&mc.text, heading_ctx.as_ref());
 
-        let (first_page, last_page, page_spans) = if let Some(pb) = page_boundaries {
-            // Propagate boundary-validation errors instead of silently discarding page
-            // provenance (#258) — matches the non-semantic path (chunking/builder.rs),
-            // which propagates the same errors via `?`.
-            let (first_page, last_page) = calculate_page_range(mc.byte_start, mc.byte_end, pb)?;
-            let page_spans = calculate_page_spans(mc.byte_start, mc.byte_end, pb)?;
-            (first_page, last_page, page_spans)
-        } else {
-            (None, None, Vec::new())
-        };
+        let (first_page, last_page, page_spans) = resolve_page_provenance(mc.byte_start, mc.byte_end, page_boundaries)?;
 
         let heading_path = heading_path_from_context(&heading_ctx);
         let token_count = token_counter.as_ref().map(|counter| counter(&mc.text));
@@ -153,6 +109,78 @@ pub(crate) fn chunk_semantic(
         chunk_count: chunks.len(),
         chunks,
     })
+}
+
+/// Split `text` into fine-grained segments, recording each segment's byte offset
+/// into the source.
+///
+/// Offsets are recovered by pointer arithmetic against the source's base address,
+/// which holds because the splitters yield subslices of `text` rather than copies. ~keep
+fn split_into_segments(text: &str) -> Vec<Segment<'_>> {
+    let seg_size = SEGMENT_SIZE;
+    let has_markdown_headers = text.lines().any(crate::utils::markdown_utils::is_markdown_header);
+    let splitter_segments: Vec<&str> = if has_markdown_headers {
+        let splitter = MarkdownSplitter::new(seg_size);
+        splitter.chunks(text).collect()
+    } else {
+        let splitter = TextSplitter::new(seg_size);
+        splitter.chunks(text).collect()
+    };
+
+    let source_start = text.as_ptr() as usize;
+    splitter_segments
+        .iter()
+        .map(|&s| {
+            let byte_start = s.as_ptr() as usize - source_start;
+            debug_assert!(
+                byte_start + s.len() <= text.len(),
+                "text_splitter segment is not a subslice of the input"
+            );
+            Segment { text: s, byte_start }
+        })
+        .collect()
+}
+
+/// Mark the segments that structural boundaries force a chunk break at.
+///
+/// Segment 0 is always forced. `detected` boundaries are consumed in ascending
+/// offset order against a single forward scan of `segments`. ~keep
+fn forced_boundaries(text: &str, segments: &[Segment<'_>]) -> Vec<bool> {
+    let detected = detect_plain_text_boundaries(text);
+    let mut forced: Vec<bool> = vec![false; segments.len()];
+    forced[0] = true;
+
+    let mut seg_idx = 0;
+    for boundary in &detected {
+        while seg_idx < segments.len()
+            && segments[seg_idx].byte_start + segments[seg_idx].text.len() <= boundary.byte_offset
+        {
+            seg_idx += 1;
+        }
+        if seg_idx < segments.len() {
+            forced[seg_idx] = true;
+        }
+    }
+
+    forced
+}
+
+/// Resolve a merged chunk's page range and page spans from the page boundaries.
+fn resolve_page_provenance(
+    byte_start: usize,
+    byte_end: usize,
+    page_boundaries: Option<&[PageBoundary]>,
+) -> Result<(Option<u32>, Option<u32>, Vec<crate::types::PageSpan>)> {
+    if let Some(pb) = page_boundaries {
+        // Propagate boundary-validation errors instead of silently discarding page
+        // provenance (#258) — matches the non-semantic path (chunking/builder.rs),
+        // which propagates the same errors via `?`.
+        let (first_page, last_page) = calculate_page_range(byte_start, byte_end, pb)?;
+        let page_spans = calculate_page_spans(byte_start, byte_end, pb)?;
+        Ok((first_page, last_page, page_spans))
+    } else {
+        Ok((None, None, Vec::new()))
+    }
 }
 
 /// Compute final boundary vector, incorporating embeddings when available.

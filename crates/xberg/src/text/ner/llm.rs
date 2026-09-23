@@ -146,21 +146,11 @@ fn parse_category(raw: &str, custom_lookup: &std::collections::HashMap<String, S
     }
 }
 
-/// Inline structured-output helper.
+/// Build the NER extraction prompt, listing the requested categories.
 ///
-/// Stream A owns the canonical `crate::llm::structured` helper; until that
-/// signature stabilises we ship our own thin wrapper here so the NER backend
-/// is self-contained and can be feature-tested independently.
-async fn complete_with_json_schema(
-    config: &LlmConfig,
-    text: &str,
-    categories: &[EntityCategory],
-    custom_labels: &[String],
-) -> Result<(Value, Option<crate::types::LlmUsage>)> {
-    use liter_llm::LlmClient;
-
-    let client = crate::llm::client::create_client(config)?;
-
+/// With neither configured categories nor custom labels the model is given a
+/// default category set rather than an empty list. ~keep
+fn build_ner_prompt(text: &str, categories: &[EntityCategory], custom_labels: &[String]) -> String {
     let mut category_strings: Vec<String> = if categories.is_empty() && custom_labels.is_empty() {
         ["person", "organization", "location", "date", "email", "phone", "url"]
             .iter()
@@ -176,16 +166,19 @@ async fn complete_with_json_schema(
     }
 
     let category_list = category_strings.join(", ");
-    let prompt = format!(
+    format!(
         "Identify named entities in the text. For each entity, return:\n\
          - text: the exact mention as it appears in the input\n\
          - category: one of {category_list}\n\
          - confidence: a number between 0 and 1\n\n\
          Return JSON only, conforming to the supplied schema.\n\n\
          TEXT:\n{text}"
-    );
+    )
+}
 
-    let schema = json!({
+/// JSON schema for the NER structured-output response.
+fn ner_response_schema() -> Value {
+    json!({
         "type": "object",
         "properties": {
             "entities": {
@@ -202,7 +195,26 @@ async fn complete_with_json_schema(
             }
         },
         "required": ["entities"]
-    });
+    })
+}
+
+/// Inline structured-output helper.
+///
+/// Stream A owns the canonical `crate::llm::structured` helper; until that
+/// signature stabilises we ship our own thin wrapper here so the NER backend
+/// is self-contained and can be feature-tested independently.
+async fn complete_with_json_schema(
+    config: &LlmConfig,
+    text: &str,
+    categories: &[EntityCategory],
+    custom_labels: &[String],
+) -> Result<(Value, Option<crate::types::LlmUsage>)> {
+    use liter_llm::LlmClient;
+
+    let client = crate::llm::client::create_client(config)?;
+
+    let prompt = build_ner_prompt(text, categories, custom_labels);
+    let schema = ner_response_schema();
 
     let mut request = liter_llm::ChatCompletionRequest {
         model: config.model.clone(),

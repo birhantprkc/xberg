@@ -194,6 +194,15 @@ fn pagerank_scores(token_lists: &[Vec<String>]) -> Vec<f32> {
         }
     }
 
+    power_iteration(&transition, &dangling, n)
+}
+
+/// Run damped power iteration over a column-stochastic `transition` matrix until the
+/// L1 delta falls below [`PAGERANK_TOLERANCE`] or the iteration cap is reached.
+///
+/// `dangling` lists the column indices with no outgoing mass; their score is
+/// redistributed uniformly each iteration. ~keep
+fn power_iteration(transition: &[Vec<f32>], dangling: &[usize], n: usize) -> Vec<f32> {
     let mut scores = vec![1.0f32 / n as f32; n];
     let teleport = (1.0 - PAGERANK_DAMPING) / n as f32;
     for _ in 0..PAGERANK_MAX_ITERATIONS {
