@@ -9,13 +9,23 @@ use xberg_native_pdf::layout::TextSpan;
 #[cfg(test)]
 use crate::core::config::DEFAULT_SCANNED_MIN_CONFIDENCE;
 
-/// Counts calls to [`fabricated_provenance_page_indices`], the whole-document separate read
-/// over every page's raw spans. A caller holding per-page counts already gathered by the main
-/// text pass must never reach this function (issue #1744); tests reset and read it to prove
-/// that second read did not happen. ~keep
 #[cfg(test)]
-pub(crate) static FABRICATED_PROVENANCE_SECOND_PASS_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Counts calls to [`fabricated_provenance_page_indices`], the whole-document separate
+    /// read over every page's raw spans. A caller holding per-page counts already gathered by
+    /// the main text pass must never reach this function (issue #1744); tests reset and read
+    /// it to prove that second read did not happen.
+    ///
+    /// Thread-local rather than a process-global counter: `cargo test`'s default harness runs
+    /// each `#[test]` on its own thread, and a process-global counter is incremented by ANY
+    /// test in the binary that reaches this function via the production path
+    /// (`pdf/native/metadata.rs::ocr_routing_pages`), not only tests that name it. `#[serial]`
+    /// only excludes other `#[serial]` tests, so it could not guard against that (issue #1752
+    /// review). A thread-local gives each test's own thread its own counter, so a concurrent,
+    /// unrelated test's calls are invisible to it regardless of `#[serial]`. ~keep
+    pub(crate) static FABRICATED_PROVENANCE_SECOND_PASS_CALLS: std::sync::atomic::AtomicUsize =
+        const { std::sync::atomic::AtomicUsize::new(0) };
+}
 
 /// Below this raster coverage a page is text with a figure, never a scan.
 const IMAGE_COVERAGE_MIN: f32 = 0.80;
@@ -275,7 +285,7 @@ fn page_has_fabricated_text(doc: &PdfDocument, page_index: usize, min_ratio: f64
 /// meant to be unioned into the caller's scanned-page set.
 pub(crate) fn fabricated_provenance_page_indices(doc: &PdfDocument, min_ratio: f64, min_chars: usize) -> Vec<usize> {
     #[cfg(test)]
-    FABRICATED_PROVENANCE_SECOND_PASS_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    FABRICATED_PROVENANCE_SECOND_PASS_CALLS.with(|counter| counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
 
     let Ok(page_count) = doc.page_count() else {
         return Vec::new();
@@ -392,13 +402,11 @@ mod tests {
     /// through it never races a cold load, which is the shape #1737 exists to make
     /// order-independent. ~keep
     ///
-    /// `#[serial]` because this test calls `fabricated_provenance_page_indices`, which
-    /// increments the process-global `FABRICATED_PROVENANCE_SECOND_PASS_CALLS`. That counter
-    /// is what `provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers`
-    /// (`pdf/native/text.rs`) zeroes and then asserts is still zero, so the two running
-    /// concurrently made that assertion fail spuriously. Both carry the marker; `#[serial]`
-    /// excludes only other `#[serial]` tests, so a future test that reaches this function
-    /// needs the marker too. ~keep
+    /// This test calls `fabricated_provenance_page_indices`, which increments
+    /// `FABRICATED_PROVENANCE_SECOND_PASS_CALLS` -- now thread-local, so it no longer shares
+    /// state with `provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers`
+    /// (`pdf/native/text.rs`) or any other test's thread. `#[serial]` is kept regardless, since
+    /// nothing about the counter change makes concurrent PDF-handle work here cheaper. ~keep
     #[test]
     #[serial_test::serial]
     fn both_page_passes_match_a_page_by_page_run() {

@@ -6358,11 +6358,14 @@ mod tests {
     /// is incremented only inside that whole-document function, so a count of zero after this
     /// call proves the second read did not happen, not just that the final numbers happen to
     /// agree. The expected page list is computed independently, on its own document handle,
-    /// before the counter is reset, so computing it cannot mask a regression. ~keep
+    /// before the counter is reset, so computing it cannot mask a regression.
     ///
-    /// `#[serial]` because the counter is process-global: `both_page_passes_match_a_page_by_page_run`
-    /// (`pdf/scan_detect.rs`) also drives `fabricated_provenance_page_indices` and increments it,
-    /// so running beside this test made the zero assertion below fail spuriously. ~keep
+    /// The counter is thread-local (issue #1752 review): a process-global counter was
+    /// incremented by ANY test in the binary reaching `fabricated_provenance_page_indices` via
+    /// the production path, not only `#[serial]`-marked siblings -- `#[serial]` excludes other
+    /// `#[serial]` tests, not the hundreds of ordinary ones. `extract_text_and_metadata` below
+    /// runs synchronously on this test's own thread, so its thread-local counter observes
+    /// exactly this call graph. ~keep
     #[test]
     #[serial_test::serial]
     fn provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers() {
@@ -6384,13 +6387,15 @@ mod tests {
             "fixture must fabricate at least one page for this test to mean anything"
         );
 
-        crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS
+            .with(|counter| counter.store(0, std::sync::atomic::Ordering::SeqCst));
 
         let mut doc = NativeDocument::open_bytes(&bytes).expect("corpus document must open a second time");
         let (_, _, _, metadata) = extract_text_and_metadata(&mut doc, None).expect("extraction must succeed");
 
         assert_eq!(
-            crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS
+                .with(|counter| counter.load(std::sync::atomic::Ordering::SeqCst)),
             0,
             "extract_text_and_metadata must not read every page's text a second time for provenance (issue #1744)"
         );
