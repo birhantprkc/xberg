@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.8] - 2026-09-23
+
+### Fixed
+
+- **(ocr): PDF OCR no longer upscales a page raster the layout pass already rendered.** The `source_dpi` hint that tells the image preprocessor how finely a page was sampled was derived only on the route that rendered the pages itself. When layout detection is on, OCR reuses the rasters the layout pass produced, and with the hint absent the preprocessor fell back to assuming 72 dpi. Both passes render at the same resolution -- `effective_pdf_render_dpi`, 150 by default -- so a correctly sampled raster was resampled toward the 300 dpi target by about 4.2x instead of the intended 2x, and clamped at the 4096 px ceiling: a US Letter page went to 3165 x 4096 where the OCR-rendered path produced 2550 x 3300. The extra pixels are interpolated, so they cost memory and recognition time and carry no detail the raster did not already hold. The resolution is now read from the raster's own pixel dimensions against the source page's MediaBox, which needs no extra PDF parse -- the same open already served the `/Rotate` hint on this route. A raster whose two axes disagree on the resolution they imply is not a whole-page MediaBox-oriented render of that page (a display-oriented render of a rotated page, or a crop), and keeps the previous hint-free behaviour rather than adopting a confidently wrong number. (GH#1753)
+
 ## [1.2.7] - 2026-09-22
 
 ### Added

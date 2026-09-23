@@ -3656,9 +3656,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.56.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6a806f80c1f5560431009ce5ec29b59d38f950e0cd7db5f1b8925e6d8104e21"
+checksum = "71160ed5f6dbe36a2d6be79f4ca03ee09a99d2866f340faed49458913449aefa"
 dependencies = [
  "ahash",
  "bytecount",
@@ -3684,18 +3684,18 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.56.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb862addfa7782108933abcf842fe25334523a9df5b89ea4d9620e3dd7b42181"
+checksum = "48d2120d8466ffcdc1b3be4b88ff0e9191bf5b6b09b1b1af1eef9aff8f465ea3"
 dependencies = [
  "regex-syntax",
 ]
 
 [[package]]
 name = "jsonschema-value"
-version = "0.56.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a05cd404c5ff6e2731dbbf7e290a27417750acfb59e329560a1d0af384c93fb0"
+checksum = "3fbfa40a42415369d940b3848f3ce08099f1f1ac04d73e8580f4d652617c4f44"
 dependencies = [
  "ahash",
  "bytecount",
@@ -5872,9 +5872,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.56.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3b4a92fac7e28c27de3ad26df2ecb9e652f227b258e845af034052e5b22c96c"
+checksum = "b06f6798be4fed305e74df8b1fb90cf59c6b8cc17aa3febeb1830c0c6b627b3e"
 dependencies = [
  "ahash",
  "fluent-uri",
@@ -8120,11 +8120,11 @@ checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 
 [[package]]
 name = "unhwp"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb12c3c0f03659771ad7fed484ce649f5cdff985bcca53b90b353bf669a9642b"
+checksum = "45db5079a34ac00ed877f6ac79b4e77bf0374dc8fd93dcff301e0558c3da973b"
 dependencies = [
- "cfb 0.14.0",
+ "cfb 0.15.0",
  "flate2",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
@@ -8342,9 +8342,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "utoipa"
-version = "5.5.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bde15df68e80b16c7d16b9616e80770ad158988daa56a27dccd1e55558b0160"
+checksum = "8765fe27aeff71012a3f90fa474cf1df863a7d0dd81ed25de4e63fff2544994f"
 dependencies = [
  "indexmap",
  "serde",
@@ -8354,14 +8354,14 @@ dependencies = [
 
 [[package]]
 name = "utoipa-gen"
-version = "5.5.0"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba0b99ee52df3028635d93840c797102da61f8a7bb3cf751032455895b52ef8"
+checksum = "6fa77c92cdc2442ce7b570a069dcb62263c07a870de839faa4f10235828f3c85"
 dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "syn 2.0.119",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -9024,7 +9024,7 @@ dependencies = [
 
 [[package]]
 name = "xberg"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -9160,7 +9160,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-candle-ocr"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "base64 0.23.1",
  "candle-core",
@@ -9180,7 +9180,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-gliner"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -9194,7 +9194,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libheif"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "cfg-if",
  "enumn",
@@ -9205,7 +9205,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-libwpd"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "cc",
  "flate2",
@@ -9218,7 +9218,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-native-pdf"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "aes 0.9.3",
  "base64 0.23.1",
@@ -9263,7 +9263,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-paddle-ocr"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "geo-clipper",
  "geo-types",
@@ -9278,7 +9278,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-rb"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "async-trait",
  "crawlberg",
@@ -9294,7 +9294,7 @@ dependencies = [
 
 [[package]]
 name = "xberg-tesseract"
-version = "1.2.7"
+version = "1.2.8"
 dependencies = [
  "cc",
  "cmake",
