@@ -5891,7 +5891,7 @@ mod tests {
 
     /// Metadata for a `ScannedPages` routing test: `page_count` pages, of which
     /// `scanned_pages` were flagged by scan detection.
-    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[cfg(feature = "ocr")]
     fn scanned_pages_metadata(
         page_count: Option<u32>,
         scanned_pages: Vec<u32>,
