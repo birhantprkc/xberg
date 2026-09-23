@@ -1591,7 +1591,8 @@ pub(crate) fn straddled_boundary_ratio(region: &[HocrWord], column_positions: &[
 /// Well-formedness gate for the borderless heuristic path, which is the only
 /// caller holding raw word geometry and the page's drawn-rule count.
 ///
-/// Implements the two-signal admission test from xberg-io/xberg#1399:
+/// Implements the two-signal admission test from xberg-io/xberg#1399, plus the
+/// short-region evidence requirement from xberg-io/xberg#1760:
 ///
 /// 1. **Drawn ruling lines (positive).** A page whose region carries horizontal
 ///    rules had a producer that drew a table, so the candidate is admitted. The
@@ -1603,6 +1604,11 @@ pub(crate) fn straddled_boundary_ratio(region: &[HocrWord], column_positions: &[
 ///    merely aligns into column-like x-buckets has words running across those
 ///    boundaries on most rows; a real borderless table does not, because its
 ///    cells do not overlap.
+/// 3. **Is there anything left to judge it by?** Both of the prose-flow tests in
+///    [`post_process_table_inner`] need four or more rows to fire, so a shorter
+///    candidate has passed them only because they never ran. See
+///    [`short_grid_has_positive_table_evidence`], which is tested before signal 1
+///    because signal 1 is page-scoped.
 ///
 /// This only ever narrows acceptance relative to [`is_well_formed_table`].
 pub(crate) fn is_well_formed_borderless_table(
@@ -1614,10 +1620,62 @@ pub(crate) fn is_well_formed_borderless_table(
     if !is_well_formed_table(grid) {
         return false;
     }
+    if !short_grid_has_positive_table_evidence(grid) {
+        return false;
+    }
     if horizontal_rules > 0 {
         return true;
     }
     straddled_boundary_ratio(region, column_positions) < MAX_STRADDLED_BOUNDARY_RATIO
+}
+
+/// Rows a candidate must have before [`post_process_table_inner`]'s prose tests
+/// can say anything about it: `column_text_flow` needs three data rows with both
+/// of the first two columns filled, and `row_continuation_flow` needs more than
+/// three rows in total. A three-row grid clears neither bar.
+const MIN_ROWS_FOR_PROSE_FLOW_TESTS: usize = 4;
+
+/// Longest a header cell may be and still read as a column label rather than a
+/// line of prose that happens to have landed in the grid's top row.
+const LABEL_HEADER_MAX_WORDS: usize = 3;
+const LABEL_HEADER_MAX_CHARS: usize = 30;
+
+/// Third signal of the borderless admission test (xberg-io/xberg#1760).
+///
+/// A region too short for the prose tests above has been judged by nothing: two
+/// text columns of a page, clipped to a few lines by a region cut, reach this
+/// point with every statistical guard satisfied and no flow signal able to fire.
+/// Below [`MIN_ROWS_FOR_PROSE_FLOW_TESTS`], require something that positively
+/// says "table" rather than merely failing to say "prose": numeric value cells
+/// ([`is_predominantly_numeric_short_grid`] is the established measure of them,
+/// and the only one with no row or column floor of its own) or a row of column
+/// labels.
+///
+/// Tested ahead of the page's drawn-rule count rather than behind it. Signal 1
+/// is page-scoped, so on a paper whose real table is ruled it admits every other
+/// short region on that page too -- which is how a three-row band of shredded
+/// prose on `embedded_images_tables.pdf` reached the output. A rule drawn for a
+/// different table says nothing about this region. ~keep
+fn short_grid_has_positive_table_evidence(grid: &[Vec<String>]) -> bool {
+    grid.len() >= MIN_ROWS_FOR_PROSE_FLOW_TESTS
+        || is_predominantly_numeric_short_grid(grid)
+        || has_label_like_header_row(grid)
+}
+
+/// Whether every column of the grid carries a short header label of its own.
+/// A genuine short borderless table names its columns; prose bucketed into a
+/// grid has a sentence fragment in its top row instead.
+fn has_label_like_header_row(grid: &[Vec<String>]) -> bool {
+    let Some(header) = grid.first() else {
+        return false;
+    };
+    !header.is_empty()
+        && header.iter().all(|cell| {
+            let trimmed = cell.trim();
+            !trimmed.is_empty()
+                && trimmed.split_whitespace().count() <= LABEL_HEADER_MAX_WORDS
+                && trimmed.chars().count() <= LABEL_HEADER_MAX_CHARS
+        })
 }
 
 /// Core well-formedness check. `skip_columnar_prose_guard` drops only the
@@ -4606,6 +4664,124 @@ mod tests {
             find_data_start(&table, false),
             2,
             "a non-numeric second header row must not be mistaken for data"
+        );
+    }
+
+    /// A clean two-column region: nothing straddles the boundary at x=200, so
+    /// #1399's geometric gate admits it and only the row count is in question.
+    fn gh1760_clean_two_column_region(rows: usize) -> Vec<HocrWord> {
+        let mut region = Vec::new();
+        for row in 0..rows {
+            let top = row as u32 * 40;
+            region.push(geometry_word(&format!("left{row}"), 0, top, 80));
+            region.push(geometry_word(&format!("right{row}"), 200, top, 80));
+        }
+        region
+    }
+
+    #[test]
+    fn short_unruled_grid_without_numeric_cells_is_not_well_formed_gh1760() {
+        let region = gh1760_clean_two_column_region(3);
+        let columns = vec![0u32, 200];
+        let grid = vec![
+            vec![
+                "more potent vaccines and/or careful attention to revaccination".to_string(),
+                "org/10.1016/j.vaccine.2024.126325.".to_string(),
+            ],
+            vec!["schedules.".to_string(), String::new()],
+            vec![String::new(), "References".to_string()],
+        ];
+
+        assert_eq!(
+            straddled_boundary_ratio(&region, &columns),
+            0.0,
+            "precondition: the geometric gate has no objection to this region"
+        );
+        assert!(
+            !is_well_formed_borderless_table(&grid, &region, &columns, 0),
+            "a three-row unruled candidate is below the row count at which the prose-flow \
+             tests can fire, so it must show positive evidence of being a table"
+        );
+    }
+
+    #[test]
+    fn four_row_unruled_grid_is_judged_by_the_prose_tests_as_before_gh1760() {
+        let region = gh1760_clean_two_column_region(4);
+        let columns = vec![0u32, 200];
+        let grid = vec![
+            vec!["Department".to_string(), "Head".to_string()],
+            vec!["Telecommunications".to_string(), "Alice".to_string()],
+            vec!["Finance".to_string(), "Bob".to_string()],
+            vec!["Logistics".to_string(), "Carol".to_string()],
+        ];
+
+        assert!(
+            is_well_formed_borderless_table(&grid, &region, &columns, 0),
+            "at four rows the prose-flow tests can fire, so the evidence requirement must not \
+             apply and this candidate must still be admitted"
+        );
+    }
+
+    #[test]
+    fn short_unruled_numeric_grid_is_still_well_formed_gh1760() {
+        let region = gh1760_clean_two_column_region(3);
+        let columns = vec![0u32, 200];
+        let grid = vec![
+            vec!["Region".to_string(), "Doses".to_string()],
+            vec!["1,240".to_string(), "8,415".to_string()],
+            vec!["2,310".to_string(), "9,702".to_string()],
+        ];
+
+        assert!(
+            is_well_formed_borderless_table(&grid, &region, &columns, 0),
+            "numeric value cells are the positive evidence the short-region gate asks for"
+        );
+    }
+
+    #[test]
+    fn short_grid_with_column_labels_is_well_formed_gh1760() {
+        let region = gh1760_clean_two_column_region(3);
+        let columns = vec![0u32, 200];
+        let grid = vec![
+            vec!["Name".to_string(), "Role".to_string()],
+            vec!["Alice".to_string(), "Engineer".to_string()],
+            vec!["Bob".to_string(), "Designer".to_string()],
+        ];
+
+        assert!(
+            is_well_formed_borderless_table(&grid, &region, &columns, 0),
+            "a row of short column labels is the other positive evidence a short text table \
+             can offer, and must keep such a table admissible with no rules drawn"
+        );
+    }
+
+    #[test]
+    fn page_rules_do_not_admit_a_short_prose_grid_gh1760() {
+        // The page-scoped rule count is signal 1 of #1399, but a rule drawn for a real
+        // table elsewhere on the page says nothing about a three-row band of shredded
+        // prose. Measured on `embedded_images_tables.pdf`, whose ruled numeric table
+        // let exactly such a band through. ~keep
+        let region = gh1760_clean_two_column_region(3);
+        let columns = vec![0u32, 200];
+        let grid = vec![
+            vec![
+                "surface in 0.5 M H 2 SO4 follow Langmuir".to_string(),
+                "show the SEM/EDX".to_string(),
+            ],
+            vec![
+                "surface morphology analysis of stainless steel. Figs. 7 and 8 are".to_string(),
+                "the SEM/EDX images of the stainless".to_string(),
+            ],
+            vec![
+                "steel specimens".to_string(),
+                "without and with inhibitor after weight loss".to_string(),
+            ],
+        ];
+
+        assert!(
+            !is_well_formed_borderless_table(&grid, &region, &columns, 6),
+            "six drawn rules elsewhere on the page must not stand in for evidence that this \
+             three-row region is a table"
         );
     }
 }
