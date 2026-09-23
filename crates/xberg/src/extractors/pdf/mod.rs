@@ -731,10 +731,18 @@ fn record_implausible_text_pages(
 ///
 /// `ExtractionConfig::ocr_scanned_page_quality_gate` is the caller's explicit answer;
 /// `None` derives it from whether an `ocr` block is present, which is what this condition
-/// was before GH#1752 gave the behaviour a setting of its own. ~keep
+/// was before GH#1752 gave the behaviour a setting of its own. `Some(true)` without an `ocr`
+/// block also requires a registered automatic backend, mirroring the sibling
+/// `near_empty_ocr_fallback_applies`'s own `Some(true)` arm (its doc comment states the same
+/// requirement) -- without this, a whole-document failure inside the gate selected every page
+/// for OCR with nothing able to run it, turning a would-be native-text degradation into a
+/// hard extraction failure. ~keep
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 fn scanned_page_quality_gate_enabled(config: &ExtractionConfig) -> bool {
-    config.ocr_scanned_page_quality_gate.unwrap_or(config.ocr.is_some())
+    config
+        .ocr_scanned_page_quality_gate
+        .map(|on| on && (config.ocr.is_some() || automatic_ocr_backend_is_registered()))
+        .unwrap_or(config.ocr.is_some())
 }
 
 /// Whether the `Auto` near-empty fallback branch runs for this document.
@@ -6018,6 +6026,30 @@ mod tests {
             scanned_pages_to_ocr(&config, &scanned_pages_metadata(Some(3), Vec::new()), "", None),
             None,
             "no detected scan and no gate means nothing to select"
+        );
+    }
+
+    /// GH#1752 F1: mirrors `near_empty_fallback_unset_reproduces_the_1338_carve_out`'s oracle
+    /// pattern below, which already compares `near_empty_ocr_fallback_applies`'s `Some(true)`
+    /// arm against `automatic_ocr_backend_is_registered()` directly rather than forcing a
+    /// particular build's registry state. Switched on without an `ocr` block,
+    /// `scanned_page_quality_gate_enabled` must require a registered automatic backend the
+    /// same way; before a fix it returned `true` unconditionally, which let
+    /// `scanned_pages_to_ocr` enter the per-page gate (and its `whole_doc_failure` branch,
+    /// selecting every page) with no backend able to run OCR on any of them.
+    #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+    #[test]
+    fn scanned_page_quality_gate_on_without_an_ocr_block_requires_a_registered_backend() {
+        let config = ExtractionConfig {
+            ocr: None,
+            ocr_scanned_page_quality_gate: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            scanned_page_quality_gate_enabled(&config),
+            automatic_ocr_backend_is_registered(),
+            "switched on without an `ocr` block, the gate must require a registered automatic \
+             backend, exactly like its sibling `near_empty_ocr_fallback_applies`'s `Some(true)` arm"
         );
     }
 
