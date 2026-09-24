@@ -68,7 +68,48 @@ const PLAUSIBILITY_MIN_PROSE_CHUNKS: usize = 3;
 /// 0.25 ceiling on this real, punctuation-and-bullet-heavy text (a synthetic pure-prose ROT-3
 /// fixture measures well under 0.25 and does not need the higher ceiling). 0.35 keeps a
 /// margin above the measured 0.303 without approaching whatlang's own 0.9 reliability bar. ~keep
-const PLAUSIBILITY_MAX_MEAN_CONFIDENCE: f64 = 0.35;
+pub(super) const PLAUSIBILITY_MAX_MEAN_CONFIDENCE: f64 = 0.35;
+/// Minimum fraction of a prose text's alphabetic characters that must fall in the Latin-1
+/// Supplement block (`U+00C0`-`U+00FF`, `À`-`ÿ`) before the text is flagged implausible on
+/// this signal alone, regardless of how confidently whatlang classifies it (issue #1767).
+///
+/// A single-byte code page's alphabet decoded as Latin-1/Windows-1252 by mistake (the classic
+/// case: Cyrillic cp1251, whose 64 letters sit at `0xC0`-`0xFF`, identical to this block) lands
+/// almost every letter in this narrow 64-codepoint band. No real language does that: even the
+/// most diacritic-dense Western European prose (French, Welsh, Icelandic, Portuguese) is
+/// dominated by plain ASCII consonants that are never accented, so genuine text measures well
+/// under this ratio. This is why #1696's language-confidence check alone cannot catch #1767's
+/// case: whatlang can find a real, highly confident, highly reliable language in mojibake shaped
+/// this way (measured `reliable_ratio=0.8`, `mean_confidence=0.83`, classified `cym` throughout)
+/// because every chunk's *character shapes* genuinely resemble that language's orthography --
+/// the confidence signal is telling the truth about shape, just not about content. This
+/// signature is orthogonal: it looks at *which* codepoints appear, not at whether whatlang
+/// recognizes their pattern. ~keep
+pub(super) const MOJIBAKE_LATIN1_SUPPLEMENT_ALPHA_RATIO: f64 = 0.90;
+/// Inclusive start of the Latin-1 Supplement alphabetic range consulted by
+/// [`latin1_supplement_alpha_ratio`]. ~keep
+const LATIN1_SUPPLEMENT_ALPHA_START: char = '\u{C0}';
+/// Inclusive end of the Latin-1 Supplement alphabetic range consulted by
+/// [`latin1_supplement_alpha_ratio`]. ~keep
+const LATIN1_SUPPLEMENT_ALPHA_END: char = '\u{FF}';
+
+/// Fraction of `text`'s alphabetic characters that fall in the Latin-1 Supplement block
+/// (`U+00C0`-`U+00FF`). `0.0` when `text` holds no alphabetic characters at all.
+pub(super) fn latin1_supplement_alpha_ratio(text: &str) -> f64 {
+    let mut alpha = 0usize;
+    let mut in_range = 0usize;
+    for c in text.chars().filter(|c| c.is_alphabetic()) {
+        alpha += 1;
+        if (LATIN1_SUPPLEMENT_ALPHA_START..=LATIN1_SUPPLEMENT_ALPHA_END).contains(&c) {
+            in_range += 1;
+        }
+    }
+    if alpha == 0 {
+        0.0
+    } else {
+        in_range as f64 / alpha as f64
+    }
+}
 
 /// The outcome of judging a span of text for language/dictionary plausibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +197,11 @@ pub(super) fn evaluate_text_plausibility(text: &str, thresholds: &OcrQualityThre
     let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
     let reliability = crate::language_detection::chunk_reliability(&chunk_refs);
 
-    let implausible = reliability.reliable_ratio() < thresholds.min_reliable_language_chunk_ratio
+    let low_confidence_implausible = reliability.reliable_ratio() < thresholds.min_reliable_language_chunk_ratio
         && reliability.mean_confidence() < PLAUSIBILITY_MAX_MEAN_CONFIDENCE;
+    let mojibake_implausible = latin1_supplement_alpha_ratio(&prose_text) >= MOJIBAKE_LATIN1_SUPPLEMENT_ALPHA_RATIO;
 
-    if implausible {
+    if low_confidence_implausible || mojibake_implausible {
         PlausibilityVerdict::Implausible
     } else {
         PlausibilityVerdict::Plausible

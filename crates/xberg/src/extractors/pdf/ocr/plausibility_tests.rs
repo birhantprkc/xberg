@@ -326,3 +326,73 @@ fn scan_text_plausibility_keeps_a_judged_page_apart_from_an_unjudged_one() {
         scan.implausible
     );
 }
+
+/// The GH#1767 carrier: Cyrillic written at cp1251 code points and read as Latin-1. Supplied
+/// by the reporter; fictitious marketing copy naming no real individual or organisation.
+const CP1251_CYRILLIC_AS_LATIN1: &str = "\u{C2}\u{E5}\u{F1}\u{E5}\u{ED}\u{ED}\u{FF}\u{FF} \u{EA}\u{E0}\u{EC}\u{EF}\u{E0}\u{ED}\u{E8}\u{FF} \u{E1}\u{F0}\u{E5}\u{ED}\u{E4}\u{E0} \u{D1}\u{E5}\u{E2}\u{E5}\u{F0}\u{ED}\u{FB}\u{E9} \u{E2}\u{E5}\u{F2}\u{E5}\u{F0} \u{F1}\u{F2}\u{F0}\u{EE}\u{E8}\u{F2}\u{F1}\u{FF} \u{E2}\u{EE}\u{EA}\u{F0}\u{F3}\u{E3} \u{E8}\u{F1}\u{F2}\u{EE}\u{F0}\u{E8}\u{E9} \u{EC}\u{E5}\u{F1}\u{F2}\u{ED}\u{FB}\u{F5} \u{EC}\u{E0}\u{F1}\u{F2}\u{E5}\u{F0}\u{EE}\u{E2}. \u{CC}\u{FB} \u{EF}\u{EE}\u{EA}\u{E0}\u{E7}\u{FB}\u{E2}\u{E0}\u{E5}\u{EC}, \u{EA}\u{E0}\u{EA} \u{ED}\u{E5}\u{E1}\u{EE}\u{EB}\u{FC}\u{F8}\u{E8}\u{E5} \u{EC}\u{E0}\u{F1}\u{F2}\u{E5}\u{F0}\u{F1}\u{EA}\u{E8}\u{E5} \u{EF}\u{F0}\u{E5}\u{E2}\u{F0}\u{E0}\u{F9}\u{E0}\u{FE}\u{F2} \u{EF}\u{F0}\u{EE}\u{F1}\u{F2}\u{FB}\u{E5} \u{EC}\u{E0}\u{F2}\u{E5}\u{F0}\u{E8}\u{E0}\u{EB}\u{FB} \u{E2} \u{E2}\u{E5}\u{F9}\u{E8}, \u{EA}\u{EE}\u{F2}\u{EE}\u{F0}\u{FB}\u{E5} \u{F1}\u{EB}\u{F3}\u{E6}\u{E0}\u{F2} \u{E3}\u{EE}\u{E4}\u{E0}\u{EC}\u{E8}. \u{C3}\u{EB}\u{E0}\u{E2}\u{ED}\u{E0}\u{FF} \u{E7}\u{E0}\u{E4}\u{E0}\u{F7}\u{E0} \u{EA}\u{E0}\u{EC}\u{EF}\u{E0}\u{ED}\u{E8}\u{E8} \u{F1}\u{EE}\u{F1}\u{F2}\u{EE}\u{E8}\u{F2} \u{E2} \u{F2}\u{EE}\u{EC}, \u{F7}\u{F2}\u{EE}\u{E1}\u{FB} \u{EF}\u{EE}\u{E2}\u{FB}\u{F1}\u{E8}\u{F2}\u{FC} \u{F3}\u{E7}\u{ED}\u{E0}\u{E2}\u{E0}\u{E5}\u{EC}\u{EE}\u{F1}\u{F2}\u{FC} \u{E1}\u{F0}\u{E5}\u{ED}\u{E4}\u{E0} \u{F1}\u{F0}\u{E5}\u{E4}\u{E8} \u{EC}\u{EE}\u{EB}\u{EE}\u{E4}\u{FB}\u{F5} \u{F1}\u{E5}\u{EC}\u{E5}\u{E9} \u{E8} \u{EF}\u{F0}\u{E8}\u{E2}\u{E5}\u{F1}\u{F2}\u{E8} \u{ED}\u{EE}\u{E2}\u{FB}\u{F5} \u{EF}\u{EE}\u{EA}\u{F3}\u{EF}\u{E0}\u{F2}\u{E5}\u{EB}\u{E5}\u{E9} \u{E2} \u{F4}\u{E8}\u{F0}\u{EC}\u{E5}\u{ED}\u{ED}\u{FB}\u{E5} \u{EC}\u{E0}\u{E3}\u{E0}\u{E7}\u{E8}\u{ED}\u{FB} \u{E3}\u{EE}\u{F0}\u{EE}\u{E4}\u{E0} \u{D0}\u{E5}\u{F7}\u{ED}\u{EE}\u{E9}. \u{CE}\u{F1}\u{ED}\u{EE}\u{E2}\u{ED}\u{EE}\u{E9} \u{E2}\u{E8}\u{E7}\u{F3}\u{E0}\u{EB}\u{FC}\u{ED}\u{FB}\u{E9} \u{EE}\u{E1}\u{F0}\u{E0}\u{E7} \u{EE}\u{E1}\u{FA}\u{E5}\u{E4}\u{E8}\u{ED}\u{FF}\u{E5}\u{F2} \u{F2}\u{E5}\u{EF}\u{EB}\u{FB}\u{E9} \u{F1}\u{E2}\u{E5}\u{F2}, \u{ED}\u{E0}\u{F2}\u{F3}\u{F0}\u{E0}\u{EB}\u{FC}\u{ED}\u{EE}\u{E5} \u{E4}\u{E5}\u{F0}\u{E5}\u{E2}\u{EE} \u{E8} \u{F1}\u{EF}\u{EE}\u{EA}\u{EE}\u{E9}\u{ED}\u{FB}\u{E5} \u{F6}\u{E2}\u{E5}\u{F2}\u{E0}. \u{CD}\u{E0}\u{F0}\u{F3}\u{E6}\u{ED}\u{E0}\u{FF} \u{F0}\u{E5}\u{EA}\u{EB}\u{E0}\u{EC}\u{E0} \u{F0}\u{E0}\u{E7}\u{EC}\u{E5}\u{F9}\u{E0}\u{E5}\u{F2}\u{F1}\u{FF} \u{F0}\u{FF}\u{E4}\u{EE}\u{EC} \u{F1} \u{EF}\u{E0}\u{F0}\u{EA}\u{E0}\u{EC}\u{E8}, \u{F0}\u{FB}\u{ED}\u{EA}\u{E0}\u{EC}\u{E8} \u{E8} \u{EE}\u{F1}\u{F2}\u{E0}\u{ED}\u{EE}\u{E2}\u{EA}\u{E0}\u{EC}\u{E8} \u{EE}\u{E1}\u{F9}\u{E5}\u{F1}\u{F2}\u{E2}\u{E5}\u{ED}\u{ED}\u{EE}\u{E3}\u{EE} \u{F2}\u{F0}\u{E0}\u{ED}\u{F1}\u{EF}\u{EE}\u{F0}\u{F2}\u{E0}. \u{C4}\u{EB}\u{FF} \u{F1}\u{EE}\u{F6}\u{E8}\u{E0}\u{EB}\u{FC}\u{ED}\u{FB}\u{F5} \u{F1}\u{E5}\u{F2}\u{E5}\u{E9} \u{E3}\u{EE}\u{F2}\u{EE}\u{E2}\u{E8}\u{F2}\u{F1}\u{FF} \u{F1}\u{E5}\u{F0}\u{E8}\u{FF} \u{EA}\u{EE}\u{F0}\u{EE}\u{F2}\u{EA}\u{E8}\u{F5} \u{F0}\u{EE}\u{EB}\u{E8}\u{EA}\u{EE}\u{E2}, \u{E3}\u{E4}\u{E5} \u{EA}\u{E0}\u{E6}\u{E4}\u{FB}\u{E9} \u{EC}\u{E0}\u{F1}\u{F2}\u{E5}\u{F0} \u{F0}\u{E0}\u{F1}\u{F1}\u{EA}\u{E0}\u{E7}\u{FB}\u{E2}\u{E0}\u{E5}\u{F2} \u{EE} \u{F1}\u{E2}\u{EE}\u{E5}\u{E9} \u{F0}\u{E0}\u{E1}\u{EE}\u{F2}\u{E5}.";
+
+#[test]
+fn cp1251_cyrillic_read_as_latin1_is_implausible_gh1767() {
+    assert_eq!(
+        evaluate_text_plausibility(CP1251_CYRILLIC_AS_LATIN1, &t()),
+        PlausibilityVerdict::Implausible,
+        "a single-byte code page's alphabet read as Latin-1 must route to OCR"
+    );
+}
+
+/// Pins WHY the GH#1696 confidence signal cannot catch GH#1767, so it is not rediscovered:
+/// whatlang finds a real language in this mojibake and is confident and reliable about it.
+/// It is telling the truth about character shape and nothing about content, so a check on
+/// confidence alone can only ever read this page as plausible. Both clauses of that check
+/// are asserted to be satisfied here -- if either ever stops being, this fix's whole
+/// premise needs rechecking. ~keep
+#[test]
+fn the_gh1767_carrier_defeats_the_confidence_signal_on_both_clauses() {
+    let prose = select_prose_text(CP1251_CYRILLIC_AS_LATIN1);
+    let chunks = prose_chunks(&prose);
+    let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+    let reliability = crate::language_detection::chunk_reliability(&chunk_refs);
+
+    assert!(
+        reliability.reliable_ratio() >= t().min_reliable_language_chunk_ratio,
+        "carrier clears the reliability bar at {}, so that clause cannot flag it",
+        reliability.reliable_ratio()
+    );
+    assert!(
+        reliability.mean_confidence() >= PLAUSIBILITY_MAX_MEAN_CONFIDENCE,
+        "carrier clears the confidence bar at {}, so that clause cannot flag it either",
+        reliability.mean_confidence()
+    );
+}
+
+/// The separation the GH#1767 threshold rests on. The Latin-1 Supplement block holds no
+/// unaccented ASCII letters, and every Latin-script orthography needs them, so genuine prose
+/// cannot approach a ratio of 1.0 however diacritic-dense it is. Measured against the densest
+/// real cases available and against 229 corpus documents, whose maximum was 0.0065 -- but the
+/// corpus is predominantly English and so cannot speak for the population actually at risk,
+/// which is why these samples are pinned here instead. ~keep
+#[test]
+fn diacritic_dense_real_prose_stays_far_below_the_mojibake_threshold() {
+    const ICELANDIC: &str = "\u{DE}etta er \u{ED}slenskur texti me\u{F0} m\u{F6}rgum s\u{E9}rst\u{F6}kum st\u{F6}fum \u{FE}ar sem \u{E1}hersla er l\u{F6}g\u{F0} \u{E1} a\u{F0} s\u{FD}na hvernig tungum\u{E1}li\u{F0} l\u{ED}tur \u{FA}t \u{ED} venjulegu prentu\u{F0}u m\u{E1}li.";
+    const PORTUGUESE: &str = "A informa\u{E7}\u{E3}o n\u{E3}o est\u{E1} dispon\u{ED}vel porque a pr\u{F3}xima reuni\u{E3}o de avalia\u{E7}\u{E3}o foi adiada at\u{E9} \u{E0} conclus\u{E3}o das obras de manuten\u{E7}\u{E3}o no edif\u{ED}cio hist\u{F3}rico da c\u{E2}mara municipal.";
+    const FRENCH: &str = "Les h\u{F4}tels tr\u{E8}s pris\u{E9}s de la r\u{E9}gion c\u{F4}ti\u{E8}re accueillent chaque \u{E9}t\u{E9} des millions de visiteurs \u{E9}trangers qui d\u{E9}couvrent une cuisine r\u{E9}put\u{E9}e et des paysages pr\u{E9}serv\u{E9}s.";
+    const WELSH: &str = "Mae'r tywydd yng Nghymru yn newid yn gyflym iawn yn ystod misoedd yr hydref, ac mae llawer o ymwelwyr yn dod i weld y mynyddoedd a'r traethau hardd.";
+
+    for (language, sample) in [
+        ("Icelandic", ICELANDIC),
+        ("Portuguese", PORTUGUESE),
+        ("French", FRENCH),
+        ("Welsh", WELSH),
+    ] {
+        let ratio = latin1_supplement_alpha_ratio(sample);
+        assert!(
+            ratio < 0.25,
+            "{language} measured {ratio}, too close to the {MOJIBAKE_LATIN1_SUPPLEMENT_ALPHA_RATIO} threshold"
+        );
+    }
+    assert_eq!(
+        latin1_supplement_alpha_ratio(CP1251_CYRILLIC_AS_LATIN1),
+        1.0,
+        "every letter of the carrier sits inside the block"
+    );
+}
