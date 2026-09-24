@@ -115,9 +115,27 @@ struct HeadingRun {
 /// sub-threshold content is unevenly distributed inside the run. That
 /// exactness is why centers are computed in f32 as `(lo + hi) / 2`:
 /// an integer `lo + width / 2` truncates, which would shift the split
-/// by half a unit on every odd-width run and so change the common case
-/// this fix is meant to leave alone. `uniform_run_split_is_unchanged`
-/// pins it. ~keep
+/// by half a unit on every odd-width run. That arithmetic is pinned by
+/// `a_candidate_that_would_cut_a_span_is_rejected`, whose chosen gap has
+/// odd width -- NOT by `uniform_run_split_is_unchanged_from_the_legacy_midpoint`,
+/// which cannot reach it: a uniform run's midpoint is by definition at the
+/// floor, so the guard below returns before any centre is computed. ~keep
+/// Share of the projected region a below-threshold run must exceed before its midpoint is
+/// treated as untrustworthy (GH#1763).
+///
+/// A real column gutter is narrow -- 15 to 80 pt on a region of roughly 500 pt, so 3% to 16%
+/// -- and its midpoint is the gutter, which is why splitting there worked for years. The
+/// GH#1763 page is the opposite case: its "valley" is 254 pt of a 523 pt region, 48.6%,
+/// because the left column is a figure and a 7.2 pt caption that fall below the density
+/// threshold almost everywhere. A run that wide is not a gutter at all, it is a sparse
+/// region, and its arithmetic midpoint says nothing about where the columns divide.
+///
+/// 35% sits well above any plausible gutter and well below the reporting page. Relocating
+/// regardless of run width was measured across 230 corpus documents and was not an
+/// improvement: 23 documents changed and, by absolute dictionary-valid word count, more got
+/// worse than better. ~keep
+const SPARSE_VALLEY_REGION_SHARE: f32 = 0.35;
+
 fn deepest_valley_point(density: &[f32], start: usize, end: usize, split_is_clear: &dyn Fn(f32) -> bool) -> f32 {
     debug_assert!(start < end && end <= density.len());
     if start >= end || end > density.len() {
@@ -125,6 +143,12 @@ fn deepest_valley_point(density: &[f32], start: usize, end: usize, split_is_clea
     }
     let run_mid = (start + end) as f32 / 2.0;
     let min_density = density[start..end].iter().copied().fold(f32::INFINITY, f32::min);
+
+    // A narrow run IS the gutter, and its midpoint is the right place to split; only a run
+    // too wide to be a gutter has an untrustworthy midpoint. See SPARSE_VALLEY_REGION_SHARE. ~keep
+    if ((end - start) as f32) <= density.len() as f32 * SPARSE_VALLEY_REGION_SHARE {
+        return (start + end) as f32 / 2.0;
+    }
 
     // Relocate ONLY when the midpoint actually lands on content -- the defect's own
     // precondition. If the midpoint already sits at the run's density floor, the split is
@@ -3952,14 +3976,49 @@ mod tests {
 
     #[test]
     fn uniform_run_split_is_unchanged_from_the_legacy_midpoint() {
-        let density = vec![0.0f32; 64];
-        for (start, end) in [(3usize, 8usize), (3, 9), (0, 5), (0, 4), (10, 17), (2, 3), (1, 64)] {
+        // This pins a behavioural guarantee -- a uniformly empty run splits exactly where it
+        // always did -- and not the centre arithmetic, which it cannot reach: a uniform run's
+        // midpoint is by definition at the density floor, so the floor guard returns first.
+        // `a_candidate_that_would_cut_a_span_is_rejected` is what pins the f32 centre.
+        // The runs are still sized to clear the sparse-run gate so the guarantee is delivered
+        // by the floor guard rather than by short-circuiting earlier still.
+        for (start, end) in [(3usize, 8usize), (3, 9), (0, 5), (0, 4), (10, 17), (2, 5), (1, 64)] {
+            let density = vec![0.0f32; end];
+            let share = (end - start) as f32 / end as f32;
+            assert!(
+                share > SPARSE_VALLEY_REGION_SHARE,
+                "run [{start},{end}) is {share} of its region; the sparse gate would short-circuit it"
+            );
             assert_eq!(
                 XYCutStrategy::deepest_point_wrapper(&density, start, end),
                 XYCutStrategy::legacy_valley_midpoint(start, end),
                 "uniformly empty run [{start},{end}) must split exactly where it always did"
             );
         }
+    }
+
+    /// A below-threshold run narrow enough to BE a gutter keeps its midpoint without the
+    /// candidate search running at all -- that is the case GH#1763 must not disturb, and it
+    /// is most of the corpus. ~keep
+    #[test]
+    fn a_run_narrow_enough_to_be_a_gutter_keeps_its_midpoint() {
+        // 20 empty bins in a 200-bin region: 10%, the shape of a real column gutter. An
+        // off-centre single-bin dip would otherwise win the candidate search.
+        let mut density = vec![5.0f32; 200];
+        for bin in 90..110 {
+            density[bin] = 1.0;
+        }
+        density[92] = 0.0;
+        let (start, end) = (90usize, 110usize);
+        assert!(
+            ((end - start) as f32) <= density.len() as f32 * SPARSE_VALLEY_REGION_SHARE,
+            "this run must be narrow enough for the gate to fire, or the test pins nothing"
+        );
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper(&density, start, end),
+            XYCutStrategy::legacy_valley_midpoint(start, end),
+            "a gutter-width run must split at its midpoint, as it always did"
+        );
     }
 
     /// The GH#1763 reporter could not supply a reproducing PDF, but did attach the
