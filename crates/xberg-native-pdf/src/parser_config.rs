@@ -74,7 +74,9 @@ pub struct ParserOptions {
     ///
     /// Prevents memory exhaustion from extremely large decompressed streams.
     ///
-    /// Default: 100 MB. Set to 0 to disable check.
+    /// Default: 256 MB baseline, overridable via the
+    /// `XBERG_NATIVE_PDF_MAX_DECOMPRESS_MB` environment variable; doubled by
+    /// [`ParserOptions::very_lenient`]. Set to 0 to disable check.
     ///
     /// Security: Protects against decompression bombs and malicious PDFs.
     pub max_decompressed_size: usize,
@@ -110,7 +112,7 @@ impl ParserOptions {
             allow_missing_endobj: false,
             allow_malformed_streams: false,
             max_decompression_ratio: 100,
-            max_decompressed_size: 100 * 1024 * 1024,
+            max_decompressed_size: crate::decoders::default_max_decompressed_size(),
             max_recursion_depth: 100,
             max_file_size: 500 * 1024 * 1024,
         }
@@ -129,7 +131,7 @@ impl ParserOptions {
             allow_missing_endobj: true,
             allow_malformed_streams: true,
             max_decompression_ratio: 100,
-            max_decompressed_size: 100 * 1024 * 1024,
+            max_decompressed_size: crate::decoders::default_max_decompressed_size(),
             max_recursion_depth: 100,
             max_file_size: 500 * 1024 * 1024,
         }
@@ -147,8 +149,11 @@ impl ParserOptions {
             max_nesting: 200,
             allow_missing_endobj: true,
             allow_malformed_streams: true,
+            // Doubles the size cap alongside the ratio cap (100 -> 200 above): this mode
+            // already accepts twice the bomb risk by design, so the size cap tracks it
+            // proportionally instead of being a second, independently hardcoded number. ~keep
             max_decompression_ratio: 200,
-            max_decompressed_size: 200 * 1024 * 1024,
+            max_decompressed_size: crate::decoders::default_max_decompressed_size().saturating_mul(2),
             max_recursion_depth: 200,
             max_file_size: 1024 * 1024 * 1024,
         }
@@ -187,6 +192,26 @@ mod tests {
         assert!(!opts.strict);
         assert!(opts.skip_invalid_objects);
         assert!(opts.allow_missing_endobj);
+    }
+
+    /// GH#1754 unified `default_max_decompressed_size()` (`decoders::mod`) with
+    /// `flate::effective_limit()`, but `ParserOptions::strict()`/`lenient()`/
+    /// `very_lenient()` kept hardcoding `100 * 1024 * 1024` independently. Every
+    /// production call site passes `options: None` so the env var already reached
+    /// production; this only affected callers that construct `ParserOptions`
+    /// explicitly, whose cap the env var could not move. One knob must govern both. ~keep
+    #[test]
+    fn max_decompressed_size_tracks_the_crate_wide_default() {
+        let default_cap = crate::decoders::default_max_decompressed_size();
+        assert_eq!(ParserOptions::default().max_decompressed_size, default_cap);
+        assert_eq!(ParserOptions::strict().max_decompressed_size, default_cap);
+        assert_eq!(ParserOptions::lenient().max_decompressed_size, default_cap);
+        assert_eq!(
+            ParserOptions::very_lenient().max_decompressed_size,
+            default_cap.saturating_mul(2),
+            "very_lenient already doubles max_decompression_ratio (100 -> 200); its size cap \
+             scales the same way rather than being a second, independently hardcoded number"
+        );
     }
 
     #[test]

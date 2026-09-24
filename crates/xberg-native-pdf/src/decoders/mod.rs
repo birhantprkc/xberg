@@ -73,7 +73,7 @@ const DEFAULT_MAX_DECOMPRESSION_RATIO: u32 = 100;
 /// rejects an allocation that already happened rather than bounding it, and raising
 /// the number raises that transient peak with it. Bounding those decoders mid-decode
 /// needs `StreamDecoder::decode` to carry the limit — tracked in GH#1764. ~keep
-fn default_max_decompressed_size() -> usize {
+pub(crate) fn default_max_decompressed_size() -> usize {
     usize::try_from(flate::effective_limit()).unwrap_or(usize::MAX)
 }
 
@@ -316,7 +316,8 @@ fn decode_stream_with_options_and_expected_size(
 /// xref-stream decoding), neither of which has a `ParserOptions` to thread
 /// through. It delegates to [`decode_stream_with_options`] with `options:
 /// None` so those callers still get the default decompression-bomb guard
-/// (100:1 ratio, 100 MB output cap) rather than none at all — without that,
+/// (100:1 ratio, 256 MB output cap by default — overridable via
+/// `XBERG_NATIVE_PDF_MAX_DECOMPRESS_MB`) rather than none at all — without that,
 /// chained filters like `RunLengthDecode` or `LZWDecode` have no cap of their
 /// own and a few KB of input can expand by orders of magnitude before this
 /// function ever returns.
