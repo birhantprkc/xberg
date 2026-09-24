@@ -337,10 +337,10 @@ impl PdfDocument {
                                 tracing::warn!(target: LOG_TARGET, "Circular reference in page tree at object {}, skipping", obj_ref);
                                 continue;
                             }
-                            Err(Error::RecursionLimitExceeded(_)) => {
-                                tracing::warn!(target: LOG_TARGET, "Recursion limit exceeded in page tree, skipping branch");
-                                continue;
-                            }
+                            // GH#1755: RecursionLimitExceeded used to get its own arm here,
+                            // but it only ever changed the log line — telemetry_code()
+                            // already reports "recursion_limit_exceeded" through the
+                            // general arm below, so the split was dead. ~keep
                             Err(error) => {
                                 tracing::warn!(target: LOG_TARGET,
                                     error_code = error.telemetry_code(),
@@ -940,11 +940,19 @@ impl PdfDocument {
                             tracing::warn!(target: LOG_TARGET, "Circular reference in page tree at object {}, skipping", obj_ref);
                             continue;
                         }
-                        Err(Error::RecursionLimitExceeded(_)) => {
-                            tracing::warn!(target: LOG_TARGET, "Recursion limit exceeded in page tree, skipping branch");
+                        // GH#1755: RecursionLimitExceeded used to get its own arm here,
+                        // but it only ever changed the log line (and the previous
+                        // catch-all below logged nothing at all) — fold both into one
+                        // arm with the same structured logging `count_pages_recursive`
+                        // uses for its equivalent catch-all. ~keep
+                        Err(error) => {
+                            tracing::warn!(target: LOG_TARGET,
+                                error_code = error.telemetry_code(),
+                                error_offset = ?error.telemetry_offset(),
+                                "error walking to page in tree; skipping branch"
+                            );
                             continue;
                         }
-                        Err(_) => continue,
                     }
                 }
 

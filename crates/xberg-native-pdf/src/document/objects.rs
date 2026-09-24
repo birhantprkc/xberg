@@ -143,9 +143,20 @@ impl PdfDocument {
             return Ok(());
         }
 
+        // GH#1755: degrade rather than abort. One unloadable branch (corrupt object,
+        // recursion limit, ...) must not cost the caller every OTHER page in the
+        // document. Matches `collect_all_pages`'s per-kid handling in `pages.rs`, and
+        // brings this walker in line with the other four page-tree walkers, which all
+        // skip a bad branch instead of failing the whole traversal. ~keep
         for kid in kids {
-            if let Some(kid_ref) = kid.as_reference() {
-                self.collect_page_refs(kid_ref, out, visited, depth + 1)?;
+            if let Some(kid_ref) = kid.as_reference()
+                && let Err(error) = self.collect_page_refs(kid_ref, out, visited, depth + 1)
+            {
+                tracing::warn!(target: LOG_TARGET,
+                    error_code = error.telemetry_code(),
+                    error_offset = ?error.telemetry_offset(),
+                    "error collecting page ref from tree; skipping branch"
+                );
             }
         }
         Ok(())

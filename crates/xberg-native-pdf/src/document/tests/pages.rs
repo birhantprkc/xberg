@@ -163,12 +163,18 @@ fn should_return_rather_than_abort_when_page_tree_chain_exceeds_the_depth_cap() 
         page_ref_error
     );
 
-    let refs_error = doc.all_page_refs().expect_err("all_page_refs must surface the cap");
-    assert!(
-        matches!(refs_error, Error::RecursionLimitExceeded(MAX_PAGE_TREE_DEPTH)),
-        "expected RecursionLimitExceeded({}), got {:?}",
-        MAX_PAGE_TREE_DEPTH,
-        refs_error
+    // GH#1755: collect_page_refs (objects.rs) used to be the one page-tree walker that
+    // propagated RecursionLimitExceeded with `?` instead of skipping the offending
+    // branch, so all_page_refs() surfaced `Err` here where every other walker above
+    // degrades. It now matches them: the over-cap branch is skipped like any other bad
+    // branch. This fixture is a single linear chain with no fork above the cap, so
+    // "skip the one branch that fails" and "collect everything else" coincide at an
+    // empty result — not because the walker gave up, but because there was nothing
+    // else in the tree to find. ~keep
+    assert_eq!(
+        doc.all_page_refs().unwrap(),
+        Vec::new(),
+        "all_page_refs must degrade like the other page-tree walkers, not abort"
     );
 }
 
