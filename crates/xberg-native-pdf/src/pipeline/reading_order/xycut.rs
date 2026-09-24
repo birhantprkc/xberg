@@ -3725,13 +3725,6 @@ mod tests {
         assert_eq!(total, spans.len(), "depth guard must not drop spans");
     }
 
-    /// GH#1763 target split X: the center of the widest all-zero sub-run
-    /// inside the wide interior valley `gh1763_page` produces — see that
-    /// function's doc comment for the derivation. The pre-fix midpoint
-    /// formula instead lands at 254.5, inside the "CAP5…" caption
-    /// fragment's span (see `legacy_valley_midpoint`). ~keep
-    const GH1763_GUTTER_X: f32 = 466.0;
-
     /// Reproduces GH#1763: a figure-caption block (left) beside a body
     /// column (right) whose true empty gutter sits OFF the interior
     /// valley's arithmetic midpoint.
