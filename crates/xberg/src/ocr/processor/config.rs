@@ -7,7 +7,7 @@ use crate::ocr::error::OcrError;
 use crate::ocr::types::TesseractConfig;
 use xberg_tesseract::TesseractAPI;
 
-const TESSERACT_RESULT_SCHEMA_VERSION: u8 = 10;
+const TESSERACT_RESULT_SCHEMA_VERSION: u8 = 11;
 
 /// Compute a deterministic hash of the OCR configuration.
 ///
@@ -17,15 +17,22 @@ const TESSERACT_RESULT_SCHEMA_VERSION: u8 = 10;
 /// # Arguments
 ///
 /// * `config` - Configuration to hash
+/// * `resolved_tessdata_path` - The tessdata directory OCR will actually run against, as
+///   returned by [`super::validation::resolve_tessdata_path`]. Hashing the resolved directory
+///   rather than only `config.tessdata_path` (the optional override) is required: without it,
+///   two calls that resolve to different directories through `TESSDATA_PREFIX` or another
+///   fallback in the search chain — with no explicit `OcrConfig.tessdata_path` set — hash
+///   identically and share a cache entry even though a different tessdata model produced the
+///   cached text (#1787).
 ///
 /// # Returns
 ///
 /// Hexadecimal string representation of the configuration hash
-pub(super) fn hash_config(config: &TesseractConfig) -> String {
-    hash_config_for_schema(config, TESSERACT_RESULT_SCHEMA_VERSION)
+pub(super) fn hash_config(config: &TesseractConfig, resolved_tessdata_path: &str) -> String {
+    hash_config_for_schema(config, resolved_tessdata_path, TESSERACT_RESULT_SCHEMA_VERSION)
 }
 
-fn hash_config_for_schema(config: &TesseractConfig, result_schema_version: u8) -> String {
+fn hash_config_for_schema(config: &TesseractConfig, resolved_tessdata_path: &str, result_schema_version: u8) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[result_schema_version]);
     hash_bytes(&mut hasher, config.language.as_bytes());
@@ -82,15 +89,10 @@ fn hash_config_for_schema(config: &TesseractConfig, result_schema_version: u8) -
             hasher.update(&[0]);
         }
     }
-    match config.tessdata_path.as_ref() {
-        Some(path) => {
-            hasher.update(&[1]);
-            hash_bytes(&mut hasher, path.as_os_str().as_encoded_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
+    // The resolved tessdata directory, not merely the optional override (#1787). Two configs
+    // that leave `tessdata_path` unset can still resolve to different directories through
+    // `TESSDATA_PREFIX`/cache/system fallbacks, and must not collide.
+    hash_bytes(&mut hasher, resolved_tessdata_path.as_bytes());
     // `page_number` is stamped onto every returned element, table, and `OcrElement` (see
     // `perform_ocr`), so two calls with byte-identical images but different declared page
     // numbers produce different output for an unchanged image hash. Omitting it here would
@@ -187,6 +189,8 @@ fn tesseract_variable_set(config: &TesseractConfig) -> Vec<(&'static str, String
 mod tests {
     use super::*;
 
+    const TEST_TESSDATA_PATH: &str = "/test/tessdata/eng";
+
     fn create_test_config() -> TesseractConfig {
         TesseractConfig {
             output_format: "text".to_string(),
@@ -200,8 +204,8 @@ mod tests {
     fn test_hash_config_deterministic() {
         let config = create_test_config();
 
-        let hash1 = hash_config(&config);
-        let hash2 = hash_config(&config);
+        let hash1 = hash_config(&config, TEST_TESSDATA_PATH);
+        let hash2 = hash_config(&config, TEST_TESSDATA_PATH);
 
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 32);
@@ -227,13 +231,13 @@ mod tests {
         };
 
         assert_ne!(
-            hash_config(&unknown),
-            hash_config(&at_150),
+            hash_config(&unknown, TEST_TESSDATA_PATH),
+            hash_config(&at_150, TEST_TESSDATA_PATH),
             "a known source DPI must not collide with the unknown/72-assumption case"
         );
         assert_ne!(
-            hash_config(&at_150),
-            hash_config(&at_300),
+            hash_config(&at_150, TEST_TESSDATA_PATH),
+            hash_config(&at_300, TEST_TESSDATA_PATH),
             "two different known source DPIs must not collide"
         );
     }
@@ -254,9 +258,43 @@ mod tests {
         };
 
         assert_ne!(
-            hash_config(&page_one),
-            hash_config(&page_two),
+            hash_config(&page_one, TEST_TESSDATA_PATH),
+            hash_config(&page_two, TEST_TESSDATA_PATH),
             "two different declared page numbers must not collide"
+        );
+    }
+
+    /// #1787 part 2: the cache key must depend on the tessdata directory OCR actually runs
+    /// against, not only the optional `TesseractConfig.tessdata_path` override. Two calls with
+    /// byte-identical `TesseractConfig` but resolved against different tessdata directories
+    /// (e.g. one via `TESSDATA_PREFIX=fast`, one via `TESSDATA_PREFIX=best`) must not share a
+    /// cache entry, or the second model's request is silently served the first model's text.
+    ///
+    /// Fails on unfixed code: `hash_config` takes a single argument, so this does not compile.
+    #[test]
+    fn should_distinguish_cache_keys_by_resolved_tessdata_directory() {
+        let config = create_test_config();
+
+        assert_ne!(
+            hash_config(&config, "/tessdata/fast"),
+            hash_config(&config, "/tessdata/best"),
+            "two different resolved tessdata directories must not collide, \
+             or a comparison across models silently reads the first model's cached text"
+        );
+    }
+
+    /// Negative control for the fix above: the resolved-directory hashing must not become so
+    /// specific that two calls resolving to the SAME directory stop sharing a cache entry. An
+    /// over-eager fix (e.g. hashing a directory listing, an inode, or a timestamp instead of the
+    /// resolved path string) would make this fail while the positive test above still passes.
+    #[test]
+    fn same_resolved_tessdata_directory_still_shares_a_cache_key() {
+        let config = create_test_config();
+
+        assert_eq!(
+            hash_config(&config, "/tessdata/fast"),
+            hash_config(&config, "/tessdata/fast"),
+            "two calls resolving to the same tessdata directory must still hit the same cache entry"
         );
     }
 
@@ -265,13 +303,16 @@ mod tests {
         let config = create_test_config();
 
         assert_eq!(
-            TESSERACT_RESULT_SCHEMA_VERSION, 10,
-            "the corrected retained-confidence matcher must invalidate schema-v9 cache entries"
+            TESSERACT_RESULT_SCHEMA_VERSION, 11,
+            "folding the resolved tessdata directory into the key (#1787) must invalidate schema-v10 cache entries"
         );
-        assert_ne!(hash_config_for_schema(&config, 1), hash_config_for_schema(&config, 2));
         assert_ne!(
-            hash_config(&config),
-            hash_config_for_schema(&config, TESSERACT_RESULT_SCHEMA_VERSION - 1)
+            hash_config_for_schema(&config, TEST_TESSDATA_PATH, 1),
+            hash_config_for_schema(&config, TEST_TESSDATA_PATH, 2)
+        );
+        assert_ne!(
+            hash_config(&config, TEST_TESSDATA_PATH),
+            hash_config_for_schema(&config, TEST_TESSDATA_PATH, TESSERACT_RESULT_SCHEMA_VERSION - 1)
         );
     }
 
@@ -283,8 +324,8 @@ mod tests {
         let mut config2 = create_test_config();
         config2.language = "fra".to_string();
 
-        let hash1 = hash_config(&config1);
-        let hash2 = hash_config(&config2);
+        let hash1 = hash_config(&config1, TEST_TESSDATA_PATH);
+        let hash2 = hash_config(&config2, TEST_TESSDATA_PATH);
 
         assert_ne!(hash1, hash2);
     }
@@ -297,8 +338,8 @@ mod tests {
         let mut config2 = create_test_config();
         config2.psm = 6;
 
-        let hash1 = hash_config(&config1);
-        let hash2 = hash_config(&config2);
+        let hash1 = hash_config(&config1, TEST_TESSDATA_PATH);
+        let hash2 = hash_config(&config2, TEST_TESSDATA_PATH);
 
         assert_ne!(hash1, hash2);
     }
@@ -311,8 +352,8 @@ mod tests {
         let mut config2 = create_test_config();
         config2.output_format = "markdown".to_string();
 
-        let hash1 = hash_config(&config1);
-        let hash2 = hash_config(&config2);
+        let hash1 = hash_config(&config1, TEST_TESSDATA_PATH);
+        let hash2 = hash_config(&config2, TEST_TESSDATA_PATH);
 
         assert_ne!(hash1, hash2);
     }
@@ -325,8 +366,8 @@ mod tests {
         let mut config2 = create_test_config();
         config2.enable_table_detection = true;
 
-        let hash1 = hash_config(&config1);
-        let hash2 = hash_config(&config2);
+        let hash1 = hash_config(&config1, TEST_TESSDATA_PATH);
+        let hash2 = hash_config(&config2, TEST_TESSDATA_PATH);
 
         assert_ne!(hash1, hash2);
     }
@@ -339,8 +380,8 @@ mod tests {
         let mut config2 = create_test_config();
         config2.tessedit_char_whitelist = "0123456789".to_string();
 
-        let hash1 = hash_config(&config1);
-        let hash2 = hash_config(&config2);
+        let hash1 = hash_config(&config1, TEST_TESSDATA_PATH);
+        let hash2 = hash_config(&config2, TEST_TESSDATA_PATH);
 
         assert_ne!(hash1, hash2);
     }
@@ -351,7 +392,10 @@ mod tests {
         let mut config2 = create_test_config();
         config2.tessedit_char_blacklist = "abc".to_string();
 
-        assert_ne!(hash_config(&config1), hash_config(&config2));
+        assert_ne!(
+            hash_config(&config1, TEST_TESSDATA_PATH),
+            hash_config(&config2, TEST_TESSDATA_PATH)
+        );
     }
 
     #[test]
@@ -363,7 +407,10 @@ mod tests {
         config2.tessedit_char_whitelist = "a".to_string();
         config2.tessedit_char_blacklist = "bc".to_string();
 
-        assert_ne!(hash_config(&config1), hash_config(&config2));
+        assert_ne!(
+            hash_config(&config1, TEST_TESSDATA_PATH),
+            hash_config(&config2, TEST_TESSDATA_PATH)
+        );
     }
 
     /// Regression test for the OCR structure defect: without `hocr_font_info`
@@ -448,7 +495,7 @@ mod tests {
     #[test]
     fn every_applied_tesseract_variable_moves_the_cache_key() {
         let baseline = create_test_config();
-        let baseline_hash = hash_config(&baseline);
+        let baseline_hash = hash_config(&baseline, TEST_TESSDATA_PATH);
 
         let flips = cache_key_flip_cases();
 
@@ -456,7 +503,7 @@ mod tests {
             let mut mutated = baseline.clone();
             flip(&mut mutated);
             assert_ne!(
-                hash_config(&mutated),
+                hash_config(&mutated, TEST_TESSDATA_PATH),
                 baseline_hash,
                 "changing the config field behind the `{name}` engine variable must change the \
                  OCR cache key, or a run with a different value is served the previous result"

@@ -1373,7 +1373,8 @@ fn normalize_image_bytes_for_ocr(
     // PNG `pHYs` density, then `None` (the historical 72 DPI assumption). Shared with
     // `ocr::processor::execution::perform_ocr` (GH#1621: no second density scanner).
     let explicit_source_dpi = crate::extraction::image::explicit_source_dpi_from_ocr_config(ocr_config);
-    let known_source_dpi = crate::extraction::image::resolve_known_source_dpi(explicit_source_dpi, content);
+    let known_source_dpi =
+        crate::extraction::image::resolve_known_source_dpi(explicit_source_dpi, content, width, height);
     let (planned_width, planned_height) =
         crate::image::preprocessing::normalized_image_dimensions(width, height, &dpi_config, known_source_dpi);
     let encoded_source_bytes = u64::try_from(content.len())
@@ -1636,6 +1637,26 @@ impl ImageExtractor {
         // `None`; `ExtractionConfig` still wins whenever it carries a value. ~keep
         if let Some(security_limits) = config.security_limits.clone() {
             ocr_config_with_format.security_limits = Some(security_limits);
+        }
+        // #1787: the top-level `ExtractionConfig.use_cache = false` only ever bypassed the
+        // whole-extraction cache (`extract_file_with_extractor`); the OCR backend's own result
+        // cache is governed independently by `TesseractConfig.use_cache` (default `true`), which
+        // `OcrBackend::process_image` never sees `ExtractionConfig` to read. Propagate through
+        // `backend_options["use_cache"]`, the channel `TesseractBackend::config_to_tesseract`
+        // already reads for exactly this purpose. Only the "off" direction is forwarded: a
+        // caller who leaves the top-level flag at its default keeps whatever OCR-specific cache
+        // setting they configured directly, unmodified. ~keep
+        if !config.use_cache {
+            let mut options = ocr_config_with_format
+                .backend_options
+                .take()
+                .and_then(|value| match value {
+                    serde_json::Value::Object(map) => Some(map),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            options.insert("use_cache".to_string(), serde_json::Value::Bool(false));
+            ocr_config_with_format.backend_options = Some(serde_json::Value::Object(options));
         }
         #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
         let include_words = should_use_layout_ocr(config);
@@ -2746,6 +2767,165 @@ mod tests {
                 "GH#1630: target_dpi=300 against a genuine ~300 DPI source must not resize \
                  (scale_factor was previously target/72 = ~4.17)"
             );
+        }
+    }
+
+    /// #1787 part 1: the top-level `ExtractionConfig.use_cache = false` only bypassed the
+    /// whole-extraction cache (`extract_file_with_extractor`); the OCR backend's own result
+    /// cache is governed independently by `TesseractConfig.use_cache`, which defaults to
+    /// `true`, so a caller asking for a fresh measurement through the top-level flag still got
+    /// a cached OCR result. `extract_with_ocr` must propagate `use_cache: false` into
+    /// `OcrConfig.backend_options["use_cache"]`, the channel `TesseractBackend::config_to_tesseract`
+    /// already reads (`use_cache_from_backend_options`) — this test proves the image extractor
+    /// actually sets it, using a capturing mock backend so no real Tesseract/tessdata is needed.
+    mod use_cache_propagation {
+        use super::*;
+        use crate::core::config::OcrConfig;
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin, register_ocr_backend, unregister_ocr_backend};
+        use crate::types::ExtractedDocument;
+        use std::sync::Mutex;
+
+        // Each test registers under its own name: `register_ocr_backend`/`unregister_ocr_backend`
+        // act on the process-wide registry, and `#[tokio::test]`s in this binary run
+        // concurrently, so a shared name would let one test's unregister race another's lookup.
+        struct CapturingBackend {
+            name: &'static str,
+            seen: Mutex<Option<OcrConfig>>,
+        }
+
+        impl CapturingBackend {
+            fn new(name: &'static str) -> Self {
+                Self {
+                    name,
+                    seen: Mutex::new(None),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl OcrBackend for CapturingBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, _: &[u8], config: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                *self.seen.lock().unwrap() = Some(config.clone());
+                Ok(ExtractedDocument {
+                    content: "captured".to_string(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        impl Plugin for CapturingBackend {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn version(&self) -> String {
+                "0.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn tiny_png() -> Vec<u8> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::ImageBuffer::<image::Rgb<u8>, _>::from_pixel(1, 1, image::Rgb([255u8, 255, 255]))
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .expect("failed to encode test PNG");
+            buf.into_inner()
+        }
+
+        fn use_cache_option_seen(seen: &OcrConfig) -> Option<bool> {
+            seen.backend_options
+                .as_ref()
+                .and_then(|options| options.get("use_cache"))
+                .and_then(serde_json::Value::as_bool)
+        }
+
+        #[cfg(feature = "ocr")]
+        #[tokio::test]
+        async fn top_level_use_cache_false_disables_the_ocr_backend_cache() {
+            const NAME: &str = "capturing-1787a-disables-cache-test";
+            let backend = std::sync::Arc::new(CapturingBackend::new(NAME));
+            register_ocr_backend(backend.clone()).unwrap();
+
+            let config = ExtractionConfig {
+                ocr: Some(OcrConfig {
+                    backend: NAME.to_string(),
+                    ..Default::default()
+                }),
+                use_cache: false,
+                ..Default::default()
+            };
+
+            let extractor = ImageExtractor::new();
+            extractor
+                .extract_content(&tiny_png(), "image/png", &config)
+                .await
+                .unwrap();
+
+            let seen = backend
+                .seen
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("backend must have been called");
+            assert_eq!(
+                use_cache_option_seen(&seen),
+                Some(false),
+                "top-level use_cache=false must turn off the OCR backend's own result cache, \
+                 not just the whole-extraction cache (#1787)"
+            );
+
+            unregister_ocr_backend(NAME).unwrap();
+        }
+
+        /// Negative control: a caller who leaves the top-level `use_cache` at its default
+        /// (`true`) must not have anything injected into `backend_options` — the OCR-specific
+        /// cache setting they may have configured on `tesseract_config.use_cache` directly must
+        /// keep governing, unmodified by this propagation.
+        #[cfg(feature = "ocr")]
+        #[tokio::test]
+        async fn default_top_level_use_cache_leaves_backend_options_untouched() {
+            const NAME: &str = "capturing-1787a-default-cache-test";
+            let backend = std::sync::Arc::new(CapturingBackend::new(NAME));
+            register_ocr_backend(backend.clone()).unwrap();
+
+            let config = ExtractionConfig {
+                ocr: Some(OcrConfig {
+                    backend: NAME.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(config.use_cache, "test assumes the default is true");
+
+            let extractor = ImageExtractor::new();
+            extractor
+                .extract_content(&tiny_png(), "image/png", &config)
+                .await
+                .unwrap();
+
+            let seen = backend
+                .seen
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("backend must have been called");
+            assert!(
+                use_cache_option_seen(&seen).is_none(),
+                "a default (non-disabling) top-level use_cache must not inject a backend_options \
+                 override, so the OCR cache still works as configured (negative control for #1787)"
+            );
+
+            unregister_ocr_backend(NAME).unwrap();
         }
     }
 

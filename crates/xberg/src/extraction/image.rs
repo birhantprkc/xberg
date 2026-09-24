@@ -554,6 +554,69 @@ pub(crate) fn explicit_source_dpi_from_ocr_config(config: &crate::core::config::
         .filter(|dpi| dpi.is_finite() && *dpi > 0.0)
 }
 
+/// Portrait page sizes, in inches, that [`infer_dpi_from_standard_page_size`] tests a raster's
+/// pixel dimensions against (width, height). Both orientations of each entry are tried.
+#[cfg(feature = "ocr-pipeline")]
+const STANDARD_PAGE_SIZES_INCHES: &[(f64, f64)] = &[
+    (8.5, 11.0),        // US Letter
+    (8.5, 14.0),        // US Legal
+    (11.0, 17.0),       // Tabloid / Ledger
+    (8.2677, 11.6929),  // ISO A4 (210mm x 297mm)
+    (11.6929, 16.5354), // ISO A3 (297mm x 420mm)
+];
+
+/// Scan resolutions real scanners/renderers commonly use. A page-size match is only trusted
+/// when the implied DPI lands near one of these — otherwise arbitrary pixel dimensions with a
+/// page-shaped aspect ratio (e.g. a photo) would be misread as a page at an implausible DPI.
+#[cfg(feature = "ocr-pipeline")]
+const CANDIDATE_SCAN_DPIS: &[u32] = &[72, 96, 100, 120, 150, 200, 240, 300, 400, 600, 1200];
+
+/// Relative tolerance for (a) the horizontal- and vertical-implied DPI to agree with each other,
+/// and (b) their average to land near one of [`CANDIDATE_SCAN_DPIS`].
+#[cfg(feature = "ocr-pipeline")]
+const PAGE_SIZE_MATCH_RELATIVE_TOLERANCE: f64 = 0.01;
+
+/// Infer a source DPI from pixel dimensions that match a standard page size at a plausible scan
+/// resolution (#1788): a PNG with no `pHYs` chunk was previously always assumed to be 72 DPI, so
+/// a 2550x3300 pixel page — letter size at exactly 300 DPI — was rescaled by a spurious 1.236x
+/// factor before OCR, destroying 58% of a dense page's readable words. Many tools (e.g. PIL's
+/// `Image.save` without `dpi=`) write PNGs with no density tag at all, so identical pixels
+/// otherwise gave different OCR text depending only on how the file was saved.
+///
+/// Returns `None` — leaving the caller's existing 72 DPI assumption unchanged — when the pixel
+/// dimensions do not match any [`STANDARD_PAGE_SIZES_INCHES`] entry at a DPI near
+/// [`CANDIDATE_SCAN_DPIS`], in either orientation. This is deliberate: an image whose pixel
+/// dimensions match no standard page size gets no invented DPI, not a guessed one.
+#[cfg(feature = "ocr-pipeline")]
+fn infer_dpi_from_standard_page_size(width: u32, height: u32) -> Option<f64> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (px_w, px_h) = (f64::from(width), f64::from(height));
+
+    for &(page_w, page_h) in STANDARD_PAGE_SIZES_INCHES {
+        for (candidate_px_w, candidate_px_h) in [(px_w, px_h), (px_h, px_w)] {
+            let dpi_w = candidate_px_w / page_w;
+            let dpi_h = candidate_px_h / page_h;
+            if !(dpi_w.is_finite() && dpi_h.is_finite()) || dpi_w <= 0.0 || dpi_h <= 0.0 {
+                continue;
+            }
+            let average_dpi = (dpi_w + dpi_h) / 2.0;
+            let axis_spread = (dpi_w - dpi_h).abs() / average_dpi;
+            if axis_spread > PAGE_SIZE_MATCH_RELATIVE_TOLERANCE {
+                continue;
+            }
+            let near_a_common_scan_resolution = CANDIDATE_SCAN_DPIS.iter().any(|&candidate| {
+                (average_dpi - f64::from(candidate)).abs() / f64::from(candidate) <= PAGE_SIZE_MATCH_RELATIVE_TOLERANCE
+            });
+            if near_a_common_scan_resolution {
+                return Some(average_dpi);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the resolution to report for a raster, in priority order:
 ///
 /// 1. `explicit_source_dpi` — a caller-supplied hint (see
@@ -562,14 +625,24 @@ pub(crate) fn explicit_source_dpi_from_ocr_config(config: &crate::core::config::
 ///    explicitly said "my source is 72 DPI" must not be overridden by embedded metadata.
 /// 2. The image's own embedded pixel-density metadata, when present (GH#1630; currently PNG
 ///    `pHYs` only — see [`png_pixel_density_dpi`]).
-/// 3. `None`, meaning the historical 72 DPI assumption applies further down the pipeline.
+/// 3. A standard-page-size inference from the pixel dimensions themselves (#1788; see
+///    [`infer_dpi_from_standard_page_size`]).
+/// 4. `None`, meaning the historical 72 DPI assumption applies further down the pipeline — the
+///    pixel dimensions matched no standard page size, so no DPI is invented for them.
 ///
 /// Shared by both consumers — `ocr::processor::execution::perform_ocr` and
 /// `extractors::image::normalize_image_bytes_for_ocr` — so the precedence cannot drift between
 /// them the way two independent PNG chunk scanners would (GH#1621).
 #[cfg(feature = "ocr-pipeline")]
-pub(crate) fn resolve_known_source_dpi(explicit_source_dpi: Option<f64>, image_bytes: &[u8]) -> Option<f64> {
-    explicit_source_dpi.or_else(|| png_pixel_density_dpi(image_bytes))
+pub(crate) fn resolve_known_source_dpi(
+    explicit_source_dpi: Option<f64>,
+    image_bytes: &[u8],
+    width: u32,
+    height: u32,
+) -> Option<f64> {
+    explicit_source_dpi
+        .or_else(|| png_pixel_density_dpi(image_bytes))
+        .or_else(|| infer_dpi_from_standard_page_size(width, height))
 }
 
 pub(crate) fn decode_image_to_rgb8_with_security_limits(

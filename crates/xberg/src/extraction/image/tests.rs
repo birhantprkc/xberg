@@ -525,4 +525,99 @@ mod png_density {
 
         assert_eq!(png_pixel_density_dpi(&with_phys), None);
     }
+
+    // #1788: infer a source DPI from pixel dimensions matching a standard page size when no
+    // embedded density tag exists, instead of always assuming 72 DPI.
+    mod page_size_dpi_inference {
+        use super::*;
+
+        /// The reporter's own dimensions: US Letter (8.5in x 11in) at exactly 300 DPI.
+        const LETTER_300_DPI_WIDTH: u32 = 2550;
+        const LETTER_300_DPI_HEIGHT: u32 = 3300;
+
+        #[test]
+        fn should_infer_300_dpi_for_letter_sized_pixel_dimensions() {
+            let dpi = infer_dpi_from_standard_page_size(LETTER_300_DPI_WIDTH, LETTER_300_DPI_HEIGHT)
+                .expect("2550x3300 must match US Letter at 300 DPI");
+
+            assert!((dpi - 300.0).abs() < 0.5, "expected ~300 DPI, got {dpi}");
+        }
+
+        #[test]
+        fn should_infer_the_same_dpi_in_landscape_orientation() {
+            let dpi = infer_dpi_from_standard_page_size(LETTER_300_DPI_HEIGHT, LETTER_300_DPI_WIDTH)
+                .expect("a rotated (landscape) letter page must still match");
+
+            assert!((dpi - 300.0).abs() < 0.5, "expected ~300 DPI, got {dpi}");
+        }
+
+        /// Negative control: pixel dimensions that match no standard page size at any plausible
+        /// scan resolution must not have a DPI invented for them.
+        #[test]
+        fn should_return_none_for_dimensions_matching_no_standard_page_size() {
+            assert_eq!(
+                infer_dpi_from_standard_page_size(4, 4),
+                None,
+                "a tiny fixture image must not be misread as a page at some implausible DPI"
+            );
+            assert_eq!(
+                infer_dpi_from_standard_page_size(1920, 1080),
+                None,
+                "a 16:9 screenshot's aspect ratio does not match any standard page size"
+            );
+        }
+
+        #[test]
+        fn should_return_none_for_zero_dimensions() {
+            assert_eq!(infer_dpi_from_standard_page_size(0, 100), None);
+            assert_eq!(infer_dpi_from_standard_page_size(100, 0), None);
+        }
+
+        /// End-to-end through `resolve_known_source_dpi`: a PNG with no `pHYs` chunk, whose
+        /// caller-supplied pixel dimensions are letter-at-300-DPI, must resolve to ~300 DPI
+        /// instead of falling through to the historical 72 DPI assumption (#1788).
+        #[test]
+        fn resolve_known_source_dpi_infers_letter_size_when_no_metadata_tag_is_present() {
+            let untagged_png = create_test_image(4, 4, ImageFormat::Png);
+
+            let resolved = resolve_known_source_dpi(None, &untagged_png, LETTER_300_DPI_WIDTH, LETTER_300_DPI_HEIGHT)
+                .expect("letter-sized pixel dimensions must resolve a DPI even with no pHYs chunk");
+
+            assert!((resolved - 300.0).abs() < 0.5, "expected ~300 DPI, got {resolved}");
+        }
+
+        /// Negative control: a PNG that DOES carry a resolution tag must be unaffected by the
+        /// new inference tier — the embedded tag still wins, exactly as before this fix, even
+        /// when it disagrees with what page-size inference would have guessed.
+        #[test]
+        fn resolve_known_source_dpi_prefers_an_embedded_density_tag_over_page_size_inference() {
+            let png = create_test_image(4, 4, ImageFormat::Png);
+            // 72 DPI tag (2835 px/m, rounded), deliberately mismatched from the letter-at-300
+            // pixel dimensions passed below, so a regression that ignores the tag and falls
+            // through to inference is observable.
+            const SEVENTY_TWO_DPI_PPU: u32 = 2835;
+            let tagged = png_with_phys(&png, SEVENTY_TWO_DPI_PPU);
+
+            let resolved = resolve_known_source_dpi(None, &tagged, LETTER_300_DPI_WIDTH, LETTER_300_DPI_HEIGHT)
+                .expect("pHYs chunk must be detected");
+
+            assert!(
+                (resolved - 72.0).abs() < 1.0,
+                "an explicit resolution tag must win over page-size inference, got {resolved}"
+            );
+        }
+
+        /// Dimensions matching no standard page size must still fall through cleanly to `None`
+        /// (the historical 72 DPI assumption downstream), not an invented DPI.
+        #[test]
+        fn resolve_known_source_dpi_stays_none_for_non_page_shaped_dimensions() {
+            let screenshot_shaped_png = create_test_image(4, 4, ImageFormat::Png);
+
+            assert_eq!(
+                resolve_known_source_dpi(None, &screenshot_shaped_png, 1920, 1080),
+                None,
+                "dimensions matching no standard page size must not have a DPI invented for them"
+            );
+        }
+    }
 }
