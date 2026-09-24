@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **(pdf): numeric footnotes stay separate in CLI and binding output.** A small footnote after a number no longer turns `comma 3` plus note `5` into `comma 35`. The separator requires a matching, smaller note below the reference; numeric scripts without that evidence keep their existing joins. (GH#1771)
+
 ## [1.2.9] - 2026-09-24
 
 ### Added
