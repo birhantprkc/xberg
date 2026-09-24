@@ -993,6 +993,13 @@ const MAX_REDIRECT_DISTANCE_FRACTION: f32 = 0.25;
 // inside a table. Consulted only for a split that `MIN_DENSE_COLUMN_SPLIT_LINES` lines already
 // run through, i.e. one that demonstrably sits inside a column. ~keep
 const MAX_GUTTER_CROSSING_LINES: usize = 1;
+// GH#1762 adversarial review: `redirect_survives_a_second_table_closing_the_band_from_below_gh1762`
+// (text.rs tests) shows a second full-width table below the rescued band does NOT
+// exceed this tolerance -- but only because the band's pre-existing boundary line
+// happens to end exactly at the corridor's edge and contributes zero crossings there.
+// A page where BOTH the pre-existing boundary and a second table's boundary
+// genuinely cross the true gutter is not covered by any test and remains unproven,
+// not proven safe. ~keep
 // GH#1545: two regions with different leading (a table on 8.05pt beside prose on
 // 10.45pt) are never grouped into a shared line by `group_into_lines`, so per-line
 // gutter evidence only ever sees each region's *internal* gaps and the median lands
@@ -5481,6 +5488,35 @@ mod tests {
         );
     }
 
+    /// GH#1756 adversarial review: `apply_xy_cut_if_column_aware` (hierarchy.rs) feeds
+    /// the XY-cut's heading-run pre-pass a gutter from `detect_column_gutter`, a
+    /// detector with no table-grid exclusion (`vote_is_a_grid_cell_gap` is
+    /// `detect_split_x`-only). The failure this was suspected of reaching would be
+    /// `detect_column_gutter` returning a corridor INSIDE the table grid
+    /// (`GH1756_GRID_ROW` spans x 312.6..556.7) on the same sparse-table-row page
+    /// `detect_split_x` must decline on. Measured directly: it returns `None` on both
+    /// of #1756's fixtures, because `prose_two_column_gutter`'s own column-count
+    /// clustering step requires exactly 2 significant left-edge clusters and the
+    /// table's five-column grid produces 5, so every detector in the `or_else` chain
+    /// declines independently of any grid-gap exclusion. The finding's mechanism does
+    /// not reach this page. ~keep
+    #[test]
+    fn detect_column_gutter_also_declines_on_the_sparse_table_rows_pages_gh1756() {
+        let sparse = gh1756_sparse_table_rows_page();
+        let two_sparse = gh1756_two_sparse_table_rows_page();
+
+        assert_eq!(
+            xberg_native_pdf::pipeline::reading_order::detect_column_gutter(&sparse),
+            None,
+            "detect_column_gutter must not place a gutter inside the table's own grid"
+        );
+        assert_eq!(
+            xberg_native_pdf::pipeline::reading_order::detect_column_gutter(&two_sparse),
+            None,
+            "detect_column_gutter must not place a gutter inside the table's own grid"
+        );
+    }
+
     /// GH#1756 (the reporter's page 3): two sparse lines instead of six. On v1.2.7 the
     /// median lands at 304.8, inside the gutter corridor, by luck of where the two
     /// survivors' gaps fall -- the page reads correctly but for the wrong reason. Both
@@ -5768,6 +5804,138 @@ mod tests {
             span_with_width("fugiat nulla pariatur excepteur sint occaecat cupidatat non proident", 307.00, 372.90, 250.41, 8.50, 8.50),
         ];
         spans
+    }
+
+    /// GH#1762 adversarial review: `gh1762_p1_real_reproducer_spans` plus a second
+    /// full-width table ("Table 4") below Table 3, in the same column shape as
+    /// Table 2 -- a description cell at x 44, a short numeric cell at 120, and a wide
+    /// cell at x 205 (width ~177, right edge ~382) that straddles any plausible split
+    /// between the two columns exactly the way Table 2's own rows do. `line_is_boundary`
+    /// therefore marks every one of Table 4's rows a boundary line, the same way it
+    /// already marks Table 2's.
+    ///
+    /// `band_lines_around_table_gap_split` pushes a boundary line into BOTH the band
+    /// above it and the band it opens (`text.rs` band-splitting loop). Before this
+    /// table the band under Table 2 was the page's LAST band, so it carried exactly
+    /// one boundary line (Table 2's own closing row) and `MAX_GUTTER_CROSSING_LINES`
+    /// (1) tolerated it. With Table 4 added, that band becomes a MIDDLE band bounded
+    /// by two boundary lines -- Table 2's closing row above and Table 4's first row
+    /// below -- both of which carry a cell covering the true gutter, so the per-band
+    /// corridor search now sees 2 gutter-crossing lines where it tolerates only 1. ~keep
+    fn gh1762_p1_with_second_table_below_spans() -> Vec<TextSpan> {
+        let mut spans = gh1762_p1_real_reproducer_spans();
+        const TABLE_4_ROWS: [(&str, &str, &str, &str); 6] = [
+            (
+                "Quartus vs. quintus",
+                "25",
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed",
+                "lorem ipsum dolor sit amet",
+            ),
+            (
+                "Quartus vs. quintus",
+                "31",
+                "ipsum dolor sit amet consectetur adipiscing elit sed do",
+                "ipsum dolor sit amet consectetur",
+            ),
+            (
+                "Quartus vs. quintus",
+                "44",
+                "dolor sit amet consectetur adipiscing elit sed do eiusmod",
+                "dolor sit amet consectetur",
+            ),
+            (
+                "Quartus vs. quintus",
+                "52",
+                "elit sed do eiusmod tempor incididunt ut labore et dolore",
+                "do eiusmod tempor incididunt ut",
+            ),
+            (
+                "Quartus vs. quintus",
+                "67",
+                "sed do eiusmod tempor incididunt ut labore et dolore",
+                "eiusmod tempor incididunt ut",
+            ),
+            (
+                "Quartus vs. quintus",
+                "73",
+                "do eiusmod tempor incididunt ut labore et dolore magna",
+                "tempor incididunt ut labore et",
+            ),
+        ];
+        spans.push(span_with_width("Table 4", 38.00, 345.00, 23.34, 7.00, 7.00));
+        let mut y = 335.95;
+        for (label, number, wide_cell, right_cell) in TABLE_4_ROWS {
+            spans.push(span_with_width(label, 44.00, y, 51.35, 7.00, 7.00));
+            spans.push(span_with_width(number, 120.00, y, 7.78, 7.00, 7.00));
+            spans.push(span_with_width(wide_cell, 205.00, y, 177.39, 7.00, 7.00));
+            spans.push(span_with_width(right_cell, 400.00, y, 82.07, 7.00, 7.00));
+            y -= 8.05;
+        }
+        spans
+    }
+
+    /// GH#1762 adversarial review, primary claim (measured, not reproduced): a
+    /// second full-width table below Table 3 was suspected of turning the rescued
+    /// band's one gutter-crossing boundary line into two, pushing
+    /// `page_low_occupancy_corridors` (tolerance `MAX_GUTTER_CROSSING_LINES` = 1)
+    /// over its limit and silently restoring the pre-#1762 defect.
+    ///
+    /// Measured directly: the band DOES pick up a second boundary line (Table 4's
+    /// opening row), but the pre-existing boundary above it is the SAME line the
+    /// original fixture's own doc comment already flags as surviving "by accident
+    /// of position" -- its one span ends at x=286.22998, the corridor's own left
+    /// edge, so it contributes ZERO crossings to the (286.22998, 307.0) interval
+    /// (`right > lo` is false at exact equality). Table 4's row is the only
+    /// GENUINE crossing there, so the interval's count is 1, not 2, and
+    /// `MAX_GUTTER_CROSSING_LINES` still has headroom. The redirect still finds
+    /// the true gutter (296.615, inside `GH1762_GUTTER_CORRIDOR`). A second table
+    /// positioned so BOTH its own boundary and the pre-existing one genuinely
+    /// cross the interval would still exceed the tolerance -- this fixture just
+    /// isn't that page, and the finding is not confirmed by it. ~keep
+    #[test]
+    fn redirect_survives_a_second_table_closing_the_band_from_below_gh1762() {
+        let spans = gh1762_p1_with_second_table_below_spans();
+        let order = spans_sorted_top_to_bottom(&spans);
+        let lines = group_into_lines(&spans, &order);
+        // The same incoming split the original (single-table) fixture computes
+        // (`the_page_wide_corridor_search_still_finds_nothing_gh1762` pins it to
+        // 216.7825): fixed here rather than recomputed via `detect_split_x` on the
+        // extended fixture, so this test isolates the band-scoping mechanism
+        // `band_lines_around_table_gap_split` is responsible for from any unrelated
+        // shift in the page's overall gutter vote that adding a second table's own
+        // internal cell gaps might independently cause. ~keep
+        let snapped = 216.7825_f32;
+        let min_gutter = (GH1762_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1762_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+
+        let band = band_lines_around_table_gap_split(&spans, &lines, furniture_width, min_gutter, snapped)
+            .expect("the band under Table 3's own internal boundary and above Table 4 still carries the quorum");
+        let boundary_lines_in_band = band
+            .iter()
+            .filter(|line| line_is_boundary(&spans, line, furniture_width, snapped))
+            .count();
+        assert_eq!(
+            boundary_lines_in_band, 2,
+            "the band must now carry two boundary lines: the pre-existing one above \
+             it and Table 4's opening row below it"
+        );
+
+        let corridors =
+            page_low_occupancy_corridors(&spans, &band, furniture_width, min_gutter, MAX_GUTTER_CROSSING_LINES);
+        assert_eq!(
+            corridors,
+            [(175.9, 190.0), (286.22998, 307.0)],
+            "the true gutter corridor must still be found: the pre-existing boundary \
+             line ends exactly at 286.22998 and contributes no crossing there, so \
+             Table 4's one genuine crossing stays within MAX_GUTTER_CROSSING_LINES"
+        );
+
+        let redirected = redirect_split_out_of_content(&spans, &lines, GH1762_PAGE_WIDTH, snapped);
+        assert!(
+            redirected > GH1762_GUTTER_CORRIDOR.0 && redirected < GH1762_GUTTER_CORRIDOR.1,
+            "a second full-width table below Table 3 must not regress the redirect: \
+             expected a split inside {GH1762_GUTTER_CORRIDOR:?}, got {redirected}"
+        );
     }
 
     fn gh1762_snapped_split(spans: &[TextSpan]) -> (Vec<SpanLine>, f32) {
