@@ -1975,7 +1975,11 @@ fn measure_text_bytes(bytes: &[u8], gs: &GraphicsState, font_info: Option<&crate
             // CMap must not take Tw. ~keep
             let word_space_eligible = nbytes == 1 && code == 0x20;
             if wmode == 0 {
-                let glyph_adv = font.get_glyph_width(char_code) * font_size / 1000.0;
+                // font_matrix_a converts /Widths glyph-space values to
+                // text-space units; standard fonts default to 0.001
+                // (equivalent to the old hardcoded /1000.0), but a Type 3
+                // font's own /FontMatrix[0] can differ (GH#1780). ~keep
+                let glyph_adv = font.get_glyph_width(char_code) * font_size * font.font_matrix_a;
                 advance += (glyph_adv + gs.char_space) * h_scale;
                 if word_space_eligible {
                     advance += gs.word_space * h_scale;

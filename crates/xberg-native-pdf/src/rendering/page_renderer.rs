@@ -2892,9 +2892,16 @@ impl PageRenderer {
         let saved_color_spaces = self.color_spaces.clone();
         let _ = self.load_resources(doc, &font_resources);
 
+        // font_matrix_a converts /Widths glyph-space values to text-space
+        // units (FontInfo::font_matrix_a doc comment). Standard fonts use
+        // the implicit Type 1 scale 0.001; a Type 3 font declares its own
+        // scale via /FontMatrix[0], which can be far from 0.001 (GH#1780:
+        // 0.01, i.e. a 100-unit em). Hardcoding /1000.0 here understated
+        // this font's advance ~10x, collapsing every glyph onto nearly the
+        // same x position. ~keep
         let mut x_cursor = 0.0f32;
         for &code in text {
-            let glyph_adv = font_info.get_glyph_width(code as u16) * font_size / 1000.0;
+            let glyph_adv = font_info.get_glyph_width(code as u16) * font_size * font_info.font_matrix_a;
 
             if paint_glyphs {
                 if let Some(name) = font_info.diff_glyph_names.get(&code) {
