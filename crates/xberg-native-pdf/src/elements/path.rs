@@ -624,8 +624,8 @@ fn is_degenerate_move_to(operations: &[PathOperation], index: usize) -> bool {
 /// Compute the bounding box of a sequence of path operations.
 ///
 /// Shared by [`PathContent::from_operations`] and
-/// `PathExtractor::finalize_path`, which must agree exactly: the two had
-/// drifted into byte-identical copies, so GH#1759 had to be fixed twice.
+/// `PathExtractor::finalize_path`, which must agree exactly: the two were
+/// independent, byte-identical copies, so GH#1759 had to be fixed twice.
 pub(crate) fn path_operations_bbox(operations: &[PathOperation]) -> Rect {
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
