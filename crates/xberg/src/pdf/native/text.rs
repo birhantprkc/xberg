@@ -1519,7 +1519,13 @@ fn redirect_split_out_of_content(
     // search is widened to bands that at most `MAX_GUTTER_CROSSING_LINES` lines
     // cross, minus the hanging-label indents that are wider than a real gutter on
     // every clause-numbered page (the GH#1603 shape, seen from the corridor's side).
-    if lines_crossing(spans, lines, furniture_width, split_x) < MIN_DENSE_COLUMN_SPLIT_LINES
+    //
+    // GH#1762 adversarial review: this admission gate must ask the question of the
+    // same population the search below it (`page_low_occupancy_corridors`) is about
+    // to run against -- `search_lines`, not the page-wide `lines`. Asking it of the
+    // whole page let an unrelated table elsewhere inflate or deflate the crossing
+    // count against a threshold guarding a search scoped to one band. ~keep
+    if lines_crossing(spans, search_lines, furniture_width, split_x) < MIN_DENSE_COLUMN_SPLIT_LINES
         && !split_inside_a_table_gap
     {
         return split_x;
