@@ -1210,7 +1210,7 @@ fn normalize_list_text(text: &str) -> (&str, usize) {
         return (normalized, marker.content_start);
     }
     let trimmed = text.trim_start();
-    const BULLET_CHARS: &[char] = &['\u{2022}', '\u{00B7}'];
+    const BULLET_CHARS: &[char] = &['\u{2022}', '\u{00B7}', '➢'];
     let mut normalized = trimmed;
     for &ch in BULLET_CHARS {
         if trimmed.starts_with(ch) {

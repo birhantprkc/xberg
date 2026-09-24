@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PDF arrow bullets (`➢`) now produce list items in Markdown and document structure instead of joining the preceding paragraph. (GH#1790)
+
 - **(pdf): page attributes now inherit past dangling references.** A missing indirect `/MediaBox`, `/CropBox`,
   `/Resources`, or `/Rotate` entry on a page or intermediate page-tree node no longer masks a valid ancestor
   value. Lazy and bulk page walks agree on the nearest valid ancestor and keep sibling inheritance separate.
