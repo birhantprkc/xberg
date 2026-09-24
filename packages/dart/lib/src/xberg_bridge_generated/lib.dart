@@ -7781,6 +7781,49 @@ class ExtractionConfig {
   /// Cannot be `true` simultaneously with `force_ocr`.
   final bool disableOcr;
 
+  /// Whether a PDF whose native text layer is empty or near-empty falls back to OCR
+  /// under [`OcrStrategy::Auto`] (GH#1752).
+  ///
+  /// `None` (the default) derives the answer from whether [`Self::ocr`] is set, which is
+  /// exactly the behaviour shipped before this field existed: with an `ocr` block the
+  /// fallback always runs, and without one it runs only when the page's native text is
+  /// *completely* empty (#1338). That carve-out means a scanned page carrying a visible
+  /// page label, Bates number or scanner stamp keeps only that label.
+  ///
+  /// `Some(true)` applies the near-empty fallback without requiring an `ocr` block: the
+  /// text-quality gate decides, using [`OcrConfig::default`]'s thresholds when no block is
+  /// present, and an automatic OCR backend must be registered.
+  ///
+  /// `Some(false)` suppresses the fallback even when an `ocr` block is present.
+  final bool? ocrNearEmptyFallback;
+
+  /// Whether [`OcrStrategy::ScannedPages`] folds the per-page text-quality gate into its
+  /// page selection, on top of the pages scan detection flagged (GH#1752).
+  ///
+  /// `None` (the default) derives the answer from whether [`Self::ocr`] is set, which is
+  /// exactly the behaviour shipped before this field existed. Without an `ocr` block
+  /// `ScannedPages` therefore degrades to detected-scans-only.
+  ///
+  /// `Some(true)` runs the gate without requiring an `ocr` block, using
+  /// [`OcrConfig::default`]'s thresholds; an automatic OCR backend must be registered.
+  ///
+  /// `Some(false)` selects detected scans only even when an `ocr` block is present, which
+  /// is the setting that avoids paying for recognition across a whole mixed document.
+  final bool? ocrScannedPageQualityGate;
+
+  /// Whether images embedded in a container document (DOCX, PPTX, ODT, HTML, ...) are sent
+  /// to OCR (GH#1752).
+  ///
+  /// `None` (the default) derives the answer from whether [`Self::ocr`] is set, which is
+  /// exactly the behaviour shipped before this field existed. `Some(true)` recognises
+  /// picture text without requiring an `ocr` block; `Some(false)` suppresses it even when
+  /// a block is present.
+  ///
+  /// Orthogonal to [`ImageExtractionConfig::run_ocr_on_images`], which still has to be
+  /// `true` (its own default) for embedded-image OCR to run. See
+  /// [`Self::runs_ocr_on_embedded_images`].
+  final bool? ocrEmbeddedImages;
+
   /// Text chunking configuration (None = chunking disabled)
   final ChunkingConfig? chunking;
 
@@ -8099,6 +8142,9 @@ class ExtractionConfig {
     required this.ocrStrategy,
     this.forceOcrPages,
     required this.disableOcr,
+    this.ocrNearEmptyFallback,
+    this.ocrScannedPageQualityGate,
+    this.ocrEmbeddedImages,
     this.chunking,
     this.contentFilter,
     this.images,
@@ -8155,6 +8201,9 @@ class ExtractionConfig {
       ocrStrategy.hashCode ^
       forceOcrPages.hashCode ^
       disableOcr.hashCode ^
+      ocrNearEmptyFallback.hashCode ^
+      ocrScannedPageQualityGate.hashCode ^
+      ocrEmbeddedImages.hashCode ^
       chunking.hashCode ^
       contentFilter.hashCode ^
       images.hashCode ^
@@ -8213,6 +8262,9 @@ class ExtractionConfig {
           ocrStrategy == other.ocrStrategy &&
           forceOcrPages == other.forceOcrPages &&
           disableOcr == other.disableOcr &&
+          ocrNearEmptyFallback == other.ocrNearEmptyFallback &&
+          ocrScannedPageQualityGate == other.ocrScannedPageQualityGate &&
+          ocrEmbeddedImages == other.ocrEmbeddedImages &&
           chunking == other.chunking &&
           contentFilter == other.contentFilter &&
           images == other.images &&

@@ -11010,6 +11010,18 @@ extension ExtractionConfigRef {
         __swift_bridge__$ExtractionConfig$disable_ocr(ptr)
     }
 
+    public func ocrNearEmptyFallback() -> Optional<Bool> {
+        __swift_bridge__$ExtractionConfig$ocr_near_empty_fallback(ptr).intoSwiftRepr()
+    }
+
+    public func ocrScannedPageQualityGate() -> Optional<Bool> {
+        __swift_bridge__$ExtractionConfig$ocr_scanned_page_quality_gate(ptr).intoSwiftRepr()
+    }
+
+    public func ocrEmbeddedImages() -> Optional<Bool> {
+        __swift_bridge__$ExtractionConfig$ocr_embedded_images(ptr).intoSwiftRepr()
+    }
+
     public func chunking() -> Optional<ChunkingConfig> {
         { let val = __swift_bridge__$ExtractionConfig$chunking(ptr); if val != nil { return ChunkingConfig(ptr: val!) } else { return nil } }()
     }

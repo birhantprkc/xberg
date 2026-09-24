@@ -13021,6 +13021,9 @@ const _: fn() = || {
         let _: crate::OcrStrategy = ExtractionConfig.ocr_strategy;
         let _: Option<Vec<i64>> = ExtractionConfig.force_ocr_pages;
         let _: bool = ExtractionConfig.disable_ocr;
+        let _: Option<bool> = ExtractionConfig.ocr_near_empty_fallback;
+        let _: Option<bool> = ExtractionConfig.ocr_scanned_page_quality_gate;
+        let _: Option<bool> = ExtractionConfig.ocr_embedded_images;
         let _: Option<crate::ChunkingConfig> = ExtractionConfig.chunking;
         let _: Option<crate::ContentFilterConfig> = ExtractionConfig.content_filter;
         let _: Option<crate::ImageExtractionConfig> = ExtractionConfig.images;
@@ -18226,6 +18229,9 @@ impl SseDecode for crate::ExtractionConfig {
         let mut var_ocrStrategy = <crate::OcrStrategy>::sse_decode(deserializer);
         let mut var_forceOcrPages = <Option<Vec<i64>>>::sse_decode(deserializer);
         let mut var_disableOcr = <bool>::sse_decode(deserializer);
+        let mut var_ocrNearEmptyFallback = <Option<bool>>::sse_decode(deserializer);
+        let mut var_ocrScannedPageQualityGate = <Option<bool>>::sse_decode(deserializer);
+        let mut var_ocrEmbeddedImages = <Option<bool>>::sse_decode(deserializer);
         let mut var_chunking = <Option<crate::ChunkingConfig>>::sse_decode(deserializer);
         let mut var_contentFilter = <Option<crate::ContentFilterConfig>>::sse_decode(deserializer);
         let mut var_images = <Option<crate::ImageExtractionConfig>>::sse_decode(deserializer);
@@ -18279,6 +18285,9 @@ impl SseDecode for crate::ExtractionConfig {
             ocr_strategy: var_ocrStrategy,
             force_ocr_pages: var_forceOcrPages,
             disable_ocr: var_disableOcr,
+            ocr_near_empty_fallback: var_ocrNearEmptyFallback,
+            ocr_scanned_page_quality_gate: var_ocrScannedPageQualityGate,
+            ocr_embedded_images: var_ocrEmbeddedImages,
             chunking: var_chunking,
             content_filter: var_contentFilter,
             images: var_images,
@@ -28993,6 +29002,9 @@ impl flutter_rust_bridge::IntoDart for FrbWrapper<crate::ExtractionConfig> {
             self.0.ocr_strategy.into_into_dart().into_dart(),
             self.0.force_ocr_pages.into_into_dart().into_dart(),
             self.0.disable_ocr.into_into_dart().into_dart(),
+            self.0.ocr_near_empty_fallback.into_into_dart().into_dart(),
+            self.0.ocr_scanned_page_quality_gate.into_into_dart().into_dart(),
+            self.0.ocr_embedded_images.into_into_dart().into_dart(),
             self.0.chunking.into_into_dart().into_dart(),
             self.0.content_filter.into_into_dart().into_dart(),
             self.0.images.into_into_dart().into_dart(),
@@ -36056,6 +36068,9 @@ impl SseEncode for crate::ExtractionConfig {
         <crate::OcrStrategy>::sse_encode(self.ocr_strategy, serializer);
         <Option<Vec<i64>>>::sse_encode(self.force_ocr_pages, serializer);
         <bool>::sse_encode(self.disable_ocr, serializer);
+        <Option<bool>>::sse_encode(self.ocr_near_empty_fallback, serializer);
+        <Option<bool>>::sse_encode(self.ocr_scanned_page_quality_gate, serializer);
+        <Option<bool>>::sse_encode(self.ocr_embedded_images, serializer);
         <Option<crate::ChunkingConfig>>::sse_encode(self.chunking, serializer);
         <Option<crate::ContentFilterConfig>>::sse_encode(self.content_filter, serializer);
         <Option<crate::ImageExtractionConfig>>::sse_encode(self.images, serializer);
