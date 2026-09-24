@@ -4482,4 +4482,43 @@ mod tests {
             gh1760_table_texts(&tables)
         );
     }
+
+    /// A single-column bullet list must not be split into a short, table-shaped
+    /// region because one rounded row gap measures 24 units instead of 23.
+    /// The fixture contains word boxes from nine consecutive lines of the
+    /// public PDF in #1772, not the full document.
+    #[test]
+    fn rounded_row_gap_does_not_turn_bullets_into_a_table() {
+        let words: Vec<crate::pdf::table_reconstruct::HocrWord> =
+            include_str!("../../../tests/fixtures/pdf/bullet_list_words.tsv")
+                .lines()
+                .map(|line| {
+                    let mut fields = line.splitn(5, '\t');
+                    let top = fields.next().unwrap().parse().unwrap();
+                    let left = fields.next().unwrap().parse().unwrap();
+                    let width = fields.next().unwrap().parse().unwrap();
+                    let height = fields.next().unwrap().parse().unwrap();
+                    let text = fields.next().unwrap().to_string();
+                    crate::pdf::table_reconstruct::HocrWord {
+                        text,
+                        left,
+                        top,
+                        width,
+                        height,
+                        confidence: 95.0,
+                    }
+                })
+                .collect();
+
+        let regions = cluster_words_into_vertical_regions(&words);
+        let tables: Vec<_> = regions
+            .iter()
+            .flat_map(|region| reconstruct_region_tables(region, 792.0, 2, false, 0))
+            .collect();
+        assert!(
+            tables.is_empty(),
+            "bullet-list prose was extracted as a table: {tables:?}"
+        );
+        assert_eq!(regions.len(), 1, "the adjacent bullet row was split from the prose");
+    }
 }
