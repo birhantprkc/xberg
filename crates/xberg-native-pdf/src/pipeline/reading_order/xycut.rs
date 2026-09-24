@@ -112,17 +112,22 @@ struct HeadingRun {
 /// common case: a real, empty column gutter with no stray content), the
 /// single minimal sub-run IS the whole run, so this returns exactly the
 /// old midpoint — the fix only changes behavior in the buggy case where
-/// sub-threshold content is unevenly distributed inside the run. ~keep
-fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> usize {
+/// sub-threshold content is unevenly distributed inside the run. That
+/// exactness is why centers are computed in f32 as `(lo + hi) / 2`:
+/// an integer `lo + width / 2` truncates, which would shift the split
+/// by half a unit on every odd-width run and so change the common case
+/// this fix is meant to leave alone. `uniform_run_split_is_unchanged`
+/// pins it. ~keep
+fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> f32 {
     debug_assert!(start < end && end <= density.len());
-    let run_mid = start + (end - start) / 2;
     if start >= end || end > density.len() {
-        return run_mid;
+        return (start + end) as f32 / 2.0;
     }
+    let run_mid = (start + end) as f32 / 2.0;
     let min_density = density[start..end].iter().copied().fold(f32::INFINITY, f32::min);
 
     let mut best_width = 0usize;
-    let mut best_dist = usize::MAX;
+    let mut best_dist = f32::INFINITY;
     let mut best_center = run_mid;
 
     let mut i = start;
@@ -136,8 +141,8 @@ fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> usize {
             i += 1;
         }
         let width = i - sub_start;
-        let center = sub_start + width / 2;
-        let dist = center.abs_diff(run_mid);
+        let center = (sub_start + i) as f32 / 2.0;
+        let dist = (center - run_mid).abs();
         if width > best_width || (width == best_width && dist < best_dist) {
             best_width = width;
             best_dist = dist;
@@ -1622,7 +1627,7 @@ impl XYCutStrategy {
             }
             // Deepest point within the valley run, not its midpoint
             // (GH#1763) — see `deepest_valley_point` for why. ~keep
-            profile.x_min + deepest_valley_point(&profile.density, vs, ve) as f32
+            profile.x_min + deepest_valley_point(&profile.density, vs, ve)
         } else {
             self.find_split_between_peaks(&profile)?
         };
@@ -1833,7 +1838,7 @@ impl XYCutStrategy {
 
         // Deepest point within the valley run, not its midpoint (GH#1763,
         // same fix as the horizontal split — see `deepest_valley_point`). ~keep
-        let split_y = profile.y_min + deepest_valley_point(&profile.density, valley_start, valley_end) as f32;
+        let split_y = profile.y_min + deepest_valley_point(&profile.density, valley_start, valley_end);
 
         // `Rect::top()` returns `self.y`, the SMALLER Y coordinate of the
         // normalized rectangle — the method name follows a screen-coordinate
@@ -2060,7 +2065,7 @@ impl XYCutStrategy {
     /// as an associated fn so tests can call it the same way as the other
     /// `#[cfg(test)]` wrappers in this file.
     #[cfg(test)]
-    fn deepest_point_wrapper(density: &[f32], start: usize, end: usize) -> usize {
+    fn deepest_point_wrapper(density: &[f32], start: usize, end: usize) -> f32 {
         deepest_valley_point(density, start, end)
     }
 
@@ -3791,6 +3796,34 @@ mod tests {
     /// the fix, `find_horizontal_split_indexed` used
     /// `legacy_valley_midpoint(vs, ve)` (254.5) here; that value falls
     /// inside `CAP4`'s span, which this test also pins down. ~keep
+    /// Center of the widest zero-density sub-run in the GH#1763 fixture's
+    /// valley. It falls BETWEEN two bins because that sub-run has odd
+    /// width; both neighbouring bins are asserted empty below, which is
+    /// the property that matters. Pinned as a constant so the split-point
+    /// assertion and the density lookups that prove it lands in real empty
+    /// space cannot drift apart. ~keep
+    const DEEPEST_POINT: f32 = 466.5;
+
+    /// The GH#1763 fix must be a NO-OP on a uniformly empty valley run --
+    /// the ordinary case of a real column gutter. It is not enough that the
+    /// new split be "close": `find_horizontal_split_indexed` feeds the value
+    /// straight into a coordinate comparison, so a half-unit shift reassigns
+    /// any span whose edge falls in between. An earlier revision computed the
+    /// sub-run center as `start + width / 2` in `usize`, which truncates and
+    /// moved the split by 0.5 on EVERY odd-width run -- silently changing the
+    /// common case this fix exists to leave alone. ~keep
+    #[test]
+    fn uniform_run_split_is_unchanged_from_the_legacy_midpoint() {
+        let density = vec![0.0f32; 64];
+        for (start, end) in [(3usize, 8usize), (3, 9), (0, 5), (0, 4), (10, 17), (2, 3), (1, 64)] {
+            assert_eq!(
+                XYCutStrategy::deepest_point_wrapper(&density, start, end),
+                XYCutStrategy::legacy_valley_midpoint(start, end),
+                "uniformly empty run [{start},{end}) must split exactly where it always did"
+            );
+        }
+    }
+
     #[test]
     fn find_valley_selects_the_deepest_point_not_the_midpoint_gh1763() {
         let strategy = XYCutStrategy::new();
@@ -3818,17 +3851,15 @@ mod tests {
 
         let deepest = XYCutStrategy::deepest_point_wrapper(&profile.density, valley_start, valley_end);
         assert_eq!(
-            deepest, 466,
+            deepest, DEEPEST_POINT,
             "fixed split must land at the center of the widest zero-density sub-run"
         );
         assert_eq!(
-            profile.density[466], 0.0,
-            "the fixed split point must land in the true empty gutter, not on caption content"
+            (profile.density[466], profile.density[467]),
+            (0.0, 0.0),
+            "the bins either side of the fixed split must be truly empty, not caption content"
         );
-        assert_ne!(
-            deepest as f32, buggy_midpoint,
-            "the fix must actually move the split point"
-        );
+        assert_ne!(deepest, buggy_midpoint, "the fix must actually move the split point");
     }
 
     /// Behavioral counterpart: `find_horizontal_split_indexed` (the real
@@ -3873,7 +3904,7 @@ mod tests {
         let strategy = XYCutStrategy::new();
         let spans = gh1763_page();
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
 
         let group_of = |text: &str| -> usize {
             groups
