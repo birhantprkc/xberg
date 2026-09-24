@@ -706,6 +706,20 @@ pub struct PdfDocument {
     /// cache because the sweep is only triggered on free-entry misses that
     /// also failed the file-body scan — the common path never needs it.
     objstm_recovery_done: Mutex<bool>,
+    /// Whether this document's xref table came from full-file reconstruction
+    /// (GH#1774) rather than a parsed xref table/stream. Reconstruction finds
+    /// objects only via a literal "N G obj" header scan, so it is structurally
+    /// blind to objects that live solely inside a compressed `/ObjStm`
+    /// container — unlike a *parsed* xref, which can carry a type-2
+    /// (compressed) entry pointing straight at the container. Set once at
+    /// construction and never mutated, so a plain `bool` (no `Mutex`)
+    /// suffices. Used to (a) proactively sweep object streams once so
+    /// ObjStm-packed objects resolve normally, and (b) gate the
+    /// `XrefRecovery` warning so it fires only when a reference is missing
+    /// *because* reconstruction couldn't see it — never for a healthy,
+    /// normally-parsed document, and never for a reference that is legitimately
+    /// free per §7.3.10. ~keep
+    xref_reconstructed: bool,
     /// Cache of XObject refs known to NOT be Form XObjects (i.e., Image or unknown).
     /// Used by text extraction to skip expensive full-object loads for images.
     image_xobject_cache: Mutex<HashSet<ObjectRef>>,

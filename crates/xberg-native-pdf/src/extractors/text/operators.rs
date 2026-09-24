@@ -85,6 +85,45 @@ impl<'doc> TextExtractor<'doc> {
                                     cur_font_size,
                                 ) =>
                         {
+                            // Fixed-pitch word-gap recovery (GH#1770). This
+                            // continuation path glues consecutive Tm+Tj glyph
+                            // runs into one buffer purely on baseline/transform
+                            // geometry — no space-insertion heuristic runs here at
+                            // all, unlike the cross-span merge path in
+                            // `span_merging.rs`. A fixed-pitch form/receipt
+                            // producer that renders one glyph per Tm/Tj and marks
+                            // a word gap as a bare empty cell (no space glyph) was
+                            // therefore ALWAYS glued regardless of gap size.
+                            //
+                            // Scoped narrowly to monospace horizontal runs: a
+                            // fixed-pitch font's own space-glyph advance IS its
+                            // character-cell pitch, so a gap of at least half a
+                            // cell beyond the buffer's own accumulated advance can
+                            // only be an empty cell — no glyph, proportional or
+                            // otherwise, occupies less than its own cell in a
+                            // fixed-pitch layout. Left at wmode 0 and gated on
+                            // `is_monospace` so proportional-font Tm+Tj runs (a
+                            // separate, differently-shaped gap problem) are
+                            // untouched. ~keep
+                            let expected_next_e = buffer.start_matrix.e + buffer.accumulated_width;
+                            let raw_gap = e - expected_next_e;
+                            if buffer.wmode == 0
+                                && buffer.is_monospace
+                                && !buffer.unicode.ends_with(|c: char| c.is_whitespace())
+                                && let Some(font) = buffer.cached_font.as_ref()
+                            {
+                                let cell_pitch = (font.get_space_glyph_width() / 1000.0) * cur_font_size;
+                                if cell_pitch > 0.0 && raw_gap > cell_pitch * 0.5 {
+                                    tracing::trace!(target: LOG_TARGET,
+                                        "Fixed-pitch word gap: inserting space (gap={:.2}pt, cell_pitch={:.2}pt)",
+                                        raw_gap,
+                                        cell_pitch
+                                    );
+                                    buffer.unicode.push(' ');
+                                    buffer.char_widths.push(raw_gap);
+                                }
+                            }
+
                             // Same line, same transform, LTR progression →
                             // update width to reflect actual visual extent ~keep
                             buffer.accumulated_width = e - buffer.start_matrix.e;

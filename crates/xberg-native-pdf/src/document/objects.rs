@@ -369,6 +369,27 @@ impl PdfDocument {
         *self.objstm_recovery_done.lock_or_recover() = true;
     }
 
+    /// Run [`recover_from_object_streams`](Self::recover_from_object_streams)
+    /// proactively, once, when this document's xref came from full-file
+    /// reconstruction (GH#1774).
+    ///
+    /// Reconstruction only ever finds objects via a literal "N G obj" header
+    /// scan, so it is structurally blind to anything packed inside a
+    /// `/ObjStm` — routinely true for font dictionaries etc. in the final
+    /// revision of an incrementally-updated PDF. Left unrecovered, such a
+    /// reference resolves to `Object::Null` per §7.3.10 on first use, with no
+    /// error anywhere: exactly the "86 of 88 pages silently empty" shape of
+    /// GH#1774. The sweep is guarded by `objstm_recovery_done`, so calling it
+    /// here costs one whole-file scan, not a per-miss cost — the same sweep
+    /// `pages.rs::get_page_by_scanning` already runs for the analogous
+    /// "compressed object's xref slot is wrong" shape on a *parsed* xref that
+    /// mis-flags a compressed object as free. ~keep
+    pub(super) fn recover_object_streams_if_reconstructed(&self) {
+        if self.xref_reconstructed {
+            self.recover_from_object_streams();
+        }
+    }
+
     /// Load an object by its reference.
     ///
     /// This function:
@@ -489,6 +510,39 @@ impl PdfDocument {
                             obj_ref.id,
                             obj_ref.generation
                         );
+                        // GH#1774: on a document whose xref came from full-file
+                        // reconstruction, "not in the xref table at all" (this
+                        // branch) is a materially different situation than a
+                        // reference that is legitimately free per §7.3.10 (the
+                        // `!entry.in_use` branch above, reached only for an
+                        // entry the xref DOES contain) — a reconstructed xref
+                        // never emits a free entry in the first place (see
+                        // `xref_reconstruction.rs`'s `XRefEntry::uncompressed`
+                        // use), so that branch can't fire here regardless. This
+                        // one fires when reconstruction's header-only scan
+                        // simply never saw the object, which is exactly what
+                        // happens for one still compressed inside an `/ObjStm`
+                        // that `recover_from_object_streams` (already run
+                        // proactively in `open.rs` for a reconstructed xref)
+                        // could not recover either — genuinely gone, not a
+                        // silent-by-design deletion. Surface it instead of
+                        // reproducing the empty-page-with-no-error shape. ~keep
+                        if self.xref_reconstructed {
+                            let msg = format!(
+                                "Object {} {} referenced but absent from the reconstructed xref table \
+                                 (not found by header scan or object-stream recovery); treating as Null \
+                                 per §7.3.10, but this document's xref was reconstructed and content may \
+                                 be missing as a result",
+                                obj_ref.id, obj_ref.generation
+                            );
+                            tracing::warn!(target: LOG_TARGET, "{}", msg);
+                            self.push_structured_warning(crate::extractors::warnings::Warning {
+                                category: crate::extractors::warnings::WarningCategory::XrefRecovery,
+                                page: None,
+                                message: msg,
+                                spec_section: Some("7.3.10"),
+                            });
+                        }
                         self.object_cache.lock_or_recover().insert(obj_ref, Object::Null);
                         return Ok(Object::Null);
                     }
