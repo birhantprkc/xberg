@@ -564,12 +564,31 @@ impl FontInfo {
         if self.has_truetype_cmap() {
             return P::EmbeddedCmap;
         }
-        // 4. A simple font resolves through its /Encoding → glyph name → AGL, and
+        // 4. A Type 3 font's /Differences glyph names identify CharProcs
+        //    procedures, not Adobe Glyph List entries (§9.6.5) — a name like
+        //    "g02" carries no Unicode meaning at all, unlike a simple font's
+        //    /Differences overlay on a named base encoding (WinAnsi/MacRoman/
+        //    Standard). GH#1782: without a ToUnicode CMap, a Type 3 font whose
+        //    glyph names don't resolve through the AGL has no mapping path
+        //    left — any text produced for it is fabricated, not read from the
+        //    file. A font that happens to name its procedures after real AGL
+        //    glyphs (some author-built Type 3 fonts do, deliberately) is left
+        //    at `EncodingName`, matching case 4 below. ~keep
+        if self.subtype == "Type3" && !self.diff_glyph_names.is_empty() {
+            let any_resolves = self
+                .diff_glyph_names
+                .values()
+                .any(|name| glyph_name_to_unicode(name).is_some());
+            if !any_resolves {
+                return P::Fallback;
+            }
+        }
+        // 5. A simple font resolves through its /Encoding → glyph name → AGL, and
         //    symbolic Symbol/ZapfDingbats through their built-in encodings. ~keep
         if self.subtype != "Type0" {
             return P::EncodingName;
         }
-        // 5. A Type0 font with none of the above severs every path to Unicode. ~keep
+        // 6. A Type0 font with none of the above severs every path to Unicode. ~keep
         P::Fallback
     }
 
@@ -816,7 +835,14 @@ impl FontInfo {
         };
 
         let (encoding_wmode, encoding, diff_multi_char_map, diff_glyph_names, embedded_cid_map) =
-            Self::resolve_encoding_fields(font_dict, doc, &base_font, flags, font_program_enc_cache)?;
+            Self::resolve_encoding_fields(
+                font_dict,
+                doc,
+                &base_font,
+                flags,
+                font_program_enc_cache,
+                subtype == "Type3",
+            )?;
 
         // Parse ToUnicode CMap if present (Phase 5.1: Lazy Loading)
         // The CMap stream is stored raw and parsed only on first character lookup ~keep
@@ -1441,6 +1467,7 @@ impl FontInfo {
         base_font: &str,
         flags: Option<i32>,
         font_program_enc_cache: Option<HashMap<u8, char>>,
+        is_type3: bool,
     ) -> Result<(
         u8,
         Encoding,
@@ -1505,7 +1532,7 @@ impl FontInfo {
                 tracing::debug!("Font '{}' using /Encoding entry", base_font);
             }
             let (mut parsed_enc, mut multi_map, glyph_names) =
-                Self::parse_encoding(&resolved_enc_obj, doc, font_program_enc_cache.as_ref())?;
+                Self::parse_encoding(&resolved_enc_obj, doc, font_program_enc_cache.as_ref(), is_type3)?;
 
             // When /Encoding is a named encoding (e.g., /WinAnsiEncoding) AND the font
             // has an embedded program, merge the font program's encoding. This handles
@@ -2708,6 +2735,7 @@ impl FontInfo {
         dict: &HashMap<String, Object>,
         doc: &PdfDocument,
         font_program_encoding: Option<&HashMap<u8, char>>,
+        is_type3: bool,
     ) -> HashMap<u8, char> {
         if let Some(base_enc_obj) = dict.get("BaseEncoding") {
             let resolved_base = if let Some(obj_ref) = base_enc_obj.as_reference() {
@@ -2736,6 +2764,18 @@ impl FontInfo {
             // "If BaseEncoding is absent and the font has a built-in encoding,
             // the built-in encoding shall be used as the base encoding." ~keep
             prog_enc.clone()
+        } else if is_type3 {
+            // GH#1782: a Type 3 font has no implicit "built-in" character
+            // set — every code is defined solely by /Differences (§9.6.5).
+            // Defaulting unmapped codes to StandardEncoding invents a
+            // plausible-looking ASCII punctuation character (codes 0x20-0x7E
+            // land on real StandardEncoding glyphs) for a code that has no
+            // font-defined meaning at all, masking a fabricated-mapping page
+            // as ordinary text and shrinking the fabricated/total ratio used
+            // to route such pages to OCR. An empty base map leaves every
+            // code with no AGL-resolvable /Differences name mapped to
+            // nothing, correctly signaling "no mapping" instead. ~keep
+            HashMap::new()
         } else {
             let mut map = HashMap::new();
             for code in 0u8..=255 {
@@ -2882,6 +2922,7 @@ impl FontInfo {
         enc_obj: &Object,
         doc: &PdfDocument,
         font_program_encoding: Option<&HashMap<u8, char>>,
+        is_type3: bool,
     ) -> Result<(Encoding, HashMap<u8, String>, HashMap<u8, String>)> {
         let empty_map = HashMap::new();
         if let Some(name) = enc_obj.as_name() {
@@ -2920,11 +2961,20 @@ impl FontInfo {
             let mut multi_char_map: HashMap<u8, String> = HashMap::new();
             let mut diff_glyph_names: HashMap<u8, String> = HashMap::new();
 
-            let mut encoding_map: HashMap<u8, char> = Self::resolve_base_encoding_map(dict, doc, font_program_encoding);
+            let mut encoding_map: HashMap<u8, char> =
+                Self::resolve_base_encoding_map(dict, doc, font_program_encoding, is_type3);
 
             Self::apply_differences_array(dict, doc, &mut encoding_map, &mut multi_char_map, &mut diff_glyph_names);
 
-            if !encoding_map.is_empty() || !multi_char_map.is_empty() {
+            if !encoding_map.is_empty() || !multi_char_map.is_empty() || is_type3 {
+                // GH#1782: an empty `encoding_map`/`multi_char_map` for a Type 3
+                // font (every /Differences glyph name failed to resolve) must
+                // stay `Encoding::Custom` with nothing in it, not fall through
+                // to `Encoding::Standard("StandardEncoding")` below — the
+                // `Standard` variant's `char_to_unicode` branch runs a raw
+                // `standard_encoding_lookup` for ANY code, reintroducing the
+                // exact fabricated ASCII-punctuation guess
+                // `resolve_base_encoding_map` was just taught to withhold. ~keep
                 Ok((Encoding::Custom(encoding_map), multi_char_map, diff_glyph_names))
             } else {
                 Ok((
@@ -6728,7 +6778,7 @@ mod tests {
         // emptied it for whichever peer test was mid-assertion on its own warnings. ~keep
         let logs = capture_warnings(|| {
             FontInfo::from_dict(&type3, &doc).expect("minimal Type3 dictionary must parse");
-            FontInfo::parse_encoding(&encoding, &doc, None).expect("malformed differences must recover");
+            FontInfo::parse_encoding(&encoding, &doc, None, false).expect("malformed differences must recover");
         });
 
         assert_eq!(logs.len(), 2, "expected exactly two recovery warnings: {logs:#?}");
@@ -8603,6 +8653,62 @@ mod tests {
     #[test]
     fn best_mapping_provenance_encoding_for_simple_font() {
         let f = make_font(|_| {});
+        assert_eq!(
+            f.best_mapping_provenance(),
+            crate::fonts::MappingProvenance::EncodingName
+        );
+    }
+
+    // GH#1782: a Type 3 font's /Differences glyph names identify CharProcs
+    // procedures (e.g. "g02"), not Adobe Glyph List entries — they carry no
+    // Unicode meaning. Without a ToUnicode CMap such a font has no mapping
+    // path at all, and its text must be judged Fallback (fabricated), not
+    // EncodingName (implying it is safely recoverable). ~keep
+    #[test]
+    fn best_mapping_provenance_fallback_for_type3_with_procedural_glyph_names() {
+        let f = make_font(|f| {
+            f.subtype = "Type3".to_string();
+            f.to_unicode = None;
+            f.diff_glyph_names = std::collections::HashMap::from([
+                (2u8, "g02".to_string()),
+                (3u8, "g03".to_string()),
+                (4u8, "g04".to_string()),
+            ]);
+        });
+        assert_eq!(f.best_mapping_provenance(), crate::fonts::MappingProvenance::Fallback);
+    }
+
+    // Negative control: a Type 3 font whose /Differences glyph names ARE
+    // real AGL names (some author-built Type 3 fonts deliberately name
+    // procedures this way) keeps its mapping — must NOT be downgraded to
+    // Fallback just for being Type 3.
+    #[test]
+    fn best_mapping_provenance_encoding_for_type3_with_agl_glyph_names() {
+        let f = make_font(|f| {
+            f.subtype = "Type3".to_string();
+            f.to_unicode = None;
+            f.diff_glyph_names = std::collections::HashMap::from([
+                (65u8, "A".to_string()),
+                (66u8, "B".to_string()),
+                (32u8, "space".to_string()),
+            ]);
+        });
+        assert_eq!(
+            f.best_mapping_provenance(),
+            crate::fonts::MappingProvenance::EncodingName
+        );
+    }
+
+    // A Type 3 font with no /Differences entries at all (empty map) must not
+    // be forced to Fallback by the new branch — it falls through to the
+    // pre-existing simple-font behavior unchanged.
+    #[test]
+    fn best_mapping_provenance_type3_with_no_differences_is_unaffected() {
+        let f = make_font(|f| {
+            f.subtype = "Type3".to_string();
+            f.to_unicode = None;
+            f.diff_glyph_names = std::collections::HashMap::new();
+        });
         assert_eq!(
             f.best_mapping_provenance(),
             crate::fonts::MappingProvenance::EncodingName
@@ -11124,7 +11230,8 @@ mod tests {
     #[test]
     fn test_diff_glyph_names_retains_period_for_code_58() {
         let doc = minimal_pdf_doc();
-        let (_enc, _multi, diff_names) = FontInfo::parse_encoding(&cmmi_like_encoding_obj(), &doc, None).unwrap();
+        let (_enc, _multi, diff_names) =
+            FontInfo::parse_encoding(&cmmi_like_encoding_obj(), &doc, None, false).unwrap();
         assert_eq!(diff_names.get(&58).map(String::as_str), Some("period"));
         assert_eq!(diff_names.get(&44).map(String::as_str), Some("arrowhookleft"));
     }
