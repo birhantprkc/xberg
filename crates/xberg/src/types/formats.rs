@@ -40,6 +40,24 @@ where
     }
 }
 
+/// Deserialize `thresholding_method`: an integer (`0`-`2`), or the legacy `bool` a pre-GH#1784
+/// config may send (`false` -> `0` Otsu, `true` -> `1` LeptonicaOtsu, its old "adaptive" doc).
+fn deserialize_thresholding_method<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(false) => Ok(0),
+        serde_json::Value::Bool(true) => Ok(1),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| Error::custom("thresholding_method must be an integer (0-2)")),
+        _ => Err(Error::custom("thresholding_method must be an integer (0-2) or a bool")),
+    }
+}
+
 /// Excel workbook representation.
 ///
 /// Contains all sheets from an Excel file (.xlsx, .xls, etc.) with
@@ -534,8 +552,14 @@ pub struct TesseractConfig {
     /// Variable-width space detection
     pub textord_space_size_is_variable: bool,
 
-    /// Use adaptive thresholding method
-    pub thresholding_method: bool,
+    /// Tesseract image-binarization method (0-2): 0 = Otsu (default), 1 = LeptonicaOtsu,
+    /// 2 = Sauvola. Sent to Tesseract's integer `thresholding_method` engine variable.
+    ///
+    /// GH#1784: used to be a `bool` sent as `"true"`/`"false"`, silently ignored by
+    /// Tesseract's integer parser. A config for the old field still deserializes: `false` ->
+    /// `0` (Otsu, the prior no-op), `true` -> `1` (LeptonicaOtsu, the old "adaptive" doc).
+    #[serde(deserialize_with = "deserialize_thresholding_method")]
+    pub thresholding_method: i32,
 }
 
 impl Default for TesseractConfig {
@@ -563,7 +587,7 @@ impl Default for TesseractConfig {
             tessedit_char_blacklist: String::new(),
             tessedit_use_primary_params_model: true,
             textord_space_size_is_variable: true,
-            thresholding_method: false,
+            thresholding_method: 0,
         }
     }
 }
@@ -947,5 +971,30 @@ mod tests {
             "public TesseractConfig::default() must match crate::ocr::types::TesseractConfig::default() \
              for language_model_ngram_on (true), or standalone image OCR silently gets the stale value"
         );
+    }
+
+    /// GH#1784: a config written for the old `bool` field must still deserialize, resolving to
+    /// what its doc comment described (`true`, "adaptive thresholding", now actually works).
+    #[test]
+    fn should_deserialize_legacy_bool_thresholding_method_for_backward_compatibility() {
+        let legacy_false: TesseractConfig =
+            serde_json::from_value(json!({"thresholding_method": false})).expect("legacy false must deserialize");
+        let legacy_true: TesseractConfig =
+            serde_json::from_value(json!({"thresholding_method": true})).expect("legacy true must deserialize");
+
+        assert_eq!(legacy_false.thresholding_method, 0, "false must map to Otsu");
+        assert_eq!(legacy_true.thresholding_method, 1, "true must map to LeptonicaOtsu");
+    }
+
+    /// The integer form (0-2) round-trips; an omitted field defaults to Otsu (`0`).
+    #[test]
+    fn should_deserialize_integer_thresholding_method_and_default_when_omitted() {
+        for method in 0..=2 {
+            let config: TesseractConfig =
+                serde_json::from_value(json!({"thresholding_method": method})).expect("integer form must deserialize");
+            assert_eq!(config.thresholding_method, method);
+        }
+        let omitted: TesseractConfig = serde_json::from_value(json!({})).expect("empty object must deserialize");
+        assert_eq!(omitted.thresholding_method, 0);
     }
 }

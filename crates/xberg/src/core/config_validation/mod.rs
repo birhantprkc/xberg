@@ -48,7 +48,10 @@ pub use sections::layout_wastes_plain_output;
 
 #[cfg(test)]
 pub(crate) use sections::validate_binarization_method;
-pub(crate) use sections::{validate_image_preprocessing_config, validate_tesseract_oem, validate_tesseract_psm};
+pub(crate) use sections::{
+    validate_image_preprocessing_config, validate_tesseract_oem, validate_tesseract_psm,
+    validate_tesseract_thresholding_method,
+};
 
 // `validate_output_format` stays `#[cfg(test)]`-only, and correctly so: both
 // `ExtractionConfig::output_format` and `OcrConfig::output_format` are the strongly-typed
@@ -256,6 +259,24 @@ mod tests {
         assert!(validate_tesseract_oem(-1).is_err());
         assert!(validate_tesseract_oem(4).is_err());
         assert!(validate_tesseract_oem(10).is_err());
+    }
+
+    #[test]
+    fn test_validate_tesseract_thresholding_method_valid() {
+        for thresholding_method in 0..=2 {
+            assert!(
+                validate_tesseract_thresholding_method(thresholding_method).is_ok(),
+                "thresholding_method {} should be valid",
+                thresholding_method
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_tesseract_thresholding_method_invalid() {
+        assert!(validate_tesseract_thresholding_method(-1).is_err());
+        assert!(validate_tesseract_thresholding_method(3).is_err());
+        assert!(validate_tesseract_thresholding_method(100).is_err());
     }
 
     #[test]

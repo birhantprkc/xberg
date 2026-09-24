@@ -448,6 +448,55 @@ mod tests {
         );
     }
 
+    /// GH#1784: `thresholding_method` was documented as "use adaptive thresholding" while
+    /// being a `bool`, and Tesseract's `thresholding_method` engine variable is an
+    /// `INT_MEMBER` parsed with `stream >> intval` — the literal strings `"true"`/`"false"`
+    /// xberg used to send never parsed as an integer, so the engine variable stayed at
+    /// Tesseract's own default (Otsu, `0`) no matter what the caller configured.
+    ///
+    /// Uses a real (non-mocked) `TesseractAPI`, with no `init()` call: `thresholding_method`
+    /// is an `INT_MEMBER` populated by the `TessBaseAPI` constructor itself (see
+    /// `get_variable_accessors_return_the_stored_value` in `xberg-tesseract/src/api.rs`), so
+    /// reading it back needs no tessdata and cannot be skipped by environment.
+    ///
+    /// Fails on the pre-fix code (where this field is a `bool` sent via `.to_string()` as the
+    /// literal `"true"`): the engine variable then reads back `Some(0)`, not `Some(1)`,
+    /// proving the value never reached Tesseract as a usable integer — not merely that our
+    /// own struct field held the caller's choice.
+    #[test]
+    fn should_reach_tesseract_as_an_integer_leptonica_otsu_value_not_the_literal_string_true() {
+        let api = xberg_tesseract::TesseractAPI::new().expect("create engine");
+
+        let mut config = create_test_config();
+        config.thresholding_method = 1;
+        apply_tesseract_variables(&api, &config).expect("apply_tesseract_variables should succeed");
+
+        assert_eq!(
+            api.get_int_variable("thresholding_method").ok(),
+            Some(1),
+            "thresholding_method: 1 must select Tesseract's LeptonicaOtsu method as an integer \
+             the engine actually parses"
+        );
+    }
+
+    /// Negative control for GH#1784: when nothing is configured, the effective Tesseract
+    /// method must remain Otsu (`0`) — the regression risk of the fix is a default that
+    /// silently changes for every caller who never touched this field.
+    #[test]
+    fn should_default_to_otsu_when_thresholding_method_is_unconfigured() {
+        let api = xberg_tesseract::TesseractAPI::new().expect("create engine");
+
+        let config = create_test_config();
+        apply_tesseract_variables(&api, &config).expect("apply_tesseract_variables should succeed");
+
+        assert_eq!(
+            api.get_int_variable("thresholding_method").ok(),
+            Some(0),
+            "an unconfigured thresholding_method must leave Tesseract at Otsu (0), unchanged \
+             from before this fix"
+        );
+    }
+
     #[test]
     fn test_character_variables_include_empty_resets() {
         let mut configured = create_test_config();
@@ -578,7 +627,7 @@ mod tests {
             ),
             (
                 "thresholding_method",
-                Box::new(|c: &mut TesseractConfig| c.thresholding_method = !c.thresholding_method),
+                Box::new(|c: &mut TesseractConfig| c.thresholding_method = (c.thresholding_method + 1) % 3),
             ),
         ]
     }

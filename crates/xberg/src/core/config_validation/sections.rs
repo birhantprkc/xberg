@@ -239,6 +239,9 @@ const VALID_TESSERACT_PSM: &[i32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 /// Valid tesseract OEM (OCR Engine Mode) values.
 const VALID_TESSERACT_OEM: &[i32] = &[0, 1, 2, 3];
 
+/// Valid tesseract `thresholding_method` values: 0 = Otsu, 1 = LeptonicaOtsu, 2 = Sauvola.
+const VALID_TESSERACT_THRESHOLDING_METHOD: &[i32] = &[0, 1, 2];
+
 /// Valid output formats for document extraction.
 /// Supports plain text, markdown, djot, HTML, JSON, and structured output formats.
 /// "json" and "structured" are distinct formats, not aliases of each other.
@@ -505,6 +508,43 @@ pub(crate) fn validate_tesseract_oem(oem: i32) -> Result<()> {
                 "Invalid tesseract OEM value '{}'. Valid range is 0-3. \
                  0=Legacy, 1=LSTM, 2=Legacy+LSTM, 3=Default",
                 oem
+            ),
+            source: None,
+        })
+    }
+}
+
+/// Validate a tesseract `thresholding_method` value.
+///
+/// # Arguments
+///
+/// * `thresholding_method` - The thresholding method to validate (0-2)
+///
+/// # Returns
+///
+/// `Ok(())` if the value is valid, or a `ValidationError` with details about valid options.
+///
+/// # Examples
+///
+/// Not run as a doctest: `pub(crate)`, so it is unreachable from a downstream crate.
+///
+/// ```ignore
+/// use xberg::core::config_validation::validate_tesseract_thresholding_method;
+///
+/// assert!(validate_tesseract_thresholding_method(0).is_ok());  // Otsu
+/// assert!(validate_tesseract_thresholding_method(1).is_ok());  // LeptonicaOtsu
+/// assert!(validate_tesseract_thresholding_method(2).is_ok());  // Sauvola
+/// assert!(validate_tesseract_thresholding_method(3).is_err()); // Out of range
+/// ```
+pub(crate) fn validate_tesseract_thresholding_method(thresholding_method: i32) -> Result<()> {
+    if VALID_TESSERACT_THRESHOLDING_METHOD.contains(&thresholding_method) {
+        Ok(())
+    } else {
+        Err(XbergError::Validation {
+            message: format!(
+                "Invalid tesseract thresholding_method value '{}'. Valid range is 0-2. \
+                 0=Otsu, 1=LeptonicaOtsu, 2=Sauvola",
+                thresholding_method
             ),
             source: None,
         })

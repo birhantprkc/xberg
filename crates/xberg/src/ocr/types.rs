@@ -126,8 +126,11 @@ pub struct TesseractConfig {
     pub tessedit_use_primary_params_model: bool,
     /// Tesseract `textord_space_size_is_variable` variable.
     pub textord_space_size_is_variable: bool,
-    /// Use adaptive thresholding (`true`) instead of Otsu (`false`).
-    pub thresholding_method: bool,
+    /// Tesseract `thresholding_method` engine variable (0-2): 0 = Otsu, 1 = LeptonicaOtsu,
+    /// 2 = Sauvola. Sent to Tesseract as a decimal integer string — see GH#1784: this used to
+    /// be a `bool` sent as `"true"`/`"false"`, which Tesseract's integer parameter parser
+    /// (`stream >> intval`) silently failed to read, so the setting had no effect.
+    pub thresholding_method: u8,
 
     /// Enable automatic page rotation based on orientation detection.
     ///
@@ -252,7 +255,7 @@ impl Default for TesseractConfig {
             tessedit_char_blacklist: String::new(),
             tessedit_use_primary_params_model: true,
             textord_space_size_is_variable: true,
-            thresholding_method: false,
+            thresholding_method: 0,
             auto_rotate: false,
             tessdata_path: None,
             source_dpi: None,
@@ -312,7 +315,7 @@ impl From<&crate::types::TesseractConfig> for TesseractConfig {
             tessedit_char_blacklist: config.tessedit_char_blacklist.clone(),
             tessedit_use_primary_params_model: config.tessedit_use_primary_params_model,
             textord_space_size_is_variable: config.textord_space_size_is_variable,
-            thresholding_method: config.thresholding_method,
+            thresholding_method: config.thresholding_method as u8,
             auto_rotate: config.preprocessing.as_ref().map(|p| p.auto_rotate).unwrap_or(false),
             tessdata_path: None,
             // The public config is a user-supplied document-wide setting and cannot know the
@@ -605,7 +608,7 @@ mod tests {
             tessedit_char_blacklist: "!@#$".to_string(),
             tessedit_use_primary_params_model: false,
             textord_space_size_is_variable: false,
-            thresholding_method: true,
+            thresholding_method: 2,
         };
 
         let internal_config: TesseractConfig = (&public_config).into();
@@ -630,6 +633,6 @@ mod tests {
         assert_eq!(internal_config.tessedit_char_blacklist, "!@#$");
         assert!(!internal_config.tessedit_use_primary_params_model);
         assert!(!internal_config.textord_space_size_is_variable);
-        assert!(internal_config.thresholding_method);
+        assert_eq!(internal_config.thresholding_method, 2);
     }
 }

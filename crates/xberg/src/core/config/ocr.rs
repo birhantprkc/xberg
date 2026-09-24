@@ -1326,9 +1326,10 @@ fn validate_languages(languages: &[String]) -> Result<(), XbergError> {
 
 /// Validate the Tesseract tuning knobs that are plain integers and strings rather than enums.
 ///
-/// `psm`, `oem` and `binarization_method` are the only OCR fields whose type does not already
-/// constrain them at deserialization time, so an out-of-range mode reaches the backend and fails
-/// there — far from the config that caused it. Validating here keeps the error next to the input.
+/// `psm`, `oem`, `thresholding_method` and `binarization_method` are the only OCR fields whose
+/// type does not already constrain them at deserialization time, so an out-of-range mode
+/// reaches the backend and fails there — far from the config that caused it. Validating here
+/// keeps the error next to the input.
 fn validate_tesseract_tuning(tesseract_config: Option<&crate::types::TesseractConfig>) -> Result<(), XbergError> {
     let Some(tesseract_config) = tesseract_config else {
         return Ok(());
@@ -1337,6 +1338,7 @@ fn validate_tesseract_tuning(tesseract_config: Option<&crate::types::TesseractCo
         crate::core::config_validation::validate_tesseract_psm(psm)?;
     }
     crate::core::config_validation::validate_tesseract_oem(tesseract_config.oem)?;
+    crate::core::config_validation::validate_tesseract_thresholding_method(tesseract_config.thresholding_method)?;
     if let Some(ref preprocessing) = tesseract_config.preprocessing {
         crate::core::config_validation::validate_image_preprocessing_config(preprocessing)?;
     }
