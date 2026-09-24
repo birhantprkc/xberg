@@ -86,9 +86,8 @@ impl PdfDocument {
         let (major, minor, header_offset) = parse_header(&mut reader, true)?;
         let version = (major, minor);
 
-        // Whether the xref table below came from a full-file reconstruction
-        // scan (vs. a parsed xref). Used to pre-seed the object-scan cache so
-        // a later miss doesn't rescan the whole file a second time. ~keep
+        // Xref came from full-file reconstruction, not a parsed xref (see
+        // the `xref_reconstructed` field doc for what this gates). ~keep
         let mut xref_reconstructed = false;
         // SYNTHETIC objects a recovery invented (a rebuilt Catalog / page-tree
         // root for a truncated file). They have no byte offset, so they are
@@ -257,6 +256,7 @@ impl PdfDocument {
             page_cache_populated: AtomicBool::new(false),
             scanned_object_offsets: Mutex::new(prepopulated_scan),
             objstm_recovery_done: Mutex::new(false),
+            xref_reconstructed,
             image_xobject_cache: Mutex::new(HashSet::new()),
             xobject_text_free_cache: Mutex::new(HashSet::new()),
             xobject_stream_cache: Mutex::new(HashMap::new()),
@@ -286,6 +286,8 @@ impl PdfDocument {
                 cache.insert(obj_ref, obj);
             }
         }
+
+        document.recover_object_streams_if_reconstructed(); // GH#1774 ~keep
 
         if let Err(error) = document.ensure_encryption_initialized() {
             trace_recoverable_pdf_error("initialize_encryption", &error);
