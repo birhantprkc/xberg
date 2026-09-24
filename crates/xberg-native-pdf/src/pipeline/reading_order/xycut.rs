@@ -126,6 +126,20 @@ fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> f32 {
     let run_mid = (start + end) as f32 / 2.0;
     let min_density = density[start..end].iter().copied().fold(f32::INFINITY, f32::min);
 
+    // Relocate ONLY when the midpoint actually lands on content -- the defect's own
+    // precondition. If the midpoint already sits at the run's density floor, the split is
+    // already falling through empty space and cutting nothing, so moving it to some wider
+    // empty region elsewhere changes reading order for no benefit. Measured: without this
+    // guard the fix altered 23 of 230 corpus documents and, counted by dictionary-valid
+    // words, made 11 worse against 8 better -- the split was being relocated on pages that
+    // had nothing wrong with them. A split line of odd width falls between two bins; either
+    // one being at the floor is enough to leave it alone. ~keep
+    let mid_low = run_mid.floor() as usize;
+    let mid_high = (run_mid.ceil() as usize).min(end - 1);
+    if density[mid_low] == min_density || density[mid_high] == min_density {
+        return run_mid;
+    }
+
     let mut best_width = 0usize;
     let mut best_dist = f32::INFINITY;
     let mut best_center = run_mid;
@@ -3805,6 +3819,35 @@ mod tests {
     /// sub-run center as `start + width / 2` in `usize`, which truncates and
     /// moved the split by 0.5 on EVERY odd-width run -- silently changing the
     /// common case this fix exists to leave alone. ~keep
+    /// The guard that keeps the GH#1763 relocation to pages that actually have the defect.
+    /// Here the midpoint already falls in empty space, and a WIDER empty region sits
+    /// off-centre. Relocating would be pointless -- the split was cutting nothing where it
+    /// was -- and it is exactly this case that made the unguarded fix rewrite the reading
+    /// order of 23 of 230 corpus documents, 11 of which got worse by dictionary-valid word
+    /// count. The split must not move. ~keep
+    #[test]
+    fn a_split_already_falling_through_empty_space_does_not_move() {
+        // content | narrow gap (holds the midpoint) | content | WIDER gap, off-centre
+        let mut density = vec![0.0f32; 40];
+        for bin in (0..17).chain(23..26) {
+            density[bin] = 3.0;
+        }
+        let (start, end) = (0usize, 40usize);
+        let midpoint = XYCutStrategy::legacy_valley_midpoint(start, end);
+        assert_eq!(midpoint, 20.0);
+        assert_eq!(density[20], 0.0, "the midpoint must start out in empty space");
+        assert!(
+            (26..40).len() > (17..23).len(),
+            "the off-centre empty region must be the WIDER one, or this pins nothing"
+        );
+
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper(&density, start, end),
+            midpoint,
+            "a split already falling through empty space must stay where it is"
+        );
+    }
+
     #[test]
     fn uniform_run_split_is_unchanged_from_the_legacy_midpoint() {
         let density = vec![0.0f32; 64];
