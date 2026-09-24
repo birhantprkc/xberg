@@ -84,7 +84,7 @@ impl PathContent {
 
     /// Create a path from operations.
     pub fn from_operations(operations: Vec<PathOperation>) -> Self {
-        let bbox = Self::compute_bbox(&operations);
+        let bbox = path_operations_bbox(&operations);
         Self {
             bbox,
             operations,
@@ -606,45 +606,68 @@ impl PathContent {
         flush_subpath(&mut current, &mut subpaths);
         subpaths
     }
+}
 
-    /// Compute bounding box from path operations.
-    fn compute_bbox(operations: &[PathOperation]) -> Rect {
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
+/// True when `operations[index]` is a `MoveTo` that begins a subpath no
+/// segment follows. Such a subpath paints nothing (§8.5.2: path construction
+/// operators place no marks; a lone point has "no vestige"), so it must not
+/// extend the bounding box. GH#1759: a footer band followed by a stray
+/// `0 842 m` otherwise reports a page-sized box, which unions every rule on
+/// the page into one cluster. ~keep
+fn is_degenerate_move_to(operations: &[PathOperation], index: usize) -> bool {
+    !matches!(
+        operations.get(index + 1),
+        Some(PathOperation::LineTo(..) | PathOperation::CurveTo(..) | PathOperation::ClosePath)
+    )
+}
 
-        for op in operations {
-            match op {
-                PathOperation::MoveTo(x, y) | PathOperation::LineTo(x, y) => {
-                    min_x = min_x.min(*x);
-                    min_y = min_y.min(*y);
-                    max_x = max_x.max(*x);
-                    max_y = max_y.max(*y);
-                }
-                PathOperation::CurveTo(x1, y1, x2, y2, x3, y3) => {
-                    for (x, y) in [(*x1, *y1), (*x2, *y2), (*x3, *y3)] {
-                        min_x = min_x.min(x);
-                        min_y = min_y.min(y);
-                        max_x = max_x.max(x);
-                        max_y = max_y.max(y);
-                    }
-                }
-                PathOperation::Rectangle(x, y, w, h) => {
-                    min_x = min_x.min(*x);
-                    min_y = min_y.min(*y);
-                    max_x = max_x.max(*x + *w);
-                    max_y = max_y.max(*y + *h);
-                }
-                PathOperation::ClosePath => {}
+/// Compute the bounding box of a sequence of path operations.
+///
+/// Shared by [`PathContent::from_operations`] and
+/// `PathExtractor::finalize_path`, which must agree exactly: the two were
+/// independent, byte-identical copies, so GH#1759 had to be fixed twice.
+pub(crate) fn path_operations_bbox(operations: &[PathOperation]) -> Rect {
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+
+    for (index, op) in operations.iter().enumerate() {
+        match op {
+            PathOperation::MoveTo(..) if is_degenerate_move_to(operations, index) => {}
+            PathOperation::MoveTo(x, y) | PathOperation::LineTo(x, y) => {
+                min_x = min_x.min(*x);
+                min_y = min_y.min(*y);
+                max_x = max_x.max(*x);
+                max_y = max_y.max(*y);
             }
+            PathOperation::CurveTo(x1, y1, x2, y2, x3, y3) => {
+                for (x, y) in [(*x1, *y1), (*x2, *y2), (*x3, *y3)] {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+            PathOperation::Rectangle(x, y, w, h) => {
+                // `PathExtractor::rectangle` stores the CTM-transformed
+                // delta, so a flipping CTM (negative `a`/`d`) or a
+                // negative-extent `re` yields a negative `w`/`h`. Order the
+                // corners here — `Rect::new` normalises a whole rect, but is
+                // handed pre-reduced min/extent values below. ~keep
+                min_x = min_x.min(x.min(*x + *w));
+                min_y = min_y.min(y.min(*y + *h));
+                max_x = max_x.max(x.max(*x + *w));
+                max_y = max_y.max(y.max(*y + *h));
+            }
+            PathOperation::ClosePath => {}
         }
+    }
 
-        if min_x == f32::MAX {
-            Rect::new(0.0, 0.0, 0.0, 0.0)
-        } else {
-            Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
-        }
+    if min_x == f32::MAX {
+        Rect::new(0.0, 0.0, 0.0, 0.0)
+    } else {
+        Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 }
 
@@ -884,6 +907,78 @@ mod tests {
         let footer_rule = PathContent::line(0.0, 48.30, 595.28, 48.30);
         assert!(footer_rule.is_table_primitive());
         assert!(!footer_rule.is_page_frame_rectangle((0.0, 0.0, 595.28, 842.0)));
+    }
+
+    #[test]
+    fn trailing_move_to_does_not_extend_the_bounding_box_to_the_page() {
+        // GH#1759 carrier: `0 42.63 595.28 -28.35 re  0 842 m  f*`. The
+        // lone trailing `m` starts a subpath no segment follows, so it
+        // paints nothing and must not stretch the box to the page. ~keep
+        let path = PathContent::from_operations(vec![
+            PathOperation::Rectangle(0.0, 14.28, 595.28, 28.35),
+            PathOperation::MoveTo(0.0, 842.0),
+        ]);
+
+        assert!(
+            (path.bbox.y - 14.28).abs() < 1e-3,
+            "expected the footer band's own y (14.28), got {}",
+            path.bbox.y
+        );
+        assert!(
+            (path.bbox.height - 28.35).abs() < 1e-3,
+            "expected the footer band's own height (28.35), got {}",
+            path.bbox.height
+        );
+        assert!((path.bbox.x - 0.0).abs() < 1e-3, "got x {}", path.bbox.x);
+        assert!((path.bbox.width - 595.28).abs() < 1e-3, "got width {}", path.bbox.width);
+    }
+
+    #[test]
+    fn negative_extent_rectangle_is_normalised_when_mixed_with_a_segment() {
+        // `PathExtractor::rectangle` stores the CTM-transformed delta, so a
+        // flipping CTM or a negative-extent `re` yields a negative stored
+        // width/height. Mixed with another operation the box is built from
+        // min/max across operations, so the rectangle's own corners must be
+        // ordered first. GH#1759. ~keep
+        let path = PathContent::from_operations(vec![
+            PathOperation::Rectangle(100.0, 200.0, -40.0, -30.0),
+            PathOperation::LineTo(80.0, 180.0),
+        ]);
+
+        assert_eq!(path.bbox.x, 60.0, "expected the normalised left edge");
+        assert_eq!(path.bbox.y, 170.0, "expected the normalised bottom edge");
+        assert_eq!(path.bbox.width, 40.0, "expected the normalised width");
+        assert_eq!(path.bbox.height, 30.0, "expected the normalised height");
+    }
+
+    #[test]
+    fn move_to_followed_by_a_segment_still_contributes_both_points() {
+        // Control for GH#1759: a `MoveTo` that begins a real subpath is
+        // painted and must keep contributing its point. ~keep
+        let lined = PathContent::from_operations(vec![
+            PathOperation::MoveTo(10.0, 20.0),
+            PathOperation::LineTo(110.0, 120.0),
+        ]);
+        assert_eq!(lined.bbox.x, 10.0);
+        assert_eq!(lined.bbox.y, 20.0);
+        assert_eq!(lined.bbox.width, 100.0);
+        assert_eq!(lined.bbox.height, 100.0);
+
+        let curved = PathContent::from_operations(vec![
+            PathOperation::MoveTo(10.0, 20.0),
+            PathOperation::CurveTo(30.0, 40.0, 50.0, 60.0, 70.0, 80.0),
+        ]);
+        assert_eq!(curved.bbox.x, 10.0);
+        assert_eq!(curved.bbox.y, 20.0);
+
+        let closed = PathContent::from_operations(vec![
+            PathOperation::MoveTo(10.0, 20.0),
+            PathOperation::LineTo(110.0, 20.0),
+            PathOperation::MoveTo(10.0, 200.0),
+            PathOperation::ClosePath,
+        ]);
+        assert_eq!(closed.bbox.y, 20.0);
+        assert_eq!(closed.bbox.height, 180.0);
     }
 
     /// Ground-truth cubic Bézier evaluation, used to validate flattening.

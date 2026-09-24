@@ -113,29 +113,13 @@ pub fn classify_region(spans: &[TextSpan], indices: &[usize]) -> RegionClass {
         return RegionClass::Mixed;
     }
 
-    let mut total_chars = 0usize;
-    let mut wide_lines = 0usize;
-    let mut numbered_lines = 0usize;
-    let mut form_lines = 0usize;
-    let mut left_edges: Vec<f32> = Vec::with_capacity(line_count);
-    for l in &lines {
-        total_chars += l.nonws_chars;
-        let extent = (l.right - l.left).max(0.0);
-        if extent >= region_width * 0.6 {
-            wide_lines += 1;
-        }
-        if starts_numbered_entry(&l.lead_text) {
-            numbered_lines += 1;
-        }
-        if line_has_label_value_gap(l, region_width) {
-            form_lines += 1;
-        }
-        left_edges.push(l.left);
-    }
-    let mean_chars = total_chars as f32 / line_count as f32;
-    let mostly_wide = wide_lines * 2 > line_count;
-    let numbered_frac = numbered_lines as f32 / line_count as f32;
-    let form_frac = form_lines as f32 / line_count as f32;
+    let RegionShape {
+        mean_chars,
+        mostly_wide,
+        numbered_frac,
+        form_frac,
+        left_edges,
+    } = summarize_lines(&lines, region_width);
 
     // --- decision ladder (specific → general; default Mixed) ---
     //
@@ -176,6 +160,47 @@ pub fn classify_region(spans: &[TextSpan], indices: &[usize]) -> RegionClass {
     }
 
     RegionClass::Mixed
+}
+
+/// Shape signals aggregated over a region's clustered lines, consumed by the
+/// decision ladder in [`classify_region`].
+struct RegionShape {
+    mean_chars: f32,
+    mostly_wide: bool,
+    numbered_frac: f32,
+    form_frac: f32,
+    left_edges: Vec<f32>,
+}
+
+/// Tally the per-line signals. Callers guarantee `lines` is non-empty.
+fn summarize_lines(lines: &[LineStat], region_width: f32) -> RegionShape {
+    let line_count = lines.len();
+    let mut total_chars = 0usize;
+    let mut wide_lines = 0usize;
+    let mut numbered_lines = 0usize;
+    let mut form_lines = 0usize;
+    let mut left_edges: Vec<f32> = Vec::with_capacity(line_count);
+    for l in lines {
+        total_chars += l.nonws_chars;
+        let extent = (l.right - l.left).max(0.0);
+        if extent >= region_width * 0.6 {
+            wide_lines += 1;
+        }
+        if starts_numbered_entry(&l.lead_text) {
+            numbered_lines += 1;
+        }
+        if line_has_label_value_gap(l, region_width) {
+            form_lines += 1;
+        }
+        left_edges.push(l.left);
+    }
+    RegionShape {
+        mean_chars: total_chars as f32 / line_count as f32,
+        mostly_wide: wide_lines * 2 > line_count,
+        numbered_frac: numbered_lines as f32 / line_count as f32,
+        form_frac: form_lines as f32 / line_count as f32,
+        left_edges,
+    }
 }
 
 /// Median of the spans' glyph heights (linear-time enough for blocks).

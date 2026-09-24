@@ -63,11 +63,22 @@ pub(crate) async fn process_images_with_ocr(
     config: &crate::core::config::ExtractionConfig,
     warnings: &mut Vec<crate::types::ProcessingWarning>,
 ) -> crate::Result<Vec<ExtractedImage>> {
-    if images.is_empty() || config.ocr.is_none() {
+    // `runs_ocr_on_embedded_images` rather than `config.ocr.is_some()`: this early return
+    // was a third separately-written copy of the pipeline's gate, so `ocr_embedded_images:
+    // Some(true)` without an `ocr` block would have been accepted by the caller and then
+    // silently discarded here. Same predicate everywhere -- see GH#1662, GH#1752. ~keep
+    if images.is_empty() || !config.runs_ocr_on_embedded_images() {
         return Ok(images);
     }
 
-    let ocr_config = config.ocr.as_ref().unwrap();
+    // Opting in without an `ocr` block is an AUTOMATIC trigger: with nothing registered to
+    // run it, spawning a task per image would only produce one failure warning per image. ~keep
+    if config.ocr.is_none() && !crate::plugins::registry::automatic_ocr_backend_is_registered() {
+        return Ok(images);
+    }
+
+    let default_ocr_config = crate::core::config::OcrConfig::default();
+    let ocr_config = config.ocr.as_ref().unwrap_or(&default_ocr_config);
     let max_tasks = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
     let mut pending = build_pending_ocr_tasks(&images, ocr_config, config);
 

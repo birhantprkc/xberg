@@ -97,6 +97,37 @@ pub fn get_ocr_backend_registry() -> Arc<RwLock<OcrBackendRegistry>> {
     OCR_BACKEND_REGISTRY.clone()
 }
 
+/// Whether the OCR backend an AUTOMATIC trigger would use is actually registered.
+///
+/// `ocr-pipeline` can be enabled with no backend at all -- `ocr` implies
+/// `ocr-pipeline`, not the reverse -- and a host application can clear the registry at
+/// runtime. In such a build an automatic trigger has nothing to run, and attempting it
+/// turned an ordinary extraction that never requested OCR into a hard `Plugin` error
+/// naming a backend the caller never chose.
+///
+/// EXPLICIT requests deliberately do not consult this. `force_ocr`, `force_ocr_pages`,
+/// `ocr_inline_images` and a caller-supplied `ocr` config all asked for something this
+/// build cannot do, and must be told so rather than silently given native text. The
+/// `ocr_*` opt-ins on `ExtractionConfig` (GH#1752) are automatic triggers for this
+/// purpose: they name a behaviour, not a backend, so they consult this like any other.
+///
+/// A configured pipeline resolves each of its own stage backends internally, so this
+/// reports available for it and leaves that route's behaviour unchanged. See GH#1610. ~keep
+///
+/// Lives here rather than in `extractors/pdf` because the PDF page routes and the
+/// container embedded-image route (`extraction::image_ocr`) must answer this one
+/// question the same way. ~keep
+#[cfg(feature = "ocr-pipeline")]
+pub(crate) fn automatic_ocr_backend_is_registered() -> bool {
+    let ocr_config = crate::core::config::OcrConfig::default();
+    if ocr_config.pipeline.is_some() {
+        return true;
+    }
+    let registry = get_ocr_backend_registry();
+    let registry = registry.read();
+    registry.get(&ocr_config.backend).is_ok()
+}
+
 /// Get the global embedding backend registry.
 #[cfg_attr(alef, alef(skip))]
 pub fn get_embedding_backend_registry() -> Arc<RwLock<EmbeddingBackendRegistry>> {

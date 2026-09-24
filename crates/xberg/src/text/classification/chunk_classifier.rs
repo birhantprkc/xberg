@@ -173,6 +173,78 @@ async fn classify_batch(
     Ok((parse_batch_response(&value), usage))
 }
 
+/// What a single spawned classification batch resolves to.
+type BatchTaskResult = crate::Result<(HashMap<usize, Vec<ClassificationLabel>>, Option<LlmUsage>)>;
+
+/// Aggregated result of draining every spawned classification batch.
+struct BatchOutcome {
+    per_chunk: HashMap<usize, Vec<ClassificationLabel>>,
+    usages: Vec<LlmUsage>,
+    first_error: Option<crate::XbergError>,
+    failed_batches: usize,
+    any_success: bool,
+}
+
+/// Group non-empty chunks into `batch_size`-sized batches of `(chunk_index, text)`.
+///
+/// The index is the chunk's position in the original document, not in the filtered
+/// list, so results can be written back onto the right chunk. ~keep
+fn build_batches(chunks: &[crate::types::Chunk], batch_size: usize) -> Vec<Vec<(usize, String)>> {
+    chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, chunk)| !chunk.content.is_empty())
+        .map(|(index, chunk)| (index, chunk.content.clone()))
+        .collect::<Vec<_>>()
+        .chunks(batch_size)
+        .map(<[(usize, String)]>::to_vec)
+        .collect()
+}
+
+/// Drain every spawned batch task, keeping partial results and the first error.
+///
+/// A panicked or cancelled join is folded into the same error channel as a failed
+/// batch so one broken task cannot abort the surviving batches' results. ~keep
+async fn collect_batch_outcomes(join_set: &mut tokio::task::JoinSet<BatchTaskResult>) -> BatchOutcome {
+    let mut per_chunk: HashMap<usize, Vec<ClassificationLabel>> = HashMap::new();
+    let mut usages: Vec<LlmUsage> = Vec::new();
+    let mut first_error: Option<crate::XbergError> = None;
+    let mut failed_batches = 0usize;
+    let mut any_success = false;
+
+    while let Some(joined) = join_set.join_next().await {
+        let batch_result = match joined {
+            Ok(inner) => inner,
+            Err(join_err) => Err(crate::XbergError::Other(format!(
+                "chunk classification batch task failed to complete: {join_err}"
+            ))),
+        };
+        match batch_result {
+            Ok((labels_by_index, usage)) => {
+                any_success = true;
+                per_chunk.extend(labels_by_index);
+                if let Some(u) = usage {
+                    usages.push(u);
+                }
+            }
+            Err(err) => {
+                failed_batches += 1;
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    BatchOutcome {
+        per_chunk,
+        usages,
+        first_error,
+        failed_batches,
+        any_success,
+    }
+}
+
 /// Run chunk classification against an extraction result.
 ///
 /// Mutates `ChunkMetadata::classifications` on every chunk in
@@ -207,15 +279,7 @@ pub async fn classify_chunks(result: &mut ExtractedDocument, config: &ChunkClass
     let batch_size = config.batch_size.max(1);
     let max_concurrency = config.max_concurrency.max(1);
 
-    let batches: Vec<Vec<(usize, String)>> = chunks
-        .iter()
-        .enumerate()
-        .filter(|(_, chunk)| !chunk.content.is_empty())
-        .map(|(index, chunk)| (index, chunk.content.clone()))
-        .collect::<Vec<_>>()
-        .chunks(batch_size)
-        .map(<[(usize, String)]>::to_vec)
-        .collect();
+    let batches = build_batches(chunks, batch_size);
 
     if batches.is_empty() {
         return Ok(());
@@ -239,35 +303,13 @@ pub async fn classify_chunks(result: &mut ExtractedDocument, config: &ChunkClass
         });
     }
 
-    let mut per_chunk: HashMap<usize, Vec<ClassificationLabel>> = HashMap::new();
-    let mut usages: Vec<LlmUsage> = Vec::new();
-    let mut first_error: Option<crate::XbergError> = None;
-    let mut failed_batches = 0usize;
-    let mut any_success = false;
-
-    while let Some(joined) = join_set.join_next().await {
-        let batch_result = match joined {
-            Ok(inner) => inner,
-            Err(join_err) => Err(crate::XbergError::Other(format!(
-                "chunk classification batch task failed to complete: {join_err}"
-            ))),
-        };
-        match batch_result {
-            Ok((labels_by_index, usage)) => {
-                any_success = true;
-                per_chunk.extend(labels_by_index);
-                if let Some(u) = usage {
-                    usages.push(u);
-                }
-            }
-            Err(err) => {
-                failed_batches += 1;
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
-    }
+    let BatchOutcome {
+        per_chunk,
+        usages,
+        first_error,
+        failed_batches,
+        any_success,
+    } = collect_batch_outcomes(&mut join_set).await;
 
     if !any_success && let Some(err) = first_error {
         return Err(err);

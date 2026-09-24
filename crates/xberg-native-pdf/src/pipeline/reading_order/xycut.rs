@@ -84,6 +84,125 @@ struct HeadingRun {
     combined_bbox: Rect,
 }
 
+/// Within a valley run `[start, end)` of a projection profile's density
+/// array, choose the split OFFSET at the run's deepest (lowest-density)
+/// point rather than its arithmetic midpoint (GH#1763).
+///
+/// A wide interior run classified "below threshold" is not uniformly
+/// empty: `horizontal_projection_indexed` only excludes spans wider than
+/// 55% of the region and spans with fewer than 2 non-whitespace
+/// characters, so a full-width caption line or a single-char table-cell
+/// row can still occupy bins inside the run with nonzero (but
+/// sub-threshold) density. The run's arithmetic midpoint has no relation
+/// to where that content sits, so it can land squarely inside a figure
+/// caption even though a genuinely empty gutter exists elsewhere in the
+/// same run.
+///
+/// Tie-break order, applied to the contiguous sub-runs that attain the
+/// run's minimum density value:
+///   1. Widest sub-run wins — a genuine open gutter is wide; an isolated
+///      single-bin dip that happens to share the same minimum density
+///      is not a gutter and should not win over a real one.
+///   2. On a width tie, the sub-run whose center is nearest the WHOLE
+///      run's arithmetic midpoint wins — keeps the choice deterministic
+///      and, when nothing else distinguishes the candidates, close to
+///      the pre-fix behavior.
+///
+/// When the run is uniformly at its minimum density throughout (the
+/// common case: a real, empty column gutter with no stray content), the
+/// single minimal sub-run IS the whole run, so this returns exactly the
+/// old midpoint — the fix only changes behavior in the buggy case where
+/// sub-threshold content is unevenly distributed inside the run. That
+/// exactness is why centers are computed in f32 as `(lo + hi) / 2`:
+/// an integer `lo + width / 2` truncates, which would shift the split
+/// by half a unit on every odd-width run. That arithmetic is pinned by
+/// `a_candidate_that_would_cut_a_span_is_rejected`, whose chosen gap has
+/// odd width -- NOT by `uniform_run_split_is_unchanged_from_the_legacy_midpoint`,
+/// which cannot reach it: a uniform run's midpoint is by definition at the
+/// floor, so the guard below returns before any centre is computed. ~keep
+/// Share of the projected region a below-threshold run must exceed before its midpoint is
+/// treated as untrustworthy (GH#1763).
+///
+/// A real column gutter is narrow -- 15 to 80 pt on a region of roughly 500 pt, so 3% to 16%
+/// -- and its midpoint is the gutter, which is why splitting there worked for years. The
+/// GH#1763 page is the opposite case: its "valley" is 254 pt of a 523 pt region, 48.6%,
+/// because the left column is a figure and a 7.2 pt caption that fall below the density
+/// threshold almost everywhere. A run that wide is not a gutter at all, it is a sparse
+/// region, and its arithmetic midpoint says nothing about where the columns divide.
+///
+/// 35% sits well above any plausible gutter and well below the reporting page. Relocating
+/// regardless of run width was measured across 230 corpus documents and was not an
+/// improvement: 23 documents changed and, by absolute dictionary-valid word count, more got
+/// worse than better. ~keep
+const SPARSE_VALLEY_REGION_SHARE: f32 = 0.35;
+
+fn deepest_valley_point(density: &[f32], start: usize, end: usize, split_is_clear: &dyn Fn(f32) -> bool) -> f32 {
+    debug_assert!(start < end && end <= density.len());
+    if start >= end || end > density.len() {
+        return (start + end) as f32 / 2.0;
+    }
+    let run_mid = (start + end) as f32 / 2.0;
+    let min_density = density[start..end].iter().copied().fold(f32::INFINITY, f32::min);
+
+    // A narrow run IS the gutter, and its midpoint is the right place to split; only a run
+    // too wide to be a gutter has an untrustworthy midpoint. See SPARSE_VALLEY_REGION_SHARE. ~keep
+    if ((end - start) as f32) <= density.len() as f32 * SPARSE_VALLEY_REGION_SHARE {
+        return (start + end) as f32 / 2.0;
+    }
+
+    // Relocate ONLY when the midpoint actually lands on content -- the defect's own
+    // precondition. If the midpoint already sits at the run's density floor, the split is
+    // already falling through empty space and cutting nothing, so moving it to some wider
+    // empty region elsewhere changes reading order for no benefit. Measured: without this
+    // guard the fix altered 23 of 230 corpus documents and, counted by dictionary-valid
+    // words, made 11 worse against 8 better -- the split was being relocated on pages that
+    // had nothing wrong with them. A split line of odd width falls between two bins; either
+    // one being at the floor is enough to leave it alone. ~keep
+    let mid_low = run_mid.floor() as usize;
+    let mid_high = (run_mid.ceil() as usize).min(end - 1);
+    if density[mid_low] == min_density || density[mid_high] == min_density {
+        return run_mid;
+    }
+
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
+    let mut i = start;
+    while i < end {
+        if density[i] != min_density {
+            i += 1;
+            continue;
+        }
+        let sub_start = i;
+        while i < end && density[i] == min_density {
+            i += 1;
+        }
+        candidates.push((i - sub_start, (sub_start + i) as f32 / 2.0));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| crate::utils::safe_float_cmp((left.1 - run_mid).abs(), (right.1 - run_mid).abs()))
+    });
+
+    // A zero in this profile does NOT mean no glyphs: `horizontal_projection_indexed`
+    // deliberately omits spans wider than 55% of the region, spans of fewer than two
+    // non-whitespace characters, and the part of every span beyond its estimated text core.
+    // Seeking the deepest point therefore steers the split straight at the regions those
+    // omissions create, which is the opposite of what a midpoint did by accident. Measured
+    // without this check: 22 of 230 corpus documents changed and words came apart at
+    // single-character spans -- "virgin" into "v" + "irgin", "test" into "t" + "est" --
+    // because the split landed between two spans of one word. Candidates are therefore
+    // checked against the real span extents, not the profile, and a run whose candidates all
+    // cut something keeps the midpoint, which is exactly the pre-GH#1763 behaviour. ~keep
+    for (_, center) in candidates {
+        if split_is_clear(center) {
+            return center;
+        }
+    }
+    run_mid
+}
+
 /// Union of the bboxes of `spans[indices]`. Empty index list yields a
 /// zero-sized rect at the origin (never built in practice — guarded by
 /// the caller).
@@ -214,8 +333,13 @@ impl XYCutStrategy {
     /// body paragraph, line 2..N orphaned into the wrong block — and the
     /// markdown converter then promotes the orphan tail to a phantom
     /// heading (`### …`) in the wrong location.
-    pub fn partition_region(&self, spans: &[TextSpan]) -> Vec<Vec<TextSpan>> {
-        let heading_runs = self.find_heading_runs(spans);
+    ///
+    /// `column_gutter` is the mid-X of the page's column gutter when the
+    /// caller has detected one; it keeps the heading-run pre-pass from
+    /// folding a heading that opens the other column into a wrapped
+    /// heading's run (GH#1757). `None` leaves that fold unconditional.
+    pub fn partition_region(&self, spans: &[TextSpan], column_gutter: Option<f32>) -> Vec<Vec<TextSpan>> {
+        let heading_runs = self.find_heading_runs(spans, column_gutter);
         if heading_runs.is_empty() {
             // Hot path: no headings found, skip the synthesize/expand
             // pair entirely so the cost is bounded to one O(n log n) sort
@@ -252,7 +376,7 @@ impl XYCutStrategy {
     ///
     /// `median_font_size` is computed across non-bold spans so heavy
     /// bold runs don't bias the body-size estimate upward.
-    fn find_heading_runs(&self, spans: &[TextSpan]) -> Vec<HeadingRun> {
+    fn find_heading_runs(&self, spans: &[TextSpan], column_gutter: Option<f32>) -> Vec<HeadingRun> {
         if spans.len() < 2 {
             return Vec::new();
         }
@@ -350,6 +474,26 @@ impl XYCutStrategy {
             // SAME wrapped-heading line, e.g. two bold Tj segments). ~keep
             let same_line = (span.bbox.top() - last.bbox.top()).abs() <= 1.0;
 
+            // Rows are sorted by top across the WHOLE page, so a heading
+            // opening the other column can sort between a wrapped heading's
+            // two lines (GH#1757: 0.25 pt below line 1, 78.9 pt away across
+            // the gutter). Skip it — neither fold it in nor let it close the
+            // run — so the run stays open for the real continuation line,
+            // which is the whole point of this pre-pass. Folding it in makes
+            // it the run's last span and the continuation line then fails the
+            // indent test against the WRONG column's x; letting it break the
+            // run leaves two single-line candidates that the >= 2 distinct
+            // lines filter below drops. This sits BEFORE the size/weight
+            // tests because both failure modes cost the run: the issue's
+            // 10 pt variant fails `size_ok` and breaks it instead.
+            //
+            // Inert unless the caller supplied a gutter, so every XY-cut
+            // entry point on an output path must pass one — see
+            // `PdfDocument::detect_column_gutter`. ~keep
+            if same_line && Self::same_line_span_belongs_to_other_column(span, last, column_gutter) {
+                continue;
+            }
+
             if size_ok && bold_ok && same_line {
                 current.push(idx);
                 continue;
@@ -409,6 +553,34 @@ impl XYCutStrategy {
                 })
             })
             .collect()
+    }
+
+    /// Whether `span`, which shares a line with the current run's last span
+    /// `last`, in fact belongs to a DIFFERENT column — in which case it is
+    /// neither run material nor a reason to close the run.
+    ///
+    /// The answer is geometric and exact: the two spans are in different
+    /// columns when one ends before the gutter and the other begins after it.
+    /// A span that straddles the gutter (a full-width banner heading) is in
+    /// neither column and is never separated from anything by this test.
+    ///
+    /// `None` — a caller with no gutter to give — answers `false`, so the
+    /// fold is unconditional exactly as it was before GH#1757. A width-based
+    /// stand-in was measured and rejected: on a page with no detected gutter
+    /// the gaps it would have to reject are the same size as the gaps inside
+    /// legitimate heading lines (median 82 pt, half at or above the 79 pt of
+    /// GH#1757's own gutter, on one corpus document), so no threshold
+    /// separates the two populations and every such page would change. ~keep
+    fn same_line_span_belongs_to_other_column(span: &TextSpan, last: &TextSpan, column_gutter: Option<f32>) -> bool {
+        let Some(gutter_x) = column_gutter else {
+            return false;
+        };
+        let (left_box, right_box) = if span.bbox.left() <= last.bbox.left() {
+            (span, last)
+        } else {
+            (last, span)
+        };
+        left_box.bbox.right() <= gutter_x && right_box.bbox.left() >= gutter_x
     }
 
     /// Build a synthetic span list where each detected `HeadingRun`
@@ -1504,7 +1676,17 @@ impl XYCutStrategy {
             if vw < self.min_valley_width {
                 return None;
             }
-            profile.x_min + (vs + ve) as f32 / 2.0
+            // Deepest point within the valley run, not its midpoint
+            // (GH#1763) — see `deepest_valley_point` for why. ~keep
+            let x_min = profile.x_min;
+            let split_is_clear = |offset: f32| {
+                let x = x_min + offset;
+                !indices.iter().any(|&i| {
+                    let bbox = &all_spans[i].bbox;
+                    bbox.left() < x && x < bbox.right()
+                })
+            };
+            x_min + deepest_valley_point(&profile.density, vs, ve, &split_is_clear)
         } else {
             self.find_split_between_peaks(&profile)?
         };
@@ -1713,7 +1895,17 @@ impl XYCutStrategy {
             return None;
         }
 
-        let split_y = profile.y_min + (valley_start + valley_end) as f32 / 2.0;
+        // Deepest point within the valley run, not its midpoint (GH#1763,
+        // same fix as the horizontal split — see `deepest_valley_point`). ~keep
+        let y_min = profile.y_min;
+        let split_is_clear = |offset: f32| {
+            let y = y_min + offset;
+            !indices.iter().any(|&i| {
+                let bbox = &all_spans[i].bbox;
+                bbox.top() < y && y < bbox.bottom()
+            })
+        };
+        let split_y = y_min + deepest_valley_point(&profile.density, valley_start, valley_end, &split_is_clear);
 
         // `Rect::top()` returns `self.y`, the SMALLER Y coordinate of the
         // normalized rectangle — the method name follows a screen-coordinate
@@ -1724,8 +1916,11 @@ impl XYCutStrategy {
         // point is already above the split line, i.e. the entire span sits
         // above the cut. Since `split_y` is the midpoint of a horizontal
         // projection valley (an empty band by construction), spans should
-        // not straddle it in practice; any that do (e.g. a tall header
-        // glyph whose ascenders dip into the valley) fall into `below`. ~keep
+        // not straddle it in practice -- and since GH#1763 the chosen point is
+        // additionally checked against the real span extents, because a zero in
+        // the profile does not by itself mean no glyphs are there. Any span that
+        // still straddles (e.g. a tall header glyph whose ascenders dip into the
+        // valley) falls into `below`. ~keep
         let (above, below): (Vec<usize>, Vec<usize>) =
             indices.iter().partition(|&&i| all_spans[i].bbox.top() >= split_y);
 
@@ -1936,6 +2131,33 @@ impl XYCutStrategy {
             .max_by(|a, b| crate::utils::safe_float_cmp(a.2, b.2))
     }
 
+    /// Test-only wrapper exposing `deepest_valley_point` (a free function)
+    /// as an associated fn so tests can call it the same way as the other
+    /// `#[cfg(test)]` wrappers in this file.
+    #[cfg(test)]
+    fn deepest_point_wrapper(density: &[f32], start: usize, end: usize) -> f32 {
+        deepest_valley_point(density, start, end, &|_| true)
+    }
+
+    /// As [`Self::deepest_point_wrapper`], but with the span-straddle check the real
+    /// callers supply, so a test can pin that a candidate cutting a span is rejected.
+    #[cfg(test)]
+    fn deepest_point_wrapper_checked(
+        density: &[f32],
+        start: usize,
+        end: usize,
+        split_is_clear: &dyn Fn(f32) -> bool,
+    ) -> f32 {
+        deepest_valley_point(density, start, end, split_is_clear)
+    }
+
+    /// Old (pre-GH#1763) split-point formula, kept only so the fixed
+    /// behaviour can be asserted against what the bug used to produce. ~keep
+    #[cfg(test)]
+    fn legacy_valley_midpoint(start: usize, end: usize) -> f32 {
+        (start + end) as f32 / 2.0
+    }
+
     /// Test-only wrapper for horizontal projection on a contiguous slice.
     #[cfg(test)]
     fn horizontal_projection(&self, spans: &[TextSpan]) -> Option<ProjectionProfile> {
@@ -2005,13 +2227,13 @@ struct ProjectionProfile {
 }
 
 impl ReadingOrderStrategy for XYCutStrategy {
-    fn apply(&self, spans: Vec<TextSpan>, _context: &ReadingOrderContext) -> Result<Vec<OrderedTextSpan>> {
+    fn apply(&self, spans: Vec<TextSpan>, context: &ReadingOrderContext) -> Result<Vec<OrderedTextSpan>> {
         // Detects multi-line heading runs and routes the
         // partition through synthetic-span space so the splitter treats
         // each wrapped heading as a single atomic block. When no
         // headings are found we use the original index-only path that
         // avoids span clones during recursion. ~keep
-        let heading_runs = self.find_heading_runs(&spans);
+        let heading_runs = self.find_heading_runs(&spans, context.column_gutter);
 
         let index_groups: Vec<Vec<usize>> = if heading_runs.is_empty() {
             let indices: Vec<usize> = (0..spans.len()).collect();
@@ -2122,7 +2344,7 @@ mod tests {
             make_span(10.0, 70.0, 50.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 3);
     }
@@ -2154,7 +2376,7 @@ mod tests {
             y -= leading;
         }
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(
             groups.len(),
             1,
@@ -2229,7 +2451,7 @@ mod tests {
             y -= 14.0;
         }
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(
             groups.len() <= 2,
             "single-column with header should produce at most 2 groups, got {}",
@@ -2251,7 +2473,7 @@ mod tests {
             make_span(100.0, 85.0, 50.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(!groups.is_empty(), "Expected at least 1 group");
         let total_spans: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total_spans, 4, "Expected all 4 spans to be preserved");
@@ -2282,7 +2504,7 @@ mod tests {
             make_span_text(253.33, 612.13, 12.08, 11.59, "GJ", 11.59),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let texts: Vec<&str> = groups.iter().flatten().map(|s| s.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2314,7 +2536,7 @@ mod tests {
             make_span_text(100.0, 186.0, 50.0, 10.0, "B2", 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let texts: Vec<&str> = groups.iter().flatten().map(|s| s.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2338,7 +2560,7 @@ mod tests {
             make_span(350.0, 85.0, 100.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(groups.len() >= 2, "Expected at least 2 groups, got {}", groups.len());
     }
 
@@ -2347,7 +2569,7 @@ mod tests {
         let strategy = XYCutStrategy::new();
         let spans = vec![make_span(10.0, 100.0, 50.0, 10.0)];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
     }
@@ -2405,7 +2627,7 @@ mod tests {
         let strategy = XYCutStrategy::new();
         let spans = vec![make_span(10.0, 100.0, 30.0, 10.0), make_span(45.0, 100.0, 30.0, 10.0)];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(groups.len(), 1);
     }
 
@@ -2468,7 +2690,7 @@ mod tests {
             make_span_text(210.0, 532.0, 45.0, 10.0, "Northwind", 10.0),
             make_span_text(290.0, 532.0, 34.0, 10.0, "Traders", 10.0),
         ];
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert_eq!(
             groups.len(),
             1,
@@ -2655,7 +2877,7 @@ mod tests {
             14.0,
         ));
 
-        let runs = strategy.find_heading_runs(&spans);
+        let runs = strategy.find_heading_runs(&spans, None);
         assert_eq!(runs.len(), 1, "expected exactly one heading run, got {runs:?}");
         assert_eq!(
             runs[0].span_indices.len(),
@@ -2667,7 +2889,7 @@ mod tests {
         // case is a single-line heading that XY-cut already handles. ~keep
         let mut spans_single = vec![make_body_span(body_left, 720.0, body_width, 12.0); 5];
         spans_single.push(make_bold_span(body_left, 500.0, 180.0, "Lone Heading", 14.0));
-        let runs_single = strategy.find_heading_runs(&spans_single);
+        let runs_single = strategy.find_heading_runs(&spans_single, None);
         assert!(
             runs_single.is_empty(),
             "single-line bold runs must not produce a HeadingRun"
@@ -2720,7 +2942,7 @@ mod tests {
         spans.push(make_body_span(right_col_x, 420.0, col_width, 12.0));
         spans.push(make_body_span(right_col_x, 404.0, col_width, 12.0));
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
 
         let heading_first_group = groups
             .iter()
@@ -2820,17 +3042,14 @@ mod tests {
         );
     }
 
-    /// GH#1738: a numbered heading whose producer set the marker and title
-    /// in ONE `TJ` array with a kern for the tab (`[(3.)-1329.5(Title )] TJ`)
-    /// must not absorb a right-column caption that Y-overlaps its first
-    /// line. The kern becomes a space-only span that is always
-    /// `FontWeight::Normal` (see `extractors/text/advance.rs`), which used
-    /// to break `find_heading_runs`'s clustering right at the
-    /// marker/title boundary: the marker ("3.") was left out of the run
-    /// while the wrapped title ("…GASTECHNISCHE" / "INSTALLATEUR")
-    /// formed a run on its own, whose narrower union bbox no longer
-    /// covered the marker's column position and let the caption's span
-    /// land between the run's two original lines once expanded.
+    /// GH#1738: mid-X between the left column's right edge (237.56) and the
+    /// right column's left edge (312.60) on the reproducer's page 1.
+    const GH1738_GUTTER_X: f32 = 275.08;
+
+    /// The GH#1738 reproducer's page 1 as a fixture, with the right column's
+    /// caption parameterised. `(10.0, 810.40)` is the measured original; the
+    /// GH#1757 negative control re-runs the same page with the caption at the
+    /// heading's own size and on its row.
     ///
     /// Geometry transcribed verbatim from `PdfDocument::extract_spans` on
     /// page 1 of the GH#1738 reproducer (a two-column A4 page: a bold
@@ -2840,12 +3059,7 @@ mod tests {
     /// values, and `y` decreases top-to-bottom exactly like every other
     /// `y` in this file's `dense_two_column_*` fixtures. No position is
     /// invented. ~keep
-    #[test]
-    fn gh1738_kern_tab_heading_does_not_absorb_other_column_caption() {
-        use crate::pipeline::reading_order::ReadingOrderContext;
-
-        let strategy = XYCutStrategy::new();
-
+    fn gh1738_page(caption_font_size: f32, caption_top: f32) -> Vec<TextSpan> {
         let kern_space = |x: f32, y: f32, width: f32, font_size: f32| {
             let mut s = make_span_text(x, y, width, font_size, " ", font_size);
             s.offset_semantic = true;
@@ -2857,7 +3071,7 @@ mod tests {
         let spans = vec![
             make_bold_span(30.07, 809.09, 7.51, "3.", 9.0),
             kern_space(37.58, 809.09, 0.28, 9.0),
-            make_bold_span(312.60, 810.40, 129.00, "Fig. 6. Branderdruk (P1-P2)", 10.0),
+            make_bold_span(312.60, caption_top, 129.00, "Fig. 6. Branderdruk (P1-P2)", caption_font_size),
             make_bold_span(49.54, 809.09, 188.02, "INSTRUCTIES VOOR DE GASTECHNISCHE ", 9.0),
             make_bold_span(49.54, 799.39, 67.66, "INSTALLATEUR", 9.0),
             make_bold_span(30.07, 782.02, 12.51, "3.1", 9.0),
@@ -2901,6 +3115,26 @@ mod tests {
             body(312.60, 374.30, 115.11, "d. Branderdrukken controleren."),
             make_bold_span(312.60, 293.20, 120.10, "Fig. 7. Tweetrapsregeling", 10.0),
         ];
+        spans
+    }
+
+    /// GH#1738: a numbered heading whose producer set the marker and title
+    /// in ONE `TJ` array with a kern for the tab (`[(3.)-1329.5(Title )] TJ`)
+    /// must not absorb a right-column caption that Y-overlaps its first
+    /// line. The kern becomes a space-only span that is always
+    /// `FontWeight::Normal` (see `extractors/text/advance.rs`), which used
+    /// to break `find_heading_runs`'s clustering right at the
+    /// marker/title boundary: the marker ("3.") was left out of the run
+    /// while the wrapped title ("…GASTECHNISCHE" / "INSTALLATEUR")
+    /// formed a run on its own, whose narrower union bbox no longer
+    /// covered the marker's column position and let the caption's span
+    /// land between the run's two original lines once expanded. ~keep
+    #[test]
+    fn gh1738_kern_tab_heading_does_not_absorb_other_column_caption() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+        let spans = gh1738_page(10.0, 810.40);
 
         let context = ReadingOrderContext::new();
         let ordered = strategy.apply(spans, &context).expect("apply");
@@ -2939,6 +3173,345 @@ mod tests {
             "the other column's caption must not land inside the heading run \
              (marker={pos_marker}, title={pos_title}, wrap={pos_wrap}, \
              caption={pos_caption}): {order:?}"
+        );
+    }
+
+    /// GH#1757 left column, line 1: the chapter title following the `3.` marker.
+    const GH1757_TITLE: &str = "INSTRUKTIES VOOR DE GASTECHNISCHE ";
+    /// GH#1757 right column: the section heading that hijacked the run.
+    const GH1757_RIGHT_HEADING: &str = "3.2 VERBRANDINGSGASAFVOER EN LUCHTTOEVOER";
+    /// GH#1757: mid-X of the gutter between the page's two detected columns
+    /// (`Detected 2 columns: [(34.622, 276.310), (276.310, 560.031)]`).
+    const GH1757_GUTTER_X: f32 = 276.31;
+
+    /// GH#1757: page 4 of the installation manual (A4, 595 × 842). A numbered
+    /// chapter heading wraps to a second line at the top of the LEFT column
+    /// while the RIGHT column opens with a section heading in the same face,
+    /// 0.25 pt lower. `right_top`, `right_bold` and `right_font_size` select
+    /// the rows of the issue's variants table.
+    ///
+    /// Heading positions are the reporter's measured values, in PDF
+    /// coordinates (`y` = box top, decreasing down the page) — the left
+    /// heading's two lines at 804.93 / 794.13 and the right heading at
+    /// 804.68 are the content stream's own `Tm` operands. Body lines carry
+    /// the manual's measured leading with paraphrased text, exactly as the
+    /// reporter's reproducer sets them. ~keep
+    fn gh1757_wrapped_heading_over_two_columns(
+        right_top: f32,
+        right_bold: bool,
+        right_font_size: f32,
+    ) -> Vec<TextSpan> {
+        let kern_space = |x: f32, y: f32, width: f32, font_size: f32| {
+            let mut s = make_span_text(x, y, width, font_size, " ", font_size);
+            s.offset_semantic = true;
+            s
+        };
+        let body = |x: f32, y: f32, width: f32, text: &str| make_span_text(x, y, width, 8.3, text, 8.3);
+
+        let right_heading = if right_bold {
+            make_bold_span(322.7, right_top, 237.1, GH1757_RIGHT_HEADING, right_font_size)
+        } else {
+            make_span_text(
+                322.7,
+                right_top,
+                237.1,
+                right_font_size,
+                GH1757_RIGHT_HEADING,
+                right_font_size,
+            )
+        };
+
+        // The producer draws the whole RIGHT column as one text object and the
+        // whole LEFT column as a second, so the right heading precedes the
+        // left heading in span order. ~keep
+        let mut spans = vec![right_heading];
+        for (i, text) in [
+            "Het afvoersysteem en de uitmonding voldoen aan de geldende",
+            "norm voor gesloten toestellen met ventilator in een",
+            "opstellingsruimte. De afvoerleiding mag op afschot naar het",
+            "toestel liggen, want bij de toegestane lengte en de",
+            "voorgeschreven mantel ontstaat er geen condens. Een",
+            "doorvoer naar buiten ligt op een afschot van ten minste vijf",
+            "millimeter per meter naar buiten, zodat er geen regen in kan",
+            "lopen. Het toestel vangt zelf geen condens of regenwater op.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            spans.push(body(322.7, 784.8 - (i as f32) * 10.5, 237.3, text));
+        }
+        spans.push(make_bold_span(
+            322.7,
+            668.0,
+            149.8,
+            "3.2.1 AANSLUITING OP DE KETEL",
+            9.0,
+        ));
+        for (i, text) in [
+            "Het toestel wordt geleverd met een aansluitset voor een",
+            "bovenaansluiting met twee stompen van rond 80 mm. Op",
+            "bestelling is een set voor een achteraansluiting leverbaar,",
+            "eveneens met twee stompen van rond 80 mm.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            spans.push(body(322.7, 648.2 - (i as f32) * 10.5, 237.3, text));
+        }
+
+        spans.push(make_bold_span(34.6, 804.93, 7.5, "3.", 9.0));
+        spans.push(kern_space(42.14, 804.93, 0.28, 9.0));
+        spans.push(make_bold_span(55.9, 804.93, 185.2, GH1757_TITLE, 9.0));
+        spans.push(make_bold_span(55.9, 794.13, 67.6, "INSTALLATEUR", 9.0));
+        spans.push(make_bold_span(
+            34.6,
+            773.3,
+            179.9,
+            "3.1 GASAANSLUITING EN INSTALLATIE.",
+            9.0,
+        ));
+        for (i, text) in [
+            "1. Werk altijd volgens de laatste eisen en de plaatselijke",
+            "voorschriften.",
+            "2. Plaats bij te verwachten vuil in het gas bij voorkeur een",
+            "gaszeef.",
+            "3. Een dichtheidscontrole van het gasblok gebeurt met een druk",
+            "van ten hoogste 500 mm waterkolom.",
+            "4. Heeft de installatie minder vermogen nodig dan de",
+            "fabrieksafstelling, dan kan de branderdruk naar de gewenste",
+            "capaciteit worden aangepast volgens figuur 3.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            spans.push(body(34.6, 753.5 - (i as f32) * 10.5, 236.8, text));
+        }
+        spans
+    }
+
+    /// Texts of the spans backing each detected heading run, in run order.
+    fn heading_run_texts<'a>(spans: &'a [TextSpan], runs: &[HeadingRun]) -> Vec<Vec<&'a str>> {
+        runs.iter()
+            .map(|r| r.span_indices.iter().map(|&i| spans[i].text.as_str()).collect())
+            .collect()
+    }
+
+    /// GH#1757: the left column's wrapped chapter heading must be locked as
+    /// ONE run even though the right column's section heading sorts between
+    /// its two lines. The right heading sits across the detected gutter, so
+    /// it is neither folded into the run nor allowed to close it.
+    #[test]
+    fn wrapped_heading_run_survives_other_column_heading_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, true, 9.0);
+
+        let runs = strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X));
+        let texts = heading_run_texts(&spans, &runs);
+
+        assert_eq!(
+            texts,
+            vec![vec!["3.", GH1757_TITLE, "INSTALLATEUR"]],
+            "expected exactly one locked heading run covering the marker, the \
+             title and its wrapped continuation line"
+        );
+        assert!(
+            !texts.iter().flatten().any(|t| *t == GH1757_RIGHT_HEADING),
+            "the other column's heading must not be part of any heading run: {texts:?}"
+        );
+    }
+
+    /// GH#1757: the skip is gated entirely on a known gutter. A caller with
+    /// none must get the pre-GH#1757 behaviour verbatim — the far span folds
+    /// in and the run is lost — so that pages nobody classified as
+    /// multi-column are untouched.
+    ///
+    /// A width-based stand-in for the gutter was built and measured, and it
+    /// is why this test asserts the defect rather than the fix: on one corpus
+    /// document it fired 1385 times with a median gap of 82 pt, half of them
+    /// at or above the 79 pt gap of GH#1757's own gutter. No threshold
+    /// separates a cross-gutter gap from an in-line one without a gutter to
+    /// measure against. The fix is to give every output path the gutter (see
+    /// `PdfDocument::detect_column_gutter`), not to guess at one here. ~keep
+    #[test]
+    fn heading_run_fold_is_unchanged_without_a_known_gutter_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, true, 9.0);
+
+        assert!(
+            strategy.find_heading_runs(&spans, None).is_empty(),
+            "with no gutter the far span must still fold in, exactly as before"
+        );
+    }
+
+    /// GH#1757 at the entry points that actually reach the output lenses.
+    ///
+    /// `find_heading_runs` runs about a dozen times per page from several
+    /// call sites; `postprocess_spans` is only one of them, and threading the
+    /// gutter through it alone left the reproducer welded because the text
+    /// and markdown lenses read the ordering produced by `partition_region`
+    /// and by `apply`. Both must honour the gutter, so both are asserted
+    /// here: the marker, its title and the wrapped continuation line come out
+    /// adjacent and ahead of the other column's heading. ~keep
+    #[test]
+    fn output_path_entry_points_honour_the_gutter_gh1757() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, true, 9.0);
+
+        let partition_groups = strategy.partition_region(&spans, Some(GH1757_GUTTER_X));
+        let from_partition: Vec<&str> = partition_groups.iter().flatten().map(|s| s.text.as_str()).collect();
+
+        let context = ReadingOrderContext::new().with_column_gutter(GH1757_GUTTER_X);
+        let applied = strategy.apply(spans.clone(), &context).expect("apply");
+        let from_apply: Vec<&str> = applied.iter().map(|o| o.span.text.as_str()).collect();
+
+        for (label, order) in [("partition_region", &from_partition), ("apply", &from_apply)] {
+            let position = |needle: &str| {
+                order
+                    .iter()
+                    .position(|t| *t == needle)
+                    .unwrap_or_else(|| panic!("{label}: {needle:?} missing from {order:?}"))
+            };
+            let marker = position("3.");
+            let title = position(GH1757_TITLE);
+            let wrap = position("INSTALLATEUR");
+            let other = position(GH1757_RIGHT_HEADING);
+
+            assert_eq!(
+                title,
+                marker + 1,
+                "{label}: marker and title must stay adjacent: {order:?}"
+            );
+            assert_eq!(
+                wrap,
+                title + 1,
+                "{label}: the wrapped line must follow the title: {order:?}"
+            );
+            assert!(
+                other > wrap,
+                "{label}: the other column's heading must not precede or split the \
+                 heading run (marker={marker}, title={title}, wrap={wrap}, \
+                 other={other}): {order:?}"
+            );
+        }
+    }
+
+    /// GH#1757 control (the reproducer's page 2): the right column's heading
+    /// 1.5 pt ABOVE line 1 sorts before it and falls outside the 1 pt
+    /// same-line window, so the left heading already locks correctly today.
+    /// It must keep doing so.
+    #[test]
+    fn wrapped_heading_run_intact_when_other_column_heading_sits_higher_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(806.43, true, 9.0);
+
+        assert_eq!(
+            heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X))),
+            vec![vec!["3.", GH1757_TITLE, "INSTALLATEUR"]],
+            "the control page's heading run must stay intact"
+        );
+    }
+
+    /// GH#1757 variants table, the two rows that weld on the stock build:
+    /// the right heading on exactly the same baseline as line 1, and the
+    /// right heading one point larger. Both must leave the left column's run
+    /// whole.
+    ///
+    /// Asserting the run's exact membership matters here: "the right heading
+    /// is in no run" is also true of the defect, which produces no runs at
+    /// all. ~keep
+    #[test]
+    fn other_column_bold_heading_variants_keep_the_run_gh1757() {
+        let strategy = XYCutStrategy::new();
+
+        for (right_top, right_font_size, label) in [
+            (804.9295_f32, 9.0_f32, "same baseline"),
+            (804.68_f32, 10.0_f32, "10 pt"),
+        ] {
+            let spans = gh1757_wrapped_heading_over_two_columns(right_top, true, right_font_size);
+            let texts = heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X)));
+            assert_eq!(
+                texts,
+                vec![vec!["3.", GH1757_TITLE, "INSTALLATEUR"]],
+                "variant '{label}': the left column's heading run must stay whole"
+            );
+        }
+    }
+
+    /// GH#1757 variants table, the regular-face row. It never welded — a
+    /// 9 pt regular span on a 8.3 pt body page is not heading-like, so
+    /// clustering rejects it before any same-line test. Green before and
+    /// after the fix; pinned so a later widening of `is_heading_like` cannot
+    /// quietly turn the other column's opening line into run material.
+    ///
+    /// The left column's run is still lost on this variant — a far
+    /// non-heading-like span BREAKS the run rather than being skipped, which
+    /// is the issue's option 3 and is not addressed here. ~keep
+    #[test]
+    fn other_column_regular_face_line_never_joins_the_run_gh1757() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1757_wrapped_heading_over_two_columns(804.68, false, 9.0);
+
+        let texts = heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1757_GUTTER_X)));
+
+        assert!(
+            !texts.iter().flatten().any(|t| *t == GH1757_RIGHT_HEADING),
+            "a regular-face line in the other column must not join a heading run: {texts:?}"
+        );
+    }
+
+    /// GH#1757 negative control for GH#1738. That test's caption clears
+    /// `size_ok` (10 pt against the heading's 9 pt) AND sits 1.31 pt above
+    /// the heading row, outside the 1 pt same-line window — two independent
+    /// reasons it never reached the same-line fold. Put it at the heading's
+    /// own size and 0.25 pt below its row, as GH#1757's page has it, and it
+    /// takes exactly the GH#1757 path: the stock build folds it in, the
+    /// wrapped line then fails the indent test against it, and the run is
+    /// lost. `apply` then welds the whole top row into one line.
+    #[test]
+    fn gh1738_equal_size_caption_on_the_heading_row_is_not_absorbed_gh1757() {
+        use crate::pipeline::reading_order::ReadingOrderContext;
+
+        let strategy = XYCutStrategy::new();
+        let spans = gh1738_page(9.0, 808.84);
+
+        assert_eq!(
+            heading_run_texts(&spans, &strategy.find_heading_runs(&spans, Some(GH1738_GUTTER_X))),
+            vec![vec!["3.", "INSTRUCTIES VOOR DE GASTECHNISCHE ", "INSTALLATEUR"]],
+            "the caption must not be folded into the heading run"
+        );
+
+        let context = ReadingOrderContext::new().with_column_gutter(GH1738_GUTTER_X);
+        let ordered = strategy.apply(spans, &context).expect("apply");
+        let order: Vec<&str> = ordered.iter().map(|o| o.span.text.as_str()).collect();
+
+        let position = |needle: &str| {
+            order
+                .iter()
+                .position(|t| *t == needle)
+                .unwrap_or_else(|| panic!("{needle:?} must appear in reading order: {order:?}"))
+        };
+        let pos_marker = position("3.");
+        let pos_title = position("INSTRUCTIES VOOR DE GASTECHNISCHE ");
+        let pos_wrap = position("INSTALLATEUR");
+        let pos_caption = position("Fig. 6. Branderdruk (P1-P2)");
+
+        assert_eq!(
+            pos_title,
+            pos_marker + 1,
+            "the marker and title must stay adjacent: {order:?}"
+        );
+        assert_eq!(
+            pos_wrap,
+            pos_title + 1,
+            "the wrapped second line must stay adjacent to the title: {order:?}"
+        );
+        assert!(
+            pos_caption < pos_marker || pos_caption > pos_wrap,
+            "an equal-size caption on the heading's own row must not land inside \
+             the heading run (marker={pos_marker}, title={pos_title}, \
+             wrap={pos_wrap}, caption={pos_caption}): {order:?}"
         );
     }
 
@@ -2995,7 +3568,7 @@ mod tests {
         spans.push(make_word(455.0, 670.0, "(1)"));
         spans.push(make_word(505.0, 660.0, "(2)"));
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         assert!(
             groups.len() >= 2,
             "expected at least 2 groups (column split) for narrow-gutter 2-col body \
@@ -3061,7 +3634,7 @@ mod tests {
         spans.push(make_word(80.0, 410.0, "caption"));
         spans.push(make_word(300.0, 410.0, "(continued)"));
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         // For a true single-column page, partition_region should
         // return either ONE group or a small number from row/header
         // splits — never a column split that lands left-side spans
@@ -3211,7 +3784,7 @@ mod tests {
             make_span(degenerate_x, 100.0, 30.0, 10.0),
         ];
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, spans.len(), "all spans must be preserved");
     }
@@ -3229,8 +3802,428 @@ mod tests {
             .map(|i| make_span(10.0, (i as f32) * 11.0, 30.0, 10.0))
             .collect();
 
-        let groups = strategy.partition_region(&spans);
+        let groups = strategy.partition_region(&spans, None);
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, spans.len(), "depth guard must not drop spans");
+    }
+
+    /// Reproduces GH#1763: a figure-caption block (left) beside a body
+    /// column (right) whose true empty gutter sits OFF the interior
+    /// valley's arithmetic midpoint.
+    ///
+    /// Geometry (all X in points, region x_min = 0):
+    ///   - `CAP1`/`CAP2` (2/3 non-ws chars, 10pt font ⇒ core width 9/13.5pt,
+    ///     both left-edge 0) overlap at bin 0, giving density 20 there —
+    ///     ABOVE the run's threshold (18 = 0.3 × peak 60) so `find_valley`'s
+    ///     interior filter (`start > first_nonzero`) admits the run that
+    ///     follows instead of treating the whole region as one leading
+    ///     margin. This is the "super-threshold strip at the left content
+    ///     edge" the bug fix's interior-run gate requires.
+    ///   - `FIG.3.A` (bold, 14pt, 7 non-ws chars ⇒ core width 44.1pt,
+    ///     left-edge 60) and `CAP4`/`CAP5` (30/25 non-ws chars, 10pt,
+    ///     left-edges 150/320) are ragged sub-threshold caption content —
+    ///     real ink, never above 18 density, ending at x = 342 (CAP5's
+    ///     core right edge = 320 + 25×4.5 = 432.5, ceil 433 — the LAST
+    ///     content before the true gutter).
+    ///   - `BODY1..BODY6` (56 non-ws chars, 10pt ⇒ core width 252pt,
+    ///     left-edge 500, six identical lines) set the peak: 6 × 10 = 60.
+    ///
+    /// The resulting horizontal-projection run below threshold spans bins
+    /// [9, 500) (width 491, comfortably the widest and only interior
+    /// valley — `BODY` is uniform so it contributes no valley of its
+    /// own). Within that run the true empty gutter is [433, 500) (width
+    /// 67) — clearly off-center: the run's own arithmetic midpoint,
+    /// (9 + 500) / 2 = 254.5, lands inside `CAP4`'s span (density 10 at
+    /// that x), not in the empty band.
+    ///
+    /// All five upstream column/prose detectors decline on this fixture
+    /// before reaching the valley split, so the bug path is genuinely
+    /// exercised: `detect_two_column_prose` sees 5 left-edge clusters
+    /// (0, 60, 150, 320, 500 — the staggered caption starts plus the
+    /// body's own), not the exactly-2 it requires; `detect_narrow_gutter_prose`
+    /// declines outright (11 spans < its 24-span floor); and
+    /// `is_single_column_region` returns false because no single line's
+    /// extent reaches 60% of the 752pt region width. ~keep
+    fn gh1763_page() -> Vec<TextSpan> {
+        let cap1 = make_span_text(0.0, 740.0, 9.0, 10.0, "c1", 10.0);
+        let cap2 = make_span_text(0.0, 725.0, 13.5, 10.0, "c2z", 10.0);
+        let fig3 = make_bold_span(60.0, 760.0, 44.1, "FIG.3.A", 14.0);
+        let cap4 = make_span_text(150.0, 705.0, 135.0, 10.0, &format!("CAP4{}", "x".repeat(26)), 10.0);
+        let cap5 = make_span_text(320.0, 685.0, 112.5, 10.0, &format!("CAP5{}", "x".repeat(21)), 10.0);
+
+        let mut spans = vec![cap1, cap2, fig3, cap4, cap5];
+        for (i, y) in [655.0, 635.0, 615.0, 595.0, 575.0, 555.0].into_iter().enumerate() {
+            spans.push(make_span_text(
+                500.0,
+                y,
+                252.0,
+                10.0,
+                &format!("BODY{}{}", i, "x".repeat(51)),
+                10.0,
+            ));
+        }
+        spans
+    }
+
+    /// RED-then-GREEN unit test for the GH#1763 fix. Asserts the profile,
+    /// the chosen valley run, and the resulting split coordinate
+    /// explicitly — not just inferred from final group membership. Before
+    /// the fix, `find_horizontal_split_indexed` used
+    /// `legacy_valley_midpoint(vs, ve)` (254.5) here; that value falls
+    /// inside `CAP4`'s span, which this test also pins down. ~keep
+    /// Center of the widest zero-density sub-run in the GH#1763 fixture's
+    /// valley. It falls BETWEEN two bins because that sub-run has odd
+    /// width; both neighbouring bins are asserted empty below, which is
+    /// the property that matters. Pinned as a constant so the split-point
+    /// assertion and the density lookups that prove it lands in real empty
+    /// space cannot drift apart. ~keep
+    const DEEPEST_POINT: f32 = 466.5;
+
+    /// The GH#1763 fix must be a NO-OP on a uniformly empty valley run --
+    /// the ordinary case of a real column gutter. It is not enough that the
+    /// new split be "close": `find_horizontal_split_indexed` feeds the value
+    /// straight into a coordinate comparison, so a half-unit shift reassigns
+    /// any span whose edge falls in between. An earlier revision computed the
+    /// sub-run center as `start + width / 2` in `usize`, which truncates and
+    /// moved the split by 0.5 on EVERY odd-width run -- silently changing the
+    /// common case this fix exists to leave alone. ~keep
+    /// The guard that keeps the GH#1763 relocation to pages that actually have the defect.
+    /// Here the midpoint already falls in empty space, and a WIDER empty region sits
+    /// off-centre. Relocating would be pointless -- the split was cutting nothing where it
+    /// was -- and it is exactly this case that made the unguarded fix rewrite the reading
+    /// order of 23 of 230 corpus documents, 11 of which got worse by dictionary-valid word
+    /// count. The split must not move. ~keep
+    /// A zero in the projection does not mean no glyphs sit there:
+    /// `horizontal_projection_indexed` omits spans under two non-whitespace characters,
+    /// spans wider than 55% of the region, and everything past a span's estimated text core.
+    /// Seeking the deepest point walks straight into those blind spots, and the corpus showed
+    /// the result -- words coming apart at single-character spans, "virgin" into "v" +
+    /// "irgin". A candidate that cuts a real span must be rejected in favour of the next, and
+    /// a run whose candidates all cut something must keep the midpoint. ~keep
+    #[test]
+    fn a_candidate_that_would_cut_a_span_is_rejected() {
+        // content | gap A (narrow, clear) | content over the midpoint | gap B (wider, crossed)
+        let mut density = vec![0.0f32; 40];
+        for bin in (0..10).chain(18..23) {
+            density[bin] = 3.0;
+        }
+        let (start, end) = (0usize, 40usize);
+        // The midpoint must sit ON content, or the floor guard returns it before any
+        // candidate is considered and this pins nothing.
+        assert_eq!(density[20], 3.0, "midpoint must be on content for this test to bite");
+
+        // Gap B (23..40, width 17) beats gap A (10..18, width 8) on width, but an invisible
+        // span -- one the projection omitted -- runs straight through gap B's centre.
+        let invisible_span = 28.0f32..35.0f32;
+        let clear = |offset: f32| !(invisible_span.start < offset && offset < invisible_span.end);
+
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper(&density, start, end),
+            31.5,
+            "unchecked, the widest gap wins and the split lands inside the hidden span"
+        );
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper_checked(&density, start, end, &clear),
+            14.0,
+            "checked, the split falls back to the narrower gap that cuts nothing"
+        );
+    }
+
+    /// When every candidate would cut a span, the split must stay exactly where it was
+    /// before GH#1763 -- the midpoint -- rather than picking the least-bad cut. ~keep
+    #[test]
+    fn a_run_whose_candidates_all_cut_something_keeps_the_midpoint() {
+        let mut density = vec![0.0f32; 40];
+        for bin in (0..10).chain(18..23) {
+            density[bin] = 3.0;
+        }
+        let (start, end) = (0usize, 40usize);
+        let midpoint = XYCutStrategy::legacy_valley_midpoint(start, end);
+        assert_eq!(
+            density[20], 3.0,
+            "midpoint must be on content, or the floor guard decides this"
+        );
+
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper_checked(&density, start, end, &|_| false),
+            midpoint,
+            "no clear candidate means the pre-GH#1763 midpoint stands"
+        );
+    }
+
+    #[test]
+    fn a_split_already_falling_through_empty_space_does_not_move() {
+        // content | narrow gap (holds the midpoint) | content | WIDER gap, off-centre
+        let mut density = vec![0.0f32; 40];
+        for bin in (0..17).chain(23..26) {
+            density[bin] = 3.0;
+        }
+        let (start, end) = (0usize, 40usize);
+        let midpoint = XYCutStrategy::legacy_valley_midpoint(start, end);
+        assert_eq!(midpoint, 20.0);
+        assert_eq!(density[20], 0.0, "the midpoint must start out in empty space");
+        assert!(
+            (26..40).len() > (17..23).len(),
+            "the off-centre empty region must be the WIDER one, or this pins nothing"
+        );
+
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper(&density, start, end),
+            midpoint,
+            "a split already falling through empty space must stay where it is"
+        );
+    }
+
+    #[test]
+    fn uniform_run_split_is_unchanged_from_the_legacy_midpoint() {
+        // This pins a behavioural guarantee -- a uniformly empty run splits exactly where it
+        // always did -- and not the centre arithmetic, which it cannot reach: a uniform run's
+        // midpoint is by definition at the density floor, so the floor guard returns first.
+        // `a_candidate_that_would_cut_a_span_is_rejected` is what pins the f32 centre.
+        // The runs are still sized to clear the sparse-run gate so the guarantee is delivered
+        // by the floor guard rather than by short-circuiting earlier still.
+        for (start, end) in [(3usize, 8usize), (3, 9), (0, 5), (0, 4), (10, 17), (2, 5), (1, 64)] {
+            let density = vec![0.0f32; end];
+            let share = (end - start) as f32 / end as f32;
+            assert!(
+                share > SPARSE_VALLEY_REGION_SHARE,
+                "run [{start},{end}) is {share} of its region; the sparse gate would short-circuit it"
+            );
+            assert_eq!(
+                XYCutStrategy::deepest_point_wrapper(&density, start, end),
+                XYCutStrategy::legacy_valley_midpoint(start, end),
+                "uniformly empty run [{start},{end}) must split exactly where it always did"
+            );
+        }
+    }
+
+    /// A below-threshold run narrow enough to BE a gutter keeps its midpoint without the
+    /// candidate search running at all -- that is the case GH#1763 must not disturb, and it
+    /// is most of the corpus. ~keep
+    #[test]
+    fn a_run_narrow_enough_to_be_a_gutter_keeps_its_midpoint() {
+        // 20 empty bins in a 200-bin region: 10%, the shape of a real column gutter. An
+        // off-centre single-bin dip would otherwise win the candidate search.
+        let mut density = vec![5.0f32; 200];
+        for bin in 90..110 {
+            density[bin] = 1.0;
+        }
+        density[92] = 0.0;
+        let (start, end) = (90usize, 110usize);
+        assert!(
+            ((end - start) as f32) <= density.len() as f32 * SPARSE_VALLEY_REGION_SHARE,
+            "this run must be narrow enough for the gate to fire, or the test pins nothing"
+        );
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper(&density, start, end),
+            XYCutStrategy::legacy_valley_midpoint(start, end),
+            "a gutter-width run must split at its midpoint, as it always did"
+        );
+    }
+
+    /// The GH#1763 reporter could not supply a reproducing PDF, but did attach the
+    /// horizontal projection their page 8 actually produced under stock v1.2.7. Running
+    /// the real profile is what binds this fix to the reported page rather than to a
+    /// hand-built approximation of it: the synthetic `gh1763_page` fixture exercises the
+    /// same mechanism, but only this asserts the reported page now splits where the
+    /// reporter said it should.
+    ///
+    /// Their stated numbers, all reproduced below: threshold 98.03, valley run
+    /// x 53.6..307.6, buggy midpoint x 180.6, target x 301.6. The valley's empty core is
+    /// 12 pt wide -- UNDER `min_valley_width` (15) -- which is why the width gate must
+    /// keep applying to the run as a whole and not to its core, as the issue warns. ~keep
+    #[test]
+    fn the_reported_gh1763_profile_now_splits_at_its_empty_core() {
+        const PROFILE: &str = include_str!("../../../tests/fixtures/gh1763_horizontal_density_profile.txt");
+        const X_MIN: f32 = 37.587;
+        const VALLEY_THRESHOLD: f32 = 0.3;
+        const MIN_VALLEY_WIDTH: f32 = 15.0;
+
+        let density: Vec<f32> = PROFILE
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.parse().expect("fixture must hold one float per line"))
+            .collect();
+        assert_eq!(density.len(), 523, "fixture must be the reporter's full profile");
+
+        let peak = density.iter().copied().fold(f32::MIN, f32::max);
+        let threshold = VALLEY_THRESHOLD * peak;
+        assert_eq!(
+            (peak * 100.0).round() / 100.0,
+            326.77,
+            "profile peak must match the reporter's"
+        );
+        assert_eq!(
+            (threshold * 100.0).round() / 100.0,
+            98.03,
+            "valley threshold must match the reporter's"
+        );
+
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut index = 0usize;
+        while index < density.len() {
+            if density[index] < threshold {
+                let start = index;
+                while index < density.len() && density[index] < threshold {
+                    index += 1;
+                }
+                if start > 0 && index < density.len() {
+                    runs.push((start, index));
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let (valley_start, valley_end) = runs
+            .into_iter()
+            .max_by_key(|(start, end)| end - start)
+            .expect("the profile must contain an interior valley");
+        assert_eq!(
+            (X_MIN + valley_start as f32, X_MIN + valley_end as f32),
+            (53.587, 307.587),
+            "widest interior valley run must be the one the reporter measured"
+        );
+
+        let run_width = (valley_end - valley_start) as f32;
+        assert!(
+            run_width >= MIN_VALLEY_WIDTH,
+            "the width gate applies to the whole run, which passes it"
+        );
+
+        let buggy = X_MIN + XYCutStrategy::legacy_valley_midpoint(valley_start, valley_end);
+        assert_eq!(buggy, 180.587, "pre-fix split must be the midpoint the reporter saw");
+
+        let fixed = X_MIN + XYCutStrategy::deepest_point_wrapper(&density, valley_start, valley_end);
+        assert_eq!(
+            fixed, 301.587,
+            "fixed split must be the empty core the reporter identified"
+        );
+        assert_eq!(
+            density[(fixed - X_MIN) as usize],
+            0.0,
+            "the fixed split must land on a zero-density bin"
+        );
+    }
+
+    #[test]
+    fn find_valley_selects_the_deepest_point_not_the_midpoint_gh1763() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1763_page();
+
+        let profile = strategy
+            .horizontal_projection(&spans)
+            .expect("non-empty span set must produce a projection profile");
+
+        let (valley_start, valley_end, valley_width) = strategy
+            .find_valley(&profile)
+            .expect("a wide interior valley must be found");
+        assert_eq!(
+            (valley_start, valley_end, valley_width),
+            (9, 500, 491.0),
+            "unexpected valley run bounds"
+        );
+
+        let buggy_midpoint = XYCutStrategy::legacy_valley_midpoint(valley_start, valley_end);
+        assert_eq!(buggy_midpoint, 254.5, "pre-fix formula must land inside CAP4's span");
+        assert_eq!(
+            profile.density[254], 10.0,
+            "the pre-fix midpoint must land on real (sub-threshold) caption content, not empty space"
+        );
+
+        let deepest = XYCutStrategy::deepest_point_wrapper(&profile.density, valley_start, valley_end);
+        assert_eq!(
+            deepest, DEEPEST_POINT,
+            "fixed split must land at the center of the widest zero-density sub-run"
+        );
+        assert_eq!(
+            (profile.density[466], profile.density[467]),
+            (0.0, 0.0),
+            "the bins either side of the fixed split must be truly empty, not caption content"
+        );
+        assert_ne!(deepest, buggy_midpoint, "the fix must actually move the split point");
+    }
+
+    /// Behavioral counterpart: `find_horizontal_split_indexed` (the real
+    /// caller, not a hand-rolled reimplementation) must partition the
+    /// GH#1763 fixture so every caption fragment (`CAP1`, `CAP2`,
+    /// `FIG.3.A`, `CAP4`, `CAP5`) stays on the left and every body line
+    /// (`BODY*`) stays on the right — pre-fix, `CAP5` crossed into the
+    /// body side because the buggy midpoint (254.5) sits to the LEFT of
+    /// CAP5's own left edge (320). ~keep
+    #[test]
+    fn find_horizontal_split_indexed_keeps_caption_fragments_together_gh1763() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1763_page();
+        let indices: Vec<usize> = (0..spans.len()).collect();
+
+        let (left, right) = strategy
+            .find_horizontal_split_indexed(&spans, &indices)
+            .expect("a valid column split must be found");
+
+        assert_eq!(
+            left,
+            vec![0, 1, 2, 3, 4],
+            "left side must hold exactly the 5 caption fragments"
+        );
+        assert_eq!(
+            right,
+            vec![5, 6, 7, 8, 9, 10],
+            "right side must hold exactly the 6 body lines"
+        );
+    }
+
+    /// Integration-level counterpart via the public `partition_region`
+    /// entry point. Column purity — no caption fragment sharing a final
+    /// group with any body line, and vice versa — is asserted rather
+    /// than "same group_id for all 5 caption fragments", because the
+    /// sparse, widely-spaced caption fragments legitimately subdivide
+    /// further under recursion (each such sub-split is rejected by
+    /// `MIN_RESULT_WIDTH_PT`, so in practice they land in one group, but
+    /// the invariant that must hold regardless is column purity). ~keep
+    #[test]
+    fn gh1763_caption_fragments_never_bleed_into_the_body_column() {
+        let strategy = XYCutStrategy::new();
+        let spans = gh1763_page();
+
+        let groups = strategy.partition_region(&spans, None);
+
+        let group_of = |text: &str| -> usize {
+            groups
+                .iter()
+                .position(|g| g.iter().any(|s| s.text == text))
+                .unwrap_or_else(|| panic!("{text} missing from output: {groups:?}"))
+        };
+
+        let caption_texts = ["c1", "c2z", "FIG.3.A"];
+        let caption_groups: Vec<usize> = caption_texts.iter().map(|t| group_of(t)).collect();
+        let cap4_group = groups
+            .iter()
+            .position(|g| g.iter().any(|s| s.text.starts_with("CAP4")))
+            .expect("CAP4 fragment missing");
+        let cap5_group = groups
+            .iter()
+            .position(|g| g.iter().any(|s| s.text.starts_with("CAP5")))
+            .expect("CAP5 fragment missing");
+        let body_groups: Vec<usize> = (0..6)
+            .map(|i| {
+                groups
+                    .iter()
+                    .position(|g| g.iter().any(|s| s.text.starts_with(&format!("BODY{i}"))))
+                    .unwrap_or_else(|| panic!("BODY{i} missing from output: {groups:?}"))
+            })
+            .collect();
+
+        for &cg in caption_groups.iter().chain([&cap4_group, &cap5_group]) {
+            assert!(
+                !body_groups.contains(&cg),
+                "a caption fragment must never share a group with body content: {groups:?}"
+            );
+        }
+        // The specific manifestation of the bug: CAP5 must stay with FIG.3.A,
+        // not fall into the body group. ~keep
+        assert_eq!(
+            cap5_group, caption_groups[2],
+            "CAP5 must group with FIG.3.A, not drift to the body column: {groups:?}"
+        );
     }
 }

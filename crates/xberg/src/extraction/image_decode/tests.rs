@@ -101,6 +101,70 @@ fn luma_decode_rejects_peak_when_rgba_source_alone_fits() {
     assert!(error.to_string().contains("live image-processing bytes"));
 }
 
+fn budget_of(max_content_size: usize) -> ImageDecodeBudget {
+    ImageDecodeBudget::from_security_limits(&SecurityLimits {
+        max_content_size,
+        ..Default::default()
+    })
+}
+
+#[test]
+fn budget_admits_a_pixel_count_over_budget_when_the_byte_count_fits() {
+    // GH#1761 crossing point: the budget is a number of BYTES, so a
+    // 10_000-pixel image whose decoded form is 500 bytes is within a
+    // 1_000-byte budget. Comparing the pixel count against it rejected
+    // this. Every caller today also passes a byte count >= the pixel
+    // count, so only a test at the crossing point can see the unit
+    // mismatch. ~keep
+    budget_of(1_000)
+        .validate(100, 100, 500)
+        .expect("10_000 pixels decoding to 500 bytes fits a 1_000-byte budget");
+}
+
+#[test]
+fn budget_still_rejects_a_byte_count_over_budget() {
+    let error = budget_of(1_000)
+        .validate(10, 10, 1_001)
+        .expect_err("1_001 bytes must not fit a 1_000-byte budget");
+
+    assert!(matches!(error, XbergError::Validation { .. }));
+    assert!(error.to_string().contains("live image-processing bytes"));
+}
+
+#[test]
+fn budget_accepts_a_byte_count_exactly_at_the_budget() {
+    budget_of(1_000)
+        .validate(10, 10, 1_000)
+        .expect("a byte count exactly at the budget must fit");
+}
+
+#[test]
+fn budget_rejects_a_zero_dimension() {
+    // `validate` doubles as the zero-dimension guard; a zero extent is
+    // malformed input regardless of how few bytes it claims. ~keep
+    assert!(budget_of(1_000).validate(0, 10, 1).is_err());
+    assert!(budget_of(1_000).validate(10, 0, 1).is_err());
+    assert!(budget_of(1_000).validate(0, 0, 0).is_err());
+}
+
+#[test]
+fn budget_handles_the_largest_representable_dimension_product() {
+    // u32::MAX squared is 18_446_744_065_119_617_025, just under
+    // u64::MAX, so widening both extents to u64 makes the product
+    // unrepresentable-by-construction impossible. The `checked_mul` in
+    // `validate` is therefore a backstop for a future widening of the
+    // dimension types, not a branch reachable from u32 input — this test
+    // pins the arithmetic that makes it unreachable, and shows such an
+    // image is still refused on its byte count. ~keep
+    assert!(u64::from(u32::MAX).checked_mul(u64::from(u32::MAX)).is_some());
+
+    let error = budget_of(1_000)
+        .validate(u32::MAX, u32::MAX, u64::MAX)
+        .expect_err("a maximal image's byte count must exceed the budget");
+
+    assert!(matches!(error, XbergError::Validation { .. }));
+}
+
 #[test]
 fn source_audit_detects_aliases_multiline_calls_and_decoder_families() {
     let source = r#"

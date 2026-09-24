@@ -81,10 +81,27 @@ impl TextAnalyzer {
         score += (long_word_count as f32 / words.len() as f32) * LONG_WORD_WEIGHT;
         score += (punct_density as f32 / sentence.len() as f32) * PUNCTUATION_DENSITY_WEIGHT;
 
+        let final_unique_count = Self::count_unique_words(&words);
+
+        let diversity_ratio = final_unique_count as f32 / words.len() as f32;
+        score += diversity_ratio * DIVERSITY_RATIO_WEIGHT;
+
+        let char_entropy = Self::calculate_char_entropy(sentence);
+        score += char_entropy * CHAR_ENTROPY_WEIGHT;
+
+        score
+    }
+
+    /// Counts distinct alphabetic-only, lowercased word forms in `words`.
+    ///
+    /// Stops early once an estimated-unique budget is reached and only completes the
+    /// full pass when that budget was not met, so the common case avoids hashing
+    /// every word. ~keep
+    fn count_unique_words(words: &[&str]) -> usize {
         let estimated_unique = (words.len() as f32 * 0.6).ceil() as usize;
         let mut unique_words: ahash::AHashSet<String> = ahash::AHashSet::with_capacity(estimated_unique.max(10));
 
-        for w in &words {
+        for w in words {
             let clean = w
                 .chars()
                 .filter(|c| c.is_alphabetic())
@@ -97,10 +114,10 @@ impl TextAnalyzer {
             }
         }
 
-        let final_unique_count = if unique_words.len() >= estimated_unique {
+        if unique_words.len() >= estimated_unique {
             unique_words.len()
         } else {
-            for w in &words {
+            for w in words {
                 let clean = w
                     .chars()
                     .filter(|c| c.is_alphabetic())
@@ -109,15 +126,7 @@ impl TextAnalyzer {
                 unique_words.insert(clean);
             }
             unique_words.len()
-        };
-
-        let diversity_ratio = final_unique_count as f32 / words.len() as f32;
-        score += diversity_ratio * DIVERSITY_RATIO_WEIGHT;
-
-        let char_entropy = Self::calculate_char_entropy(sentence);
-        score += char_entropy * CHAR_ENTROPY_WEIGHT;
-
-        score
+        }
     }
 
     /// Calculates character entropy (measure of text randomness/information content).

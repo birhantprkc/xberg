@@ -45,6 +45,13 @@ impl From<ort::Error> for LateInteractionError {
     }
 }
 
+/// Parallel per-row tensors for one tokenized batch, one row per encoding.
+struct InputRows {
+    ids_rows: Vec<Vec<i64>>,
+    mask_rows: Vec<Vec<i64>>,
+    type_rows: Vec<Vec<i64>>,
+}
+
 /// ColBERT late-interaction (multi-vector) model with thread-safe inference.
 ///
 /// Rust-only: an opaque ORT-backed handle with no faithful binding
@@ -114,18 +121,13 @@ impl LateInteractionEngine {
         Ok(all)
     }
 
-    fn embed_batch<S: AsRef<str>>(
-        &self,
-        batch: &[S],
-        is_query: bool,
-    ) -> Result<Vec<MultiVectorEmbedding>, LateInteractionError> {
-        let inputs: Vec<&str> = batch.iter().map(|t| t.as_ref()).collect();
-        let encodings = self
-            .tokenizer
-            .encode_batch(inputs, true)
-            .map_err(|e| LateInteractionError::Tokenizer(e.to_string()))?;
-
-        let batch_size = batch.len();
+    /// Build the per-row token id, attention mask, and token-type vectors for one batch.
+    ///
+    /// All three vectors are parallel and share one row per encoding.
+    ///
+    /// Applies the ColBERT tokenization tricks to each encoding in turn: marker
+    /// insertion at position 1 and, for queries, fixed-length mask padding.
+    fn build_input_rows(&self, encodings: &[tokenizers::Encoding], batch_size: usize, is_query: bool) -> InputRows {
         let marker_id = if is_query {
             self.query_marker_id
         } else {
@@ -136,7 +138,7 @@ impl LateInteractionEngine {
         let mut mask_rows: Vec<Vec<i64>> = Vec::with_capacity(batch_size);
         let mut type_rows: Vec<Vec<i64>> = Vec::with_capacity(batch_size);
 
-        for encoding in &encodings {
+        for encoding in encodings {
             let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
             let mut mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
 
@@ -152,6 +154,31 @@ impl LateInteractionEngine {
             mask_rows.push(mask);
             type_rows.push(types);
         }
+
+        InputRows {
+            ids_rows,
+            mask_rows,
+            type_rows,
+        }
+    }
+
+    fn embed_batch<S: AsRef<str>>(
+        &self,
+        batch: &[S],
+        is_query: bool,
+    ) -> Result<Vec<MultiVectorEmbedding>, LateInteractionError> {
+        let inputs: Vec<&str> = batch.iter().map(|t| t.as_ref()).collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(inputs, true)
+            .map_err(|e| LateInteractionError::Tokenizer(e.to_string()))?;
+
+        let batch_size = batch.len();
+        let InputRows {
+            ids_rows,
+            mask_rows,
+            type_rows,
+        } = self.build_input_rows(&encodings, batch_size, is_query);
 
         let seq_len = ids_rows
             .first()

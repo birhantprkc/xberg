@@ -96,48 +96,21 @@ impl DocumentClassifier {
     where
         I: Iterator<Item = &'a str>,
     {
-        let mut stats = DocumentStats::default();
-        let mut line_lengths = Vec::new();
-        let mut justified_count = 0;
-        let mut form_field_count = 0;
-        let mut citation_count = 0;
-        let mut math_symbol_count = 0;
-        let mut line_spacing_values = Vec::new();
-        let mut word_gaps = Vec::new();
+        let LineTally {
+            line_count,
+            line_lengths,
+            justified_count,
+            form_field_count,
+            citation_count,
+            math_symbol_count,
+            line_spacing_values,
+            word_gaps,
+        } = Self::tally_lines(lines);
 
-        for (idx, line) in lines.enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            stats.line_count += 1;
-
-            line_lengths.push(trimmed.len());
-
-            if Self::looks_justified(trimmed) {
-                justified_count += 1;
-            }
-
-            if Self::contains_form_field_markers(trimmed) {
-                form_field_count += 1;
-            }
-
-            if Self::looks_like_citation(trimmed) {
-                citation_count += 1;
-            }
-
-            if Self::contains_math_symbols(trimmed) {
-                math_symbol_count += 1;
-            }
-
-            let gaps = Self::extract_word_gaps(trimmed);
-            word_gaps.extend(gaps);
-
-            if idx > 0 {
-                line_spacing_values.push(1.0);
-            }
-        }
+        let mut stats = DocumentStats {
+            line_count,
+            ..DocumentStats::default()
+        };
 
         if !line_lengths.is_empty() {
             let total_chars: usize = line_lengths.iter().sum();
@@ -191,6 +164,49 @@ impl DocumentClassifier {
         let doc_type = Self::classify_from_stats(&stats);
 
         (doc_type, stats)
+    }
+
+    /// Walk the lines once and collect the raw tallies `classify_lines` folds
+    /// into a [`DocumentStats`]. Blank lines are skipped and do not count.
+    fn tally_lines<'a, I>(lines: I) -> LineTally
+    where
+        I: Iterator<Item = &'a str>,
+    {
+        let mut tally = LineTally::default();
+        for (idx, line) in lines.enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            tally.line_count += 1;
+
+            tally.line_lengths.push(trimmed.len());
+
+            if Self::looks_justified(trimmed) {
+                tally.justified_count += 1;
+            }
+
+            if Self::contains_form_field_markers(trimmed) {
+                tally.form_field_count += 1;
+            }
+
+            if Self::looks_like_citation(trimmed) {
+                tally.citation_count += 1;
+            }
+
+            if Self::contains_math_symbols(trimmed) {
+                tally.math_symbol_count += 1;
+            }
+
+            let gaps = Self::extract_word_gaps(trimmed);
+            tally.word_gaps.extend(gaps);
+
+            if idx > 0 {
+                tally.line_spacing_values.push(1.0);
+            }
+        }
+        tally
     }
 
     /// Placeholder for line-based classification (backward compatibility)
@@ -345,6 +361,20 @@ impl DocumentClassifier {
                 | 'ω'
         )
     }
+}
+
+/// Raw per-line tallies gathered by [`DocumentClassifier::tally_lines`] before
+/// they are folded into a [`DocumentStats`].
+#[derive(Default)]
+struct LineTally {
+    line_count: usize,
+    line_lengths: Vec<usize>,
+    justified_count: usize,
+    form_field_count: usize,
+    citation_count: usize,
+    math_symbol_count: usize,
+    line_spacing_values: Vec<f32>,
+    word_gaps: Vec<f32>,
 }
 
 #[cfg(test)]

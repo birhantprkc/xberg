@@ -659,6 +659,84 @@ fn classifier_gutter_rejects_degenerate_ctm_content_width() {
     assert!(PdfDocument::classifier_column_gutter(&spans).is_none());
 }
 
+/// GH#1757 adversarial review: `detect_column_gutter`'s doc comment promises "`None`
+/// on single-column, grid/form/table and off-centre pages, so a caller that gates on
+/// `Some` is unchanged on all of those" -- an executable contract test for the
+/// combined function (each sub-detector already has its own single-column/grid
+/// coverage above; this exercises the `or_else` chain as a whole, the shape every
+/// call site actually calls). ~keep
+#[test]
+fn detect_column_gutter_rejects_single_column() {
+    let mut spans = Vec::new();
+    for i in 0..16 {
+        let y = 700.0 - i as f32 * 12.0;
+        spans.push(corridor_span(
+            "Full width single column line of text here",
+            50.0,
+            y,
+            400.0,
+        ));
+    }
+    assert_eq!(PdfDocument::detect_column_gutter(&spans), None);
+}
+
+#[test]
+fn detect_column_gutter_rejects_three_column_grid() {
+    let mut spans = Vec::new();
+    for i in 0..12 {
+        let y = 700.0 - i as f32 * 12.0;
+        spans.push(corridor_span("colA", 50.0, y, 60.0));
+        spans.push(corridor_span("colB", 140.0, y, 60.0));
+        spans.push(corridor_span("colC", 230.0, y, 60.0));
+    }
+    assert_eq!(PdfDocument::detect_column_gutter(&spans), None);
+}
+
+/// A label:value form: one clean central corridor (label column narrow, value
+/// column wide), the shape `prose_two_column_gutter`'s per-column classifier must
+/// read as Form/Table on the left and reject, mirroring `test_corridor_rejects_
+/// label_column_table` above but through the combined entry point every call site
+/// actually uses.
+#[test]
+fn detect_column_gutter_rejects_a_label_value_form() {
+    let mut spans = Vec::new();
+    for i in 0..20 {
+        let y = 700.0 - i as f32 * 14.0;
+        spans.push(corridor_span("Field", 50.0, y, 20.0));
+        spans.push(corridor_span(
+            "A filled-in value for this row of the form",
+            300.0,
+            y,
+            200.0,
+        ));
+    }
+    assert_eq!(PdfDocument::detect_column_gutter(&spans), None);
+}
+
+/// GH#1757 adversarial review: `density_central_gutter` had no Table/Form class
+/// gate at all -- measured directly, it returned `Some(244.0625)` on the exact
+/// label:value form fixture above before the gate was added, contradicting
+/// `detect_column_gutter`'s own "None on ... form" doc contract even though
+/// `prose_two_column_gutter` and `classifier_column_gutter` both already declined
+/// it. Pinned here at the sub-detector level so a future change to the combined
+/// function's detector order cannot hide a regression the way the ordering did
+/// before this fix. ~keep
+#[test]
+fn density_gutter_rejects_a_label_value_form() {
+    let mut spans = Vec::new();
+    for i in 0..20 {
+        let y = 700.0 - i as f32 * 14.0;
+        spans.push(corridor_span("Field", 50.0, y, 20.0));
+        spans.push(corridor_span(
+            "A filled-in value for this row of the form",
+            300.0,
+            y,
+            200.0,
+        ));
+    }
+    assert_eq!(PdfDocument::density_central_gutter(&spans), None);
+}
+
 #[test]
 fn block_char_density_separates_dense_from_sparse() {
     // 5 lines of prose (~21 chars/line) is DENSE; 5 lines of bare numbers

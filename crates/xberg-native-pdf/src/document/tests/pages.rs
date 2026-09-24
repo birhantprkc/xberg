@@ -132,3 +132,70 @@ fn test_get_page_rotation_status_135_is_malformed_not_folded_to_valid_zero() {
     let doc = PdfDocument::from_bytes(build_pdf_with_rotate_token(Some("135"), false)).unwrap();
     assert_eq!(doc.get_page_rotation_status(0).unwrap(), PageRotation::Malformed);
 }
+
+/// GH#1755. The page tree is walked recursively, so a chain of `/Pages` nodes is a
+/// chain of stack frames. Unfixed, a chain overflows a 2 MiB thread stack — an abort,
+/// not a catchable panic, so one uploaded PDF took the whole consuming process down.
+/// Measured on a 2 MiB thread before the cap landed: abort at ~370 levels in a debug
+/// build and at ~3,000 in a release build. The red step therefore cannot live here —
+/// a genuine overflow would kill the test process rather than fail one test — so what
+/// is asserted is the post-cap contract: every page-tree entry point RETURNS.
+#[test]
+fn should_return_rather_than_abort_when_page_tree_chain_exceeds_the_depth_cap() {
+    let levels = MAX_PAGE_TREE_DEPTH as usize + 4;
+    let doc = PdfDocument::from_bytes(build_page_tree_chain_pdf(levels)).unwrap();
+
+    // Degraded, not lost: the tree walk stops at the cap, and the object scan
+    // still recovers the single leaf page. ~keep
+    assert_eq!(doc.page_count().unwrap(), 1, "page_count must degrade, not abort");
+
+    let page = doc.get_page(0).expect("get_page must degrade to the scanning fallback");
+    assert!(
+        !page.as_dict().unwrap().contains_key("MediaBox"),
+        "the page was recovered by scanning, so the root's inheritable /MediaBox is NOT merged \
+         - this is what distinguishes the capped walk from the control below"
+    );
+
+    let page_ref_error = doc.get_page_ref(0).expect_err("get_page_ref has no scanning fallback");
+    assert!(
+        matches!(page_ref_error, Error::InvalidPdf(_)),
+        "expected the tree walk to run out of kids, got {:?}",
+        page_ref_error
+    );
+
+    // GH#1755: collect_page_refs (objects.rs) used to be the one page-tree walker that
+    // propagated RecursionLimitExceeded with `?` instead of skipping the offending
+    // branch, so all_page_refs() surfaced `Err` here where every other walker above
+    // degrades. It now matches them: the over-cap branch is skipped like any other bad
+    // branch. This fixture is a single linear chain with no fork above the cap, so
+    // "skip the one branch that fails" and "collect everything else" coincide at an
+    // empty result — not because the walker gave up, but because there was nothing
+    // else in the tree to find. ~keep
+    assert_eq!(
+        doc.all_page_refs().unwrap(),
+        Vec::new(),
+        "all_page_refs must degrade like the other page-tree walkers, not abort"
+    );
+}
+
+/// The control for the test above: one level shallower than the cap resolves
+/// through the page tree itself, inherited attributes and all. Without it, a cap
+/// of zero would pass the over-cap test just as well.
+#[test]
+fn should_resolve_the_page_normally_when_the_chain_stays_under_the_depth_cap() {
+    let levels = MAX_PAGE_TREE_DEPTH as usize - 1;
+    let doc = PdfDocument::from_bytes(build_page_tree_chain_pdf(levels)).unwrap();
+
+    assert_eq!(doc.page_count().unwrap(), 1);
+
+    let page = doc.get_page(0).unwrap();
+    let page_dict = page.as_dict().unwrap();
+    assert!(
+        page_dict.contains_key("MediaBox"),
+        "the tree walk reached the leaf, so the root's /MediaBox must be inherited"
+    );
+    assert!(page_dict.contains_key("Resources"), "/Resources is inheritable too");
+
+    assert_eq!(doc.get_page_ref(0).unwrap().id, (2 + levels) as u32);
+    assert_eq!(doc.all_page_refs().unwrap().len(), 1);
+}

@@ -63,6 +63,15 @@ impl PdfDocument {
         })?;
 
         if self.page_cannot_have_text(page_dict) {
+            // A whole page discarded with no log line is why GH#1754 needed a downstream
+            // consumer to find it. Both this guard and `may_contain_text` below drop every
+            // span on the page, so both say which page and why. ~keep
+            tracing::debug!(
+                target: LOG_TARGET,
+                page_index,
+                reason = "no /Font resources and no Form XObjects",
+                "skipping page text extraction"
+            );
             return Ok(Vec::new());
         }
 
@@ -82,6 +91,13 @@ impl PdfDocument {
         };
 
         if !Self::may_contain_text(&content_data) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                page_index,
+                content_bytes = content_data.len(),
+                reason = "content stream has no BT and no Do operator",
+                "skipping page text extraction"
+            );
             return Ok(Vec::new());
         }
 
@@ -202,7 +218,15 @@ impl PdfDocument {
     ) -> Result<Vec<crate::layout::TextSpan>> {
         use crate::pipeline::reading_order::{ReadingOrderContext as ROContext, ReadingOrderStrategy, XYCutStrategy};
         let strategy = XYCutStrategy::new();
-        let context = ROContext::new().with_page(page_index as u32);
+        // The heading-run pre-pass needs the gutter to tell a heading opening
+        // the other column apart from a second `Tj` segment of the same
+        // heading line (GH#1757). This is the ordering that reaches the text
+        // and markdown lenses, so leaving it `None` leaves the defect live
+        // even when `postprocess_spans` has the gutter. ~keep
+        let mut context = ROContext::new().with_page(page_index as u32);
+        if let Some(gutter_x) = Self::detect_column_gutter(&spans) {
+            context = context.with_column_gutter(gutter_x);
+        }
         let ordered = strategy.apply(spans, &context)?;
         Ok(ordered.into_iter().map(|o| o.span).collect())
     }
@@ -1233,7 +1257,12 @@ impl PdfDocument {
                     s.retain(|span| !regions.iter().any(|r| r.intersects(&span.bbox)));
                 }
                 let strategy = XYCutStrategy::new();
-                strategy.partition_region(&s).into_iter().flatten().collect()
+                let column_gutter = Self::detect_column_gutter(&s);
+                strategy
+                    .partition_region(&s, column_gutter)
+                    .into_iter()
+                    .flatten()
+                    .collect()
             }
             None => {
                 let ordered = if include_artifacts {
@@ -1558,7 +1587,12 @@ impl PdfDocument {
                     s.retain(|span| !regions.iter().any(|r| r.intersects(&span.bbox)));
                 }
                 let strategy = XYCutStrategy::new();
-                strategy.partition_region(&s).into_iter().flatten().collect()
+                let column_gutter = Self::detect_column_gutter(&s);
+                strategy
+                    .partition_region(&s, column_gutter)
+                    .into_iter()
+                    .flatten()
+                    .collect()
             }
             None => {
                 let ordered = if include_artifacts {

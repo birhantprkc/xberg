@@ -993,6 +993,13 @@ const MAX_REDIRECT_DISTANCE_FRACTION: f32 = 0.25;
 // inside a table. Consulted only for a split that `MIN_DENSE_COLUMN_SPLIT_LINES` lines already
 // run through, i.e. one that demonstrably sits inside a column. ~keep
 const MAX_GUTTER_CROSSING_LINES: usize = 1;
+// GH#1762 adversarial review: `redirect_survives_a_second_table_closing_the_band_from_below_gh1762`
+// (text.rs tests) shows a second full-width table below the rescued band does NOT
+// exceed this tolerance -- but only because the band's pre-existing boundary line
+// happens to end exactly at the corridor's edge and contributes zero crossings there.
+// A page where BOTH the pre-existing boundary and a second table's boundary
+// genuinely cross the true gutter is not covered by any test and remains unproven,
+// not proven safe. ~keep
 // GH#1545: two regions with different leading (a table on 8.05pt beside prose on
 // 10.45pt) are never grouped into a shared line by `group_into_lines`, so per-line
 // gutter evidence only ever sees each region's *internal* gaps and the median lands
@@ -1181,6 +1188,61 @@ fn line_has_grid_row_gaps(spans: &[xberg_native_pdf::layout::TextSpan], line: &S
     gap_count >= MIN_GRID_ROW_GAP_COUNT
 }
 
+// GH#1756: one shared left edge is a margin, not a grid. Two is the floor at which a
+// set of column edges describes a table at all, and a row that `line_has_grid_row_gaps`
+// accepts has five or more cells, so a genuine table's grid clears this with room to
+// spare -- it only refuses the degenerate case where the excluded rows agree on a
+// single x, where every line on the page that starts there would otherwise be read as
+// a table line. ~keep
+const MIN_GRID_COLUMNS_FOR_CELL_GAP_VOTES: usize = 2;
+
+/// True if the gap at `midpoint` that `line` is about to vote for is a gap *between*
+/// two of `columns` -- a table's own cell gap -- and `line` is itself a row of that
+/// table rather than prose running across it.
+///
+/// GH#1756: `line_has_grid_row_gaps` removes a table's *full* rows from
+/// `detect_split_x`'s vote, but a table typeset by a journal also carries sparse lines
+/// -- the second and third line of a wrapped column header, a standard-deviation line
+/// under its row, a row whose long label closes the gap to its first value, a group row
+/// with empty cells, a units line. Each opens only one to three internal gaps, so each
+/// keeps its vote, and each votes for a gap deep inside the table. With the full rows
+/// gone those sparse lines are the *majority* of the vote: measured on the reporter's
+/// carrier the vote fell from 38 midpoints to 11, the median moved from 383.3 to 449.1,
+/// and the distance from the true gutter corridor grew from 84.5pt to 150.3pt -- 1.5pt
+/// past `MAX_REDIRECT_DISTANCE_FRACTION` of the page width (148.8pt), so the redirect
+/// that had been rescuing the page could no longer reach it.
+///
+/// The rows the gap-count filter already excluded are what identifies the rest of the
+/// table: they establish its column grid (`strong_column_edges`, which still requires
+/// `MIN_DENSE_COLUMN_SPLIT_LINES` independent rows to agree on an edge).
+/// `row_follows_column_grid` -- the same predicate `order_region_by_panels` uses to
+/// tell a table row from a caption running across one, reused rather than reinvented --
+/// then recognises the sparse rows whatever their gap count.
+///
+/// The vote's own position is the second half of the test, and it is what keeps this
+/// from throwing away real evidence: a table row's *last* gap, between its rightmost
+/// cell and the opposite column, IS the page gutter and is the only per-line evidence
+/// some pages have. Only a gap that falls between two of the table's own column edges
+/// is a cell gap. Both halves are load-bearing in opposite directions: without the
+/// alignment test, ordinary prose whose gap happens to fall across a table elsewhere on
+/// the page loses its vote; without the position test, a table row whose widest gap is
+/// the gutter loses its vote, which on the GH#1742 reproducer moves the median 5pt into
+/// the left column's longest line. ~keep
+fn vote_is_a_grid_cell_gap(
+    spans: &[xberg_native_pdf::layout::TextSpan],
+    line: &SpanLine,
+    columns: &[f32],
+    midpoint: f32,
+) -> bool {
+    if columns.len() < MIN_GRID_COLUMNS_FOR_CELL_GAP_VOTES {
+        return false;
+    }
+    let (Some(&first), Some(&last)) = (columns.first(), columns.last()) else {
+        return false;
+    };
+    midpoint > first && midpoint < last && row_follows_column_grid(spans, line, columns)
+}
+
 // GH#1742 (reproducer page 4): a three-column table row opens only two internal
 // gaps, one short of `MIN_GRID_ROW_GAP_COUNT`, so it is never excluded from
 // `detect_split_x`'s vote and can still make the median land inside the table. Once
@@ -1250,6 +1312,56 @@ fn lines_with_internal_gap_at(
         .count()
 }
 
+/// The lines of the one content band that carries the split's own inside-a-table-gap
+/// population, or `None` when no single band carries `MIN_DENSE_COLUMN_SPLIT_LINES` of
+/// them.
+///
+/// GH#1762: the corridor search `redirect_split_out_of_content` runs is page-wide, but
+/// the split it rescues is applied *per band*. `build_bands` already sets a full-width
+/// table apart -- every one of its rows straddles a split that sits inside a column
+/// below it, so every one is a boundary line -- and yet those same rows still close the
+/// gutter for the band beneath them, where nothing is written across it at all. On the
+/// reporter's page a five-row table at the top of the page left `page_whitespace_
+/// corridors` and `page_low_occupancy_corridors` both empty, so a split sitting between
+/// two columns of a four-column table lower down had nowhere to be moved to and stayed
+/// there; removing that table (their page 2) or moving its columns clear of the gutter
+/// (their page 3) makes the same page-wide search find the corridor at once.
+///
+/// The band is chosen by the population that made the split wrong in the first place:
+/// the lines with the split inside one of their own multi-column cell gaps
+/// (`line_has_internal_gap_at`, the GH#1742 signal). Requiring one band to carry
+/// `MIN_DENSE_COLUMN_SPLIT_LINES` of them applies the same bar the page-wide count
+/// applies, to the band rather than to the page, so a page whose evidence is spread
+/// thinly across several bands keeps the page-wide search it has always had. ~keep
+fn band_lines_around_table_gap_split(
+    spans: &[xberg_native_pdf::layout::TextSpan],
+    lines: &[SpanLine],
+    furniture_width: f32,
+    min_gutter: f32,
+    split_x: f32,
+) -> Option<Vec<SpanLine>> {
+    let mut bands: Vec<(usize, Vec<SpanLine>)> = vec![(0, Vec::new())];
+    for line in lines {
+        let (population, band) = bands.last_mut().expect("bands always holds the band being accumulated");
+        if line_is_boundary(spans, line, furniture_width, split_x) {
+            // A boundary line is emitted *between* the band above it and the band
+            // below it, so it is context for both: the caption over a table, the
+            // introductory line before it. Only a band separated from this one by such
+            // a line is out of scope. ~keep
+            band.push(line.clone());
+            bands.push((0, vec![line.clone()]));
+            continue;
+        }
+        *population += usize::from(line_has_internal_gap_at(spans, line, min_gutter, split_x));
+        band.push(line.clone());
+    }
+    bands
+        .into_iter()
+        .max_by_key(|&(population, _)| population)
+        .filter(|&(population, _)| population >= MIN_DENSE_COLUMN_SPLIT_LINES)
+        .map(|(_, band)| band)
+}
+
 /// Establish the page's gutter x-position from independent per-line evidence.
 ///
 /// Each line is checked in isolation for an internal gap at least
@@ -1273,21 +1385,36 @@ fn lines_with_internal_gap_at(
 /// `MAX_DENSE_COLUMN_GUTTER_FRACTION` in `widest_gap_midpoint` below, which independently
 /// rejects the same line's gap for being implausibly wide -- either fix alone
 /// already removes it from the vote. ~keep
+///
+/// GH#1756: the lines `line_has_grid_row_gaps` rejects are not only removed from the
+/// vote, they are read first, for the column grid they establish. A line that sits on
+/// that grid and votes for a gap between two of its columns is a table row whatever
+/// its own gap count, and is removed too (`vote_is_a_grid_cell_gap`). ~keep
 fn detect_split_x(spans: &[xberg_native_pdf::layout::TextSpan], lines: &[SpanLine], page_width: f32) -> Option<f32> {
     let min_gutter = (page_width * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
     let max_gutter = page_width * MAX_DENSE_COLUMN_GUTTER_FRACTION;
     let furniture_width = page_width * FULL_WIDTH_FURNITURE_FRACTION;
 
-    let mut midpoints: Vec<f32> = lines
-        .iter()
-        .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
-        .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+    let voting_lines = || {
+        lines
+            .iter()
+            .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
+            .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+    };
+    let grid_rows: Vec<SpanLine> = voting_lines()
+        .filter(|&line| line_has_grid_row_gaps(spans, line, min_gutter))
+        .cloned()
+        .collect();
+    let grid_columns = strong_column_edges(spans, &grid_rows);
+
+    let mut midpoints: Vec<f32> = voting_lines()
         .filter(|&line| !line_has_grid_row_gaps(spans, line, min_gutter))
         .filter_map(|line| {
             let edges = line
                 .iter()
                 .map(|&index| (spans[index].bbox.left(), spans[index].bbox.right()));
-            widest_gap_midpoint(edges, min_gutter, max_gutter)
+            let midpoint = widest_gap_midpoint(edges, min_gutter, max_gutter)?;
+            (!vote_is_a_grid_cell_gap(spans, line, &grid_columns, midpoint)).then_some(midpoint)
         })
         .collect();
     if midpoints.len() < MIN_DENSE_COLUMN_SPLIT_LINES {
@@ -1367,6 +1494,12 @@ fn redirect_split_out_of_content(
     if !cuts_a_span && !split_inside_a_table_gap {
         return split_x;
     }
+    // GH#1762: ask the corridor question of the band the split is wrong in, not of the
+    // whole page -- a table in another band, already set apart by its own boundary
+    // lines, must not close this band's gutter. Falls back to the page when no single
+    // band carries the evidence. ~keep
+    let band = band_lines_around_table_gap_split(spans, lines, furniture_width, min_gutter, split_x);
+    let search_lines: &[SpanLine] = band.as_deref().unwrap_or(lines);
     let max_redirect_distance = page_width * MAX_REDIRECT_DISTANCE_FRACTION;
     let widest_within_reach = |corridors: Vec<(f32, f32)>| {
         corridors
@@ -1375,7 +1508,12 @@ fn redirect_split_out_of_content(
             .map(|(left, right)| (left + right) / 2.0)
             .filter(|candidate| (candidate - split_x).abs() <= max_redirect_distance)
     };
-    if let Some(candidate) = widest_within_reach(page_whitespace_corridors(spans, lines, furniture_width, min_gutter)) {
+    if let Some(candidate) = widest_within_reach(page_whitespace_corridors(
+        spans,
+        search_lines,
+        furniture_width,
+        min_gutter,
+    )) {
         return candidate;
     }
 
@@ -1388,17 +1526,29 @@ fn redirect_split_out_of_content(
     // search is widened to bands that at most `MAX_GUTTER_CROSSING_LINES` lines
     // cross, minus the hanging-label indents that are wider than a real gutter on
     // every clause-numbered page (the GH#1603 shape, seen from the corridor's side).
-    if lines_crossing(spans, lines, furniture_width, split_x) < MIN_DENSE_COLUMN_SPLIT_LINES
+    //
+    // GH#1762 adversarial review: this admission gate must ask the question of the
+    // same population the search below it (`page_low_occupancy_corridors`) is about
+    // to run against -- `search_lines`, not the page-wide `lines`. Asking it of the
+    // whole page let an unrelated table elsewhere inflate or deflate the crossing
+    // count against a threshold guarding a search scoped to one band. ~keep
+    if lines_crossing(spans, search_lines, furniture_width, split_x) < MIN_DENSE_COLUMN_SPLIT_LINES
         && !split_inside_a_table_gap
     {
         return split_x;
     }
     let max_label_width = page_width * MAX_DENSE_COLUMN_SPLIT_SNAP_SPAN_FRACTION;
-    let corridors = page_low_occupancy_corridors(spans, lines, furniture_width, min_gutter, MAX_GUTTER_CROSSING_LINES)
-        .into_iter()
-        .filter(|&corridor| !corridor_is_hanging_label_indent(spans, lines, max_label_width, corridor))
-        .filter(|&(left, right)| both_sides_are_columns(spans, lines, furniture_width, (left + right) / 2.0))
-        .collect();
+    let corridors = page_low_occupancy_corridors(
+        spans,
+        search_lines,
+        furniture_width,
+        min_gutter,
+        MAX_GUTTER_CROSSING_LINES,
+    )
+    .into_iter()
+    .filter(|&corridor| !corridor_is_hanging_label_indent(spans, search_lines, max_label_width, corridor))
+    .filter(|&(left, right)| both_sides_are_columns(spans, search_lines, furniture_width, (left + right) / 2.0))
+    .collect();
     widest_within_reach(corridors).unwrap_or(split_x)
 }
 
@@ -5121,6 +5271,807 @@ mod tests {
         );
     }
 
+    const GH1756_PAGE_WIDTH: f32 = 595.3;
+    /// The reporter's own whitespace corridor between the two columns: the left
+    /// column's right edge and the right column's left edge, midpoint 298.8.
+    const GH1756_GUTTER_CORRIDOR: (f32, f32) = (291.0, 306.6);
+    /// The column grid the carrier's full table rows establish (issue #1756's own
+    /// measurement: 312.6 / 397.2 / 441.0 / 488.4 / 534.7), as `(left, width)`. Every
+    /// consecutive pair leaves a gap wider than `min_gutter` (11.9pt at this page
+    /// width), so a full row opens four internal gaps and `line_has_grid_row_gaps`
+    /// already excludes it from the vote on both builds.
+    const GH1756_GRID_ROW: [(f32, f32); 5] = [
+        (312.6, 30.0),
+        (397.2, 20.0),
+        (441.0, 20.0),
+        (488.4, 21.1),
+        (534.7, 22.0),
+    ];
+    /// One full row above the wrapped column header, then 26 below it -- the 27 grid
+    /// rows the issue counts, covering y 325.0..700.3, the extent all six sparse lines
+    /// fall inside.
+    const GH1756_TOP_GRID_ROW_Y: f32 = 700.3;
+    const GH1756_FIRST_BODY_GRID_ROW_Y: f32 = 675.0;
+    const GH1756_BODY_GRID_ROW_COUNT: usize = 26;
+    const GH1756_GRID_ROW_LEADING: f32 = 14.0;
+
+    /// The six sparse table lines of the reporter's page 1, as `(y, cells)` with each
+    /// cell `(left, width)`. Each reproduces the three facts the issue measures for
+    /// that line -- its internal gap count (one to three, always under
+    /// `MIN_GRID_ROW_GAP_COUNT`, so it keeps its vote), the midpoint of its widest gap,
+    /// and how many of its spans sit on the grid above -- rather than the carrier's
+    /// literal text:
+    ///
+    /// | y | issue: gaps / midpoint / aligned | fixture: gaps / midpoint / aligned |
+    /// |---|---|---|
+    /// | 691.7 | 1 / 482.1 / 2 of 2 | 1 / 482.1 / 2 of 2 |
+    /// | 683.1 | 1 / 471.7 / 2 of 4 | 1 / 471.7 / 2 of 2 |
+    /// | 652.9 | 1 / 449.1 / 2 of 2 | 1 / 449.1 / 2 of 2 |
+    /// | 627.2 | 3 / 522.1 / 5 of 7 | 3 / 522.1 / 5 of 7 |
+    /// | 601.5 | 3 / 465.7 / 5 of 5 | 3 / 464.7 / 5 of 5 |
+    /// | 327.3 | 2 / 449.1 / 2 of 3 | 2 / 449.1 / 2 of 3 |
+    ///
+    /// The y-601.5 midpoint is 464.7 rather than the issue's 465.7: that line's widest
+    /// gap runs between two zero-width empty-cell markers, which can only sit on the
+    /// grid's own column edges, so the midpoint is pinned to (441.0 + 488.4) / 2. The
+    /// 1.0pt difference does not move the median, which is the 449.1 six places in.
+    const GH1756_SPARSE_TABLE_LINES: [(f32, &[(f32, f32)]); 6] = [
+        (691.7, &[(441.0, 34.8), (488.4, 34.0)]),
+        (683.1, &[(441.0, 14.0), (488.4, 22.0)]),
+        (652.9, &[(397.2, 12.6), (488.4, 20.0)]),
+        (
+            627.2,
+            &[
+                (312.6, 20.0),
+                (334.0, 6.0),
+                (341.0, 45.0),
+                (397.2, 25.0),
+                (441.0, 28.0),
+                (488.4, 21.1),
+                (534.7, 22.0),
+            ],
+        ),
+        (
+            601.5,
+            &[(312.6, 77.4), (397.2, 0.0), (441.0, 0.0), (488.4, 0.0), (534.7, 22.0)],
+        ),
+        (327.3, &[(320.0, 30.0), (397.2, 12.6), (488.4, 20.0)]),
+    ];
+    /// The reporter's page 3 removes the four sparse lines whose widest gap lies
+    /// furthest right (y 691.7, 683.1, 627.2, 601.5), leaving these two.
+    const GH1756_P3_SPARSE_TABLE_LINES: [usize; 2] = [2, 5];
+
+    /// The five ordinary prose lines that keep their vote on every build, contributing
+    /// the issue's measured midpoints 255.0, 276.0, 298.8, 304.8 and 365.0 in that
+    /// order. The first two sit inside the table's y extent and off its column grid, so
+    /// they are the fixture's own control that the grid exclusion discriminates by
+    /// alignment and not merely by y.
+    const GH1756_PROSE_VOTE_LINES: [(f32, &[(f32, f32)]); 5] = [
+        (668.0, &[(37.6, 211.4), (261.0, 30.0)]),
+        (640.0, &[(37.6, 232.4), (282.0, 9.0)]),
+        (760.0, &[(37.6, 253.4), (306.6, 235.0)]),
+        (746.0, &[(37.6, 253.4), (318.6, 223.0)]),
+        (720.0, &[(306.6, 46.4), (377.0, 60.0)]),
+    ];
+
+    /// The band below the table that makes the wrong split *act*: the issue's own
+    /// reordering band (its y 418.7..472.9, left 33 inked `Prose` spans, right 6
+    /// `Mixed`, row pairing 0.23). Interleaved left-only prose lines and right-only
+    /// cells, neither of which straddles the bad split at 449.1, so the whole run stays
+    /// one content band with six inked spans a side and no row pairing across it --
+    /// `reorder_band_columns` accepts it, `reorder_dense_two_column_page` returns
+    /// `true`, and the page is emitted in y order. None of these lines has an internal
+    /// gap of its own, so the band adds no vote on either build.
+    const GH1756_REORDERING_BAND_TOP_Y: f32 = 297.0;
+    const GH1756_REORDERING_BAND_LEADING: f32 = 7.0;
+    const GH1756_REORDERING_BAND_LINES: usize = 2 * MIN_DENSE_COLUMN_SPANS_PER_SIDE;
+    const GH1756_BAND_PROSE_TEXT: &str = "left column body text continuing past the table";
+    const GH1756_BAND_PROSE_X: f32 = 37.6;
+    const GH1756_BAND_PROSE_WIDTH: f32 = 200.0;
+    const GH1756_BAND_CELL_X: f32 = 488.4;
+    const GH1756_BAND_CELL_WIDTH: f32 = 60.0;
+
+    fn gh1756_push_line(spans: &mut Vec<TextSpan>, y: f32, cells: &[(f32, f32)]) {
+        for &(x, width) in cells {
+            // The carrier marks an empty table cell with a zero-width U+200B, which
+            // `trim()` does not remove -- so it counts as ink and holds its column's
+            // position, which is why the y-601.5 group row aligns 5 of 5. ~keep
+            let text = if width == 0.0 { "\u{200b}" } else { "cell" };
+            spans.push(span_with_width(text, x, y, width, 7.0, 7.0));
+        }
+    }
+
+    fn gh1756_push_grid_rows(spans: &mut Vec<TextSpan>) {
+        gh1756_push_line(spans, GH1756_TOP_GRID_ROW_Y, &GH1756_GRID_ROW);
+        for row in 0..GH1756_BODY_GRID_ROW_COUNT {
+            let y = GH1756_FIRST_BODY_GRID_ROW_Y - row as f32 * GH1756_GRID_ROW_LEADING;
+            gh1756_push_line(spans, y, &GH1756_GRID_ROW);
+        }
+    }
+
+    fn gh1756_push_reordering_band(spans: &mut Vec<TextSpan>) {
+        for line in 0..GH1756_REORDERING_BAND_LINES {
+            let y = GH1756_REORDERING_BAND_TOP_Y - line as f32 * GH1756_REORDERING_BAND_LEADING;
+            if line.is_multiple_of(2) {
+                spans.push(span_with_width(
+                    GH1756_BAND_PROSE_TEXT,
+                    GH1756_BAND_PROSE_X,
+                    y,
+                    GH1756_BAND_PROSE_WIDTH,
+                    8.5,
+                    8.5,
+                ));
+            } else {
+                spans.push(span_with_width(
+                    "cell",
+                    GH1756_BAND_CELL_X,
+                    y,
+                    GH1756_BAND_CELL_WIDTH,
+                    7.0,
+                    7.0,
+                ));
+            }
+        }
+    }
+
+    fn gh1756_page_with_sparse_lines(sparse_lines: &[usize]) -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        gh1756_push_grid_rows(&mut spans);
+        for &line in sparse_lines {
+            let (y, cells) = GH1756_SPARSE_TABLE_LINES[line];
+            gh1756_push_line(&mut spans, y, cells);
+        }
+        for &(y, cells) in &GH1756_PROSE_VOTE_LINES {
+            gh1756_push_line(&mut spans, y, cells);
+        }
+        gh1756_push_reordering_band(&mut spans);
+        spans
+    }
+
+    /// GH#1756 (the reporter's page 1): a journal table whose 27 full rows are already
+    /// excluded from `detect_split_x`'s vote, plus the six *sparse* table lines that
+    /// are not -- a wrapped column header's second and third line, an SD line under its
+    /// row, a row whose long label closes the gap to its first value, a group row with
+    /// empty cells, and a units line. Five ordinary prose lines are the only genuine
+    /// gutter evidence left. On v1.2.7 the six sparse lines outvote them six to five
+    /// and the median lands at 449.1, deep inside the right column and 150.3pt from the
+    /// true corridor -- 1.5pt past what `MAX_REDIRECT_DISTANCE_FRACTION` (148.8pt at
+    /// this page width) lets the redirect reach back.
+    fn gh1756_sparse_table_rows_page() -> Vec<TextSpan> {
+        gh1756_page_with_sparse_lines(&[0, 1, 2, 3, 4, 5])
+    }
+
+    /// GH#1756 (the reporter's page 3): the same page with four of the six sparse lines
+    /// removed.
+    fn gh1756_two_sparse_table_rows_page() -> Vec<TextSpan> {
+        gh1756_page_with_sparse_lines(&GH1756_P3_SPARSE_TABLE_LINES)
+    }
+
+    /// GH#1756's control page: the same 27-row table with no sparse lines at all, and
+    /// six genuine two-column prose lines interleaved with the table's own rows.
+    /// Excluding a table's sparse rows must not cost the page the gutter evidence that
+    /// merely sits beside the table.
+    fn gh1756_prose_beside_a_full_grid_table() -> Vec<TextSpan> {
+        let mut spans = Vec::new();
+        gh1756_push_grid_rows(&mut spans);
+        for line in 0..MIN_DENSE_COLUMN_SPLIT_LINES {
+            let y = 668.0 - line as f32 * GH1756_GRID_ROW_LEADING;
+            gh1756_push_line(&mut spans, y, &[(37.6, 253.4), (306.6, 235.0)]);
+        }
+        spans
+    }
+
+    fn gh1756_detect_split_x(spans: &[TextSpan]) -> Option<f32> {
+        let order = spans_sorted_top_to_bottom(spans);
+        let lines = group_into_lines(spans, &order);
+        detect_split_x(spans, &lines, GH1756_PAGE_WIDTH)
+    }
+
+    /// GH#1756: with the table's full rows already out of the vote, its six sparse
+    /// lines are the majority of what is left and carry the median to 449.1 -- inside
+    /// the right column, and further from the gutter than the redirect may reach. The
+    /// sparse lines sit on the very column grid the excluded full rows establish, so
+    /// excluding them too leaves the five prose votes, one short of the
+    /// `MIN_DENSE_COLUMN_SPLIT_LINES` quorum: the repair declines and the page falls to
+    /// the XY-cut, which reads it in column order (the reporter measures exactly that
+    /// on their page 2).
+    #[test]
+    fn detect_split_x_declines_when_sparse_table_rows_outvote_the_gutter_gh1756() {
+        let spans = gh1756_sparse_table_rows_page();
+
+        assert_eq!(
+            gh1756_detect_split_x(&spans),
+            None,
+            "the table's sparse lines must not be gutter evidence: with only the five \
+             genuine prose votes left the vote is below quorum and must decline rather \
+             than place the split at 449.1, inside the right column"
+        );
+    }
+
+    /// GH#1756 adversarial review: `apply_xy_cut_if_column_aware` (hierarchy.rs) feeds
+    /// the XY-cut's heading-run pre-pass a gutter from `detect_column_gutter`, a
+    /// detector with no table-grid exclusion (`vote_is_a_grid_cell_gap` is
+    /// `detect_split_x`-only). The failure this was suspected of reaching would be
+    /// `detect_column_gutter` returning a corridor INSIDE the table grid
+    /// (`GH1756_GRID_ROW` spans x 312.6..556.7) on the same sparse-table-row page
+    /// `detect_split_x` must decline on. Measured directly: it returns `None` on both
+    /// of #1756's fixtures, because `prose_two_column_gutter`'s own column-count
+    /// clustering step requires exactly 2 significant left-edge clusters and the
+    /// table's five-column grid produces 5, so every detector in the `or_else` chain
+    /// declines independently of any grid-gap exclusion. The finding's mechanism does
+    /// not reach this page. ~keep
+    #[test]
+    fn detect_column_gutter_also_declines_on_the_sparse_table_rows_pages_gh1756() {
+        let sparse = gh1756_sparse_table_rows_page();
+        let two_sparse = gh1756_two_sparse_table_rows_page();
+
+        assert_eq!(
+            xberg_native_pdf::pipeline::reading_order::detect_column_gutter(&sparse),
+            None,
+            "detect_column_gutter must not place a gutter inside the table's own grid"
+        );
+        assert_eq!(
+            xberg_native_pdf::pipeline::reading_order::detect_column_gutter(&two_sparse),
+            None,
+            "detect_column_gutter must not place a gutter inside the table's own grid"
+        );
+    }
+
+    /// GH#1756 (the reporter's page 3): two sparse lines instead of six. On v1.2.7 the
+    /// median lands at 304.8, inside the gutter corridor, by luck of where the two
+    /// survivors' gaps fall -- the page reads correctly but for the wrong reason. Both
+    /// survivors are still table lines on the grid, so the repair declines here too and
+    /// the page reaches the same correct column order through the XY-cut.
+    #[test]
+    fn detect_split_x_declines_on_two_sparse_table_rows_gh1756() {
+        let spans = gh1756_two_sparse_table_rows_page();
+
+        assert_eq!(
+            gh1756_detect_split_x(&spans),
+            None,
+            "both surviving sparse lines sit on the table's own column grid, so the \
+             five prose votes are all that is left and the vote is below quorum"
+        );
+    }
+
+    fn gh1756_grid_columns(spans: &[TextSpan]) -> Vec<f32> {
+        let order = spans_sorted_top_to_bottom(spans);
+        let lines = group_into_lines(spans, &order);
+        let min_gutter = (GH1756_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1756_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+        let grid_rows: Vec<SpanLine> = lines
+            .iter()
+            .filter(|&line| !line_has_width_furniture(spans, line, furniture_width))
+            .filter(|&line| line.iter().any(|&index| span_has_ink(&spans[index])))
+            .filter(|&line| line_has_grid_row_gaps(spans, line, min_gutter))
+            .cloned()
+            .collect();
+        strong_column_edges(spans, &grid_rows)
+    }
+
+    fn gh1756_line_at(spans: &[TextSpan], y: f32) -> SpanLine {
+        let order = spans_sorted_top_to_bottom(spans);
+        group_into_lines(spans, &order)
+            .into_iter()
+            .find(|line| (spans[line[0]].bbox.y - y).abs() < LINE_Y_TOLERANCE_PTS)
+            .expect("the fixture must carry a line on this baseline")
+    }
+
+    /// GH#1756: the predicate's two halves discriminate in opposite directions, so each
+    /// needs its own control. A sparse table line is on the grid *and* votes for a gap
+    /// between two of its columns. A prose line whose own gap happens to fall across
+    /// the table's columns is not on the grid, and keeps its vote. A prose line in the
+    /// real gutter is neither.
+    #[test]
+    fn only_a_grid_row_voting_for_its_own_cell_gap_is_excluded_gh1756() {
+        let spans = gh1756_sparse_table_rows_page();
+        let columns = gh1756_grid_columns(&spans);
+
+        assert_eq!(
+            columns,
+            GH1756_GRID_ROW.iter().map(|&(x, _)| x).collect::<Vec<_>>(),
+            "the full rows the gap-count filter already excluded must establish the \
+             table's own column grid"
+        );
+        assert!(
+            vote_is_a_grid_cell_gap(&spans, &gh1756_line_at(&spans, 652.9), &columns, 449.1),
+            "the SD line under `Age, y` sits on the grid and votes for the gap between \
+             the table's own second and fourth columns"
+        );
+        assert!(
+            !vote_is_a_grid_cell_gap(&spans, &gh1756_line_at(&spans, 720.0), &columns, 365.0),
+            "a prose line whose gap falls across the table's columns, but whose spans \
+             start nowhere near their edges, must keep its vote"
+        );
+        assert!(
+            !vote_is_a_grid_cell_gap(&spans, &gh1756_line_at(&spans, 760.0), &columns, 298.8),
+            "a line voting for the page's real gutter, left of the table entirely, must \
+             keep its vote"
+        );
+    }
+
+    /// GH#1756's end-to-end control: six genuine two-column prose lines whose baselines
+    /// interleave a 27-row table's own rows keep their votes and carry the median to
+    /// the true gutter. Without this the exclusion could pass its own tests by
+    /// swallowing every line level with a table.
+    #[test]
+    fn detect_split_x_keeps_prose_votes_beside_a_table_gh1756() {
+        let spans = gh1756_prose_beside_a_full_grid_table();
+
+        let detected = gh1756_detect_split_x(&spans).expect("six paired prose lines meet the quorum on their own");
+        assert!(
+            detected > GH1756_GUTTER_CORRIDOR.0 && detected < GH1756_GUTTER_CORRIDOR.1,
+            "prose beside a table must keep its gutter vote; expected a split inside \
+             {GH1756_GUTTER_CORRIDOR:?}, got {detected}"
+        );
+    }
+
+    /// GH#1756 end to end: with the vote below quorum `reorder_dense_two_column_page`
+    /// declines and leaves every span exactly where it was, handing the page to the
+    /// XY-cut fallback. On v1.2.7 it instead returns `true` on a split of 449.1 and the
+    /// page is emitted in y order -- the left column's `2.6.` heading welded to the
+    /// right column's `Table 4`, and prose from the two columns interleaved.
+    #[test]
+    fn dense_two_column_page_with_sparse_table_rows_declines_the_repair_gh1756() {
+        let mut spans = gh1756_sparse_table_rows_page();
+        let original: Vec<(String, f32, f32)> = spans
+            .iter()
+            .map(|span| (span.text.clone(), span.bbox.x, span.bbox.y))
+            .collect();
+
+        assert!(
+            !reorder_dense_two_column_page(&mut spans, GH1756_PAGE_WIDTH),
+            "a page whose only remaining gutter evidence is five prose lines must \
+             decline the dense two-column repair rather than split inside a column"
+        );
+
+        let after: Vec<(String, f32, f32)> = spans
+            .iter()
+            .map(|span| (span.text.clone(), span.bbox.x, span.bbox.y))
+            .collect();
+        assert_eq!(after, original, "a declined repair must leave the page untouched");
+    }
+
+    const GH1762_PAGE_WIDTH: f32 = 595.28;
+    /// The page's real gutter: the left column's widest line ends at 288.16, the right
+    /// column starts at 307.0 -- the whitespace corridor pages 2 and 3 of the reporter's
+    /// own reproducer find, and redirect into, at 297.6.
+    const GH1762_GUTTER_CORRIDOR: (f32, f32) = (288.15894, 307.0);
+    /// The baseline of Table 2's last row: everything above this belongs to the
+    /// full-width table's own band.
+    const GH1762_TABLE_2_BOTTOM_Y: f32 = 644.15;
+
+    /// GH#1762, the reporter's reproducer page 1, transcribed from the attached PDF:
+    /// one `span_with_width` per span `PdfDocument::extract_spans` returns, x / y /
+    /// width / height / font size unmodified. The one edit is the left table's first
+    /// header cell, whose Latin the repository's spell check reads as a misspelled
+    /// English word; the replacement keeps the cell's advance width and its length.
+    ///
+    /// A full-width `Table 2` occupies the top of the page, its third column running
+    /// x 205..~390 straight across the page's gutter. Below it the page is two columns:
+    /// the left is `Table 3`, four columns (a description at x 44 and three numeric
+    /// columns at 190 / 228 / 262) on its own 8.05pt leading; the right is prose on the
+    /// body's 10.45pt leading, opening with `4.1. Lorem ipsum dolor sit amet`.
+    ///
+    /// Measured on this fixture before the fix, matching the issue's own trace:
+    /// `detect_split_x` returns 216.784 -- between Table 3's second and third numeric
+    /// columns, because the table's rows never share a line with the right column
+    /// (different leading) so every vote is one of the table's own cell gaps, and a
+    /// four-column row opens three internal gaps, one short of
+    /// `MIN_GRID_ROW_GAP_COUNT`. `redirect_split_out_of_content` then finds
+    /// `cuts_a_span`, 16 lines with the split inside their own cell gap, and *no*
+    /// corridor at all -- neither empty nor low-occupancy -- because every row of
+    /// Table 2 is written across the gutter. The split stays at 216.784 and the band
+    /// below Table 2 is reordered around it, welding the table's numbers to the right
+    /// column's prose.
+    fn gh1762_p1_real_reproducer_spans() -> Vec<TextSpan> {
+        #[rustfmt::skip]
+        let spans = vec![
+            span_with_width("Table 2", 38.00, 795.00, 23.34, 7.00, 7.00),
+            span_with_width("consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi", 38.00, 786.95, 499.92, 7.00, 7.00),
+            span_with_width("Comparatio", 44.00, 776.90, 36.18, 7.00, 7.00),
+            span_with_width("Numerus", 120.00, 776.90, 28.39, 7.00, 7.00),
+            span_with_width("Summa superior", 205.00, 776.90, 51.35, 7.00, 7.00),
+            span_with_width("Summa inferior", 400.00, 776.90, 47.45, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 768.85, 51.35, 7.00, 7.00),
+            span_with_width("80", 120.00, 768.85, 7.78, 7.00, 7.00),
+            span_with_width("lorem ipsum dolor sit amet consectetur adipiscing elit sed", 205.00, 768.85, 177.39, 7.00, 7.00),
+            span_with_width("lorem ipsum dolor sit amet", 400.00, 768.85, 82.07, 7.00, 7.00),
+            span_with_width("ipsum dolor sit amet consectetur adipiscing elit sed do", 205.00, 760.80, 167.68, 7.00, 7.00),
+            span_with_width("ipsum dolor sit amet consectetur", 400.00, 760.80, 100.76, 7.00, 7.00),
+            span_with_width("dolor sit amet consectetur adipiscing elit sed do eiusmod", 205.00, 752.75, 175.46, 7.00, 7.00),
+            span_with_width("dolor sit amet consectetur", 400.00, 752.75, 80.14, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 741.70, 51.35, 7.00, 7.00),
+            span_with_width("69", 120.00, 741.70, 7.78, 7.00, 7.00),
+            span_with_width("elit sed do eiusmod tempor incididunt ut labore et dolore", 205.00, 741.70, 173.91, 7.00, 7.00),
+            span_with_width("do eiusmod tempor incididunt ut", 400.00, 741.70, 99.21, 7.00, 7.00),
+            span_with_width("sed do eiusmod tempor incididunt ut labore et dolore", 205.00, 733.65, 163.02, 7.00, 7.00),
+            span_with_width("eiusmod tempor incididunt ut", 400.00, 733.65, 89.48, 7.00, 7.00),
+            span_with_width("do eiusmod tempor incididunt ut labore et dolore magna", 205.00, 725.60, 173.14, 7.00, 7.00),
+            span_with_width("tempor incididunt ut labore et", 400.00, 725.60, 90.26, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 714.55, 51.35, 7.00, 7.00),
+            span_with_width("58", 120.00, 714.55, 7.78, 7.00, 7.00),
+            span_with_width("labore et dolore magna aliqua enim ad minim veniam quis", 205.00, 714.55, 179.35, 7.00, 7.00),
+            span_with_width("aliqua enim ad minim veniam quis", 400.00, 714.55, 105.42, 7.00, 7.00),
+            span_with_width("et dolore magna aliqua enim ad minim veniam quis nostrud", 205.00, 706.50, 183.24, 7.00, 7.00),
+            span_with_width("enim ad minim veniam quis", 400.00, 706.50, 84.80, 7.00, 7.00),
+            span_with_width("dolore magna aliqua enim ad minim veniam quis nostrud", 205.00, 698.45, 175.45, 7.00, 7.00),
+            span_with_width("ad minim veniam quis nostrud", 400.00, 698.45, 92.97, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 687.40, 51.35, 7.00, 7.00),
+            span_with_width("47", 120.00, 687.40, 7.78, 7.00, 7.00),
+            span_with_width("minim veniam quis nostrud exercitation ullamco laboris nisi", 205.00, 687.40, 182.05, 7.00, 7.00),
+            span_with_width("laboris nisi aliquip ex ea commodo", 400.00, 687.40, 106.98, 7.00, 7.00),
+            span_with_width("veniam quis nostrud exercitation ullamco laboris nisi aliquip", 205.00, 679.35, 183.62, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo", 400.00, 679.35, 84.42, 7.00, 7.00),
+            span_with_width("quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 205.00, 671.30, 178.18, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat", 400.00, 671.30, 106.22, 7.00, 7.00),
+            span_with_width("Lorem vs. ipsum", 44.00, 660.25, 51.35, 7.00, 7.00),
+            span_with_width("36", 120.00, 660.25, 7.78, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo consequat duis aute irure in", 205.00, 660.25, 172.35, 7.00, 7.00),
+            span_with_width("irure in reprehenderit voluptate velit", 400.00, 660.25, 109.71, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in", 205.00, 652.20, 159.91, 7.00, 7.00),
+            span_with_width("in reprehenderit voluptate velit", 400.00, 652.20, 93.76, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure in reprehenderit", 205.00, 644.15, 181.31, 7.00, 7.00),
+            span_with_width("reprehenderit voluptate velit esse", 400.00, 644.15, 103.10, 7.00, 7.00),
+            span_with_width("Table 3", 38.00, 613.25, 23.34, 7.00, 7.00),
+            span_with_width("4.1. Lorem ipsum dolor sit amet", 307.00, 613.25, 133.05, 9.50, 9.50),
+            span_with_width("ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation", 38.00, 605.20, 250.16, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate velit", 38.00, 597.15, 248.23, 7.00, 7.00),
+            span_with_width("veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 307.00, 592.35, 246.12, 8.50, 8.50),
+            span_with_width("Designatio", 44.00, 587.10, 31.12, 7.00, 7.00),
+            span_with_width("Primus", 190.00, 587.10, 21.78, 7.00, 7.00),
+            span_with_width("Secundus Tertius", 228.00, 587.10, 55.39, 7.00, 7.00),
+            span_with_width("quis nostrud exercitation ullamco laboris nisi aliquip ex ea", 307.00, 581.90, 216.36, 8.50, 8.50),
+            span_with_width("lorem ipsum dolor sit amet consectetur", 44.00, 579.05, 120.20, 7.00, 7.00),
+            span_with_width("21.00", 190.00, 579.05, 17.51, 7.00, 7.00),
+            span_with_width("20.48", 228.00, 579.05, 17.51, 7.00, 7.00),
+            span_with_width("18.23", 262.00, 579.05, 17.51, 7.00, 7.00),
+            span_with_width("nostrud exercitation ullamco laboris nisi aliquip ex ea commodo", 307.00, 571.45, 238.08, 8.50, 8.50),
+            span_with_width("sit amet consectetur adipiscing elit sed do", 44.00, 571.00, 129.56, 7.00, 7.00),
+            span_with_width("18.96", 190.00, 571.00, 17.51, 7.00, 7.00),
+            span_with_width("18.32", 228.00, 571.00, 17.51, 7.00, 7.00),
+            span_with_width("21.04", 262.00, 571.00, 17.51, 7.00, 7.00),
+            span_with_width("adipiscing elit sed do eiusmod tempor", 44.00, 562.95, 117.10, 7.00, 7.00),
+            span_with_width("20.85", 190.00, 562.95, 17.51, 7.00, 7.00),
+            span_with_width("19.10", 228.00, 562.95, 17.51, 7.00, 7.00),
+            span_with_width("6.10", 262.00, 562.95, 13.62, 7.00, 7.00),
+            span_with_width("exercitation ullamco laboris nisi aliquip ex ea commodo consequat", 307.00, 561.00, 248.96, 8.50, 8.50),
+            span_with_width("do eiusmod tempor incididunt ut labore et", 44.00, 554.90, 128.39, 7.00, 7.00),
+            span_with_width("20.48", 190.00, 554.90, 17.51, 7.00, 7.00),
+            span_with_width("18.23", 228.00, 554.90, 17.51, 7.00, 7.00),
+            span_with_width("20.27", 262.00, 554.90, 17.51, 7.00, 7.00),
+            span_with_width("ullamco laboris nisi aliquip ex ea commodo consequat duis aute", 307.00, 550.55, 239.99, 8.50, 8.50),
+            span_with_width("incididunt ut labore et dolore magna aliqua", 44.00, 546.85, 131.90, 7.00, 7.00),
+            span_with_width("18.32", 190.00, 546.85, 17.51, 7.00, 7.00),
+            span_with_width("21.04", 228.00, 546.85, 17.51, 7.00, 7.00),
+            span_with_width("19.61", 262.00, 546.85, 17.51, 7.00, 7.00),
+            span_with_width("laboris nisi aliquip ex ea commodo consequat duis aute irure in", 307.00, 540.10, 236.68, 8.50, 8.50),
+            span_with_width("et dolore magna aliqua enim ad minim", 44.00, 538.80, 118.66, 7.00, 7.00),
+            span_with_width("19.10", 190.00, 538.80, 17.51, 7.00, 7.00),
+            span_with_width("6.10", 228.00, 538.80, 13.62, 7.00, 7.00),
+            span_with_width("19.24", 262.00, 538.80, 17.51, 7.00, 7.00),
+            span_with_width("aliqua enim ad minim veniam quis nostrud", 44.00, 530.75, 130.71, 7.00, 7.00),
+            span_with_width("18.23", 190.00, 530.75, 17.51, 7.00, 7.00),
+            span_with_width("20.27", 228.00, 530.75, 17.51, 7.00, 7.00),
+            span_with_width("16.63", 262.00, 530.75, 17.51, 7.00, 7.00),
+            span_with_width("nisi aliquip ex ea commodo consequat duis aute irure in", 307.00, 529.65, 209.29, 8.50, 8.50),
+            span_with_width("minim veniam quis nostrud exercitation", 44.00, 522.70, 120.98, 7.00, 7.00),
+            span_with_width("21.04", 190.00, 522.70, 17.51, 7.00, 7.00),
+            span_with_width("19.61", 228.00, 522.70, 17.51, 7.00, 7.00),
+            span_with_width("21.42", 262.00, 522.70, 17.51, 7.00, 7.00),
+            span_with_width("aliquip ex ea commodo consequat duis aute irure in reprehenderit", 307.00, 519.20, 247.09, 8.50, 8.50),
+            span_with_width("nostrud exercitation ullamco laboris nisi", 44.00, 514.65, 122.15, 7.00, 7.00),
+            span_with_width("6.10", 190.00, 514.65, 13.62, 7.00, 7.00),
+            span_with_width("19.24", 228.00, 514.65, 17.51, 7.00, 7.00),
+            span_with_width("5.81", 262.00, 514.65, 13.62, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure in reprehenderit", 307.00, 508.75, 220.16, 8.50, 8.50),
+            span_with_width("laboris nisi aliquip ex ea commodo", 44.00, 506.60, 106.98, 7.00, 7.00),
+            span_with_width("20.27", 190.00, 506.60, 17.51, 7.00, 7.00),
+            span_with_width("16.63", 228.00, 506.60, 17.51, 7.00, 7.00),
+            span_with_width("21.00", 262.00, 506.60, 17.51, 7.00, 7.00),
+            span_with_width("ex ea commodo consequat duis aute irure", 44.00, 498.55, 130.34, 7.00, 7.00),
+            span_with_width("19.61", 190.00, 498.55, 17.51, 7.00, 7.00),
+            span_with_width("21.42", 228.00, 498.55, 17.51, 7.00, 7.00),
+            span_with_width("18.96", 262.00, 498.55, 17.51, 7.00, 7.00),
+            span_with_width("ea commodo consequat duis aute irure in reprehenderit voluptate", 307.00, 498.30, 245.68, 8.50, 8.50),
+            span_with_width("consequat duis aute irure in reprehenderit", 44.00, 490.50, 129.56, 7.00, 7.00),
+            span_with_width("19.24", 190.00, 490.50, 17.51, 7.00, 7.00),
+            span_with_width("5.81", 228.00, 490.50, 13.62, 7.00, 7.00),
+            span_with_width("20.85", 262.00, 490.50, 17.51, 7.00, 7.00),
+            span_with_width("commodo consequat duis aute irure in reprehenderit voluptate velit", 307.00, 487.85, 251.34, 8.50, 8.50),
+            span_with_width("irure in reprehenderit voluptate velit esse", 44.00, 482.45, 126.44, 7.00, 7.00),
+            span_with_width("16.63", 190.00, 482.45, 17.51, 7.00, 7.00),
+            span_with_width("21.00", 228.00, 482.45, 17.51, 7.00, 7.00),
+            span_with_width("20.48", 262.00, 482.45, 17.51, 7.00, 7.00),
+            span_with_width("consequat duis aute irure in reprehenderit voluptate velit esse", 307.00, 477.40, 231.97, 8.50, 8.50),
+            span_with_width("voluptate velit esse cillum fugiat nulla", 44.00, 474.40, 115.16, 7.00, 7.00),
+            span_with_width("21.42", 190.00, 474.40, 17.51, 7.00, 7.00),
+            span_with_width("18.96", 228.00, 474.40, 17.51, 7.00, 7.00),
+            span_with_width("18.32", 262.00, 474.40, 17.51, 7.00, 7.00),
+            span_with_width("duis aute irure in reprehenderit voluptate velit esse cillum fugiat", 307.00, 466.95, 237.63, 8.50, 8.50),
+            span_with_width("cillum fugiat nulla pariatur excepteur sint", 44.00, 466.35, 124.88, 7.00, 7.00),
+            span_with_width("5.81", 190.00, 466.35, 13.62, 7.00, 7.00),
+            span_with_width("20.85", 228.00, 466.35, 17.51, 7.00, 7.00),
+            span_with_width("19.10", 262.00, 466.35, 17.51, 7.00, 7.00),
+            span_with_width("aute irure in reprehenderit voluptate velit esse cillum fugiat nulla", 307.00, 456.50, 239.99, 8.50, 8.50),
+            span_with_width("irure in reprehenderit voluptate velit esse cillum fugiat nulla pariatur", 307.00, 446.05, 252.26, 8.50, 8.50),
+            span_with_width("in reprehenderit voluptate velit esse cillum fugiat nulla pariatur", 307.00, 435.60, 232.90, 8.50, 8.50),
+            span_with_width("reprehenderit voluptate velit esse cillum fugiat nulla pariatur", 307.00, 425.15, 223.92, 8.50, 8.50),
+            span_with_width("voluptate velit esse cillum fugiat nulla pariatur excepteur sint", 307.00, 414.70, 226.29, 8.50, 8.50),
+            span_with_width("velit esse cillum fugiat nulla pariatur excepteur sint occaecat", 307.00, 404.25, 225.81, 8.50, 8.50),
+            span_with_width("esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat", 307.00, 393.80, 245.19, 8.50, 8.50),
+            span_with_width("cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non", 307.00, 383.35, 241.42, 8.50, 8.50),
+            span_with_width("fugiat nulla pariatur excepteur sint occaecat cupidatat non proident", 307.00, 372.90, 250.41, 8.50, 8.50),
+        ];
+        spans
+    }
+
+    /// GH#1762 adversarial review: `gh1762_p1_real_reproducer_spans` plus a second
+    /// full-width table ("Table 4") below Table 3, in the same column shape as
+    /// Table 2 -- a description cell at x 44, a short numeric cell at 120, and a wide
+    /// cell at x 205 (width ~177, right edge ~382) that straddles any plausible split
+    /// between the two columns exactly the way Table 2's own rows do. `line_is_boundary`
+    /// therefore marks every one of Table 4's rows a boundary line, the same way it
+    /// already marks Table 2's.
+    ///
+    /// `band_lines_around_table_gap_split` pushes a boundary line into BOTH the band
+    /// above it and the band it opens (`text.rs` band-splitting loop). Before this
+    /// table the band under Table 2 was the page's LAST band, so it carried exactly
+    /// one boundary line (Table 2's own closing row) and `MAX_GUTTER_CROSSING_LINES`
+    /// (1) tolerated it. With Table 4 added, that band becomes a MIDDLE band bounded
+    /// by two boundary lines -- Table 2's closing row above and Table 4's first row
+    /// below -- both of which carry a cell covering the true gutter, so the per-band
+    /// corridor search now sees 2 gutter-crossing lines where it tolerates only 1. ~keep
+    fn gh1762_p1_with_second_table_below_spans() -> Vec<TextSpan> {
+        let mut spans = gh1762_p1_real_reproducer_spans();
+        const TABLE_4_ROWS: [(&str, &str, &str, &str); 6] = [
+            (
+                "Quartus vs. quintus",
+                "25",
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed",
+                "lorem ipsum dolor sit amet",
+            ),
+            (
+                "Quartus vs. quintus",
+                "31",
+                "ipsum dolor sit amet consectetur adipiscing elit sed do",
+                "ipsum dolor sit amet consectetur",
+            ),
+            (
+                "Quartus vs. quintus",
+                "44",
+                "dolor sit amet consectetur adipiscing elit sed do eiusmod",
+                "dolor sit amet consectetur",
+            ),
+            (
+                "Quartus vs. quintus",
+                "52",
+                "elit sed do eiusmod tempor incididunt ut labore et dolore",
+                "do eiusmod tempor incididunt ut",
+            ),
+            (
+                "Quartus vs. quintus",
+                "67",
+                "sed do eiusmod tempor incididunt ut labore et dolore",
+                "eiusmod tempor incididunt ut",
+            ),
+            (
+                "Quartus vs. quintus",
+                "73",
+                "do eiusmod tempor incididunt ut labore et dolore magna",
+                "tempor incididunt ut labore et",
+            ),
+        ];
+        spans.push(span_with_width("Table 4", 38.00, 345.00, 23.34, 7.00, 7.00));
+        let mut y = 335.95;
+        for (label, number, wide_cell, right_cell) in TABLE_4_ROWS {
+            spans.push(span_with_width(label, 44.00, y, 51.35, 7.00, 7.00));
+            spans.push(span_with_width(number, 120.00, y, 7.78, 7.00, 7.00));
+            spans.push(span_with_width(wide_cell, 205.00, y, 177.39, 7.00, 7.00));
+            spans.push(span_with_width(right_cell, 400.00, y, 82.07, 7.00, 7.00));
+            y -= 8.05;
+        }
+        spans
+    }
+
+    /// GH#1762 adversarial review, primary claim (measured, not reproduced): a
+    /// second full-width table below Table 3 was suspected of turning the rescued
+    /// band's one gutter-crossing boundary line into two, pushing
+    /// `page_low_occupancy_corridors` (tolerance `MAX_GUTTER_CROSSING_LINES` = 1)
+    /// over its limit and silently restoring the pre-#1762 defect.
+    ///
+    /// Measured directly: the band DOES pick up a second boundary line (Table 4's
+    /// opening row), but the pre-existing boundary above it is the SAME line the
+    /// original fixture's own doc comment already flags as surviving "by accident
+    /// of position" -- its one span ends at x=286.22998, the corridor's own left
+    /// edge, so it contributes ZERO crossings to the (286.22998, 307.0) interval
+    /// (`right > lo` is false at exact equality). Table 4's row is the only
+    /// GENUINE crossing there, so the interval's count is 1, not 2, and
+    /// `MAX_GUTTER_CROSSING_LINES` still has headroom. The redirect still finds
+    /// the true gutter (296.615, inside `GH1762_GUTTER_CORRIDOR`). A second table
+    /// positioned so BOTH its own boundary and the pre-existing one genuinely
+    /// cross the interval would still exceed the tolerance -- this fixture just
+    /// isn't that page, and the finding is not confirmed by it. ~keep
+    #[test]
+    fn redirect_survives_a_second_table_closing_the_band_from_below_gh1762() {
+        let spans = gh1762_p1_with_second_table_below_spans();
+        let order = spans_sorted_top_to_bottom(&spans);
+        let lines = group_into_lines(&spans, &order);
+        // The same incoming split the original (single-table) fixture computes
+        // (`the_page_wide_corridor_search_still_finds_nothing_gh1762` pins it to
+        // 216.7825): fixed here rather than recomputed via `detect_split_x` on the
+        // extended fixture, so this test isolates the band-scoping mechanism
+        // `band_lines_around_table_gap_split` is responsible for from any unrelated
+        // shift in the page's overall gutter vote that adding a second table's own
+        // internal cell gaps might independently cause. ~keep
+        let snapped = 216.7825_f32;
+        let min_gutter = (GH1762_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1762_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+
+        let band = band_lines_around_table_gap_split(&spans, &lines, furniture_width, min_gutter, snapped)
+            .expect("the band under Table 3's own internal boundary and above Table 4 still carries the quorum");
+        let boundary_lines_in_band = band
+            .iter()
+            .filter(|line| line_is_boundary(&spans, line, furniture_width, snapped))
+            .count();
+        assert_eq!(
+            boundary_lines_in_band, 2,
+            "the band must now carry two boundary lines: the pre-existing one above \
+             it and Table 4's opening row below it"
+        );
+
+        let corridors =
+            page_low_occupancy_corridors(&spans, &band, furniture_width, min_gutter, MAX_GUTTER_CROSSING_LINES);
+        assert_eq!(
+            corridors,
+            [(175.9, 190.0), (286.22998, 307.0)],
+            "the true gutter corridor must still be found: the pre-existing boundary \
+             line ends exactly at 286.22998 and contributes no crossing there, so \
+             Table 4's one genuine crossing stays within MAX_GUTTER_CROSSING_LINES"
+        );
+
+        let redirected = redirect_split_out_of_content(&spans, &lines, GH1762_PAGE_WIDTH, snapped);
+        assert!(
+            redirected > GH1762_GUTTER_CORRIDOR.0 && redirected < GH1762_GUTTER_CORRIDOR.1,
+            "a second full-width table below Table 3 must not regress the redirect: \
+             expected a split inside {GH1762_GUTTER_CORRIDOR:?}, got {redirected}"
+        );
+    }
+
+    fn gh1762_snapped_split(spans: &[TextSpan]) -> (Vec<SpanLine>, f32) {
+        let order = spans_sorted_top_to_bottom(spans);
+        let lines = group_into_lines(spans, &order);
+        let detected = detect_split_x(spans, &lines, GH1762_PAGE_WIDTH)
+            .expect("the left table's own cell gaps meet the quorum on their own");
+        let snapped = snap_split_left_of_hanging_labels(spans, &lines, GH1762_PAGE_WIDTH, detected);
+        (lines, snapped)
+    }
+
+    /// GH#1762: the corridor search is page-wide, but the split it rescues is applied
+    /// per band. `build_bands` has already set Table 2 apart -- every one of its rows
+    /// is a boundary line, because the split runs through it -- yet the same rows still
+    /// close the gutter for the band below, where nothing is written across it at all.
+    /// Asking the corridor question of that band alone finds the gutter, exactly as the
+    /// whole-page question finds it on the reporter's pages 2 and 3 once Table 2 is
+    /// gone or moved clear of it.
+    #[test]
+    fn redirect_escapes_a_table_when_another_bands_table_closes_the_gutter_gh1762() {
+        let spans = gh1762_p1_real_reproducer_spans();
+        let (lines, snapped) = gh1762_snapped_split(&spans);
+
+        let redirected = redirect_split_out_of_content(&spans, &lines, GH1762_PAGE_WIDTH, snapped);
+        assert!(
+            redirected > GH1762_GUTTER_CORRIDOR.0 && redirected < GH1762_GUTTER_CORRIDOR.1,
+            "a split sitting inside a table's own cell gap must be redirected to the \
+             gutter of the band it will be applied to; expected a split inside \
+             {GH1762_GUTTER_CORRIDOR:?}, got {redirected} (incoming {snapped})"
+        );
+    }
+
+    /// GH#1762: the page-wide corridor search must still see nothing, so the fixture's
+    /// own failure mode is exactly the one the issue describes -- no corridor anywhere
+    /// on the page -- and the band-scoped search is demonstrably what finds the gutter,
+    /// not some incidental change to the page-wide one.
+    #[test]
+    fn the_page_wide_corridor_search_still_finds_nothing_gh1762() {
+        let spans = gh1762_p1_real_reproducer_spans();
+        let (lines, snapped) = gh1762_snapped_split(&spans);
+        let min_gutter = (GH1762_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1762_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+
+        assert_eq!(
+            snapped, 216.7825,
+            "the four-column table's own cell gap still wins the vote"
+        );
+        assert!(
+            page_whitespace_corridors(&spans, &lines, furniture_width, min_gutter).is_empty(),
+            "Table 2's rows close every page-wide whitespace corridor"
+        );
+        assert!(
+            page_low_occupancy_corridors(&spans, &lines, furniture_width, min_gutter, MAX_GUTTER_CROSSING_LINES)
+                .is_empty(),
+            "Table 2 crosses the gutter on far more than MAX_GUTTER_CROSSING_LINES lines"
+        );
+    }
+
+    /// GH#1762: the band the corridor question is asked of must be a proper part of the
+    /// page that leaves Table 2 out, and the gutter must be empty inside it. Without
+    /// this the redirect could reach the right answer by some unrelated route and the
+    /// scoping itself would never be shown to have done anything.
+    #[test]
+    fn the_corridor_search_is_scoped_to_the_band_under_the_full_width_table_gh1762() {
+        let spans = gh1762_p1_real_reproducer_spans();
+        let (lines, snapped) = gh1762_snapped_split(&spans);
+        let min_gutter = (GH1762_PAGE_WIDTH * MIN_DENSE_COLUMN_GUTTER_FRACTION).max(MIN_DENSE_COLUMN_GUTTER_PTS);
+        let furniture_width = GH1762_PAGE_WIDTH * FULL_WIDTH_FURNITURE_FRACTION;
+
+        let band = band_lines_around_table_gap_split(&spans, &lines, furniture_width, min_gutter, snapped)
+            .expect("one band carries every line the split sits inside the cell gap of");
+        assert_eq!(
+            band.len(),
+            37,
+            "the band is the 36 lines under Table 3's caption, plus the boundary line above them"
+        );
+        assert!(
+            band.iter()
+                .flatten()
+                .all(|&index| spans[index].bbox.y < GH1762_TABLE_2_BOTTOM_Y),
+            "Table 2's own rows must be out of scope: they are a band of their own, \
+             separated from this one by boundary lines"
+        );
+        assert_eq!(
+            page_whitespace_corridors(&spans, &band, furniture_width, min_gutter),
+            [(286.22998, 307.0)],
+            "inside that band the page's real gutter is the one and only empty corridor"
+        );
+    }
+
+    /// GH#1762 end to end: the band below Table 2 must read column-major -- the whole of
+    /// Table 3 (its caption, its description lines, then its rows) before the right
+    /// column's `4.1.` heading and its body. Before the fix the band is reordered around
+    /// 216.784 instead: `Secundus`/`Tertius` and every value under them land on the
+    /// right of the split and are emitted after -- and interleaved with -- the right
+    /// column's prose.
+    #[test]
+    fn dense_two_column_page_reorders_below_a_full_width_table_gh1762() {
+        let mut spans = gh1762_p1_real_reproducer_spans();
+
+        assert!(
+            reorder_dense_two_column_page(&mut spans, GH1762_PAGE_WIDTH),
+            "a two-column band under a full-width table must still be reordered"
+        );
+
+        let order: Vec<&str> = spans.iter().map(|span| span.text.as_str()).collect();
+        let position = |text: &str| {
+            order
+                .iter()
+                .position(|&candidate| candidate == text)
+                .unwrap_or_else(|| panic!("`{text}` must survive the reorder"))
+        };
+
+        let heading = position("4.1. Lorem ipsum dolor sit amet");
+        assert!(
+            position("Table 3") < heading,
+            "Table 3's caption belongs to the left column and must precede the right \
+             column's heading"
+        );
+        assert!(
+            position("Secundus Tertius") < heading,
+            "Table 3's own column labels must stay in the left column, not be pushed \
+             past the right column's heading by a split inside the table"
+        );
+        assert!(
+            position("5.81") < heading,
+            "the last cell of Table 3's last row must precede the right column's heading"
+        );
+        assert_eq!(
+            order[heading + 1],
+            "veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea",
+            "the right column's heading must be followed by its own first body line, \
+             not by a table cell"
+        );
+    }
+
     const GH1655_PAGE_WIDTH: f32 = 595.28;
     const GH1655_NUMBER_X: f32 = 45.22;
     const GH1655_TITLE_X: f32 = 80.68;
@@ -5581,8 +6532,16 @@ mod tests {
     /// is incremented only inside that whole-document function, so a count of zero after this
     /// call proves the second read did not happen, not just that the final numbers happen to
     /// agree. The expected page list is computed independently, on its own document handle,
-    /// before the counter is reset, so computing it cannot mask a regression. ~keep
+    /// before the counter is reset, so computing it cannot mask a regression.
+    ///
+    /// The counter is thread-local (issue #1752 review): a process-global counter was
+    /// incremented by ANY test in the binary reaching `fabricated_provenance_page_indices` via
+    /// the production path, not only `#[serial]`-marked siblings -- `#[serial]` excludes other
+    /// `#[serial]` tests, not the hundreds of ordinary ones. `extract_text_and_metadata` below
+    /// runs synchronously on this test's own thread, so its thread-local counter observes
+    /// exactly this call graph. ~keep
     #[test]
+    #[serial_test::serial]
     fn provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/non_ascii_text.pdf");
         let bytes = std::fs::read(&path).expect("corpus document must read");
@@ -5602,13 +6561,15 @@ mod tests {
             "fixture must fabricate at least one page for this test to mean anything"
         );
 
-        crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS
+            .with(|counter| counter.store(0, std::sync::atomic::Ordering::SeqCst));
 
         let mut doc = NativeDocument::open_bytes(&bytes).expect("corpus document must open a second time");
         let (_, _, _, metadata) = extract_text_and_metadata(&mut doc, None).expect("extraction must succeed");
 
         assert_eq!(
-            crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            crate::pdf::scan_detect::FABRICATED_PROVENANCE_SECOND_PASS_CALLS
+                .with(|counter| counter.load(std::sync::atomic::Ordering::SeqCst)),
             0,
             "extract_text_and_metadata must not read every page's text a second time for provenance (issue #1744)"
         );

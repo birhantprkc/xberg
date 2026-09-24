@@ -115,46 +115,56 @@ fn extract_annotations_matching(
                 continue;
             }
 
-            let annotation_type = map_annotation_subtype(annot.subtype_enum);
-
-            let content = extract_annotation_content(&annot);
-
-            let bounding_box = annot.rect.map(|rect| BoundingBox {
-                x0: rect[0],
-                y0: rect[1],
-                x1: rect[2],
-                y1: rect[3],
-            });
-
-            let quad_points: Option<Vec<BoundingBox>> = annot
-                .quad_points
-                .as_ref()
-                .map(|quads| quads.iter().map(quad_to_bounding_box).collect());
-
-            let marked_text = if is_text_markup(annot.subtype_enum) {
-                quad_points
-                    .as_deref()
-                    .and_then(|boxes| extract_marked_text(&doc.doc, page_index, boxes))
-            } else {
-                None
-            };
-
-            annotations.push(PdfAnnotation {
-                annotation_type,
-                content,
-                page_number,
-                bounding_box,
-                author: annot.author.clone().filter(|s| !s.is_empty()),
-                modified: annot.modification_date.clone().filter(|s| !s.is_empty()),
-                color: annot.color.as_deref().and_then(color_to_hex),
-                subject: annot.subject.clone().filter(|s| !s.is_empty()),
-                quad_points,
-                marked_text,
-            });
+            annotations.push(build_pdf_annotation(&doc.doc, &annot, page_index, page_number));
         }
     }
 
     (annotations, warnings, page_count)
+}
+
+/// Convert one native annotation into the public `PdfAnnotation` shape.
+fn build_pdf_annotation(
+    doc: &xberg_native_pdf::PdfDocument,
+    annot: &xberg_native_pdf::Annotation,
+    page_index: usize,
+    page_number: u32,
+) -> PdfAnnotation {
+    let annotation_type = map_annotation_subtype(annot.subtype_enum);
+
+    let content = extract_annotation_content(annot);
+
+    let bounding_box = annot.rect.map(|rect| BoundingBox {
+        x0: rect[0],
+        y0: rect[1],
+        x1: rect[2],
+        y1: rect[3],
+    });
+
+    let quad_points: Option<Vec<BoundingBox>> = annot
+        .quad_points
+        .as_ref()
+        .map(|quads| quads.iter().map(quad_to_bounding_box).collect());
+
+    let marked_text = if is_text_markup(annot.subtype_enum) {
+        quad_points
+            .as_deref()
+            .and_then(|boxes| extract_marked_text(doc, page_index, boxes))
+    } else {
+        None
+    };
+
+    PdfAnnotation {
+        annotation_type,
+        content,
+        page_number,
+        bounding_box,
+        author: annot.author.clone().filter(|s| !s.is_empty()),
+        modified: annot.modification_date.clone().filter(|s| !s.is_empty()),
+        color: annot.color.as_deref().and_then(color_to_hex),
+        subject: annot.subject.clone().filter(|s| !s.is_empty()),
+        quad_points,
+        marked_text,
+    }
 }
 
 fn visible_free_text_annotation(

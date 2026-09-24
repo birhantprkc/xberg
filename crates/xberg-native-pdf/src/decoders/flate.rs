@@ -48,7 +48,7 @@ fn effective_limit_from_env_pair(new_val: Option<&str>, old_val: Option<&str>) -
 /// `PDF_OXIDE_MAX_DECOMPRESS_MB`. Each rename kept the older spellings working because this
 /// is a deployment knob someone has already set in a Dockerfile or a systemd unit; dropping a
 /// name silently reverts their limit to the compile-time default with no error. ~keep
-fn effective_limit() -> u64 {
+pub(crate) fn effective_limit() -> u64 {
     let new_val = std::env::var("XBERG_NATIVE_PDF_MAX_DECOMPRESS_MB").ok();
     let previous_val = std::env::var("XBERG_PDF_OXIDE_MAX_DECOMPRESS_MB").ok();
     let old_val = std::env::var("PDF_OXIDE_MAX_DECOMPRESS_MB").ok();

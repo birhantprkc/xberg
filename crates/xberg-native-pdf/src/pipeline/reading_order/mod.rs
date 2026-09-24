@@ -91,6 +91,17 @@ pub struct ReadingOrderContext {
     /// falling back to geometric ordering.
     pub suspects: bool,
 
+    /// Mid-X of the column gutter the caller already detected for this page,
+    /// when it established the page is multi-column.
+    ///
+    /// The XY-cut's heading-run pre-pass walks ONE page-global top-to-bottom
+    /// order, so a heading opening the other column can sort between a wrapped
+    /// heading's two lines. Knowing where the gutter is lets the pre-pass tell
+    /// that case apart from two `Tj` segments of one heading line (GH#1757).
+    /// `None` ⇒ no gutter is known and a conservative horizontal-adjacency test
+    /// stands in.
+    pub column_gutter: Option<f32>,
+
     /// Preserve the caller-supplied span order verbatim instead of running a
     /// reading-order strategy. Set when the converter has already established a
     /// non-geometric order the strategies cannot reproduce — currently the
@@ -141,11 +152,30 @@ impl ReadingOrderContext {
         self
     }
 
+    /// Set the detected column gutter mid-X (see `column_gutter`).
+    pub fn with_column_gutter(mut self, gutter_x: f32) -> Self {
+        self.column_gutter = Some(gutter_x);
+        self
+    }
+
     /// Set the ordered article-thread bead rectangles for this page.
     pub fn with_bead_rects(mut self, bead_rects: Vec<Rect>) -> Self {
         self.bead_rects = Some(bead_rects);
         self
     }
+}
+
+/// Mid-X of the page's column gutter, or `None` when the page is not a clean
+/// two-column layout.
+///
+/// Feed the result to [`ReadingOrderContext::with_column_gutter`] at every
+/// XY-cut entry point whose ordering reaches a caller. The heading-run
+/// pre-pass uses it to tell a heading that opens the other column apart from a
+/// second `Tj` segment of the same heading line, and is inert without it
+/// (GH#1757) — so an entry point that omits it leaves that defect live on its
+/// own path regardless of what the other entry points pass.
+pub fn detect_column_gutter(spans: &[TextSpan]) -> Option<f32> {
+    crate::document::PdfDocument::detect_column_gutter(spans)
 }
 
 /// Create a reading order strategy based on configuration.

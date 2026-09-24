@@ -96,7 +96,7 @@ impl PdfDocument {
 
         let mut out: Vec<ObjectRef> = Vec::new();
         let mut visited: HashSet<ObjectRef> = HashSet::new();
-        self.collect_page_refs(pages_ref, &mut out, &mut visited)?;
+        self.collect_page_refs(pages_ref, &mut out, &mut visited, 0)?;
         Ok(out)
     }
 
@@ -105,7 +105,16 @@ impl PdfDocument {
         node_ref: ObjectRef,
         out: &mut Vec<ObjectRef>,
         visited: &mut HashSet<ObjectRef>,
+        depth: u32,
     ) -> Result<()> {
+        if depth >= MAX_PAGE_TREE_DEPTH {
+            tracing::warn!(target: LOG_TARGET,
+                object_id = node_ref.id,
+                max_depth = MAX_PAGE_TREE_DEPTH,
+                "page tree depth limit exceeded while collecting page references"
+            );
+            return Err(Error::RecursionLimitExceeded(MAX_PAGE_TREE_DEPTH));
+        }
         if !visited.insert(node_ref) {
             return Ok(());
         }
@@ -134,9 +143,20 @@ impl PdfDocument {
             return Ok(());
         }
 
+        // GH#1755: degrade rather than abort. One unloadable branch (corrupt object,
+        // recursion limit, ...) must not cost the caller every OTHER page in the
+        // document. Matches `collect_all_pages`'s per-kid handling in `pages.rs`, and
+        // brings this walker in line with the other four page-tree walkers, which all
+        // skip a bad branch instead of failing the whole traversal. ~keep
         for kid in kids {
-            if let Some(kid_ref) = kid.as_reference() {
-                self.collect_page_refs(kid_ref, out, visited)?;
+            if let Some(kid_ref) = kid.as_reference()
+                && let Err(error) = self.collect_page_refs(kid_ref, out, visited, depth + 1)
+            {
+                tracing::warn!(target: LOG_TARGET,
+                    error_code = error.telemetry_code(),
+                    error_offset = ?error.telemetry_offset(),
+                    "error collecting page ref from tree; skipping branch"
+                );
             }
         }
         Ok(())

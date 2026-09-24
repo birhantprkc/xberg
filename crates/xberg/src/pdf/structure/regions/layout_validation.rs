@@ -17,6 +17,21 @@ pub(in crate::pdf::structure) enum RegionValidation {
     Skipped,
 }
 
+/// Rectangle of a layout region in pixel coordinates (image space, y=0 at top).
+#[cfg(feature = "layout-detection")]
+#[cfg_attr(not(feature = "ocr"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(in crate::pdf::structure) struct PixelRegion {
+    /// Left edge of the region.
+    pub x: u32,
+    /// Top edge of the region.
+    pub y: u32,
+    /// Width of the region.
+    pub width: u32,
+    /// Height of the region.
+    pub height: u32,
+}
+
 /// Minimum connected components for a region to be considered text-bearing.
 #[cfg(all(feature = "layout-detection", feature = "ocr"))]
 const MIN_TEXT_CC_COUNT: i32 = 3;
@@ -27,7 +42,7 @@ const MIN_TEXT_CC_COUNT: i32 = 3;
 /// Crops the region from the page image, binarizes, counts CCs. If the
 /// count is below `MIN_TEXT_CC_COUNT`, the region is flagged as Empty.
 ///
-/// `region_x/y/w/h` are in pixel coordinates (image space, y=0 at top).
+/// `region` is in pixel coordinates (image space, y=0 at top).
 ///
 /// Requires the `ocr` feature (leptonica via xberg-tesseract). Returns
 /// `Skipped` unconditionally when `ocr` is not enabled.
@@ -36,11 +51,15 @@ pub(in crate::pdf::structure) fn validate_region_has_text(
     page_rgb: &[u8],
     page_width: u32,
     page_height: u32,
-    region_x: u32,
-    region_y: u32,
-    region_w: u32,
-    region_h: u32,
+    region: PixelRegion,
 ) -> RegionValidation {
+    let PixelRegion {
+        x: region_x,
+        y: region_y,
+        width: region_w,
+        height: region_h,
+    } = region;
+
     if region_w < 5 || region_h < 5 {
         return RegionValidation::Empty;
     }
@@ -100,10 +119,7 @@ pub(in crate::pdf::structure) fn validate_region_has_text(
     _page_rgb: &[u8],
     _page_width: u32,
     _page_height: u32,
-    _region_x: u32,
-    _region_y: u32,
-    _region_w: u32,
-    _region_h: u32,
+    _region: PixelRegion,
 ) -> RegionValidation {
     RegionValidation::HasContent
 }
@@ -149,7 +165,13 @@ pub(in crate::pdf::structure) fn validate_page_regions(
                 return RegionValidation::Skipped;
             }
 
-            validate_region_has_text(rgb_data, img_w, img_h, px_left, px_top, crop_w, crop_h)
+            let region = PixelRegion {
+                x: px_left,
+                y: px_top,
+                width: crop_w,
+                height: crop_h,
+            };
+            validate_region_has_text(rgb_data, img_w, img_h, region)
         })
         .collect()
 }

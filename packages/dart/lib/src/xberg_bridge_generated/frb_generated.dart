@@ -19414,8 +19414,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ExtractionConfig dco_decode_extraction_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 52)
-      throw Exception('unexpected arr length: expect 52 but see ${arr.length}');
+    if (arr.length != 55)
+      throw Exception('unexpected arr length: expect 55 but see ${arr.length}');
     return ExtractionConfig(
       mimeDetectionPolicy: dco_decode_mime_detection_policy(arr[0]),
       useCache: dco_decode_bool(arr[1]),
@@ -19425,58 +19425,61 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       ocrStrategy: dco_decode_ocr_strategy(arr[5]),
       forceOcrPages: dco_decode_opt_list_prim_i_64_strict(arr[6]),
       disableOcr: dco_decode_bool(arr[7]),
-      chunking: dco_decode_opt_box_autoadd_chunking_config(arr[8]),
-      contentFilter: dco_decode_opt_box_autoadd_content_filter_config(arr[9]),
-      images: dco_decode_opt_box_autoadd_image_extraction_config(arr[10]),
-      pdfOptions: dco_decode_opt_box_autoadd_pdf_config(arr[11]),
+      ocrNearEmptyFallback: dco_decode_opt_box_autoadd_bool(arr[8]),
+      ocrScannedPageQualityGate: dco_decode_opt_box_autoadd_bool(arr[9]),
+      ocrEmbeddedImages: dco_decode_opt_box_autoadd_bool(arr[10]),
+      chunking: dco_decode_opt_box_autoadd_chunking_config(arr[11]),
+      contentFilter: dco_decode_opt_box_autoadd_content_filter_config(arr[12]),
+      images: dco_decode_opt_box_autoadd_image_extraction_config(arr[13]),
+      pdfOptions: dco_decode_opt_box_autoadd_pdf_config(arr[14]),
       tokenReduction: dco_decode_opt_box_autoadd_token_reduction_options(
-        arr[12],
+        arr[15],
       ),
       languageDetection: dco_decode_opt_box_autoadd_language_detection_config(
-        arr[13],
+        arr[16],
       ),
-      pages: dco_decode_opt_box_autoadd_page_config(arr[14]),
-      keywords: dco_decode_opt_box_autoadd_keyword_config(arr[15]),
-      postprocessor: dco_decode_opt_box_autoadd_post_processor_config(arr[16]),
-      htmlOptions: dco_decode_opt_box_autoadd_conversion_options(arr[17]),
-      htmlOutput: dco_decode_opt_box_autoadd_html_output_config(arr[18]),
-      extractionTimeoutSecs: dco_decode_opt_box_autoadd_i_64(arr[19]),
-      maxConcurrentExtractions: dco_decode_opt_box_autoadd_i_64(arr[20]),
-      resultFormat: dco_decode_result_format(arr[21]),
-      securityLimits: dco_decode_opt_box_autoadd_security_limits(arr[22]),
-      maxEmbeddedFileBytes: dco_decode_opt_box_autoadd_i_64(arr[23]),
-      outputFormat: dco_decode_output_format(arr[24]),
-      escapeMarkdown: dco_decode_bool(arr[25]),
-      tableAnchors: dco_decode_bool(arr[26]),
-      jupyterCellRendering: dco_decode_jupyter_cell_rendering(arr[27]),
-      applyNotebookCellTags: dco_decode_bool(arr[28]),
-      layout: dco_decode_opt_box_autoadd_layout_detection_config(arr[29]),
-      transcription: dco_decode_opt_box_autoadd_transcription_config(arr[30]),
-      useLayoutForMarkdown: dco_decode_bool(arr[31]),
-      includeDocumentStructure: dco_decode_bool(arr[32]),
-      acceleration: dco_decode_opt_box_autoadd_acceleration_config(arr[33]),
-      cacheNamespace: dco_decode_opt_String(arr[34]),
-      cacheTtlSecs: dco_decode_opt_box_autoadd_i_64(arr[35]),
-      email: dco_decode_opt_box_autoadd_email_config(arr[36]),
-      csv: dco_decode_opt_box_autoadd_csv_config(arr[37]),
-      geojson: dco_decode_opt_box_autoadd_geo_json_extraction_config(arr[38]),
-      concurrency: dco_decode_opt_box_autoadd_concurrency_config(arr[39]),
-      url: dco_decode_url_extraction_config(arr[40]),
-      maxArchiveDepth: dco_decode_i_64(arr[41]),
-      treeSitter: dco_decode_opt_box_autoadd_tree_sitter_config(arr[42]),
+      pages: dco_decode_opt_box_autoadd_page_config(arr[17]),
+      keywords: dco_decode_opt_box_autoadd_keyword_config(arr[18]),
+      postprocessor: dco_decode_opt_box_autoadd_post_processor_config(arr[19]),
+      htmlOptions: dco_decode_opt_box_autoadd_conversion_options(arr[20]),
+      htmlOutput: dco_decode_opt_box_autoadd_html_output_config(arr[21]),
+      extractionTimeoutSecs: dco_decode_opt_box_autoadd_i_64(arr[22]),
+      maxConcurrentExtractions: dco_decode_opt_box_autoadd_i_64(arr[23]),
+      resultFormat: dco_decode_result_format(arr[24]),
+      securityLimits: dco_decode_opt_box_autoadd_security_limits(arr[25]),
+      maxEmbeddedFileBytes: dco_decode_opt_box_autoadd_i_64(arr[26]),
+      outputFormat: dco_decode_output_format(arr[27]),
+      escapeMarkdown: dco_decode_bool(arr[28]),
+      tableAnchors: dco_decode_bool(arr[29]),
+      jupyterCellRendering: dco_decode_jupyter_cell_rendering(arr[30]),
+      applyNotebookCellTags: dco_decode_bool(arr[31]),
+      layout: dco_decode_opt_box_autoadd_layout_detection_config(arr[32]),
+      transcription: dco_decode_opt_box_autoadd_transcription_config(arr[33]),
+      useLayoutForMarkdown: dco_decode_bool(arr[34]),
+      includeDocumentStructure: dco_decode_bool(arr[35]),
+      acceleration: dco_decode_opt_box_autoadd_acceleration_config(arr[36]),
+      cacheNamespace: dco_decode_opt_String(arr[37]),
+      cacheTtlSecs: dco_decode_opt_box_autoadd_i_64(arr[38]),
+      email: dco_decode_opt_box_autoadd_email_config(arr[39]),
+      csv: dco_decode_opt_box_autoadd_csv_config(arr[40]),
+      geojson: dco_decode_opt_box_autoadd_geo_json_extraction_config(arr[41]),
+      concurrency: dco_decode_opt_box_autoadd_concurrency_config(arr[42]),
+      url: dco_decode_url_extraction_config(arr[43]),
+      maxArchiveDepth: dco_decode_i_64(arr[44]),
+      treeSitter: dco_decode_opt_box_autoadd_tree_sitter_config(arr[45]),
       structuredExtraction:
-          dco_decode_opt_box_autoadd_structured_extraction_config(arr[43]),
-      ner: dco_decode_opt_box_autoadd_ner_config(arr[44]),
-      redaction: dco_decode_opt_box_autoadd_redaction_config(arr[45]),
-      summarization: dco_decode_opt_box_autoadd_summarization_config(arr[46]),
-      translation: dco_decode_opt_box_autoadd_translation_config(arr[47]),
+          dco_decode_opt_box_autoadd_structured_extraction_config(arr[46]),
+      ner: dco_decode_opt_box_autoadd_ner_config(arr[47]),
+      redaction: dco_decode_opt_box_autoadd_redaction_config(arr[48]),
+      summarization: dco_decode_opt_box_autoadd_summarization_config(arr[49]),
+      translation: dco_decode_opt_box_autoadd_translation_config(arr[50]),
       pageClassification: dco_decode_opt_box_autoadd_page_classification_config(
-        arr[48],
+        arr[51],
       ),
       chunkClassification:
-          dco_decode_opt_box_autoadd_chunk_classification_config(arr[49]),
-      captioning: dco_decode_opt_box_autoadd_captioning_config(arr[50]),
-      qrCodes: dco_decode_opt_box_autoadd_bool(arr[51]),
+          dco_decode_opt_box_autoadd_chunk_classification_config(arr[52]),
+      captioning: dco_decode_opt_box_autoadd_captioning_config(arr[53]),
+      qrCodes: dco_decode_opt_box_autoadd_bool(arr[54]),
     );
   }
 
@@ -28396,6 +28399,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_ocrStrategy = sse_decode_ocr_strategy(deserializer);
     var var_forceOcrPages = sse_decode_opt_list_prim_i_64_strict(deserializer);
     var var_disableOcr = sse_decode_bool(deserializer);
+    var var_ocrNearEmptyFallback = sse_decode_opt_box_autoadd_bool(
+      deserializer,
+    );
+    var var_ocrScannedPageQualityGate = sse_decode_opt_box_autoadd_bool(
+      deserializer,
+    );
+    var var_ocrEmbeddedImages = sse_decode_opt_box_autoadd_bool(deserializer);
     var var_chunking = sse_decode_opt_box_autoadd_chunking_config(deserializer);
     var var_contentFilter = sse_decode_opt_box_autoadd_content_filter_config(
       deserializer,
@@ -28495,6 +28505,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       ocrStrategy: var_ocrStrategy,
       forceOcrPages: var_forceOcrPages,
       disableOcr: var_disableOcr,
+      ocrNearEmptyFallback: var_ocrNearEmptyFallback,
+      ocrScannedPageQualityGate: var_ocrScannedPageQualityGate,
+      ocrEmbeddedImages: var_ocrEmbeddedImages,
       chunking: var_chunking,
       contentFilter: var_contentFilter,
       images: var_images,
@@ -39516,6 +39529,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_ocr_strategy(self.ocrStrategy, serializer);
     sse_encode_opt_list_prim_i_64_strict(self.forceOcrPages, serializer);
     sse_encode_bool(self.disableOcr, serializer);
+    sse_encode_opt_box_autoadd_bool(self.ocrNearEmptyFallback, serializer);
+    sse_encode_opt_box_autoadd_bool(self.ocrScannedPageQualityGate, serializer);
+    sse_encode_opt_box_autoadd_bool(self.ocrEmbeddedImages, serializer);
     sse_encode_opt_box_autoadd_chunking_config(self.chunking, serializer);
     sse_encode_opt_box_autoadd_content_filter_config(
       self.contentFilter,

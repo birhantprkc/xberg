@@ -256,12 +256,10 @@ impl PdfDocument {
         // gutter is invisible under titles/abstracts/footers, so they must not
         // count toward straddle density. ~keep
         let band_w = 0.6 * content_w;
-        let cols: Vec<(f32, f32)> = body
-            .iter()
-            .filter(|s| s.bbox.width <= band_w)
-            .map(|s| (s.bbox.x, s.bbox.x + s.bbox.width))
+        let col_idx: Vec<usize> = (0..spans.len())
+            .filter(|&i| finite(&spans[i]) && spans[i].bbox.width <= band_w)
             .collect();
-        if cols.len() < 12 {
+        if col_idx.len() < 12 {
             return None;
         }
         // Scan the central band; "empty" tolerates ~1 % stray straddlers (a rare
@@ -269,8 +267,13 @@ impl PdfDocument {
         let lo = cmin + 0.30 * content_w;
         let hi = cmin + 0.70 * content_w;
         let step = (content_w / 400.0).clamp(0.5, 3.0);
-        let empty_max = (0.01 * cols.len() as f32).ceil() as usize;
-        let straddle_at = |x: f32| -> usize { cols.iter().filter(|(l, r)| *l + 2.0 < x && *r - 2.0 > x).count() };
+        let empty_max = (0.01 * col_idx.len() as f32).ceil() as usize;
+        let straddle_at = |x: f32| -> usize {
+            col_idx
+                .iter()
+                .filter(|&&i| spans[i].bbox.x + 2.0 < x && spans[i].bbox.x + spans[i].bbox.width - 2.0 > x)
+                .count()
+        };
         // Find ALL near-empty corridors and the widest one; require EXACTLY ONE
         // (a 3-column grid has two, and must stay row-aware). ~keep
         let (mut corridors, mut best_w, mut best_mid) = (0usize, 0.0f32, f32::NAN);
@@ -306,16 +309,31 @@ impl PdfDocument {
         }
         // Balanced columns: each side carries a real share of the column spans
         // (rejects a single column beside a sparse margin rail). ~keep
-        let (mut left, mut right) = (0usize, 0usize);
-        for (l, r) in &cols {
-            if (l + r) * 0.5 < best_mid {
-                left += 1;
+        let (mut left_idx, mut right_idx): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        for &i in &col_idx {
+            let s = &spans[i];
+            if s.bbox.x + s.bbox.width * 0.5 < best_mid {
+                left_idx.push(i);
             } else {
-                right += 1;
+                right_idx.push(i);
             }
         }
-        let n = left + right;
-        if n == 0 || (left * 4 < n) || (right * 4 < n) {
+        let n = left_idx.len() + right_idx.len();
+        if n == 0 || (left_idx.len() * 4 < n) || (right_idx.len() * 4 < n) {
+            return None;
+        }
+        // Class gate, mirroring `classifier_column_gutter`'s (load-bearing there
+        // too): a tight, balanced corridor is not by itself proof of a two-column
+        // PROSE body -- a label:value form (narrow label column, wide value
+        // column) reads exactly the same corridor shape. Reject when either side
+        // classifies as Table/Form; this probe has no reference-list/short-line
+        // carve-out to preserve, so unlike `prose_two_column_gutter` there is no
+        // balance-test fallback here. ~keep
+        use crate::layout::RegionClass;
+        let is_table_or_form = |c| matches!(c, RegionClass::Table | RegionClass::Form);
+        if is_table_or_form(crate::layout::classify_region(spans, &left_idx))
+            || is_table_or_form(crate::layout::classify_region(spans, &right_idx))
+        {
             return None;
         }
         Some(best_mid)
@@ -1023,6 +1041,46 @@ impl PdfDocument {
         // Strong single dominant left edge ⇒ single-column prose ⇒ the
         // multi-column signal came from the table. ~keep
         top as f32 >= 0.70 * total as f32
+    }
+
+    /// Mid-X of the page's column gutter, for callers that need the value and
+    /// not just `is_multi_column_page`'s yes/no.
+    ///
+    /// Tries the same three detectors, in the same order, that the text path
+    /// in `text_assembly.rs` uses, plus the density probe that finds the tight
+    /// (10-14 pt) gutters the cover scan misses. Each returns `None` on
+    /// single-column, grid/form/table and off-centre pages (see the
+    /// `detect_column_gutter_rejects_*` tests), so a caller that gates on
+    /// `Some` is unchanged on all of those.
+    ///
+    /// This is a DIFFERENT question from `is_multi_column_page`'s, and the two are
+    /// NOT gated on each other: `page_reading_order_inner` (`pipeline/page_order.rs`)
+    /// calls this unconditionally and seeds the context with whatever it returns,
+    /// then hands the page to `StructureTreeStrategy`, whose default fallback for any
+    /// untagged page (no `/StructTreeRoot`, the common case) is `XYCutStrategy` --
+    /// regardless of what `is_multi_column_page` would have said. So this function's
+    /// 12pt corridor floor (`prose_two_column_gutter`) really is looser than
+    /// `is_multi_column_page`'s two gates (`has_clean_column_gutter`'s 18pt,
+    /// `has_bimodal_line_starts`'s 30pt) on a path that does not consult
+    /// `is_multi_column_page` at all first. This is accepted, not unified, for the
+    /// same reason `measure_single_central_gutter`'s doc comment gives for not
+    /// merging its own 18pt with this function's 12pt: the callers that consume
+    /// `Some` here act only through `same_line_span_belongs_to_other_column`, gated
+    /// on two spans' tops agreeing to 1pt (see `detect_column_gutter_rejects_*`
+    /// below for the None-contract this and the sub-detectors keep instead) -- a
+    /// false-positive 12-30pt gutter costs one heading-run merge decision on that
+    /// page, not a reordering of its content. ~keep
+    ///
+    /// Consumed by the XY-cut's heading-run pre-pass, which needs to tell a
+    /// heading opening the other column apart from a second `Tj` segment of
+    /// the same heading line (GH#1757). Every XY-cut entry point on an output
+    /// path must pass this, not `None`: `find_heading_runs` runs about a dozen
+    /// times per page from several call sites, and threading only one of them
+    /// leaves the defect reachable through the others. ~keep
+    pub(crate) fn detect_column_gutter(spans: &[crate::layout::TextSpan]) -> Option<f32> {
+        Self::prose_two_column_gutter(spans)
+            .or_else(|| Self::density_central_gutter(spans))
+            .or_else(|| Self::classifier_column_gutter(spans))
     }
 
     pub(super) fn is_multi_column_page(spans: &[crate::layout::TextSpan]) -> bool {

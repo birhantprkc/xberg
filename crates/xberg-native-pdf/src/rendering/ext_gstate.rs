@@ -114,27 +114,7 @@ pub(crate) fn parse_ext_g_state_inner(state_obj: &Object, doc: &PdfDocument) -> 
             .or_else(|| ca_upper.as_integer().map(|v| v as f32));
     }
     if let Some(bm) = read("BM") {
-        // ISO 32000-1 §11.3.5 + §11.6.3: `/BM` may be a name OR an array of
-        // names. For an array, "the first name that names a blend mode
-        // supported by the conforming reader shall be used". Unrecognised
-        // names fall back to `/Normal` per §11.6.3. The classifier in
-        // `crate::rendering::sidecar::is_recognised_mode` enumerates every
-        // standard mode from §11.3.5.2 + §11.3.5.3; we share that list so
-        // detection and dispatch stay in lockstep.
-        //
-        // Array elements may themselves be indirect refs (§7.3.10), so
-        // each is resolved before pattern-matching its name. ~keep
-        let mode = match &bm {
-            Object::Name(n) => n.clone(),
-            Object::Array(arr) => arr
-                .iter()
-                .filter_map(|elem| doc.resolve_object(elem).ok())
-                .filter_map(|elem| elem.as_name().map(str::to_string))
-                .find(|name| crate::rendering::sidecar::is_recognised_mode(name))
-                .unwrap_or_else(|| "Normal".to_string()),
-            _ => "Normal".to_string(),
-        };
-        out.blend_mode = Some(mode);
+        out.blend_mode = Some(parse_blend_mode(&bm, doc));
     }
 
     // ISO 32000-1 §11.7.4 / Table 128. `/OP` is the stroking overprint;
@@ -159,85 +139,113 @@ pub(crate) fn parse_ext_g_state_inner(state_obj: &Object, doc: &PdfDocument) -> 
     // at the image-blit site; this parser covers the ExtGState
     // path. ~keep
     if let Some(smask_obj) = state_dict.get("SMask") {
-        // Resolve through references before classifying. ~keep
-        let resolved = doc.resolve_object(smask_obj).unwrap_or(smask_obj.clone());
-        match &resolved {
-            Object::Name(n) if n == "None" => {
-                out.smask = Some(SoftMaskValue::None);
-            }
-            Object::Dictionary(mask_dict) => {
-                // §7.3.10: sub-entries of a SMask dict may themselves be
-                // indirect refs. The /G entry is always a Reference by
-                // design (it's the Form XObject id, used as a key into
-                // the xref) so it stays an explicit Reference-match. The
-                // /S, /BC, and /TR entries are values that the spec
-                // allows to be direct OR indirect — resolve before
-                // reading. ~keep
-                let resolve_in_smask = |key: &str| -> Option<Object> {
-                    let raw = mask_dict.get(key)?;
-                    doc.resolve_object(raw).ok()
-                };
-
-                // Subtype: /S /Alpha or /S /Luminosity (default Alpha
-                // per spec). Anything else falls through to None — a
-                // malformed mask must not silently mis-render. ~keep
-                let subtype = match resolve_in_smask("S").as_ref().and_then(Object::as_name) {
-                    Some("Alpha") => SoftMaskSubtype::Alpha,
-                    Some("Luminosity") => SoftMaskSubtype::Luminosity,
-                    _ => SoftMaskSubtype::Alpha,
-                };
-
-                // /G — required Form XObject reference. Stays as a raw
-                // Reference; the renderer loads the form via xref. ~keep
-                let form_ref = mask_dict.get("G").and_then(|o| match o {
-                    Object::Reference(r) => Some(*r),
-                    _ => None,
-                });
-
-                if let Some(form_ref) = form_ref {
-                    // /BC backdrop colour — array of N reals. Only
-                    // honoured for /S /Luminosity per §11.4.7; for
-                    // /S /Alpha the spec ignores /BC. Each array
-                    // element may itself be an indirect ref (§7.3.10). ~keep
-                    let backdrop = if subtype == SoftMaskSubtype::Luminosity {
-                        resolve_in_smask("BC").and_then(|o| {
-                            o.as_array().map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| doc.resolve_object(v).ok())
-                                    .filter_map(|v| {
-                                        v.as_real()
-                                            .map(|r| r as f32)
-                                            .or_else(|| v.as_integer().map(|i| i as f32))
-                                    })
-                                    .collect::<Vec<f32>>()
-                            })
-                        })
-                    } else {
-                        None
-                    };
-
-                    // /TR transfer function — stored as the resolved
-                    // value; the renderer evaluates per-pixel via the
-                    // Function evaluator already used for tint
-                    // transforms. Indirect-ref TR (very common — `/TR
-                    // 12 0 R` pointing at a Function dict) is now
-                    // resolved at parse time rather than at every
-                    // per-pixel call. ~keep
-                    let transfer = resolve_in_smask("TR");
-
-                    out.smask = Some(SoftMaskValue::Form(SoftMaskForm {
-                        form_ref,
-                        subtype,
-                        backdrop,
-                        transfer,
-                    }));
-                }
-            }
-            _ => {}
-        }
+        out.smask = parse_smask(smask_obj, doc);
     }
 
     Ok(out)
+}
+
+/// Resolve a `/BM` value to a blend-mode name.
+///
+/// ISO 32000-1 §11.3.5 + §11.6.3: `/BM` may be a name OR an array of
+/// names. For an array, "the first name that names a blend mode
+/// supported by the conforming reader shall be used". Unrecognised
+/// names fall back to `/Normal` per §11.6.3. The classifier in
+/// `crate::rendering::sidecar::is_recognised_mode` enumerates every
+/// standard mode from §11.3.5.2 + §11.3.5.3; we share that list so
+/// detection and dispatch stay in lockstep.
+///
+/// Array elements may themselves be indirect refs (§7.3.10), so
+/// each is resolved before pattern-matching its name. ~keep
+fn parse_blend_mode(bm: &Object, doc: &PdfDocument) -> String {
+    match bm {
+        Object::Name(n) => n.clone(),
+        Object::Array(arr) => arr
+            .iter()
+            .filter_map(|elem| doc.resolve_object(elem).ok())
+            .filter_map(|elem| elem.as_name().map(str::to_string))
+            .find(|name| crate::rendering::sidecar::is_recognised_mode(name))
+            .unwrap_or_else(|| "Normal".to_string()),
+        _ => "Normal".to_string(),
+    }
+}
+
+/// Classify an ExtGState `/SMask` value (§11.4.7 / Table 144). Returns `None`
+/// when the value is neither `/None` nor a soft-mask dict carrying a `/G`
+/// Form-XObject reference, which leaves the current mask untouched.
+fn parse_smask(smask_obj: &Object, doc: &PdfDocument) -> Option<SoftMaskValue> {
+    // Resolve through references before classifying. ~keep
+    let resolved = doc.resolve_object(smask_obj).unwrap_or(smask_obj.clone());
+    let mask_dict = match &resolved {
+        Object::Name(n) if n == "None" => return Some(SoftMaskValue::None),
+        Object::Dictionary(mask_dict) => mask_dict,
+        _ => return None,
+    };
+
+    // §7.3.10: sub-entries of a SMask dict may themselves be
+    // indirect refs. The /G entry is always a Reference by
+    // design (it's the Form XObject id, used as a key into
+    // the xref) so it stays an explicit Reference-match. The
+    // /S, /BC, and /TR entries are values that the spec
+    // allows to be direct OR indirect — resolve before
+    // reading. ~keep
+    let resolve_in_smask = |key: &str| -> Option<Object> {
+        let raw = mask_dict.get(key)?;
+        doc.resolve_object(raw).ok()
+    };
+
+    // Subtype: /S /Alpha or /S /Luminosity (default Alpha
+    // per spec). Anything else falls through to None — a
+    // malformed mask must not silently mis-render. ~keep
+    let subtype = match resolve_in_smask("S").as_ref().and_then(Object::as_name) {
+        Some("Alpha") => SoftMaskSubtype::Alpha,
+        Some("Luminosity") => SoftMaskSubtype::Luminosity,
+        _ => SoftMaskSubtype::Alpha,
+    };
+
+    // /G — required Form XObject reference. Stays as a raw
+    // Reference; the renderer loads the form via xref. ~keep
+    let form_ref = mask_dict.get("G").and_then(|o| match o {
+        Object::Reference(r) => Some(*r),
+        _ => None,
+    })?;
+
+    // /BC backdrop colour — array of N reals. Only
+    // honoured for /S /Luminosity per §11.4.7; for
+    // /S /Alpha the spec ignores /BC. Each array
+    // element may itself be an indirect ref (§7.3.10). ~keep
+    let backdrop = if subtype == SoftMaskSubtype::Luminosity {
+        resolve_in_smask("BC").and_then(|o| {
+            o.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| doc.resolve_object(v).ok())
+                    .filter_map(|v| {
+                        v.as_real()
+                            .map(|r| r as f32)
+                            .or_else(|| v.as_integer().map(|i| i as f32))
+                    })
+                    .collect::<Vec<f32>>()
+            })
+        })
+    } else {
+        None
+    };
+
+    // /TR transfer function — stored as the resolved
+    // value; the renderer evaluates per-pixel via the
+    // Function evaluator already used for tint
+    // transforms. Indirect-ref TR (very common — `/TR
+    // 12 0 R` pointing at a Function dict) is now
+    // resolved at parse time rather than at every
+    // per-pixel call. ~keep
+    let transfer = resolve_in_smask("TR");
+
+    Some(SoftMaskValue::Form(SoftMaskForm {
+        form_ref,
+        subtype,
+        backdrop,
+        transfer,
+    }))
 }
 
 #[cfg(test)]

@@ -2078,7 +2078,6 @@ mod tests {
         const EXPECTED_MESSAGE: &str = "font 'redacted' painted nothing for 3 glyph(s) while advancing the cursor; \
             first was code 0x41 (glyph 7): no outline. The page renders with a gap that reads as whitespace \
             downstream. Reported once per font per page.";
-        let _ = crate::extractors::warnings::drain_global_warnings();
         let mut tally = GlyphDropTally::default();
         tally.record("no outline", 0x41, 7);
         tally.record("no glyph id", 0x42, 0);
@@ -2090,15 +2089,22 @@ mod tests {
                 rasterizer.report_drops(&tally, font_name);
             }
         });
-        let warnings = crate::extractors::warnings::drain_global_warnings();
-        assert_eq!(warnings.len(), 4);
-        for warning in &warnings {
-            assert_eq!(
-                warning.category,
-                crate::extractors::warnings::WarningCategory::GlyphDropped
-            );
-            assert_eq!(warning.message, EXPECTED_MESSAGE);
-        }
+        // The structured sink is process-wide and twelve other tests in this binary push into
+        // it, so neither draining it nor measuring its total length is safe from a test thread:
+        // a stranger's warning landing mid-window reads as one of ours, and draining steals
+        // warnings a peer is about to assert on. Count only records carrying this tally's own
+        // signature, and leave the sink untouched. ~keep
+        let mine = crate::extractors::warnings::snapshot_global_warnings()
+            .into_iter()
+            .filter(|warning| {
+                warning.category == crate::extractors::warnings::WarningCategory::GlyphDropped
+                    && warning.message == EXPECTED_MESSAGE
+            })
+            .count();
+        assert_eq!(
+            mine, 4,
+            "report_drops must push one structured warning per font name, with the redacted message"
+        );
         let rendered = format!("{events:?}");
         assert!(!rendered.contains(SECRET_FONT));
         assert_eq!(

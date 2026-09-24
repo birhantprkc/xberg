@@ -11554,6 +11554,73 @@ char *xberg_extraction_config_force_ocr_pages(XBERGAlefHandle handle);
 int32_t xberg_extraction_config_disable_ocr(XBERGAlefHandle handle);
 
 /**
+ * Get the `ocr_near_empty_fallback` field from a `ExtractionConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t xberg_extraction_config_ocr_near_empty_fallback(XBERGAlefHandle handle);
+
+/**
+ * Report whether the `ocr_near_empty_fallback` field on a `ExtractionConfig` is
+ * `Some`.
+ *
+ * `xberg_extraction_config_ocr_near_empty_fallback` cannot distinguish a `None`
+ * field from a legitimate zero-valued `Some` at the C ABI boundary -- there is
+ * no null representation for a numeric return, so both collapse to the same
+ * sentinel. Call this function first: `1` means the field getter's return value
+ * is meaningful, `0` means the field is absent and the getter's sentinel must
+ * be ignored, `-1` reports an invalid handle (see `xberg_last_error_code`). #
+ * Safety Pointer must be a valid handle returned by this library.
+ */
+int32_t
+xberg_extraction_config_has_ocr_near_empty_fallback(XBERGAlefHandle handle);
+
+/**
+ * Get the `ocr_scanned_page_quality_gate` field from a `ExtractionConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t
+xberg_extraction_config_ocr_scanned_page_quality_gate(XBERGAlefHandle handle);
+
+/**
+ * Report whether the `ocr_scanned_page_quality_gate` field on a
+ * `ExtractionConfig` is `Some`.
+ *
+ * `xberg_extraction_config_ocr_scanned_page_quality_gate` cannot distinguish a
+ * `None` field from a legitimate zero-valued `Some` at the C ABI boundary --
+ * there is no null representation for a numeric return, so both collapse to the
+ * same sentinel. Call this function first: `1` means the field getter's return
+ * value is meaningful, `0` means the field is absent and the getter's sentinel
+ * must be ignored, `-1` reports an invalid handle (see
+ * `xberg_last_error_code`). # Safety Pointer must be a valid handle returned by
+ * this library.
+ */
+int32_t xberg_extraction_config_has_ocr_scanned_page_quality_gate(
+    XBERGAlefHandle handle);
+
+/**
+ * Get the `ocr_embedded_images` field from a `ExtractionConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t xberg_extraction_config_ocr_embedded_images(XBERGAlefHandle handle);
+
+/**
+ * Report whether the `ocr_embedded_images` field on a `ExtractionConfig` is
+ * `Some`.
+ *
+ * `xberg_extraction_config_ocr_embedded_images` cannot distinguish a `None`
+ * field from a legitimate zero-valued `Some` at the C ABI boundary -- there is
+ * no null representation for a numeric return, so both collapse to the same
+ * sentinel. Call this function first: `1` means the field getter's return value
+ * is meaningful, `0` means the field is absent and the getter's sentinel must
+ * be ignored, `-1` reports an invalid handle (see `xberg_last_error_code`). #
+ * Safety Pointer must be a valid handle returned by this library.
+ */
+int32_t xberg_extraction_config_has_ocr_embedded_images(XBERGAlefHandle handle);
+
+/**
  * Get the `chunking` field from a `ExtractionConfig`.
  * A non-null returned handle is owned by the caller.
  * It must be freed with `xberg_chunking_config_free`.
@@ -12161,13 +12228,25 @@ int32_t xberg_extraction_config_needs_image_data(XBERGAlefHandle this_);
 /**
  * Whether embedded images get OCR'd.
  *
- * This mirrors the condition the pipeline itself uses before it calls
- * `image_ocr::process_images_with_ocr` (`core/pipeline/mod.rs`), and it is
- * deliberately the same predicate rather than an equivalent one: when the
- * two drifted apart, a container extractor asked `needs_image_data` and was
- * told no, so it attached an image with an empty buffer, and the OCR path
- * then ran on those zero bytes and reported `Could not determine image
- * format` (GH#1662).
+ * This is THE condition -- `core/pipeline/mod.rs` and
+ * `extraction::image_ocr::process_images_with_ocr` both call this method rather
+ * than re-deriving it, because when two copies of it drifted apart a container
+ * extractor asked `needs_image_data` and was told no, so it attached an image
+ * with an empty buffer, and the OCR path then ran on those zero bytes and
+ * reported `Could not determine image format` (GH#1662). A re-derived copy
+ * anywhere reopens that defect; `embedded_image_ocr_gate_has_no_second_copy` in
+ * `core/pipeline/tests.rs` fails if one appears.
+ *
+ * `Self.ocr_embedded_images` is the caller's explicit answer to the OCR half;
+ * `None` derives it from whether an `ocr` block is present, which is what this
+ * condition was before GH#1752 gave the behaviour a setting of its own.
+ *
+ * `disable_ocr` still wins regardless: it is documented as skipping OCR "for
+ * all document types", and `ocr_embedded_images` (like the plain presence of an
+ * `ocr` block before it) is an AUTOMATIC trigger, not an explicit request like
+ * `force_ocr` -- see `Self.effective_disable_ocr`'s callers elsewhere
+ * (`needs_image_processing`, `extractors/image.rs`, `engine/extract_impl.rs`)
+ * for the same precedent.
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */

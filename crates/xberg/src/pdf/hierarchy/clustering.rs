@@ -112,48 +112,7 @@ pub(crate) fn cluster_font_sizes(blocks: &[TextBlock], k: usize) -> Result<Vec<F
 
     let font_sizes: Vec<f32> = blocks.iter().map(|b| b.font_size).collect();
 
-    let mut prev_assignments: Vec<usize> = vec![0; font_sizes.len()];
-    let mut first_iter = true;
-
-    for _ in 0..KMEANS_MAX_ITERATIONS {
-        let (size_clusters, assignments) = assign_sizes_to_centroids_tracked(&font_sizes, &centroids);
-
-        let assignments_changed = if first_iter {
-            first_iter = false;
-            1
-        } else {
-            assignments
-                .iter()
-                .zip(prev_assignments.iter())
-                .filter(|(a, b)| a != b)
-                .count()
-        };
-        prev_assignments = assignments;
-
-        if assignments_changed == 0 {
-            break;
-        }
-
-        let mut new_centroids = Vec::with_capacity(actual_k);
-        for (i, cluster) in size_clusters.iter().enumerate() {
-            if !cluster.is_empty() {
-                new_centroids.push(cluster.iter().sum::<f32>() / cluster.len() as f32);
-            } else {
-                new_centroids.push(centroids[i]);
-            }
-        }
-
-        let converged = centroids
-            .iter()
-            .zip(new_centroids.iter())
-            .all(|(old, new)| (old - new).abs() < KMEANS_CONVERGENCE_THRESHOLD);
-
-        std::mem::swap(&mut centroids, &mut new_centroids);
-
-        if converged {
-            break;
-        }
-    }
+    let centroids = refine_centroids(&font_sizes, centroids, actual_k);
 
     let clusters = assign_blocks_to_centroids(blocks, &centroids);
 
@@ -257,6 +216,57 @@ pub(crate) fn assign_heading_levels_smart(
     }
 
     result
+}
+
+/// Run the k-means refinement loop over the seeded centroids.
+///
+/// Iterates until assignments stop changing, the centroids stop moving, or
+/// `KMEANS_MAX_ITERATIONS` is reached, and returns the refined centroids.
+fn refine_centroids(font_sizes: &[f32], mut centroids: Vec<f32>, actual_k: usize) -> Vec<f32> {
+    let mut prev_assignments: Vec<usize> = vec![0; font_sizes.len()];
+    let mut first_iter = true;
+
+    for _ in 0..KMEANS_MAX_ITERATIONS {
+        let (size_clusters, assignments) = assign_sizes_to_centroids_tracked(font_sizes, &centroids);
+
+        let assignments_changed = if first_iter {
+            first_iter = false;
+            1
+        } else {
+            assignments
+                .iter()
+                .zip(prev_assignments.iter())
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        prev_assignments = assignments;
+
+        if assignments_changed == 0 {
+            break;
+        }
+
+        let mut new_centroids = Vec::with_capacity(actual_k);
+        for (i, cluster) in size_clusters.iter().enumerate() {
+            if !cluster.is_empty() {
+                new_centroids.push(cluster.iter().sum::<f32>() / cluster.len() as f32);
+            } else {
+                new_centroids.push(centroids[i]);
+            }
+        }
+
+        let converged = centroids
+            .iter()
+            .zip(new_centroids.iter())
+            .all(|(old, new)| (old - new).abs() < KMEANS_CONVERGENCE_THRESHOLD);
+
+        std::mem::swap(&mut centroids, &mut new_centroids);
+
+        if converged {
+            break;
+        }
+    }
+
+    centroids
 }
 
 /// Helper function to assign font sizes to their nearest centroid (for iteration loop).

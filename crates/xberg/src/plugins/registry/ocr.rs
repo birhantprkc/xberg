@@ -116,6 +116,13 @@ impl OcrBackendRegistry {
     /// by the self-healing initialization path so a registry emptied via
     /// [`clear`](Self::clear) can be re-seeded with the defaults.
     pub fn register_defaults(&mut self) {
+        self.register_default_engine_backends();
+        self.register_default_candle_backends();
+    }
+
+    /// Register the built-in non-Candle backends: Tesseract (native and WASM),
+    /// PaddleOCR, Sceptre, and the VLM backend.
+    fn register_default_engine_backends(&mut self) {
         #[cfg(feature = "ocr")]
         {
             use crate::ocr::tesseract_backend::TesseractBackend;
@@ -186,7 +193,11 @@ impl OcrBackendRegistry {
                 tracing::warn!("Failed to register VLM OCR backend: {e}");
             });
         }
+    }
 
+    /// Register the built-in Candle-backed backends: TrOCR, PaddleOCR-VL,
+    /// GLM-OCR, and DeepSeek-OCR.
+    fn register_default_candle_backends(&mut self) {
         #[cfg(feature = "candle-trocr")]
         {
             use crate::candle_ocr::TrocrBackend;

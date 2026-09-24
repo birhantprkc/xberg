@@ -85,19 +85,20 @@ pub fn detect_dramatic_script(row_first_glyphs: &[DetectorGlyph], row_texts: &[&
     let mut leftmost_x: Option<f32> = None;
     for (row_idx, row) in row_texts.iter().enumerate() {
         let trimmed = row.trim_start();
-        if let Some(dot_pos) = trimmed.find('.') {
-            let token = &trimmed[..=dot_pos];
-            if token.len() <= 12 && !token.is_empty() {
-                let first_glyph = &row_first_glyphs[row_idx];
-                match leftmost_x {
-                    None => leftmost_x = Some(first_glyph.x),
-                    Some(prev_x) => {
-                        if (prev_x - first_glyph.x).abs() < 2.0 {
-                            speaker_row_count += 1;
-                        }
-                    }
-                }
-            }
+        let Some(dot_pos) = trimmed.find('.') else {
+            continue;
+        };
+        let token = &trimmed[..=dot_pos];
+        if token.len() > 12 || token.is_empty() {
+            continue;
+        }
+        let first_glyph = &row_first_glyphs[row_idx];
+        let Some(prev_x) = leftmost_x else {
+            leftmost_x = Some(first_glyph.x);
+            continue;
+        };
+        if (prev_x - first_glyph.x).abs() < 2.0 {
+            speaker_row_count += 1;
         }
     }
     speaker_row_count >= 3

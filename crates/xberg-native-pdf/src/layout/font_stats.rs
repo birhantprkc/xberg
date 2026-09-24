@@ -125,28 +125,7 @@ impl PageFontStats {
         let dominant_line_height =
             compute_line_height(spans, &body_font_name, dominant_em).unwrap_or(dominant_em * 1.2);
 
-        let mut total_width = 0.0_f64;
-        let mut total_chars = 0_usize;
-        let dominant_size_min = dominant_em - 0.25;
-        let dominant_size_max = dominant_em + 0.25;
-        for s in spans {
-            if s.font_name == body_font_name
-                && s.font_size >= dominant_size_min
-                && s.font_size <= dominant_size_max
-                && s.bbox.width > 0.0
-            {
-                let chars = s.text.chars().count();
-                if chars > 0 {
-                    total_width += s.bbox.width as f64;
-                    total_chars += chars;
-                }
-            }
-        }
-        let dominant_char_width = if total_chars > 0 {
-            (total_width / total_chars as f64) as f32
-        } else {
-            dominant_em * 0.5
-        };
+        let dominant_char_width = compute_char_width(spans, &body_font_name, dominant_em);
 
         Self {
             dominant_em,
@@ -154,6 +133,33 @@ impl PageFontStats {
             dominant_char_width,
             body_font_name,
         }
+    }
+}
+
+/// Mean rendered width of one character across the body-font spans, falling
+/// back to half an em when no span qualifies.
+fn compute_char_width(spans: &[TextSpan], body_font: &str, dominant_em: f32) -> f32 {
+    let mut total_width = 0.0_f64;
+    let mut total_chars = 0_usize;
+    let dominant_size_min = dominant_em - 0.25;
+    let dominant_size_max = dominant_em + 0.25;
+    for s in spans {
+        if s.font_name == body_font
+            && s.font_size >= dominant_size_min
+            && s.font_size <= dominant_size_max
+            && s.bbox.width > 0.0
+        {
+            let chars = s.text.chars().count();
+            if chars > 0 {
+                total_width += s.bbox.width as f64;
+                total_chars += chars;
+            }
+        }
+    }
+    if total_chars > 0 {
+        (total_width / total_chars as f64) as f32
+    } else {
+        dominant_em * 0.5
     }
 }
 

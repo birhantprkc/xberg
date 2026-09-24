@@ -139,62 +139,17 @@ impl<'doc> TextExtractor<'doc> {
         by_order.sort_by(|&a, &b| crate::utils::safe_float_cmp(snapshot[a].1, snapshot[b].1));
         let ys_sorted: Vec<f32> = by_order.iter().map(|&idx| snapshot[idx].1).collect();
 
+        let search = SnapBaseSearch {
+            snapshot: &snapshot,
+            by_order: &by_order,
+            ys_sorted: &ys_sorted,
+            max_half_em,
+        };
         for i in 0..n {
-            let (sx, sy, _sw, sfs) = snapshot[i];
-            if sfs <= 0.0 {
+            if snapshot[i].3 <= 0.0 {
                 continue;
             }
-            // Find the closest base candidate (in Y) that satisfies
-            // the super/subscript geometry. Pick the smallest |y_offset|
-            // tie-breaker so a candidate sandwiched between two body
-            // lines snaps onto the nearer one. ~keep
-            let mut best_base_y: Option<f32> = None;
-            let mut best_abs_offset = f32::MAX;
-            // Candidates have `by ∈ [sy - max_half_em, sy]`; restrict the scan
-            // to that contiguous slice of the Y-sorted index. ~keep
-            let lo = ys_sorted.partition_point(|&y| y < sy - max_half_em);
-            let hi = ys_sorted.partition_point(|&y| y <= sy);
-            for &j in &by_order[lo..hi] {
-                if i == j {
-                    continue;
-                }
-                let (bx, by, bw, bfs) = snapshot[j];
-                if bfs <= sfs * 1.15 {
-                    continue;
-                }
-                let y_offset = sy - by;
-                let half_em = bfs * 0.5;
-                if y_offset.abs() > half_em {
-                    continue;
-                }
-                // Skip subscripts (lowered glyphs). The document-level
-                // pass `apply_super_sub_script_substitutions` needs to
-                // see them at their original lowered baseline so it can
-                // substitute ASCII digits with U+2080..U+2089 (e.g.
-                // H2O -> H\u{2082}O). Snapping them onto the base
-                // baseline would defeat that substitution. ~keep
-                if y_offset < 0.0 {
-                    continue;
-                }
-                // X adjacency: the candidate's left edge must sit
-                // near the base's right edge — within one base
-                // font_size to the right and a small slack to the
-                // left for kerning. Combining diacritics are
-                // excluded by the size-ratio gate above (they
-                // typically share font_size with their base
-                // letter, failing `bfs > sfs * 1.15`). ~keep
-                let base_right = bx + bw;
-                let dx = sx - base_right;
-                if dx < -bfs * 0.25 || dx > bfs {
-                    continue;
-                }
-                let abs_off = y_offset.abs();
-                if abs_off < best_abs_offset {
-                    best_abs_offset = abs_off;
-                    best_base_y = Some(by);
-                }
-            }
-            if let Some(by) = best_base_y {
+            if let Some(by) = search.base_y_for(i) {
                 self.spans[i].bbox.y = by;
             }
         }
@@ -757,5 +712,73 @@ impl<'doc> TextExtractor<'doc> {
             }
         }
         None
+    }
+}
+
+/// Y-sorted view of the span geometry `snap_superscript_baselines` searches.
+///
+/// `snapshot` holds `(x, y, width, font_size)` per span in span order;
+/// `by_order` is the span indices sorted by Y and `ys_sorted` the matching Y
+/// values, so a candidate's admissible base window is a contiguous slice.
+struct SnapBaseSearch<'a> {
+    snapshot: &'a [(f32, f32, f32, f32)],
+    by_order: &'a [usize],
+    ys_sorted: &'a [f32],
+    max_half_em: f32,
+}
+
+impl SnapBaseSearch<'_> {
+    /// Closest base candidate (in Y) that satisfies the super/subscript
+    /// geometry for span `i`. Ties break on the smallest `|y_offset|` so a
+    /// candidate sandwiched between two body lines snaps onto the nearer one.
+    fn base_y_for(&self, i: usize) -> Option<f32> {
+        let (sx, sy, _sw, sfs) = self.snapshot[i];
+        let mut best_base_y: Option<f32> = None;
+        let mut best_abs_offset = f32::MAX;
+        // Candidates have `by ∈ [sy - max_half_em, sy]`; restrict the scan
+        // to that contiguous slice of the Y-sorted index. ~keep
+        let lo = self.ys_sorted.partition_point(|&y| y < sy - self.max_half_em);
+        let hi = self.ys_sorted.partition_point(|&y| y <= sy);
+        for &j in &self.by_order[lo..hi] {
+            if i == j {
+                continue;
+            }
+            let (bx, by, bw, bfs) = self.snapshot[j];
+            if bfs <= sfs * 1.15 {
+                continue;
+            }
+            let y_offset = sy - by;
+            let half_em = bfs * 0.5;
+            if y_offset.abs() > half_em {
+                continue;
+            }
+            // Skip subscripts (lowered glyphs). The document-level
+            // pass `apply_super_sub_script_substitutions` needs to
+            // see them at their original lowered baseline so it can
+            // substitute ASCII digits with U+2080..U+2089 (e.g.
+            // H2O -> H\u{2082}O). Snapping them onto the base
+            // baseline would defeat that substitution. ~keep
+            if y_offset < 0.0 {
+                continue;
+            }
+            // X adjacency: the candidate's left edge must sit
+            // near the base's right edge — within one base
+            // font_size to the right and a small slack to the
+            // left for kerning. Combining diacritics are
+            // excluded by the size-ratio gate above (they
+            // typically share font_size with their base
+            // letter, failing `bfs > sfs * 1.15`). ~keep
+            let base_right = bx + bw;
+            let dx = sx - base_right;
+            if dx < -bfs * 0.25 || dx > bfs {
+                continue;
+            }
+            let abs_off = y_offset.abs();
+            if abs_off < best_abs_offset {
+                best_abs_offset = abs_off;
+                best_base_y = Some(by);
+            }
+        }
+        best_base_y
     }
 }

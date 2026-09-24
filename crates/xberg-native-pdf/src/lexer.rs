@@ -230,6 +230,28 @@ fn parse_number(input: &[u8]) -> IResult<&[u8], Token<'_>> {
 ///
 /// Note: We return the raw bytes including escape sequences.
 /// Decoding happens at the parser level.
+/// Position just past the backslash escape that starts at `pos`.
+///
+/// ISO 32000-1 §7.3.4.2: a backslash introduces either up to three octal
+/// digits or one escaped byte. A backslash at end-of-input consumes nothing
+/// further. Scanning only — decoding happens at the parser level.
+fn skip_escape_sequence(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos + 1;
+    if pos >= bytes.len() {
+        return pos;
+    }
+    if !bytes[pos].is_ascii_digit() {
+        return pos + 1;
+    }
+    pos += 1;
+    for _ in 0..2 {
+        if pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+    }
+    pos
+}
+
 fn parse_literal_string(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     let (mut remaining, _) = char('(')(input)?;
     let mut depth = 1;
@@ -237,22 +259,7 @@ fn parse_literal_string(input: &[u8]) -> IResult<&[u8], Token<'_>> {
 
     while depth > 0 && pos < remaining.len() {
         match remaining[pos] {
-            b'\\' => {
-                pos += 1;
-                if pos < remaining.len() {
-                    if remaining[pos].is_ascii_digit() {
-                        pos += 1;
-                        if pos < remaining.len() && remaining[pos].is_ascii_digit() {
-                            pos += 1;
-                        }
-                        if pos < remaining.len() && remaining[pos].is_ascii_digit() {
-                            pos += 1;
-                        }
-                    } else {
-                        pos += 1;
-                    }
-                }
-            }
+            b'\\' => pos = skip_escape_sequence(remaining, pos),
             b'(' => {
                 depth += 1;
                 pos += 1;

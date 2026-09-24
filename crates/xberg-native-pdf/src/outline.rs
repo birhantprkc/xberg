@@ -348,23 +348,36 @@ fn walk_name_tree(
             let Some(kid_node) = deref_obj(kid, resolve) else {
                 continue;
             };
-            let in_range = match kid_node.as_dict().and_then(|d| d.get("Limits")) {
-                Some(lim) => match deref_obj(lim, resolve).as_ref().and_then(Object::as_array) {
-                    Some(l) if l.len() == 2 => match (l[0].as_string(), l[1].as_string()) {
-                        (Some(lo), Some(hi)) => lo <= target && target <= hi,
-                        // Malformed Limits → search the kid anyway (robust). ~keep
-                        _ => true,
-                    },
-                    _ => true,
-                },
-                None => true,
-            };
+            let in_range = kid_limits_admit(&kid_node, target, resolve);
             if in_range && let Some(found) = walk_name_tree(&kid_node, target, resolve, depth + 1) {
                 return Some(found);
             }
         }
     }
     None
+}
+
+/// Whether `target` can lie under this name-tree kid, per its `/Limits`
+/// entry. A missing, unresolvable or malformed `/Limits` admits the kid, so
+/// the search stays robust against damaged trees. ~keep
+fn kid_limits_admit(
+    kid_node: &Object,
+    target: &[u8],
+    resolve: &dyn Fn(crate::object::ObjectRef) -> Option<Object>,
+) -> bool {
+    let Some(lim) = kid_node.as_dict().and_then(|d| d.get("Limits")) else {
+        return true;
+    };
+    let Some(limits) = deref_obj(lim, resolve) else {
+        return true;
+    };
+    match limits.as_array() {
+        Some(l) if l.len() == 2 => match (l[0].as_string(), l[1].as_string()) {
+            (Some(lo), Some(hi)) => lo <= target && target <= hi,
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// Resolve `target` to its destination object via the catalog

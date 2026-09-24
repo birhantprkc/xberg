@@ -152,8 +152,9 @@ impl RerankerEngine {
         Ok(all_scores)
     }
 
-    /// Score a single batch of `(query, document)` pairs.
-    fn rerank_batch(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, RerankError> {
+    /// Tokenize one batch, wrapping each document in the Qwen3 chat template when
+    /// the generative head is selected and encoding `(query, document)` pairs otherwise.
+    fn encode_documents(&self, query: &str, documents: &[&str]) -> Result<Vec<tokenizers::Encoding>, RerankError> {
         let owned_prompts: Vec<String>;
         let encodings = if self.head == RerankerHead::Qwen3Generative {
             owned_prompts = documents
@@ -181,6 +182,50 @@ impl RerankerEngine {
                 .encode_batch(pairs, true)
                 .map_err(|e| RerankError::Tokenizer(e.to_string()))?
         };
+
+        Ok(encodings)
+    }
+
+    /// Turn the raw ONNX output tensor into one relevance score per document.
+    fn decode_scores(
+        &self,
+        tensor: &ArrayView<f32, Dim<IxDynImpl>>,
+        last_token_indices: &[usize],
+    ) -> Result<Vec<f32>, RerankError> {
+        let scores = match self.head {
+            RerankerHead::CrossEncoder => match tensor.dim().ndim() {
+                1 => tensor.slice(s![..]).iter().copied().collect(),
+                2 => tensor.slice(s![.., 0]).iter().copied().collect(),
+                n => return Err(RerankError::Shape(format!("Expected 1D or 2D output tensor, got {n}D"))),
+            },
+            RerankerHead::Qwen3Generative => {
+                let true_id = self
+                    .true_token_id
+                    .ok_or_else(|| RerankError::Shape("Qwen3 head requires a resolved true_token_id".to_string()))?;
+                let false_id = self
+                    .false_token_id
+                    .ok_or_else(|| RerankError::Shape("Qwen3 head requires a resolved false_token_id".to_string()))?;
+
+                if tensor.dim().ndim() != 3 {
+                    return Err(RerankError::Shape(format!(
+                        "Qwen3 generative head expects a 3D [batch, seq, vocab] output tensor, got {}D",
+                        tensor.dim().ndim()
+                    )));
+                }
+                let logits: ArrayView3<f32> = tensor
+                    .view()
+                    .into_dimensionality::<ndarray::Ix3>()
+                    .map_err(|e| RerankError::Shape(format!("Failed to reshape Qwen3 output to 3D: {e}")))?;
+                qwen3_scores(&logits, true_id, false_id, last_token_indices)?
+            }
+        };
+
+        Ok(scores)
+    }
+
+    /// Score a single batch of `(query, document)` pairs.
+    fn rerank_batch(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>, RerankError> {
+        let encodings = self.encode_documents(query, documents)?;
 
         let encoding_length = encodings
             .first()
@@ -240,35 +285,7 @@ impl RerankerEngine {
         let (_, output_value) = outputs.iter().next().ok_or(RerankError::NoOutput)?;
         let tensor: ArrayView<f32, Dim<IxDynImpl>> = output_value.try_extract_array().map_err(RerankError::Ort)?;
 
-        let scores = match self.head {
-            RerankerHead::CrossEncoder => match tensor.dim().ndim() {
-                1 => tensor.slice(s![..]).iter().copied().collect(),
-                2 => tensor.slice(s![.., 0]).iter().copied().collect(),
-                n => return Err(RerankError::Shape(format!("Expected 1D or 2D output tensor, got {n}D"))),
-            },
-            RerankerHead::Qwen3Generative => {
-                let true_id = self
-                    .true_token_id
-                    .ok_or_else(|| RerankError::Shape("Qwen3 head requires a resolved true_token_id".to_string()))?;
-                let false_id = self
-                    .false_token_id
-                    .ok_or_else(|| RerankError::Shape("Qwen3 head requires a resolved false_token_id".to_string()))?;
-
-                if tensor.dim().ndim() != 3 {
-                    return Err(RerankError::Shape(format!(
-                        "Qwen3 generative head expects a 3D [batch, seq, vocab] output tensor, got {}D",
-                        tensor.dim().ndim()
-                    )));
-                }
-                let logits: ArrayView3<f32> = tensor
-                    .view()
-                    .into_dimensionality::<ndarray::Ix3>()
-                    .map_err(|e| RerankError::Shape(format!("Failed to reshape Qwen3 output to 3D: {e}")))?;
-                qwen3_scores(&logits, true_id, false_id, &last_token_indices)?
-            }
-        };
-
-        Ok(scores)
+        self.decode_scores(&tensor, &last_token_indices)
     }
 }
 

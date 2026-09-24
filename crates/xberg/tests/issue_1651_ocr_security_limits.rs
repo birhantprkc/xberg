@@ -8,11 +8,12 @@
 //!
 //! The limit is exercised in the *refusing* direction: a limit low enough to reject the
 //! decode is observable, whereas a raised limit is indistinguishable from the default that
-//! already permits the image. `max_content_size` is compared against both the pixel count
-//! and the live decoded byte count (`extraction/image_decode.rs::validate`), so a 64x64
-//! image (4096 pixels, 12288 decoded RGB bytes) is rejected at 5000 while its ~200 raw PNG
-//! bytes still clear every byte-size gate upstream -- the limit under test is the only
-//! thing that can fail these cases. ~keep
+//! already permits the image. `max_content_size` is compared against the live decoded byte
+//! count (`extraction/image_decode.rs::validate`), so a 64x64 image (12288 decoded RGB
+//! bytes) is rejected at 5000 while its ~200 raw PNG bytes still clear every byte-size gate
+//! upstream -- the limit under test is the only thing that can fail these cases. The 4096
+//! pixel count is deliberately *below* 5000: GH#1761 removed a pixel-count comparison
+//! against this byte budget, and these cases pass on the byte count alone either way. ~keep
 
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)] // ~keep: test/bench binaries print by design; org logging policy exempts tests
 #![cfg(feature = "ocr")]

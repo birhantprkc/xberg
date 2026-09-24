@@ -12,16 +12,21 @@
 //! [`ExtractedDocument::llm_usage`] so token / cost accounting carries over
 //! into downstream telemetry.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::task::JoinSet;
 
 use crate::RegionKind;
 use crate::Result;
-use crate::core::config::ExtractionConfig;
+use crate::core::config::{CaptioningConfig, ExtractionConfig};
 use crate::llm::region_extractor::extract_region_with_vlm_usage;
 use crate::plugins::{Plugin, PostProcessor, ProcessingStage, register_post_processor};
 use crate::types::{ExtractedDocument, ExtractedImage};
+
+type CaptionOutcome = crate::Result<(String, Option<crate::types::LlmUsage>)>;
+type PendingCaptionTask = (usize, bytes::Bytes, &'static str);
 
 /// Post-processor that captions every extracted image via a VLM.
 #[cfg_attr(alef, alef(skip))]
@@ -69,114 +74,7 @@ impl PostProcessor for CaptioningProcessor {
             return Ok(());
         }
 
-        tracing::info!(
-            target: "xberg::captioning",
-            images = images.len(),
-            model = %caption_config.llm.model,
-            min_image_area = caption_config.min_image_area,
-            "running per-image VLM captioning"
-        );
-
-        let min_area = u64::from(caption_config.min_image_area);
-        let llm = Arc::new(caption_config.llm.clone());
-        let prompt = caption_config.prompt.clone();
-
-        use std::collections::VecDeque;
-        use tokio::task::JoinSet;
-
-        // Bound VLM captioning concurrency by the per-LLM request limit when set,
-        // falling back to the configured thread budget for backward compatibility.
-        // Mirrors the image-OCR path's replenished task set (#1378).
-        let max_tasks =
-            crate::core::config::concurrency::resolve_llm_concurrency(&caption_config.llm, config.concurrency.as_ref());
-
-        type CaptionOutcome = crate::Result<(String, Option<crate::types::LlmUsage>)>;
-        type PendingCaptionTask = (usize, bytes::Bytes, &'static str);
-        let mut join_set: JoinSet<(usize, CaptionOutcome)> = JoinSet::new();
-        let mut pending: VecDeque<PendingCaptionTask> = VecDeque::with_capacity(images.len());
-
-        for (idx, image) in images.iter().enumerate() {
-            if !image_is_caption_candidate(image, min_area) {
-                continue;
-            }
-            pending.push_back((idx, image.data.clone(), mime_for_format(image.format.as_ref())));
-        }
-
-        let spawn_task = |join_set: &mut JoinSet<(usize, CaptionOutcome)>,
-                          llm: Arc<crate::core::config::LlmConfig>,
-                          prompt: Option<String>,
-                          (idx, data, mime): PendingCaptionTask| {
-            join_set.spawn(async move {
-                let outcome =
-                    extract_region_with_vlm_usage(data.as_ref(), mime, RegionKind::Caption, &llm, prompt.as_deref())
-                        .await;
-                (idx, outcome)
-            });
-        };
-
-        while join_set.len() < max_tasks {
-            let Some(task) = pending.pop_front() else {
-                break;
-            };
-            spawn_task(&mut join_set, Arc::clone(&llm), prompt.clone(), task);
-        }
-
-        let mut captured_usage: Vec<crate::types::LlmUsage> = Vec::new();
-
-        while let Some(join_result) = join_set.join_next().await {
-            let (idx, outcome) = match join_result {
-                Ok(value) => value,
-                Err(join_error) => {
-                    // A captioning task panicked. Record it and keep draining so the other
-                    // images' captions — and the image vec itself, taken out above — are not
-                    // lost by an early return before `result.images` is restored below.
-                    result.processing_warnings.push(crate::types::ProcessingWarning {
-                        source: std::borrow::Cow::Borrowed("captioning"),
-                        message: std::borrow::Cow::Owned(format!("captioning task panicked: {join_error}")),
-                    });
-                    continue;
-                }
-            };
-
-            match outcome {
-                Ok((text, usage)) => {
-                    let trimmed = text.trim().to_string();
-                    if !trimmed.is_empty() {
-                        // Renderers emit `description` at the image placeholder but never
-                        // read `caption`, so a caption produced here would otherwise never
-                        // reach the output text. Mirror it into `description` when that is
-                        // unset so the VLM caption is actually rendered at the image (#1340).
-                        if images[idx].description.is_none() {
-                            images[idx].description = Some(trimmed.clone());
-                        }
-                        images[idx].caption = Some(trimmed);
-                    }
-                    if let Some(mut usage) = usage {
-                        if usage.source.is_empty() || usage.source == "vlm_ocr" {
-                            usage.source = "captioning".to_string();
-                        }
-                        captured_usage.push(usage);
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "xberg::captioning",
-                        index = images[idx].image_index,
-                        format = %images[idx].format,
-                        error = %error,
-                        "VLM caption call failed; image left without caption"
-                    );
-                    result.processing_warnings.push(crate::types::ProcessingWarning {
-                        source: std::borrow::Cow::Borrowed("captioning"),
-                        message: std::borrow::Cow::Owned(format!("Image {idx} captioning failed: {error}")),
-                    });
-                }
-            }
-
-            if let Some(task) = pending.pop_front() {
-                spawn_task(&mut join_set, Arc::clone(&llm), prompt.clone(), task);
-            }
-        }
+        let captured_usage = caption_images_with_vlm(result, &mut images, caption_config, config).await;
 
         result.images = Some(images);
 
@@ -200,6 +98,139 @@ impl PostProcessor for CaptioningProcessor {
     fn priority(&self) -> i32 {
         50
     }
+}
+
+/// Spawn one VLM caption call for a single pending image onto `join_set`.
+fn spawn_caption_task(
+    join_set: &mut JoinSet<(usize, CaptionOutcome)>,
+    llm: Arc<crate::core::config::LlmConfig>,
+    prompt: Option<String>,
+    (idx, data, mime): PendingCaptionTask,
+) {
+    join_set.spawn(async move {
+        let outcome =
+            extract_region_with_vlm_usage(data.as_ref(), mime, RegionKind::Caption, &llm, prompt.as_deref()).await;
+        (idx, outcome)
+    });
+}
+
+/// Record one finished caption call against `images` and `result`.
+///
+/// `captured_usage` collects the per-call token accounting for the caller to merge
+/// into [`ExtractedDocument::llm_usage`] once the whole batch has drained.
+fn apply_caption_outcome(
+    result: &mut ExtractedDocument,
+    images: &mut [ExtractedImage],
+    captured_usage: &mut Vec<crate::types::LlmUsage>,
+    idx: usize,
+    outcome: CaptionOutcome,
+) {
+    match outcome {
+        Ok((text, usage)) => {
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                // Renderers emit `description` at the image placeholder but never
+                // read `caption`, so a caption produced here would otherwise never
+                // reach the output text. Mirror it into `description` when that is
+                // unset so the VLM caption is actually rendered at the image (#1340).
+                if images[idx].description.is_none() {
+                    images[idx].description = Some(trimmed.clone());
+                }
+                images[idx].caption = Some(trimmed);
+            }
+            if let Some(mut usage) = usage {
+                if usage.source.is_empty() || usage.source == "vlm_ocr" {
+                    usage.source = "captioning".to_string();
+                }
+                captured_usage.push(usage);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "xberg::captioning",
+                index = images[idx].image_index,
+                format = %images[idx].format,
+                error = %error,
+                "VLM caption call failed; image left without caption"
+            );
+            result.processing_warnings.push(crate::types::ProcessingWarning {
+                source: std::borrow::Cow::Borrowed("captioning"),
+                message: std::borrow::Cow::Owned(format!("Image {idx} captioning failed: {error}")),
+            });
+        }
+    }
+}
+
+/// Caption every eligible image in `images`, returning the collected VLM usage.
+///
+/// `images` is the vec taken out of `result` by the caller, so per-image warnings can
+/// be recorded on `result` while the captions are written back without a borrow conflict.
+async fn caption_images_with_vlm(
+    result: &mut ExtractedDocument,
+    images: &mut [ExtractedImage],
+    caption_config: &CaptioningConfig,
+    config: &ExtractionConfig,
+) -> Vec<crate::types::LlmUsage> {
+    tracing::info!(
+        target: "xberg::captioning",
+        images = images.len(),
+        model = %caption_config.llm.model,
+        min_image_area = caption_config.min_image_area,
+        "running per-image VLM captioning"
+    );
+
+    let min_area = u64::from(caption_config.min_image_area);
+    let llm = Arc::new(caption_config.llm.clone());
+    let prompt = caption_config.prompt.clone();
+
+    // Bound VLM captioning concurrency by the per-LLM request limit when set,
+    // falling back to the configured thread budget for backward compatibility.
+    // Mirrors the image-OCR path's replenished task set (#1378).
+    let max_tasks =
+        crate::core::config::concurrency::resolve_llm_concurrency(&caption_config.llm, config.concurrency.as_ref());
+
+    let mut join_set: JoinSet<(usize, CaptionOutcome)> = JoinSet::new();
+    let mut pending: VecDeque<PendingCaptionTask> = VecDeque::with_capacity(images.len());
+
+    for (idx, image) in images.iter().enumerate() {
+        if !image_is_caption_candidate(image, min_area) {
+            continue;
+        }
+        pending.push_back((idx, image.data.clone(), mime_for_format(image.format.as_ref())));
+    }
+
+    while join_set.len() < max_tasks {
+        let Some(task) = pending.pop_front() else {
+            break;
+        };
+        spawn_caption_task(&mut join_set, Arc::clone(&llm), prompt.clone(), task);
+    }
+
+    let mut captured_usage: Vec<crate::types::LlmUsage> = Vec::new();
+
+    while let Some(join_result) = join_set.join_next().await {
+        let (idx, outcome) = match join_result {
+            Ok(value) => value,
+            Err(join_error) => {
+                // A captioning task panicked. Record it and keep draining so the other
+                // images' captions — and the image vec itself, taken out above — are not
+                // lost by an early return before `result.images` is restored below.
+                result.processing_warnings.push(crate::types::ProcessingWarning {
+                    source: std::borrow::Cow::Borrowed("captioning"),
+                    message: std::borrow::Cow::Owned(format!("captioning task panicked: {join_error}")),
+                });
+                continue;
+            }
+        };
+
+        apply_caption_outcome(result, images, &mut captured_usage, idx, outcome);
+
+        if let Some(task) = pending.pop_front() {
+            spawn_caption_task(&mut join_set, Arc::clone(&llm), prompt.clone(), task);
+        }
+    }
+
+    captured_usage
 }
 
 /// Pixel-area gate: skip masks and images smaller than the configured threshold.

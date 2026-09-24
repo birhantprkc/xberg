@@ -399,7 +399,14 @@ impl PdfDocument {
                 ReadingOrderContext as ROContext, ReadingOrderStrategy, XYCutStrategy,
             };
             let strategy = XYCutStrategy::new();
-            let context = ROContext::new().with_page(page_index as u32);
+            // `is_multi_column_page` has already established there IS a
+            // gutter but returns only a bool, so re-measure its X here for
+            // the heading-run pre-pass (GH#1757). ~keep
+            let column_gutter = Self::detect_column_gutter(&spans);
+            let mut context = ROContext::new().with_page(page_index as u32);
+            if let Some(gutter_x) = column_gutter {
+                context = context.with_column_gutter(gutter_x);
+            }
             // Clone needed: apply() takes ownership, and the Err branch
             // falls back to sorting the original vec in place. ~keep
             match strategy.apply(spans.clone(), &context) {

@@ -125,8 +125,54 @@ pub(crate) async fn openweb_external_handler(
 )]
 pub(crate) async fn openweb_docling_handler(
     State(state): State<ApiState>,
-    MultipartApi(mut multipart): MultipartApi,
+    MultipartApi(multipart): MultipartApi,
 ) -> Result<Json<DoclingCompatResponse>, ApiError> {
+    let DoclingFormParts { file_data, config_json } =
+        collect_docling_form_parts(multipart, &state.default_config).await?;
+
+    let (data, mime_type, filename) = file_data.ok_or_else(|| {
+        ApiError::validation(crate::error::XbergError::validation(
+            "No file provided. Upload a file with field name 'files'.",
+        ))
+    })?;
+
+    // Honor the server's user config as the base, then merge the per-request config —
+    // same capability as `/extract`.
+    let mut config = crate::core::config::merge::build_config_from_json(&state.default_config, config_json.as_deref())
+        .map_err(|e| ApiError::validation(crate::error::XbergError::validation(e)))?;
+    if config.output_format == crate::core::config::OutputFormat::Plain {
+        config.output_format = crate::core::config::OutputFormat::Markdown;
+    }
+
+    let (data, mime_type) = resolve_openweb_bytes(data, mime_type, filename, &config).await?;
+    let request = ExtractionRequest::bytes(data, mime_type, config);
+    let mut svc = state
+        .extraction_service
+        .lock()
+        .expect("extraction service lock poisoned")
+        .clone();
+    let result = svc.call(request).await?;
+
+    Ok(Json(DoclingCompatResponse {
+        document: DoclingCompatDocument {
+            md_content: result.content,
+        },
+        status: "success".to_string(),
+    }))
+}
+
+/// The two pieces a Docling-compatible multipart request can carry: the uploaded file
+/// (bytes, MIME type, filename) and the per-request configuration as a JSON string.
+struct DoclingFormParts {
+    file_data: Option<(Vec<u8>, String, Option<String>)>,
+    config_json: Option<String>,
+}
+
+/// Drain the multipart body of a `/v1/convert/file` request into its file and config parts.
+async fn collect_docling_form_parts(
+    mut multipart: axum::extract::Multipart,
+    default_config: &crate::core::config::ExtractionConfig,
+) -> Result<DoclingFormParts, ApiError> {
     let mut file_data: Option<(Vec<u8>, String, Option<String>)> = None;
     let mut config_json: Option<String> = None;
     let mut flat_config = serde_json::Map::new();
@@ -136,7 +182,7 @@ pub(crate) async fn openweb_docling_handler(
     // Matching on them keeps Docling's own knobs (`image_export_mode`,
     // `md_page_break_placeholder`) ignored instead of failing the whole request against
     // `ExtractionConfig`'s `deny_unknown_fields`.
-    let config_keys = match serde_json::to_value(&*state.default_config) {
+    let config_keys = match serde_json::to_value(default_config) {
         Ok(serde_json::Value::Object(keys)) => keys,
         _ => serde_json::Map::new(),
     };
@@ -186,35 +232,7 @@ pub(crate) async fn openweb_docling_handler(
         config_json = Some(serde_json::Value::Object(flat_config).to_string());
     }
 
-    let (data, mime_type, filename) = file_data.ok_or_else(|| {
-        ApiError::validation(crate::error::XbergError::validation(
-            "No file provided. Upload a file with field name 'files'.",
-        ))
-    })?;
-
-    // Honor the server's user config as the base, then merge the per-request config —
-    // same capability as `/extract`.
-    let mut config = crate::core::config::merge::build_config_from_json(&state.default_config, config_json.as_deref())
-        .map_err(|e| ApiError::validation(crate::error::XbergError::validation(e)))?;
-    if config.output_format == crate::core::config::OutputFormat::Plain {
-        config.output_format = crate::core::config::OutputFormat::Markdown;
-    }
-
-    let (data, mime_type) = resolve_openweb_bytes(data, mime_type, filename, &config).await?;
-    let request = ExtractionRequest::bytes(data, mime_type, config);
-    let mut svc = state
-        .extraction_service
-        .lock()
-        .expect("extraction service lock poisoned")
-        .clone();
-    let result = svc.call(request).await?;
-
-    Ok(Json(DoclingCompatResponse {
-        document: DoclingCompatDocument {
-            md_content: result.content,
-        },
-        status: "success".to_string(),
-    }))
+    Ok(DoclingFormParts { file_data, config_json })
 }
 
 /// Convert one multipart form value into JSON for the config merge.

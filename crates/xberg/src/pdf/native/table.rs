@@ -1238,6 +1238,29 @@ fn balanced_region_sides(
     left_width >= minimum && right_width >= minimum
 }
 
+/// Multiplier on the page's median word height above which the vertical gap
+/// between two consecutive row centres starts a new region.
+const ROW_GAP_SPLIT_HEIGHT_FACTOR: f32 = 1.8;
+
+/// Slack added to the row-gap split threshold to absorb the rounding of
+/// `HocrWord::top` (xberg-io/xberg#1760). `segments_to_words` rounds each
+/// segment's image-space top to a whole unit, so a regular body pitch such as
+/// 10.45 is observed as an alternating 10/11 while the threshold for a median
+/// word height of 6 is 10.8: every 11 cuts and every 10 does not, putting the
+/// region boundary wherever the rounding happens to land rather than where the
+/// page's layout changes. Both endpoints carry up to half a unit of rounding
+/// error, so an observed gap can overstate the real one by up to a whole unit;
+/// requiring the gap's lower bound to clear the threshold keeps a regular pitch
+/// in one region, where the post-processing prose tests can judge it. ~keep
+const ROW_CENTER_ROUNDING_SLACK: f32 = 1.0;
+
+/// Vertical centre of a word, carried as `f32` so the half unit that
+/// `HocrWord`'s integer `height / 2` truncates does not shift a row's centre
+/// relative to rows of a different height (xberg-io/xberg#1760).
+fn row_center(word: &crate::pdf::table_reconstruct::HocrWord) -> f32 {
+    word.top as f32 + word.height as f32 / 2.0
+}
+
 /// Cluster words on a single page into vertically-contiguous regions.
 ///
 /// Splits the page on row gaps that are abnormally large compared to the
@@ -1254,22 +1277,22 @@ fn cluster_words_into_vertical_regions(
     heights.sort_unstable();
     let median_height = heights[heights.len() / 2].max(1);
     let row_tolerance = (median_height / 2).max(3);
-    let row_gap_split = (median_height as f32 * 1.8) as u32;
+    let row_tolerance_f = row_tolerance as f32;
+    let row_gap_split = median_height as f32 * ROW_GAP_SPLIT_HEIGHT_FACTOR + ROW_CENTER_ROUNDING_SLACK;
 
     let mut sorted = words.to_vec();
-    sorted.sort_by_key(|w| w.top + w.height / 2);
+    sorted.sort_by(|left, right| row_center(left).total_cmp(&row_center(right)));
 
     let mut regions: Vec<Vec<crate::pdf::table_reconstruct::HocrWord>> = Vec::new();
     let mut current: Vec<crate::pdf::table_reconstruct::HocrWord> = Vec::new();
-    let mut last_row_yc: Option<u32> = None;
+    let mut last_row_yc: Option<f32> = None;
 
     let mut idx = 0;
     while idx < sorted.len() {
-        let row_yc = sorted[idx].top + sorted[idx].height / 2;
+        let row_yc = row_center(&sorted[idx]);
         let mut end = idx + 1;
         while end < sorted.len() {
-            let yc = sorted[end].top + sorted[end].height / 2;
-            if yc.abs_diff(row_yc) <= row_tolerance {
+            if (row_center(&sorted[end]) - row_yc).abs() <= row_tolerance_f {
                 end += 1;
             } else {
                 break;
@@ -1277,7 +1300,6 @@ fn cluster_words_into_vertical_regions(
         }
 
         if let Some(prev_yc) = last_row_yc
-            && row_yc > prev_yc
             && row_yc - prev_yc > row_gap_split
             && !current.is_empty()
         {
@@ -1297,9 +1319,9 @@ fn cluster_words_into_vertical_regions(
         if r.len() < 4 {
             return false;
         }
-        let mut row_ycs: Vec<u32> = r.iter().map(|w| w.top + w.height / 2).collect();
-        row_ycs.sort_unstable();
-        row_ycs.dedup_by(|a, b| a.abs_diff(*b) <= row_tolerance);
+        let mut row_ycs: Vec<f32> = r.iter().map(row_center).collect();
+        row_ycs.sort_by(|left, right| left.total_cmp(right));
+        row_ycs.dedup_by(|a, b| (*a - *b).abs() <= row_tolerance_f);
         if row_ycs.len() < 3 {
             return false;
         }
@@ -4064,6 +4086,400 @@ mod tests {
             warning.message.as_ref(),
             "bordered table extraction failed for page 7: Invalid PDF: malformed table grid; \
              bordered tables on this page were skipped"
+        );
+    }
+
+    /// Page height of the xberg-io/xberg#1760 reproducer (595.3 x 793.7).
+    const GH1760_PAGE_HEIGHT: f32 = 793.7;
+    /// Word height the reproducer's 8 pt body text produces. Its lines sit 10.45 pt
+    /// apart, which `segments_to_words` rounds to alternating 10/11 unit steps.
+    const GH1760_BODY_HEIGHT: u32 = 8;
+    /// Word height the 6.4 pt reference list produces. The list is the bulk of the
+    /// page's words, so it is what sets the median height the split threshold scales.
+    const GH1760_REFERENCE_HEIGHT: u32 = 6;
+
+    /// One measured line of the reproducer: its text, its line box's left and right
+    /// edges, the top of its row, and its word height — all in the image coordinates
+    /// `segments_to_words` emits, where `top` counts down from the page's top edge.
+    struct Gh1760Line {
+        text: &'static str,
+        left: u32,
+        right: u32,
+        top: u32,
+        height: u32,
+    }
+
+    /// Lay a line's words out across its measured line box the way
+    /// `split_segment_to_words_lifted` does: each word's box is interpolated from its
+    /// byte offset within the line. `jitter` widens every word by one unit, standing in
+    /// for the issue's `whole-lines` variant — the same line drawn as one `Tj` rather
+    /// than one `Tm` + `TJ` per word, which reaches this code only as different word
+    /// boxes. (`regular-heading` is not representable at all: `HocrWord` carries no
+    /// font, so a bold and a regular `References` are the same input here.) ~keep
+    fn gh1760_push_line(words: &mut Vec<crate::pdf::table_reconstruct::HocrWord>, line: &Gh1760Line, jitter: u32) {
+        let total = line.text.len() as f32;
+        let span = (line.right - line.left) as f32;
+        let mut search_start = 0usize;
+        for token in line.text.split_whitespace() {
+            let offset = line.text[search_start..]
+                .find(token)
+                .map(|position| search_start + position)
+                .expect("split_whitespace tokens are substrings of their line");
+            search_start = offset + token.len();
+            let width = ((token.len() as f32 / total) * span).round().max(1.0) as u32;
+            words.push(crate::pdf::table_reconstruct::HocrWord {
+                text: token.to_string(),
+                left: line.left + ((offset as f32 / total) * span).round() as u32,
+                top: line.top,
+                width: width + jitter,
+                height: line.height,
+                confidence: 95.0,
+            });
+        }
+    }
+
+    /// The reproducer's defect page: the left column's paragraph ending beside the
+    /// right column's DOI tail and its `References` heading, above the 6.4 pt
+    /// reference list. Line boxes are the issue's measured ones; row tops are those
+    /// xberg derives from the file (51, 62, 72, 83, 93, 103, 114 — a 10.45 pt pitch
+    /// rounded to whole units).
+    fn gh1760_two_column_band() -> Vec<crate::pdf::table_reconstruct::HocrWord> {
+        gh1760_two_column_band_with(103, 0)
+    }
+
+    fn gh1760_two_column_band_with(references_top: u32, jitter: u32) -> Vec<crate::pdf::table_reconstruct::HocrWord> {
+        let body = GH1760_BODY_HEIGHT;
+        let mut lines = vec![
+            Gh1760Line {
+                text: "may be over or under-estimated. Nevertheless, the information provided",
+                left: 38,
+                right: 289,
+                top: 51,
+                height: body,
+            },
+            Gh1760Line {
+                text: "by the study indicates the need for better quality control of vac-",
+                left: 38,
+                right: 289,
+                top: 62,
+                height: body,
+            },
+            Gh1760Line {
+                text: "cines in Africa and that improved vaccination outcomes require",
+                left: 38,
+                right: 289,
+                top: 72,
+                height: body,
+            },
+            Gh1760Line {
+                text: "more potent vaccines and/or careful attention to revaccination",
+                left: 38,
+                right: 289,
+                top: 83,
+                height: body,
+            },
+            Gh1760Line {
+                text: "schedules.",
+                left: 38,
+                right: 74,
+                top: 93,
+                height: body,
+            },
+            Gh1760Line {
+                text: "6. Recommendations",
+                left: 38,
+                right: 120,
+                top: 114,
+                height: body,
+            },
+            Gh1760Line {
+                text: "Appendix A. Supplementary data",
+                left: 307,
+                right: 435,
+                top: 51,
+                height: body,
+            },
+            Gh1760Line {
+                text: "Supplementary data to this article can be found online at https://doi.",
+                left: 319,
+                right: 558,
+                top: 72,
+                height: body,
+            },
+            Gh1760Line {
+                text: "org/10.1016/j.vaccine.2024.126325.",
+                left: 307,
+                right: 438,
+                top: 83,
+                height: body,
+            },
+            Gh1760Line {
+                text: "References",
+                left: 307,
+                right: 348,
+                top: references_top,
+                height: body,
+            },
+        ];
+        lines.extend(gh1760_reference_list_lines());
+
+        let mut words = Vec::new();
+        for line in &lines {
+            gh1760_push_line(&mut words, line, jitter);
+        }
+        words
+    }
+
+    /// The 6.4 pt reference list below the band, at its own 7.97 pt pitch.
+    fn gh1760_reference_list_lines() -> Vec<Gh1760Line> {
+        let texts = [
+            "[1] Alexandersen S, Zhang Z, Donaldson A, Garland AJ. The pathogenesis of",
+            "foot-and-mouth disease in cattle. J Comp Pathol 2003;129:1-36.",
+            "[2] Knight-Jones TJD, Rushton J. The economic impacts of foot-and-mouth",
+            "disease. Prev Vet Med 2013;112:161-73. PMID: 23916813",
+            "[3] Paton DJ, Sumption KJ, Charleston B. Options for the control of",
+            "foot-and-mouth disease. Philos Trans R Soc 2009;364:2657-67.",
+            "[4] Doel TR. FMD vaccines. Virus Res 2003;91:81-99. PMID: 12527439",
+            "[5] Parida S. Vaccination against foot-and-mouth disease. Expert Rev",
+        ];
+        texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| Gh1760Line {
+                text,
+                left: 310,
+                right: 535,
+                top: 123 + (index as u32 * 8),
+                height: GH1760_REFERENCE_HEIGHT,
+            })
+            .collect()
+    }
+
+    /// Run the page-level heuristic path the way `extract_tables_heuristic` does:
+    /// cluster the page's words into regions, then reconstruct each region.
+    fn gh1760_page_tables(words: &[crate::pdf::table_reconstruct::HocrWord]) -> Vec<Table> {
+        cluster_words_into_vertical_regions(words)
+            .iter()
+            .flat_map(|region| reconstruct_region_tables(region, GH1760_PAGE_HEIGHT, 1, false, 0))
+            .collect()
+    }
+
+    fn gh1760_table_texts(tables: &[Table]) -> Vec<String> {
+        tables.iter().map(|table| table.markdown.clone()).collect()
+    }
+
+    fn gh1760_carries_band_text(table: &Table) -> bool {
+        table
+            .cells
+            .iter()
+            .flatten()
+            .any(|cell| cell.contains("References") || cell.contains("schedules."))
+    }
+
+    /// Just the three rows the defect cuts out, as their own region — the input the
+    /// region reconstructor sees once clustering has already isolated them.
+    fn gh1760_band_region() -> Vec<crate::pdf::table_reconstruct::HocrWord> {
+        let lines = [
+            Gh1760Line {
+                text: "more potent vaccines and/or careful attention to revaccination",
+                left: 38,
+                right: 289,
+                top: 83,
+                height: GH1760_BODY_HEIGHT,
+            },
+            Gh1760Line {
+                text: "org/10.1016/j.vaccine.2024.126325.",
+                left: 307,
+                right: 438,
+                top: 83,
+                height: GH1760_BODY_HEIGHT,
+            },
+            Gh1760Line {
+                text: "schedules.",
+                left: 38,
+                right: 74,
+                top: 93,
+                height: GH1760_BODY_HEIGHT,
+            },
+            Gh1760Line {
+                text: "References",
+                left: 307,
+                right: 348,
+                top: 103,
+                height: GH1760_BODY_HEIGHT,
+            },
+        ];
+        let mut words = Vec::new();
+        for line in &lines {
+            gh1760_push_line(&mut words, line, 0);
+        }
+        words
+    }
+
+    #[test]
+    fn two_column_gutter_band_is_not_a_table_gh1760() {
+        let words = gh1760_two_column_band();
+        let tables = gh1760_page_tables(&words);
+        assert!(
+            !tables.iter().any(gh1760_carries_band_text),
+            "the three lines where the left column's paragraph ends beside the right column's \
+             heading are two text columns side by side, not a table; got {:?}",
+            gh1760_table_texts(&tables)
+        );
+    }
+
+    #[test]
+    fn references_heading_stays_with_the_surrounding_body_region_gh1760() {
+        let words = gh1760_two_column_band();
+        let regions = cluster_words_into_vertical_regions(&words);
+        let region = regions
+            .iter()
+            .find(|region| region.iter().any(|word| word.text == "References"))
+            .expect("some region must carry the `References` heading");
+        let texts: Vec<&str> = region.iter().map(|word| word.text.as_str()).collect();
+        assert!(
+            texts.contains(&"revaccination") && texts.contains(&"Recommendations"),
+            "a regular 10.45 pt body pitch must not cut a region where its rounding to whole \
+             units happens to land; the region holding `References` must also hold the body \
+             line above and the heading below it, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn gutter_band_with_different_word_boxes_is_not_a_table_gh1760() {
+        let words = gh1760_two_column_band_with(103, 1);
+        let tables = gh1760_page_tables(&words);
+        assert!(
+            !tables.iter().any(gh1760_carries_band_text),
+            "how each line's words are boxed must not decide whether the band is a table; \
+             got {:?}",
+            gh1760_table_texts(&tables)
+        );
+    }
+
+    #[test]
+    fn references_one_unit_lower_still_produces_no_table_gh1760() {
+        // The reproducer's control page: `References` a point lower, which stock xberg
+        // already handles correctly. It must stay correct. ~keep
+        let words = gh1760_two_column_band_with(104, 0);
+        let tables = gh1760_page_tables(&words);
+        assert!(
+            !tables.iter().any(gh1760_carries_band_text),
+            "got {:?}",
+            gh1760_table_texts(&tables)
+        );
+    }
+
+    #[test]
+    fn short_unruled_prose_region_is_refused_gh1760() {
+        // Defence in depth for the band itself: handed straight to the region
+        // reconstructor, a three-row unruled region is below the row count at which
+        // `column_text_flow` and `row_continuation_flow` can fire, so nothing in
+        // post-processing can judge it. It must be refused for want of evidence. ~keep
+        let tables = reconstruct_region_tables(&gh1760_band_region(), GH1760_PAGE_HEIGHT, 1, false, 0);
+        assert!(
+            tables.is_empty(),
+            "an unruled three-row region with no numeric cells has nothing saying `table`; \
+             got {:?}",
+            gh1760_table_texts(&tables)
+        );
+    }
+
+    #[test]
+    fn short_numeric_region_is_still_a_table_gh1760() {
+        // Positive control for the evidence gate: a genuine three-row borderless
+        // numeric table must still be accepted with no ruling lines. ~keep
+        let lines = [
+            Gh1760Line {
+                text: "Region",
+                left: 20,
+                right: 60,
+                top: 100,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "Doses",
+                left: 200,
+                right: 235,
+                top: 100,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "Cost",
+                left: 340,
+                right: 370,
+                top: 100,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "North",
+                left: 20,
+                right: 55,
+                top: 118,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "1,240",
+                left: 200,
+                right: 235,
+                top: 118,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "8,415",
+                left: 340,
+                right: 375,
+                top: 118,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "South",
+                left: 20,
+                right: 55,
+                top: 136,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "2,310",
+                left: 200,
+                right: 235,
+                top: 136,
+                height: 10,
+            },
+            Gh1760Line {
+                text: "9,702",
+                left: 340,
+                right: 375,
+                top: 136,
+                height: 10,
+            },
+        ];
+        let mut region = Vec::new();
+        for line in &lines {
+            gh1760_push_line(&mut region, line, 0);
+        }
+
+        let tables = reconstruct_region_tables(&region, GH1760_PAGE_HEIGHT, 1, false, 0);
+        assert_eq!(
+            tables.len(),
+            1,
+            "a three-row grid of numeric cells is positive evidence of a table and must \
+             survive the short-region evidence gate; got {:?}",
+            gh1760_table_texts(&tables)
+        );
+    }
+
+    #[test]
+    fn gutter_band_on_a_ruled_page_is_still_refused_gh1760() {
+        // #1399's ruling-line signal is counted per page, not per region, so a paper
+        // whose real table is ruled would otherwise admit every short band on the same
+        // page. The evidence requirement is therefore tested ahead of it. ~keep
+        let tables = reconstruct_region_tables(&gh1760_band_region(), GH1760_PAGE_HEIGHT, 1, false, 6);
+        assert!(
+            tables.is_empty(),
+            "rules drawn for another table on the page are not evidence about this band; \
+             got {:?}",
+            gh1760_table_texts(&tables)
         );
     }
 }

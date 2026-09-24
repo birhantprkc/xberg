@@ -6723,12 +6723,13 @@ mod tests {
             Object::Array(vec![Object::String(SECRET_OBJECT.as_bytes().to_vec())]),
         )]));
 
-        crate::extractors::warnings::drain_global_warnings();
+        // This test asserts on tracing output only. It used to bracket the run with
+        // drain_global_warnings() as tidy-up, but that sink is process-wide: the drain
+        // emptied it for whichever peer test was mid-assertion on its own warnings. ~keep
         let logs = capture_warnings(|| {
             FontInfo::from_dict(&type3, &doc).expect("minimal Type3 dictionary must parse");
             FontInfo::parse_encoding(&encoding, &doc, None).expect("malformed differences must recover");
         });
-        crate::extractors::warnings::drain_global_warnings();
 
         assert_eq!(logs.len(), 2, "expected exactly two recovery warnings: {logs:#?}");
         assert_eq!(
