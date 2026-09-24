@@ -457,6 +457,34 @@ mod tests {
         );
     }
 
+    /// Positive control for the probe that
+    /// `provenance_is_not_read_a_second_time_for_a_document_with_no_excluded_layers`
+    /// (`pdf/native/text.rs`) relies on. That test asserts the counter is **zero** -- the
+    /// second whole-document read did not happen. A zero it can never leave proves nothing:
+    /// a counter no call site reaches on the asserting thread and a genuinely skipped second
+    /// pass render identically. Making the counter thread-local removed the flake but also
+    /// removed cross-thread visibility, so the wiring needs its own witness. ~keep
+    #[test]
+    #[serial_test::serial]
+    fn the_second_pass_counter_observes_a_call_on_its_own_thread() {
+        let thresholds = crate::core::config::OcrQualityThresholds::default();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/pdf/non_ascii_text.pdf");
+        let doc = PdfDocument::open(&path).expect("corpus document must open");
+
+        FABRICATED_PROVENANCE_SECOND_PASS_CALLS.with(|counter| counter.store(0, std::sync::atomic::Ordering::SeqCst));
+        let _ = fabricated_provenance_page_indices(
+            &doc,
+            thresholds.min_provenance_fallback_ratio,
+            thresholds.min_total_non_whitespace,
+        );
+
+        assert_eq!(
+            FABRICATED_PROVENANCE_SECOND_PASS_CALLS.with(|counter| counter.load(std::sync::atomic::Ordering::SeqCst)),
+            1,
+            "the counter must observe a call made on this thread, or the sibling test's zero is vacuous"
+        );
+    }
+
     /// Scores are sums of `f32` weights, so `0.50 + 0.35 + 0.10` lands a few ULPs
     /// off `0.95`. Compare within tolerance rather than rounding the score.
     #[track_caller]
