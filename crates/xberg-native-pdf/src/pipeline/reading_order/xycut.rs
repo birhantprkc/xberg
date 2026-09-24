@@ -3817,6 +3817,90 @@ mod tests {
         }
     }
 
+    /// The GH#1763 reporter could not supply a reproducing PDF, but did attach the
+    /// horizontal projection their page 8 actually produced under stock v1.2.7. Running
+    /// the real profile is what binds this fix to the reported page rather than to a
+    /// hand-built approximation of it: the synthetic `gh1763_page` fixture exercises the
+    /// same mechanism, but only this asserts the reported page now splits where the
+    /// reporter said it should.
+    ///
+    /// Their stated numbers, all reproduced below: threshold 98.03, valley run
+    /// x 53.6..307.6, buggy midpoint x 180.6, target x 301.6. The valley's empty core is
+    /// 12 pt wide -- UNDER `min_valley_width` (15) -- which is why the width gate must
+    /// keep applying to the run as a whole and not to its core, as the issue warns. ~keep
+    #[test]
+    fn the_reported_gh1763_profile_now_splits_at_its_empty_core() {
+        const PROFILE: &str = include_str!("../../../tests/fixtures/gh1763_horizontal_density_profile.txt");
+        const X_MIN: f32 = 37.587;
+        const VALLEY_THRESHOLD: f32 = 0.3;
+        const MIN_VALLEY_WIDTH: f32 = 15.0;
+
+        let density: Vec<f32> = PROFILE
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.parse().expect("fixture must hold one float per line"))
+            .collect();
+        assert_eq!(density.len(), 523, "fixture must be the reporter's full profile");
+
+        let peak = density.iter().copied().fold(f32::MIN, f32::max);
+        let threshold = VALLEY_THRESHOLD * peak;
+        assert_eq!(
+            (peak * 100.0).round() / 100.0,
+            326.77,
+            "profile peak must match the reporter's"
+        );
+        assert_eq!(
+            (threshold * 100.0).round() / 100.0,
+            98.03,
+            "valley threshold must match the reporter's"
+        );
+
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut index = 0usize;
+        while index < density.len() {
+            if density[index] < threshold {
+                let start = index;
+                while index < density.len() && density[index] < threshold {
+                    index += 1;
+                }
+                if start > 0 && index < density.len() {
+                    runs.push((start, index));
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let (valley_start, valley_end) = runs
+            .into_iter()
+            .max_by_key(|(start, end)| end - start)
+            .expect("the profile must contain an interior valley");
+        assert_eq!(
+            (X_MIN + valley_start as f32, X_MIN + valley_end as f32),
+            (53.587, 307.587),
+            "widest interior valley run must be the one the reporter measured"
+        );
+
+        let run_width = (valley_end - valley_start) as f32;
+        assert!(
+            run_width >= MIN_VALLEY_WIDTH,
+            "the width gate applies to the whole run, which passes it"
+        );
+
+        let buggy = X_MIN + XYCutStrategy::legacy_valley_midpoint(valley_start, valley_end);
+        assert_eq!(buggy, 180.587, "pre-fix split must be the midpoint the reporter saw");
+
+        let fixed = X_MIN + XYCutStrategy::deepest_point_wrapper(&density, valley_start, valley_end);
+        assert_eq!(
+            fixed, 301.587,
+            "fixed split must be the empty core the reporter identified"
+        );
+        assert_eq!(
+            density[(fixed - X_MIN) as usize],
+            0.0,
+            "the fixed split must land on a zero-density bin"
+        );
+    }
+
     #[test]
     fn find_valley_selects_the_deepest_point_not_the_midpoint_gh1763() {
         let strategy = XYCutStrategy::new();
