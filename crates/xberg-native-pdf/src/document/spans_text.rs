@@ -587,6 +587,24 @@ impl PdfDocument {
             }
     }
 
+    /// Keep a small, separate numeric script from changing the value of a
+    /// preceding number in plain text (`comma 3` + footnote `5` is not `35`).
+    /// A text-rise operator can mark the script even without a smaller font.
+    fn needs_numeric_script_boundary(base: &TextSpan, script: &TextSpan) -> bool {
+        if !base.text.chars().next_back().is_some_and(|c| c.is_ascii_digit())
+            || script.text.is_empty()
+            || script.text.chars().count() > 3
+            || !script.text.chars().all(|c| c.is_ascii_digit())
+            || (script.font_size >= base.font_size * 0.8 && script.text_rise.abs() < 0.10)
+        {
+            return false;
+        }
+
+        let gap = script.bbox.x - (base.bbox.x + base.bbox.width);
+        let y_diff = (base.bbox.y - script.bbox.y).abs();
+        gap >= -0.1 * base.font_size && gap <= 0.25 * base.font_size && y_diff <= 0.75 * base.font_size
+    }
+
     /// # Returns
     /// `true` if a space should be inserted between the spans
     pub(super) fn should_insert_space(prev: &TextSpan, current: &TextSpan) -> bool {
@@ -659,6 +677,10 @@ impl PdfDocument {
 
         let prev_end_x = prev.bbox.x + prev.bbox.width;
         let gap = current.bbox.x - prev_end_x;
+
+        if Self::needs_numeric_script_boundary(prev, current) {
+            return true;
+        }
 
         // CJK script ↔ non-CJK boundary: pdftotext (and the GT it produces)
         // inserts a space wherever a CJK *script* glyph (ideograph, kana, or
@@ -1029,6 +1051,9 @@ impl PdfDocument {
                     _ => ends_in_acronym(),
                 };
                 if !is_valid_base {
+                    continue;
+                }
+                if Self::needs_numeric_script_boundary(base, sub) {
                     continue;
                 }
                 let base_right = base.bbox.x + base.bbox.width;

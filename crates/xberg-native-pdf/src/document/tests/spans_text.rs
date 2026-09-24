@@ -142,6 +142,28 @@ fn merge_sub_superscript_keeps_table_number_separate() {
 }
 
 #[test]
+fn merge_sub_superscript_keeps_numeric_base_and_marker_separate() {
+    let mut spans = vec![
+        make_test_span("3", 250.14, 317.57, 6.48, 12.96),
+        make_test_span("5", 256.73, 317.57, 4.26, 8.52),
+    ];
+    PdfDocument::merge_sub_superscript_spans(&mut spans);
+    assert_eq!(spans.len(), 2, "a smaller marker must not turn 3 into 35");
+}
+
+#[test]
+fn small_numeric_span_after_numeric_prose_gets_a_separator() {
+    // Circular 6/2025, p. 5: the smaller footnote marker 5 abuts "comma 3".
+    // Both extracted spans have the same bbox bottom and only a 0.11pt gap.
+    let body = make_test_span("Il successivo comma 3", 121.1, 317.57, 135.52274, 12.96);
+    let marker = make_test_span("5", 256.73, 317.57, 4.26, 8.52);
+    assert!(PdfDocument::should_insert_space(&body, &marker));
+
+    let ordinary_digit = make_test_span("5", 256.73, 317.57, 4.26, 12.96);
+    assert!(!PdfDocument::should_insert_space(&body, &ordinary_digit));
+}
+
+#[test]
 fn test_should_insert_space_same_line_no_gap() {
     let prev = make_test_span("Hello", 0.0, 100.0, 50.0, 12.0);
     let current = make_test_span("World", 51.0, 100.0, 50.0, 12.0);
