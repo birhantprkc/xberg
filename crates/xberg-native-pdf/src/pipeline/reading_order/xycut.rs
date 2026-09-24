@@ -118,7 +118,7 @@ struct HeadingRun {
 /// by half a unit on every odd-width run and so change the common case
 /// this fix is meant to leave alone. `uniform_run_split_is_unchanged`
 /// pins it. ~keep
-fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> f32 {
+fn deepest_valley_point(density: &[f32], start: usize, end: usize, split_is_clear: &dyn Fn(f32) -> bool) -> f32 {
     debug_assert!(start < end && end <= density.len());
     if start >= end || end > density.len() {
         return (start + end) as f32 / 2.0;
@@ -140,10 +140,7 @@ fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> f32 {
         return run_mid;
     }
 
-    let mut best_width = 0usize;
-    let mut best_dist = f32::INFINITY;
-    let mut best_center = run_mid;
-
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
     let mut i = start;
     while i < end {
         if density[i] != min_density {
@@ -154,16 +151,32 @@ fn deepest_valley_point(density: &[f32], start: usize, end: usize) -> f32 {
         while i < end && density[i] == min_density {
             i += 1;
         }
-        let width = i - sub_start;
-        let center = (sub_start + i) as f32 / 2.0;
-        let dist = (center - run_mid).abs();
-        if width > best_width || (width == best_width && dist < best_dist) {
-            best_width = width;
-            best_dist = dist;
-            best_center = center;
+        candidates.push((i - sub_start, (sub_start + i) as f32 / 2.0));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| crate::utils::safe_float_cmp((left.1 - run_mid).abs(), (right.1 - run_mid).abs()))
+    });
+
+    // A zero in this profile does NOT mean no glyphs: `horizontal_projection_indexed`
+    // deliberately omits spans wider than 55% of the region, spans of fewer than two
+    // non-whitespace characters, and the part of every span beyond its estimated text core.
+    // Seeking the deepest point therefore steers the split straight at the regions those
+    // omissions create, which is the opposite of what a midpoint did by accident. Measured
+    // without this check: 22 of 230 corpus documents changed and words came apart at
+    // single-character spans -- "virgin" into "v" + "irgin", "test" into "t" + "est" --
+    // because the split landed between two spans of one word. Candidates are therefore
+    // checked against the real span extents, not the profile, and a run whose candidates all
+    // cut something keeps the midpoint, which is exactly the pre-GH#1763 behaviour. ~keep
+    for (_, center) in candidates {
+        if split_is_clear(center) {
+            return center;
         }
     }
-    best_center
+    run_mid
 }
 
 /// Union of the bboxes of `spans[indices]`. Empty index list yields a
@@ -1641,7 +1654,15 @@ impl XYCutStrategy {
             }
             // Deepest point within the valley run, not its midpoint
             // (GH#1763) — see `deepest_valley_point` for why. ~keep
-            profile.x_min + deepest_valley_point(&profile.density, vs, ve)
+            let x_min = profile.x_min;
+            let split_is_clear = |offset: f32| {
+                let x = x_min + offset;
+                !indices.iter().any(|&i| {
+                    let bbox = &all_spans[i].bbox;
+                    bbox.left() < x && x < bbox.right()
+                })
+            };
+            x_min + deepest_valley_point(&profile.density, vs, ve, &split_is_clear)
         } else {
             self.find_split_between_peaks(&profile)?
         };
@@ -1852,7 +1873,15 @@ impl XYCutStrategy {
 
         // Deepest point within the valley run, not its midpoint (GH#1763,
         // same fix as the horizontal split — see `deepest_valley_point`). ~keep
-        let split_y = profile.y_min + deepest_valley_point(&profile.density, valley_start, valley_end);
+        let y_min = profile.y_min;
+        let split_is_clear = |offset: f32| {
+            let y = y_min + offset;
+            !indices.iter().any(|&i| {
+                let bbox = &all_spans[i].bbox;
+                bbox.top() < y && y < bbox.bottom()
+            })
+        };
+        let split_y = y_min + deepest_valley_point(&profile.density, valley_start, valley_end, &split_is_clear);
 
         // `Rect::top()` returns `self.y`, the SMALLER Y coordinate of the
         // normalized rectangle — the method name follows a screen-coordinate
@@ -1863,8 +1892,11 @@ impl XYCutStrategy {
         // point is already above the split line, i.e. the entire span sits
         // above the cut. Since `split_y` is the midpoint of a horizontal
         // projection valley (an empty band by construction), spans should
-        // not straddle it in practice; any that do (e.g. a tall header
-        // glyph whose ascenders dip into the valley) fall into `below`. ~keep
+        // not straddle it in practice -- and since GH#1763 the chosen point is
+        // additionally checked against the real span extents, because a zero in
+        // the profile does not by itself mean no glyphs are there. Any span that
+        // still straddles (e.g. a tall header glyph whose ascenders dip into the
+        // valley) falls into `below`. ~keep
         let (above, below): (Vec<usize>, Vec<usize>) =
             indices.iter().partition(|&&i| all_spans[i].bbox.top() >= split_y);
 
@@ -2080,7 +2112,19 @@ impl XYCutStrategy {
     /// `#[cfg(test)]` wrappers in this file.
     #[cfg(test)]
     fn deepest_point_wrapper(density: &[f32], start: usize, end: usize) -> f32 {
-        deepest_valley_point(density, start, end)
+        deepest_valley_point(density, start, end, &|_| true)
+    }
+
+    /// As [`Self::deepest_point_wrapper`], but with the span-straddle check the real
+    /// callers supply, so a test can pin that a candidate cutting a span is rejected.
+    #[cfg(test)]
+    fn deepest_point_wrapper_checked(
+        density: &[f32],
+        start: usize,
+        end: usize,
+        split_is_clear: &dyn Fn(f32) -> bool,
+    ) -> f32 {
+        deepest_valley_point(density, start, end, split_is_clear)
     }
 
     /// Old (pre-GH#1763) split-point formula, kept only so the fixed
@@ -3825,6 +3869,64 @@ mod tests {
     /// was -- and it is exactly this case that made the unguarded fix rewrite the reading
     /// order of 23 of 230 corpus documents, 11 of which got worse by dictionary-valid word
     /// count. The split must not move. ~keep
+    /// A zero in the projection does not mean no glyphs sit there:
+    /// `horizontal_projection_indexed` omits spans under two non-whitespace characters,
+    /// spans wider than 55% of the region, and everything past a span's estimated text core.
+    /// Seeking the deepest point walks straight into those blind spots, and the corpus showed
+    /// the result -- words coming apart at single-character spans, "virgin" into "v" +
+    /// "irgin". A candidate that cuts a real span must be rejected in favour of the next, and
+    /// a run whose candidates all cut something must keep the midpoint. ~keep
+    #[test]
+    fn a_candidate_that_would_cut_a_span_is_rejected() {
+        // content | gap A (narrow, clear) | content over the midpoint | gap B (wider, crossed)
+        let mut density = vec![0.0f32; 40];
+        for bin in (0..10).chain(18..23) {
+            density[bin] = 3.0;
+        }
+        let (start, end) = (0usize, 40usize);
+        // The midpoint must sit ON content, or the floor guard returns it before any
+        // candidate is considered and this pins nothing.
+        assert_eq!(density[20], 3.0, "midpoint must be on content for this test to bite");
+
+        // Gap B (23..40, width 17) beats gap A (10..18, width 8) on width, but an invisible
+        // span -- one the projection omitted -- runs straight through gap B's centre.
+        let invisible_span = 28.0f32..35.0f32;
+        let clear = |offset: f32| !(invisible_span.start < offset && offset < invisible_span.end);
+
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper(&density, start, end),
+            31.5,
+            "unchecked, the widest gap wins and the split lands inside the hidden span"
+        );
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper_checked(&density, start, end, &clear),
+            14.0,
+            "checked, the split falls back to the narrower gap that cuts nothing"
+        );
+    }
+
+    /// When every candidate would cut a span, the split must stay exactly where it was
+    /// before GH#1763 -- the midpoint -- rather than picking the least-bad cut. ~keep
+    #[test]
+    fn a_run_whose_candidates_all_cut_something_keeps_the_midpoint() {
+        let mut density = vec![0.0f32; 40];
+        for bin in (0..10).chain(18..23) {
+            density[bin] = 3.0;
+        }
+        let (start, end) = (0usize, 40usize);
+        let midpoint = XYCutStrategy::legacy_valley_midpoint(start, end);
+        assert_eq!(
+            density[20], 3.0,
+            "midpoint must be on content, or the floor guard decides this"
+        );
+
+        assert_eq!(
+            XYCutStrategy::deepest_point_wrapper_checked(&density, start, end, &|_| false),
+            midpoint,
+            "no clear candidate means the pre-GH#1763 midpoint stands"
+        );
+    }
+
     #[test]
     fn a_split_already_falling_through_empty_space_does_not_move() {
         // content | narrow gap (holds the midpoint) | content | WIDER gap, off-centre
