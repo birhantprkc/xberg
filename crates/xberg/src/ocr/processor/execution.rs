@@ -3630,6 +3630,7 @@ mod tests {
             contrast_enhance: false,
             binarization_method: "otsu".to_string(),
             invert_colors: false,
+            normalize_shaded_rows: false,
         }
     }
 

@@ -154,6 +154,12 @@ ffi_extern! {
     /// out of bounds).
     fn pixGetPixel(pix: *mut c_void, x: i32, y: i32, pval: *mut u32) -> i32;
 
+    /// Writes a single pixel value into a Pix.
+    ///
+    /// `val` is the raw pixel value (for 8 bpp images, the grayscale intensity
+    /// 0-255). Returns 0 on success, non-zero on error (e.g. `x`/`y` out of bounds).
+    fn pixSetPixel(pix: *mut c_void, x: i32, y: i32, val: u32) -> i32;
+
     /// Creates a Leptonica BOX with the given coordinates.
     fn boxCreate(x: i32, y: i32, w: i32, h: i32) -> *mut c_void;
 
@@ -269,6 +275,51 @@ impl Pix {
                 let word: u32 = (r << 24) | (g << 16) | (b << 8) | 0xFF;
                 unsafe {
                     *data_ptr.add(row * wpl + col) = word;
+                }
+            }
+        }
+
+        unsafe { pixSetResolution(pix_ptr, 300, 300) };
+
+        Ok(Pix { ptr: pix_ptr })
+    }
+
+    /// Creates an 8 bpp grayscale Leptonica Pix from a byte-per-pixel buffer.
+    ///
+    /// `data` must contain exactly `width * height` bytes, one grayscale sample
+    /// (0-255) per pixel in left-to-right, top-to-bottom order. Writes go through
+    /// `pixSetPixel` one pixel at a time (like [`Pix::grayscale_bytes`]'s reads),
+    /// rather than packing Leptonica's 8 bpp word layout directly, to avoid
+    /// depending on undocumented byte-packing order. The DPI is set to 300 x 300;
+    /// call [`Pix::set_resolution`] afterwards to match the source image.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TesseractError::InvalidImageData` if `data.len()` does not equal
+    /// `width * height`, if either dimension is zero, if Leptonica's `pixCreate`
+    /// returns null, or if any `pixSetPixel` call fails.
+    pub fn from_grayscale_bytes(data: &[u8], width: u32, height: u32) -> Result<Pix> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(TesseractError::InvalidImageData)?;
+
+        if data.len() != expected || width == 0 || height == 0 {
+            return Err(TesseractError::InvalidImageData);
+        }
+
+        let pix_ptr = unsafe { pixCreate(width as i32, height as i32, 8) };
+        if pix_ptr.is_null() {
+            return Err(TesseractError::NullPointerError);
+        }
+
+        for row in 0..(height as i32) {
+            for col in 0..(width as i32) {
+                let value = data[(row as usize) * (width as usize) + col as usize] as u32;
+                let status = unsafe { pixSetPixel(pix_ptr, col, row, value) };
+                if status != 0 {
+                    let mut ptr = pix_ptr;
+                    unsafe { pixDestroy(&mut ptr) };
+                    return Err(TesseractError::InvalidImageData);
                 }
             }
         }
@@ -833,6 +884,38 @@ impl Pix {
     /// (zero-sized image) or if `pixGetPixel` fails.
     pub fn mean_gray_value(&self, sample_stride: i32) -> Result<f64> {
         self.grayscale_stats(255, sample_stride).map(|(mean, _)| mean)
+    }
+
+    /// Reads every pixel of an 8 bpp grayscale Pix into a byte-per-pixel buffer,
+    /// in left-to-right, top-to-bottom order.
+    ///
+    /// Unlike [`Pix::grayscale_stats`], this reads every pixel (no sampling
+    /// stride), because per-region operations such as shaded-row normalization
+    /// need the full-resolution raster, not a sampled estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TesseractError::OcrError` if the image is zero-sized or if
+    /// `pixGetPixel` fails on any pixel.
+    pub fn grayscale_bytes(&self) -> Result<Vec<u8>> {
+        let width = self.width();
+        let height = self.height();
+        if width <= 0 || height <= 0 {
+            return Err(TesseractError::OcrError);
+        }
+
+        let mut out = Vec::with_capacity((width as usize) * (height as usize));
+        for y in 0..height {
+            for x in 0..width {
+                let mut value: u32 = 0;
+                let status = unsafe { pixGetPixel(self.ptr, x, y, &mut value) };
+                if status != 0 {
+                    return Err(TesseractError::OcrError);
+                }
+                out.push(value as u8);
+            }
+        }
+        Ok(out)
     }
 
     /// Returns the raw Leptonica `PIX *` pointer.

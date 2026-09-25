@@ -393,6 +393,15 @@ pub struct OcrTableBoundingBox {
 #[serde(default, deny_unknown_fields)]
 pub struct ImagePreprocessingConfig {
     /// Target DPI for the image (300 is standard, 600 for small text).
+    ///
+    /// For a PDF page, this resamples the already-rendered raster; it does not make the page
+    /// re-render at a higher native resolution. A value above what
+    /// `image::preprocessing::calculate_target_dpi`'s memory/dimension clamp allows is
+    /// silently capped (GH#1786: 400 and 600 both clamped to the same ~372 on a Letter page
+    /// and produced byte-identical output), so upscaling interpolated pixels this way adds no
+    /// detail. To change the actual PDF render resolution, set `images.target_dpi` on
+    /// [`ExtractionConfig`](crate::core::config::ExtractionConfig) instead
+    /// (`image::dpi::effective_pdf_render_dpi`).
     pub target_dpi: i32,
 
     /// Auto-detect and correct image rotation.
@@ -414,6 +423,16 @@ pub struct ImagePreprocessingConfig {
 
     /// Invert colors (white text on black → black on white).
     pub invert_colors: bool,
+
+    /// Normalize shaded table rows (e.g. a subtotal row on a light or dark fill) before
+    /// binarization, so each shaded band is stretched to its own dark-text-on-white
+    /// polarity instead of being lost to a single whole-page threshold (GH#1785).
+    ///
+    /// This is a per-band step, not a replacement for `binarization_method`: no single
+    /// whole-page method recovers every fill color, and the per-band step itself can
+    /// regress a row style it does not fully model (e.g. a mid-grey fill with white
+    /// text), so it defaults to `false` rather than being enabled unconditionally.
+    pub normalize_shaded_rows: bool,
 }
 
 impl Default for ImagePreprocessingConfig {
@@ -426,6 +445,7 @@ impl Default for ImagePreprocessingConfig {
             contrast_enhance: false,
             binarization_method: "otsu".to_string(),
             invert_colors: false,
+            normalize_shaded_rows: false,
         }
     }
 }
@@ -474,6 +494,13 @@ pub struct TesseractConfig {
     /// language PSM 5, layout-region PSM 6, or the sparse-text retry's PSM 3) exactly as
     /// it would with no `TesseractConfig` at all — see issue #1573. Setting any other
     /// field on this struct no longer changes that behaviour.
+    ///
+    /// A rendered PDF page (`force_ocr` / `force_ocr_pages` / scanned-page OCR) does **not**
+    /// currently get a context-appropriate default here: it falls through to the engine's
+    /// generic automatic-layout PSM (3) even though standalone image OCR of the same raster
+    /// would use PSM 11 (GH#1786). Measurements on this repository's own synthetic table
+    /// fixtures gave contradictory results across font/tessdata combinations (see GH#1786's
+    /// resolution notes) — table-heavy pages may benefit from setting `psm: 11` explicitly.
     ///
     /// Common explicit values:
     /// - 3: Fully automatic page segmentation (native engine default)
