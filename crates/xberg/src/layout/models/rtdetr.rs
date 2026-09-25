@@ -18,6 +18,15 @@ const DEFAULT_THRESHOLD: f32 = 0.3;
 /// RT-DETR input resolution.
 pub(crate) const INPUT_SIZE: u32 = 640;
 
+/// The stacked `[N, 3, 640, 640]` pixel tensor and `[N, 2]` `(w, h)` sizes tensor
+/// [`RtDetrModel::build_batch_tensors`] builds for a batch, alongside each image's
+/// original `(width, height)`.
+type BatchTensors = (Array4<f32>, Array2<i64>, Vec<(u32, u32)>);
+
+/// The boxes/scores/labels [`RtDetrModel::parse_batch_outputs`] extracts from the raw ONNX
+/// outputs, alongside the resolved `num_queries`.
+type ParsedBatchOutputs = (Vec<f32>, Vec<f32>, Vec<i64>, usize);
+
 pub(crate) fn effective_acceleration(accel: Option<&AccelerationConfig>) -> Option<AccelerationConfig> {
     // The current RT-DETR export fails under CoreML; keep auto reliable while preserving explicit CoreML.
     #[cfg(target_os = "macos")]
@@ -145,78 +154,18 @@ impl RtDetrModel {
         let onnx_ms = onnx_start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(onnx_ms, "RT-DETR ONNX session.run() complete");
 
-        let mut float_data: Vec<Vec<f32>> = Vec::new();
-        let mut float_shapes: Vec<Vec<usize>> = Vec::new();
-        let mut label_data: Vec<i64> = Vec::new();
-
-        for (_name, value) in outputs {
-            match value {
-                InferenceTensor::I64(array) => {
-                    label_data = array.into_raw_vec_and_offset().0;
-                }
-                InferenceTensor::F32(array) => {
-                    float_shapes.push(array.shape().to_vec());
-                    float_data.push(array.into_raw_vec_and_offset().0);
-                }
-                _ => {}
-            }
-        }
-
-        if label_data.is_empty() && float_data.len() >= 3 {
-            label_data = float_data.last().unwrap().iter().map(|&v| v as i64).collect();
-            float_data.pop();
-            float_shapes.pop();
-        }
-
-        if float_data.len() < 2 {
-            return Err(LayoutError::InvalidOutput(format!(
-                "Expected at least 2 float output tensors, got {}",
-                float_data.len()
-            )));
-        }
-
-        let boxes = &float_data[0];
-        let scores = &float_data[1];
-        let box_shape = &float_shapes[0];
-        let num_detections = if box_shape.len() == 3 {
-            box_shape[1]
-        } else {
-            box_shape[0]
-        };
-
-        if scores.len() < num_detections || label_data.len() < num_detections || boxes.len() < num_detections * 4 {
-            return Err(LayoutError::InvalidOutput(format!(
-                "RT-DETR output shape mismatch: num_detections={num_detections} \
-                 but scores.len()={}, labels.len()={}, boxes.len()={}",
-                scores.len(),
-                label_data.len(),
-                boxes.len()
-            )));
-        }
-
-        let mut detections = Vec::new();
-        for i in 0..num_detections {
-            let score = scores[i];
-            if score < threshold {
-                continue;
-            }
-
-            let label_id = label_data[i];
-            let class = match LayoutClass::from_docling_id(label_id) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let bbox = clamp_output_box(
-                [boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2], boxes[i * 4 + 3]],
-                orig_width,
-                orig_height,
-            );
-
-            detections.push(LayoutDetection::new(class, score, bbox));
-        }
-
-        detections = LayoutDetection::sort_by_confidence_desc(detections);
+        // batch=1: the single-image path shares its output-splitting and shape
+        // validation with the batch path rather than duplicating it.
+        let (boxes, scores, label_data, num_detections) = Self::parse_batch_outputs(outputs, 1)?;
+        let detections = Self::build_single_image_detections(
+            &boxes,
+            &scores,
+            &label_data,
+            num_detections,
+            threshold,
+            (orig_width, orig_height),
+        );
+        let detections = LayoutDetection::sort_by_confidence_desc(detections);
 
         crate::layout::inference_timings::set(preprocess_ms, onnx_ms);
 
@@ -236,33 +185,14 @@ impl RtDetrModel {
         Ok(detections)
     }
 
-    /// Run batched inference over multiple images in a single ONNX call.
-    ///
-    /// Stacks per-image tensors into `[N, 3, 640, 640]` and `[N, 2]` inputs,
-    /// executes a single `session.run()`, then splits outputs by batch index.
-    ///
-    /// Returns one `Vec<LayoutDetection>` per input image, in the same order.
-    pub(crate) fn run_batch_inference(
-        &mut self,
-        images: &[&RgbImage],
-        threshold: f32,
-    ) -> Result<Vec<Vec<LayoutDetection>>, LayoutError> {
-        #[cfg(feature = "otel")]
-        let inference_span = crate::telemetry::spans::model_inference_span("rtdetr-layout");
-        #[cfg(feature = "otel")]
-        let _inference_guard = inference_span.enter();
-        #[cfg(feature = "otel")]
-        let inference_start = Instant::now();
-
-        if images.is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Preprocesses every image in a batch into the stacked `[N, 3, 640, 640]`
+    /// pixel tensor and `[N, 2]` `(w, h)` sizes tensor, alongside each image's
+    /// original `(width, height)`. Split out of [`Self::run_batch_inference`]
+    /// purely to shorten that method.
+    fn build_batch_tensors(images: &[&RgbImage]) -> Result<BatchTensors, LayoutError> {
         let batch = images.len();
-
         let ts = INPUT_SIZE as usize;
         let hw = ts * ts;
-
-        let preprocess_start = Instant::now();
 
         let mut all_pixel_data: Vec<f32> = Vec::with_capacity(batch * 3 * hw);
         let mut metas: Vec<(u32, u32)> = Vec::with_capacity(batch);
@@ -287,23 +217,17 @@ impl RtDetrModel {
         let sizes_array = Array2::from_shape_vec((batch, 2), sizes_flat)
             .map_err(|e| LayoutError::InvalidOutput(format!("Failed to build batch sizes tensor: {e}")))?;
 
-        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
-        tracing::debug!(preprocess_ms, batch, "RT-DETR batch preprocessing complete");
+        Ok((images_array, sizes_array, metas))
+    }
 
-        let onnx_start = Instant::now();
-
-        let (images_name, sizes_name) = self.input_names_pair()?;
-        let outputs = self
-            .session
-            .run(vec![
-                (images_name, InferenceTensor::F32(images_array.into_dyn())),
-                (sizes_name, InferenceTensor::I64(sizes_array.into_dyn())),
-            ])
-            .map_err(|e| LayoutError::Inference(e.to_string()))?;
-
-        let onnx_ms = onnx_start.elapsed().as_secs_f64() * 1000.0;
-        tracing::debug!(onnx_ms, batch, "RT-DETR batch ONNX session.run() complete");
-
+    /// Splits the raw ONNX outputs into boxes/scores/labels and resolves
+    /// `num_queries`, applying the labels-as-third-float-tensor fallback and
+    /// shape-mismatch validation. Shared by [`Self::run_inference`] (`batch = 1`)
+    /// and [`Self::run_batch_inference`] so the two paths validate identically.
+    fn parse_batch_outputs(
+        outputs: Vec<(String, InferenceTensor)>,
+        batch: usize,
+    ) -> Result<ParsedBatchOutputs, LayoutError> {
         let mut float_data: Vec<Vec<f32>> = Vec::new();
         let mut float_shapes: Vec<Vec<usize>> = Vec::new();
         let mut label_data: Vec<i64> = Vec::new();
@@ -334,8 +258,8 @@ impl RtDetrModel {
             )));
         }
 
-        let boxes = &float_data[0];
-        let scores = &float_data[1];
+        let boxes = float_data.remove(0);
+        let scores = float_data.remove(0);
         let box_shape = &float_shapes[0];
 
         let num_queries = if box_shape.len() == 3 {
@@ -343,8 +267,6 @@ impl RtDetrModel {
         } else {
             box_shape[0]
         };
-
-        crate::layout::inference_timings::set(preprocess_ms / batch as f64, onnx_ms / batch as f64);
 
         let expected_flat = batch * num_queries;
         if scores.len() < expected_flat || label_data.len() < expected_flat || boxes.len() < expected_flat * 4 {
@@ -357,7 +279,57 @@ impl RtDetrModel {
             )));
         }
 
-        let mut results: Vec<Vec<LayoutDetection>> = Vec::with_capacity(batch);
+        Ok((boxes, scores, label_data, num_queries))
+    }
+
+    /// Builds the detection list for a single image from already-parsed
+    /// boxes/scores/labels. Split out of [`Self::run_inference`] purely to
+    /// shorten that method.
+    fn build_single_image_detections(
+        boxes: &[f32],
+        scores: &[f32],
+        label_data: &[i64],
+        num_detections: usize,
+        threshold: f32,
+        orig_dims: (u32, u32),
+    ) -> Vec<LayoutDetection> {
+        let (orig_width, orig_height) = orig_dims;
+        let mut detections = Vec::new();
+        for i in 0..num_detections {
+            let score = scores[i];
+            if score < threshold {
+                continue;
+            }
+
+            let label_id = label_data[i];
+            let class = match LayoutClass::from_docling_id(label_id) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let bbox = clamp_output_box(
+                [boxes[i * 4], boxes[i * 4 + 1], boxes[i * 4 + 2], boxes[i * 4 + 3]],
+                orig_width,
+                orig_height,
+            );
+
+            detections.push(LayoutDetection::new(class, score, bbox));
+        }
+        detections
+    }
+
+    /// Slices the flat batch outputs back into one [`LayoutDetection`] vector per
+    /// image. Split out of [`Self::run_batch_inference`] purely to shorten that
+    /// method.
+    fn assemble_batch_detections(
+        boxes: &[f32],
+        scores: &[f32],
+        label_data: &[i64],
+        metas: &[(u32, u32)],
+        num_queries: usize,
+        threshold: f32,
+    ) -> Vec<Vec<LayoutDetection>> {
+        let mut results: Vec<Vec<LayoutDetection>> = Vec::with_capacity(metas.len());
 
         for (b, &(orig_width, orig_height)) in metas.iter().enumerate() {
             let mut detections = Vec::new();
@@ -399,6 +371,57 @@ impl RtDetrModel {
 
             results.push(detections);
         }
+
+        results
+    }
+
+    /// Run batched inference over multiple images in a single ONNX call.
+    ///
+    /// Stacks per-image tensors into `[N, 3, 640, 640]` and `[N, 2]` inputs,
+    /// executes a single `session.run()`, then splits outputs by batch index.
+    ///
+    /// Returns one `Vec<LayoutDetection>` per input image, in the same order.
+    pub(crate) fn run_batch_inference(
+        &mut self,
+        images: &[&RgbImage],
+        threshold: f32,
+    ) -> Result<Vec<Vec<LayoutDetection>>, LayoutError> {
+        #[cfg(feature = "otel")]
+        let inference_span = crate::telemetry::spans::model_inference_span("rtdetr-layout");
+        #[cfg(feature = "otel")]
+        let _inference_guard = inference_span.enter();
+        #[cfg(feature = "otel")]
+        let inference_start = Instant::now();
+
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = images.len();
+
+        let preprocess_start = Instant::now();
+        let (images_array, sizes_array, metas) = Self::build_batch_tensors(images)?;
+        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(preprocess_ms, batch, "RT-DETR batch preprocessing complete");
+
+        let onnx_start = Instant::now();
+
+        let (images_name, sizes_name) = self.input_names_pair()?;
+        let outputs = self
+            .session
+            .run(vec![
+                (images_name, InferenceTensor::F32(images_array.into_dyn())),
+                (sizes_name, InferenceTensor::I64(sizes_array.into_dyn())),
+            ])
+            .map_err(|e| LayoutError::Inference(e.to_string()))?;
+
+        let onnx_ms = onnx_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(onnx_ms, batch, "RT-DETR batch ONNX session.run() complete");
+
+        let (boxes, scores, label_data, num_queries) = Self::parse_batch_outputs(outputs, batch)?;
+
+        crate::layout::inference_timings::set(preprocess_ms / batch as f64, onnx_ms / batch as f64);
+
+        let results = Self::assemble_batch_detections(&boxes, &scores, &label_data, &metas, num_queries, threshold);
 
         tracing::debug!(preprocess_ms, onnx_ms, batch, "RT-DETR batch inference breakdown");
 

@@ -30,7 +30,6 @@ pub struct PcmAudio {
 pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAudio> {
     use std::io::Cursor;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
-    use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::formats::TrackType;
     use symphonia::core::formats::probe::Hint;
@@ -79,6 +78,42 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
         .make_audio_decoder(&audio_codec_params, &dec_opts)
         .map_err(|e| XbergError::transcription(format!("unsupported audio codec: {e}")))?;
 
+    let interleaved = decode_track_to_interleaved(&mut *format, &mut *decoder, track_id)?;
+
+    let mono = if src_channels <= 1 {
+        interleaved
+    } else {
+        down_mix_to_mono(&interleaved, src_channels)
+    };
+
+    let samples = if src_sample_rate == 16_000 {
+        mono
+    } else {
+        resample_linear_to_16k(&mono, src_sample_rate)
+    };
+
+    let duration_ms = samples.len() as u64 * 1000 / 16_000;
+
+    Ok(PcmAudio {
+        samples,
+        sample_rate_hz: 16_000,
+        channels: 1,
+        duration_ms,
+    })
+}
+
+/// Drains `format`'s packets for `track_id` through `decoder`, concatenating every
+/// decoded buffer's interleaved samples. A packet decode error discards only that
+/// packet; an end-of-stream `IoError` ends the loop rather than propagating. Split
+/// out of [`decode_audio_to_pcm`] purely to shorten that function.
+#[cfg(feature = "transcription")]
+fn decode_track_to_interleaved(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    decoder: &mut dyn symphonia::core::codecs::audio::AudioDecoder,
+    track_id: u32,
+) -> Result<Vec<f32>> {
+    use symphonia::core::errors::Error as SymphoniaError;
+
     let mut interleaved: Vec<f32> = Vec::new();
 
     loop {
@@ -120,26 +155,7 @@ pub fn decode_audio_to_pcm(bytes: &[u8], max_bytes: Option<u64>) -> Result<PcmAu
         interleaved.extend_from_slice(&chunk);
     }
 
-    let mono = if src_channels <= 1 {
-        interleaved
-    } else {
-        down_mix_to_mono(&interleaved, src_channels)
-    };
-
-    let samples = if src_sample_rate == 16_000 {
-        mono
-    } else {
-        resample_linear_to_16k(&mono, src_sample_rate)
-    };
-
-    let duration_ms = samples.len() as u64 * 1000 / 16_000;
-
-    Ok(PcmAudio {
-        samples,
-        sample_rate_hz: 16_000,
-        channels: 1,
-        duration_ms,
-    })
+    Ok(interleaved)
 }
 
 /// Average `channels` interleaved planes down to mono.

@@ -147,63 +147,9 @@ impl OcrBackend for TesseractWasmBackend {
             );
         }
         let tessdata = self.resolve_tessdata(&language, config)?;
-
-        let img = decode_wasm_ocr_image(image_bytes)?;
-        let rgb = img.into_rgb8();
-        let (width, height) = rgb.dimensions();
-        let pix = Pix::from_raw_rgb(rgb.as_raw(), width, height).map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to create Leptonica Pix from image: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-        drop(rgb);
-        let pix = match resolve_preprocessing(config) {
-            Some(preprocessing) => crate::ocr::preprocessing::preprocess_pix(pix, preprocessing).map_err(|error| {
-                crate::XbergError::Ocr {
-                    message: format!("Failed to preprocess image for OCR: {error}"),
-                    source: Some(Box::new(error)),
-                }
-            })?,
-            None => pix,
-        };
-
-        let api = TesseractAPI::new().map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to create Tesseract API handle: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-
-        api.init_5(&tessdata, tessdata.len() as i32, &language, OEM_LSTM_ONLY, &[])
-            .map_err(|e| crate::XbergError::Ocr {
-                message: format!("Failed to init Tesseract with bundled tessdata: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-
+        let pix = prepare_ocr_pix(image_bytes, config)?;
         let psm_mode = resolve_psm(config);
-        api.set_page_seg_mode(psm_mode).map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to set Tesseract page segmentation mode: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-
-        api.set_image_2(pix.as_ptr()).map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to set image on Tesseract API: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-
-        let monitor = TessMonitor::new();
-        monitor
-            .set_deadline(RECOGNITION_DEADLINE_MS)
-            .map_err(|e| crate::XbergError::Ocr {
-                message: format!("Failed to configure Tesseract recognition deadline: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-        api.recognize_with_monitor(&monitor)
-            .map_err(|e| crate::XbergError::Ocr {
-                message: format!("Tesseract recognition failed or exceeded its deadline: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-        let text = api.get_utf8_text().map_err(|e| crate::XbergError::Ocr {
-            message: format!("Failed to read Tesseract text output: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+        let text = run_tesseract_recognition(&tessdata, &language, psm_mode, &pix)?;
 
         let metadata = Metadata {
             format: Some(FormatMetadata::Ocr(OcrMetadata {
@@ -293,6 +239,72 @@ fn decode_wasm_ocr_image(image_bytes: &[u8]) -> Result<image::DynamicImage> {
     let mut reader = image::ImageReader::with_format(Cursor::new(image_bytes), format);
     reader.limits(limits);
     reader.decode().map_err(wasm_ocr_image_error)
+}
+
+/// Decodes `image_bytes` into a Leptonica [`Pix`] and applies the configured
+/// preprocessing, if any. Split out of [`TesseractWasmBackend::process_image`]
+/// purely to shorten that method.
+fn prepare_ocr_pix(image_bytes: &[u8], config: &OcrConfig) -> Result<Pix> {
+    let img = decode_wasm_ocr_image(image_bytes)?;
+    let rgb = img.into_rgb8();
+    let (width, height) = rgb.dimensions();
+    let pix = Pix::from_raw_rgb(rgb.as_raw(), width, height).map_err(|e| crate::XbergError::Ocr {
+        message: format!("Failed to create Leptonica Pix from image: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    drop(rgb);
+    match resolve_preprocessing(config) {
+        Some(preprocessing) => {
+            crate::ocr::preprocessing::preprocess_pix(pix, preprocessing).map_err(|error| crate::XbergError::Ocr {
+                message: format!("Failed to preprocess image for OCR: {error}"),
+                source: Some(Box::new(error)),
+            })
+        }
+        None => Ok(pix),
+    }
+}
+
+/// Runs a full Tesseract recognition pass (API init, PSM, image, deadline-bounded
+/// recognize, text read) and returns the recognized UTF-8 text. Split out of
+/// [`TesseractWasmBackend::process_image`] purely to shorten that method.
+fn run_tesseract_recognition(tessdata: &[u8], language: &str, psm_mode: TessPageSegMode, pix: &Pix) -> Result<String> {
+    let api = TesseractAPI::new().map_err(|e| crate::XbergError::Ocr {
+        message: format!("Failed to create Tesseract API handle: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+
+    api.init_5(tessdata, tessdata.len() as i32, language, OEM_LSTM_ONLY, &[])
+        .map_err(|e| crate::XbergError::Ocr {
+            message: format!("Failed to init Tesseract with bundled tessdata: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+    api.set_page_seg_mode(psm_mode).map_err(|e| crate::XbergError::Ocr {
+        message: format!("Failed to set Tesseract page segmentation mode: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+
+    api.set_image_2(pix.as_ptr()).map_err(|e| crate::XbergError::Ocr {
+        message: format!("Failed to set image on Tesseract API: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+
+    let monitor = TessMonitor::new();
+    monitor
+        .set_deadline(RECOGNITION_DEADLINE_MS)
+        .map_err(|e| crate::XbergError::Ocr {
+            message: format!("Failed to configure Tesseract recognition deadline: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    api.recognize_with_monitor(&monitor)
+        .map_err(|e| crate::XbergError::Ocr {
+            message: format!("Tesseract recognition failed or exceeded its deadline: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    api.get_utf8_text().map_err(|e| crate::XbergError::Ocr {
+        message: format!("Failed to read Tesseract text output: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 fn wasm_ocr_decode_limits() -> image::Limits {
