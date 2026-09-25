@@ -16,6 +16,25 @@
 //! asserts the CURRENT (buggy) glued output on purpose, so a future fix for
 //! this general case turns it red — that is the intended trigger to update
 //! or remove this test, not a regression in this test itself.
+//!
+//! GH#1778 investigation (no-ship): a fix routing this arm through the same
+//! corpus-tuned geometric threshold `should_insert_space` uses for its
+//! "strong geometric signal alone" rule (50% of the font's space-glyph
+//! width) was implemented and found UNSAFE — it broke
+//! `tests/table_cell_word_seam.rs`, whose fixture exists specifically to
+//! prove no gap-magnitude constant can separate a real word space from an
+//! intra-word fragment seam: a producer that draws one word as several
+//! Tm+Tj fragments can position them with a seam (there: 1.75pt) WIDER than
+//! a legitimate word space elsewhere on the same line (there: 1.53pt). Any
+//! threshold that keeps such fragments fused also swallows real spaces, and
+//! any threshold that keeps real spaces also splits such words — "Credit"
+//! became "Cre d it". `should_insert_space`'s cross-span path avoids this
+//! because it runs AFTER both texts are known and can lean on
+//! following-text-dependent signals (source-order/glyph evidence via the
+//! span-level merger); the Tm-continuation arm decides before the *next*
+//! Tj's text is decoded (Tm arrives before its Tj), so it structurally
+//! cannot consult those signals without a deferred-decision redesign of the
+//! per-glyph append path — out of scope for a gap-check fix. Left open.
 
 use xberg_native_pdf::document::PdfDocument;
 
