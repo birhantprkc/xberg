@@ -99,65 +99,17 @@ impl MdxExtractor {
                 continue;
             }
 
-            if trimmed.starts_with("import ") || trimmed == "import" {
-                let depth = count_braces(trimmed);
-                if depth > 0 {
-                    skip_block_depth = depth;
-                }
+            if try_skip_import_export(trimmed, &mut skip_block_depth) {
                 continue;
             }
 
-            if trimmed.starts_with("export ") || trimmed == "export" {
-                let depth = count_braces(trimmed);
-                if depth > 0 {
-                    skip_block_depth = depth;
-                }
-                continue;
-            }
-
-            // A standalone `{expression}` line is recorded as a raw JSX block before being
-            // dropped, rather than silently discarded. See #142.
-            //
-            // A JSX *comment* is excluded: it carries no document content, and recording it
-            // puts `{/* ... */}` straight back into the rendered output through the raw-block
-            // element — which is precisely what stripping exists to prevent.
             if JSX_EXPR_LINE_RE.is_match(trimmed) {
-                if let Some(ref mut blocks) = jsx_blocks
-                    && !JSX_INLINE_COMMENT_RE.replace_all(trimmed, "").trim().is_empty()
-                {
-                    blocks.push(trimmed.to_string());
-                }
+                record_jsx_expression_line(trimmed, &mut jsx_blocks);
                 continue;
             }
 
-            let without_comments = JSX_INLINE_COMMENT_RE.replace_all(line, "");
-
-            // Component tags (with their props) are recorded as raw JSX blocks at match
-            // time, not only when stripping empties the whole line — an inline component
-            // such as `See <Chart data={data} type="line" /> below.` used to lose its props
-            // entirely because the surrounding prose kept the line non-empty. See #142.
-            if let Some(ref mut blocks) = jsx_blocks {
-                for m in JSX_TAG_RE.find_iter(&without_comments) {
-                    blocks.push(m.as_str().to_string());
-                }
-            }
-
-            let processed = JSX_TAG_RE.replace_all(&without_comments, "");
-            let processed_trimmed = processed.trim();
-
-            if processed_trimmed.is_empty() && !trimmed.is_empty() {
+            let Some(processed) = process_mdx_prose_line(line, trimmed, &mut jsx_blocks) else {
                 continue;
-            }
-
-            // Inline JSX expressions left over in prose after tag/comment stripping (e.g.
-            // `The count is {count} today.`) are likewise recorded rather than dropped.
-            let processed = if let Some(ref mut blocks) = jsx_blocks {
-                for m in INLINE_JSX_EXPR_RE.find_iter(&processed) {
-                    blocks.push(m.as_str().to_string());
-                }
-                INLINE_JSX_EXPR_RE.replace_all(&processed, "")
-            } else {
-                processed
             };
 
             result.push_str(&processed);
@@ -179,6 +131,73 @@ fn count_braces(line: &str) -> i32 {
         }
     }
     depth
+}
+
+/// If `trimmed` is a top-level `import`/`export` statement, update `skip_block_depth` so the
+/// remainder of a multi-line statement is skipped, and report that the line was consumed.
+fn try_skip_import_export(trimmed: &str, skip_block_depth: &mut i32) -> bool {
+    let is_import = trimmed.starts_with("import ") || trimmed == "import";
+    let is_export = trimmed.starts_with("export ") || trimmed == "export";
+    if !is_import && !is_export {
+        return false;
+    }
+
+    let depth = count_braces(trimmed);
+    if depth > 0 {
+        *skip_block_depth = depth;
+    }
+    true
+}
+
+/// Record a standalone `{expression}` line as a raw JSX block before it is dropped, rather
+/// than silently discarding it. See #142.
+///
+/// A JSX *comment* is excluded: it carries no document content, and recording it puts
+/// `{/* ... */}` straight back into the rendered output through the raw-block element —
+/// which is precisely what stripping exists to prevent.
+fn record_jsx_expression_line(trimmed: &str, jsx_blocks: &mut Option<&mut Vec<String>>) {
+    if let Some(blocks) = jsx_blocks
+        && !JSX_INLINE_COMMENT_RE.replace_all(trimmed, "").trim().is_empty()
+    {
+        blocks.push(trimmed.to_string());
+    }
+}
+
+/// Strip JSX component tags and inline expressions from a prose line, recording what was
+/// stripped into `jsx_blocks`. Returns `None` when stripping emptied an originally non-empty
+/// line, signalling that the line should be dropped entirely.
+fn process_mdx_prose_line(line: &str, trimmed: &str, jsx_blocks: &mut Option<&mut Vec<String>>) -> Option<String> {
+    let without_comments = JSX_INLINE_COMMENT_RE.replace_all(line, "");
+
+    // Component tags (with their props) are recorded as raw JSX blocks at match
+    // time, not only when stripping empties the whole line — an inline component
+    // such as `See <Chart data={data} type="line" /> below.` used to lose its props
+    // entirely because the surrounding prose kept the line non-empty. See #142.
+    if let Some(blocks) = jsx_blocks {
+        for m in JSX_TAG_RE.find_iter(&without_comments) {
+            blocks.push(m.as_str().to_string());
+        }
+    }
+
+    let processed = JSX_TAG_RE.replace_all(&without_comments, "");
+    let processed_trimmed = processed.trim();
+
+    if processed_trimmed.is_empty() && !trimmed.is_empty() {
+        return None;
+    }
+
+    // Inline JSX expressions left over in prose after tag/comment stripping (e.g.
+    // `The count is {count} today.`) are likewise recorded rather than dropped.
+    let processed = if let Some(blocks) = jsx_blocks {
+        for m in INLINE_JSX_EXPR_RE.find_iter(&processed) {
+            blocks.push(m.as_str().to_string());
+        }
+        INLINE_JSX_EXPR_RE.replace_all(&processed, "")
+    } else {
+        processed
+    };
+
+    Some(processed.into_owned())
 }
 
 impl Default for MdxExtractor {

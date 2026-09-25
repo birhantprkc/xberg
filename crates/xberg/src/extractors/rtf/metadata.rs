@@ -45,163 +45,185 @@ pub(crate) fn parse_rtf_datetime(segment: &str) -> Option<String> {
     ))
 }
 
+/// Locate and slice the balanced `{\\info ...}` block, if present.
+fn find_rtf_info_block(rtf_content: &str) -> Option<&str> {
+    let start = rtf_content.find("{\\info")?;
+    let slice = &rtf_content[start..];
+    let mut depth = 0usize;
+    let mut end_offset: Option<usize> = None;
+
+    for (idx, ch) in slice.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    end_offset = Some(idx + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(end_offset.map(|end| &slice[..end]).unwrap_or(slice))
+}
+
+/// Split an `\\info` block into its depth-2 brace-delimited segments.
+fn split_info_segments(info_block: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut seg_depth = 0usize;
+    let mut current = String::new();
+    let mut in_segment = false;
+
+    for ch in info_block.chars() {
+        if ch == '{' {
+            seg_depth += 1;
+            if seg_depth == 2 {
+                in_segment = true;
+                current.clear();
+                continue;
+            }
+        } else if ch == '}' {
+            if seg_depth == 2 && in_segment {
+                segments.push(current.clone());
+                in_segment = false;
+            }
+            seg_depth = seg_depth.saturating_sub(1);
+            continue;
+        }
+
+        if in_segment {
+            current.push(ch);
+        }
+    }
+
+    segments
+}
+
+/// Parse a single `\\info` segment and, if recognized, insert its value into `metadata`.
+fn apply_info_segment(metadata: &mut AHashMap<Cow<'static, str>, Value>, segment: &str) {
+    if !segment.starts_with('\\') {
+        return;
+    }
+
+    let cleaned_segment = if segment.starts_with("\\*\\") {
+        segment.replacen("\\*\\", "\\", 1)
+    } else {
+        segment.to_string()
+    };
+
+    let mut chars = cleaned_segment.chars().peekable();
+    chars.next();
+    let (keyword, numeric) = parse_rtf_control_word(&mut chars);
+    let remaining: String = chars.collect();
+    let trimmed = remaining.trim();
+
+    match keyword.as_str() {
+        "author" if !trimmed.is_empty() => {
+            let author = trimmed.to_string();
+            metadata.insert(Cow::Borrowed("created_by"), Value::String(author.clone()));
+            metadata.insert(Cow::Borrowed("authors"), Value::Array(vec![Value::String(author)]));
+        }
+        "operator" if !trimmed.is_empty() => {
+            metadata.insert(Cow::Borrowed("modified_by"), Value::String(trimmed.to_string()));
+        }
+        "title" if !trimmed.is_empty() => {
+            metadata.insert(Cow::Borrowed("title"), Value::String(trimmed.to_string()));
+        }
+        "subject" if !trimmed.is_empty() => {
+            metadata.insert(Cow::Borrowed("subject"), Value::String(trimmed.to_string()));
+        }
+        "generator" if !trimmed.is_empty() => {
+            metadata.insert(Cow::Borrowed("generator"), Value::String(trimmed.to_string()));
+        }
+        "creatim" => {
+            if let Some(dt) = parse_rtf_datetime(trimmed) {
+                metadata.insert(Cow::Borrowed("created_at"), Value::String(dt));
+            }
+        }
+        "revtim" => {
+            if let Some(dt) = parse_rtf_datetime(trimmed) {
+                metadata.insert(Cow::Borrowed("modified_at"), Value::String(dt));
+            }
+        }
+        "version" => {
+            if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
+                metadata.insert(Cow::Borrowed("revision"), Value::String(val.to_string()));
+            }
+        }
+        "nofpages" => {
+            if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
+                metadata.insert(Cow::Borrowed("page_count"), Value::Number(val.into()));
+            }
+        }
+        "nofwords" => {
+            if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
+                metadata.insert(Cow::Borrowed("word_count"), Value::Number(val.into()));
+            }
+        }
+        "nofchars" => {
+            if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
+                metadata.insert(Cow::Borrowed("character_count"), Value::Number(val.into()));
+            }
+        }
+        "lines" => {
+            if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
+                metadata.insert(Cow::Borrowed("line_count"), Value::Number(val.into()));
+            }
+        }
+        "paragraphs" => {
+            if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
+                metadata.insert(Cow::Borrowed("paragraph_count"), Value::Number(val.into()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fill in word/character/line/paragraph counts derived from the extracted text, without
+/// overwriting values already parsed from the `\\info` block.
+fn apply_text_derived_metadata(metadata: &mut AHashMap<Cow<'static, str>, Value>, extracted_text: &str) {
+    let cleaned_text = extracted_text.trim();
+    if cleaned_text.is_empty() {
+        return;
+    }
+
+    let word_count = cleaned_text.split_whitespace().count() as i64;
+    metadata
+        .entry(Cow::Borrowed("word_count"))
+        .or_insert(Value::Number(word_count.into()));
+
+    let character_count = cleaned_text.chars().count() as i64;
+    metadata
+        .entry(Cow::Borrowed("character_count"))
+        .or_insert(Value::Number(character_count.into()));
+
+    let line_count = cleaned_text.lines().count() as i64;
+    metadata
+        .entry(Cow::Borrowed("line_count"))
+        .or_insert(Value::Number(line_count.into()));
+
+    let paragraph_count = cleaned_text.split("\n\n").filter(|p| !p.trim().is_empty()).count() as i64;
+    metadata
+        .entry(Cow::Borrowed("paragraph_count"))
+        .or_insert(Value::Number(paragraph_count.into()));
+}
+
 /// Extract metadata from the RTF `\\info` block and augment with computed statistics.
 pub(crate) fn extract_rtf_metadata(rtf_content: &str, extracted_text: &str) -> AHashMap<Cow<'static, str>, Value> {
     let mut metadata: AHashMap<Cow<'static, str>, Value> = AHashMap::new();
 
-    if let Some(start) = rtf_content.find("{\\info") {
-        let slice = &rtf_content[start..];
-        let mut depth = 0usize;
-        let mut end_offset: Option<usize> = None;
-
-        for (idx, ch) in slice.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                    if depth == 0 {
-                        end_offset = Some(idx + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let info_block = end_offset.map(|end| &slice[..end]).unwrap_or(slice);
-
-        let mut segments: Vec<String> = Vec::new();
-        let mut seg_depth = 0usize;
-        let mut current = String::new();
-        let mut in_segment = false;
-
-        for ch in info_block.chars() {
-            if ch == '{' {
-                seg_depth += 1;
-                if seg_depth == 2 {
-                    in_segment = true;
-                    current.clear();
-                    continue;
-                }
-            } else if ch == '}' {
-                if seg_depth == 2 && in_segment {
-                    segments.push(current.clone());
-                    in_segment = false;
-                }
-                seg_depth = seg_depth.saturating_sub(1);
-                continue;
-            }
-
-            if in_segment {
-                current.push(ch);
-            }
-        }
-
-        for segment in segments {
-            if !segment.starts_with('\\') {
-                continue;
-            }
-
-            let cleaned_segment = if segment.starts_with("\\*\\") {
-                segment.replacen("\\*\\", "\\", 1)
-            } else {
-                segment.clone()
-            };
-
-            let mut chars = cleaned_segment.chars().peekable();
-            chars.next();
-            let (keyword, numeric) = parse_rtf_control_word(&mut chars);
-            let remaining: String = chars.collect();
-            let trimmed = remaining.trim();
-
-            match keyword.as_str() {
-                "author" if !trimmed.is_empty() => {
-                    let author = trimmed.to_string();
-                    metadata.insert(Cow::Borrowed("created_by"), Value::String(author.clone()));
-                    metadata.insert(Cow::Borrowed("authors"), Value::Array(vec![Value::String(author)]));
-                }
-                "operator" if !trimmed.is_empty() => {
-                    metadata.insert(Cow::Borrowed("modified_by"), Value::String(trimmed.to_string()));
-                }
-                "title" if !trimmed.is_empty() => {
-                    metadata.insert(Cow::Borrowed("title"), Value::String(trimmed.to_string()));
-                }
-                "subject" if !trimmed.is_empty() => {
-                    metadata.insert(Cow::Borrowed("subject"), Value::String(trimmed.to_string()));
-                }
-                "generator" if !trimmed.is_empty() => {
-                    metadata.insert(Cow::Borrowed("generator"), Value::String(trimmed.to_string()));
-                }
-                "creatim" => {
-                    if let Some(dt) = parse_rtf_datetime(trimmed) {
-                        metadata.insert(Cow::Borrowed("created_at"), Value::String(dt));
-                    }
-                }
-                "revtim" => {
-                    if let Some(dt) = parse_rtf_datetime(trimmed) {
-                        metadata.insert(Cow::Borrowed("modified_at"), Value::String(dt));
-                    }
-                }
-                "version" => {
-                    if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
-                        metadata.insert(Cow::Borrowed("revision"), Value::String(val.to_string()));
-                    }
-                }
-                "nofpages" => {
-                    if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
-                        metadata.insert(Cow::Borrowed("page_count"), Value::Number(val.into()));
-                    }
-                }
-                "nofwords" => {
-                    if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
-                        metadata.insert(Cow::Borrowed("word_count"), Value::Number(val.into()));
-                    }
-                }
-                "nofchars" => {
-                    if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
-                        metadata.insert(Cow::Borrowed("character_count"), Value::Number(val.into()));
-                    }
-                }
-                "lines" => {
-                    if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
-                        metadata.insert(Cow::Borrowed("line_count"), Value::Number(val.into()));
-                    }
-                }
-                "paragraphs" => {
-                    if let Some(val) = numeric.or_else(|| trimmed.parse::<i32>().ok()) {
-                        metadata.insert(Cow::Borrowed("paragraph_count"), Value::Number(val.into()));
-                    }
-                }
-                _ => {}
-            }
+    if let Some(info_block) = find_rtf_info_block(rtf_content) {
+        for segment in split_info_segments(info_block) {
+            apply_info_segment(&mut metadata, &segment);
         }
     }
 
-    let cleaned_text = extracted_text.trim();
-    if !cleaned_text.is_empty() {
-        let word_count = cleaned_text.split_whitespace().count() as i64;
-        metadata
-            .entry(Cow::Borrowed("word_count"))
-            .or_insert(Value::Number(word_count.into()));
-
-        let character_count = cleaned_text.chars().count() as i64;
-        metadata
-            .entry(Cow::Borrowed("character_count"))
-            .or_insert(Value::Number(character_count.into()));
-
-        let line_count = cleaned_text.lines().count() as i64;
-        metadata
-            .entry(Cow::Borrowed("line_count"))
-            .or_insert(Value::Number(line_count.into()));
-
-        let paragraph_count = cleaned_text.split("\n\n").filter(|p| !p.trim().is_empty()).count() as i64;
-        metadata
-            .entry(Cow::Borrowed("paragraph_count"))
-            .or_insert(Value::Number(paragraph_count.into()));
-    }
+    apply_text_derived_metadata(&mut metadata, extracted_text);
 
     metadata
 }
