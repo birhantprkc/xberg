@@ -93,100 +93,132 @@ pub(crate) async fn extract_vlm_regions(
         let img_height = page_image.height();
 
         for hint in hints {
-            if hint.confidence < MIN_REGION_CONFIDENCE {
-                continue;
-            }
-
-            let Some(region_kind) = region_kind_for_hint(hint.class_name) else {
-                continue;
-            };
-
-            let pdf_top = hint.top;
-            let pdf_bottom = hint.bottom;
-            let pdf_left = hint.left;
-            let pdf_right = hint.right;
-
-            let pixel_y1 = (img_height as f32 - pdf_top).max(0.0).min(img_height as f32) as u32;
-            let pixel_y2 = (img_height as f32 - pdf_bottom).max(0.0).min(img_height as f32) as u32;
-            let pixel_x1 = pdf_left.max(0.0).min(img_width as f32) as u32;
-            let pixel_x2 = pdf_right.max(0.0).min(img_width as f32) as u32;
-
-            let (y_top, y_bot) = if pixel_y1 <= pixel_y2 {
-                (pixel_y1, pixel_y2)
-            } else {
-                (pixel_y2, pixel_y1)
-            };
-            let (x_left, x_right) = if pixel_x1 <= pixel_x2 {
-                (pixel_x1, pixel_x2)
-            } else {
-                (pixel_x2, pixel_x1)
-            };
-
-            let crop_w = x_right.saturating_sub(x_left);
-            let crop_h = y_bot.saturating_sub(y_top);
-
-            if crop_w * crop_h < MIN_REGION_PIXEL_AREA {
-                tracing::trace!(
-                    page = page_index,
-                    crop_w,
-                    crop_h,
-                    "region too small for VLM extraction; skipping"
-                );
-                continue;
-            }
-
-            let crop = image::imageops::crop_imm(page_image, x_left, y_top, crop_w, crop_h).to_image();
-
-            let mut png_buf = Cursor::new(Vec::<u8>::new());
-            let encode_result = image::codecs::png::PngEncoder::new(&mut png_buf).write_image(
-                crop.as_raw(),
-                crop.width(),
-                crop.height(),
-                ExtendedColorType::Rgb8,
-            );
-            if let Err(e) = encode_result {
-                tracing::warn!(
-                    page = page_index,
-                    error = %e,
-                    "failed to PNG-encode region crop; skipping VLM call"
-                );
-                continue;
-            }
-            let crop_bytes = png_buf.into_inner();
-
-            tracing::debug!(
-                page = page_index,
-                region_kind = ?region_kind,
-                confidence = hint.confidence,
-                crop_w,
-                crop_h,
-                "sending region to VLM"
-            );
-
-            match extract_region_with_vlm(&crop_bytes, "image/png", region_kind, llm_config, None).await {
-                Ok(markdown) => {
-                    let trimmed = markdown.trim().to_string();
-                    if !trimmed.is_empty() {
-                        results.push(RegionVlmResult {
-                            page_index,
-                            markdown: trimmed,
-                            hint: hint.clone(),
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        page = page_index,
-                        region_kind = ?region_kind,
-                        error = %e,
-                        "VLM region extraction failed; region suppressed"
-                    );
-                }
+            if let Some(result) =
+                extract_vlm_region(page_index, page_image, img_width, img_height, hint, llm_config).await
+            {
+                results.push(result);
             }
         }
     }
 
     results
+}
+
+/// Converts a layout hint's PDF-space bounding box (y=0 at page bottom) to a pixel-space
+/// crop rectangle `(x_left, y_top, width, height)` clamped to the page raster's bounds.
+/// Split out of [`extract_vlm_region`] purely to shorten that function.
+fn hint_pixel_crop_rect(hint: &LayoutHint, img_width: u32, img_height: u32) -> (u32, u32, u32, u32) {
+    let pixel_y1 = (img_height as f32 - hint.top).max(0.0).min(img_height as f32) as u32;
+    let pixel_y2 = (img_height as f32 - hint.bottom).max(0.0).min(img_height as f32) as u32;
+    let pixel_x1 = hint.left.max(0.0).min(img_width as f32) as u32;
+    let pixel_x2 = hint.right.max(0.0).min(img_width as f32) as u32;
+
+    let (y_top, y_bot) = if pixel_y1 <= pixel_y2 {
+        (pixel_y1, pixel_y2)
+    } else {
+        (pixel_y2, pixel_y1)
+    };
+    let (x_left, x_right) = if pixel_x1 <= pixel_x2 {
+        (pixel_x1, pixel_x2)
+    } else {
+        (pixel_x2, pixel_x1)
+    };
+
+    (
+        x_left,
+        y_top,
+        x_right.saturating_sub(x_left),
+        y_bot.saturating_sub(y_top),
+    )
+}
+
+/// PNG-encodes a cropped region, logging and returning `None` on encode failure so a
+/// single bad crop suppresses only that region rather than aborting extraction. Split
+/// out of [`extract_vlm_region`] purely to shorten that function.
+fn encode_region_png(page_index: usize, crop: &image::RgbImage) -> Option<Vec<u8>> {
+    let mut png_buf = Cursor::new(Vec::<u8>::new());
+    let encode_result = image::codecs::png::PngEncoder::new(&mut png_buf).write_image(
+        crop.as_raw(),
+        crop.width(),
+        crop.height(),
+        ExtendedColorType::Rgb8,
+    );
+    if let Err(e) = encode_result {
+        tracing::warn!(
+            page = page_index,
+            error = %e,
+            "failed to PNG-encode region crop; skipping VLM call"
+        );
+        return None;
+    }
+    Some(png_buf.into_inner())
+}
+
+/// Extracts a single layout hint's region via VLM, or returns `None` if the hint is
+/// below confidence, ineligible for VLM handling, too small to crop, or the VLM call
+/// itself fails or returns empty markdown. Split out of [`extract_vlm_regions`] so a
+/// single page/hint iteration stays a plain loop body.
+async fn extract_vlm_region(
+    page_index: usize,
+    page_image: &image::RgbImage,
+    img_width: u32,
+    img_height: u32,
+    hint: &LayoutHint,
+    llm_config: &LlmConfig,
+) -> Option<RegionVlmResult> {
+    if hint.confidence < MIN_REGION_CONFIDENCE {
+        return None;
+    }
+
+    let region_kind = region_kind_for_hint(hint.class_name)?;
+
+    let (x_left, y_top, crop_w, crop_h) = hint_pixel_crop_rect(hint, img_width, img_height);
+
+    if crop_w * crop_h < MIN_REGION_PIXEL_AREA {
+        tracing::trace!(
+            page = page_index,
+            crop_w,
+            crop_h,
+            "region too small for VLM extraction; skipping"
+        );
+        return None;
+    }
+
+    let crop = image::imageops::crop_imm(page_image, x_left, y_top, crop_w, crop_h).to_image();
+    let crop_bytes = encode_region_png(page_index, &crop)?;
+
+    tracing::debug!(
+        page = page_index,
+        region_kind = ?region_kind,
+        confidence = hint.confidence,
+        crop_w,
+        crop_h,
+        "sending region to VLM"
+    );
+
+    match extract_region_with_vlm(&crop_bytes, "image/png", region_kind, llm_config, None).await {
+        Ok(markdown) => {
+            let trimmed = markdown.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(RegionVlmResult {
+                    page_index,
+                    markdown: trimmed,
+                    hint: hint.clone(),
+                })
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                page = page_index,
+                region_kind = ?region_kind,
+                error = %e,
+                "VLM region extraction failed; region suppressed"
+            );
+            None
+        }
+    }
 }
 
 /// Finds the index in `elements` at which a region with top edge `hint_top` (PDF

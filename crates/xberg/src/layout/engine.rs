@@ -221,62 +221,7 @@ impl LayoutEngine {
                 ));
             }
             ModelBackend::Custom { path, variant } => {
-                let path_str = path.to_string_lossy();
-                let accel = config.acceleration.as_ref();
-                match variant {
-                    CustomModelVariant::RtDetr => Box::new(RtDetrModel::from_file(&path_str, accel, thread_budget)?),
-                    #[cfg(feature = "layout-detection")]
-                    CustomModelVariant::PpDocLayoutV3 => Box::new(PpDocLayoutV3Model::from_file_with_thread_budget(
-                        &path_str,
-                        accel,
-                        thread_budget,
-                    )?),
-                    #[cfg(feature = "layout-detection")]
-                    CustomModelVariant::YoloDocLayNet => Box::new(YoloModel::from_file(
-                        &path_str,
-                        YoloVariant::DocLayNet,
-                        YOLO_DOC_LAY_NET_INPUT_SIDE,
-                        YOLO_DOC_LAY_NET_INPUT_SIDE,
-                        "Custom-YOLO-DocLayNet",
-                        accel,
-                        thread_budget,
-                    )?),
-                    #[cfg(feature = "layout-detection")]
-                    CustomModelVariant::YoloDocStructBench => Box::new(YoloModel::from_file(
-                        &path_str,
-                        YoloVariant::DocStructBench,
-                        YOLO_DOC_STRUCT_BENCH_INPUT_SIDE,
-                        YOLO_DOC_STRUCT_BENCH_INPUT_SIDE,
-                        "Custom-DocLayout-YOLO",
-                        accel,
-                        thread_budget,
-                    )?),
-                    #[cfg(feature = "layout-detection")]
-                    CustomModelVariant::Yolox {
-                        input_width,
-                        input_height,
-                    } => Box::new(YoloModel::from_file(
-                        &path_str,
-                        YoloVariant::Yolox,
-                        *input_width,
-                        *input_height,
-                        "Custom-YOLOX",
-                        accel,
-                        thread_budget,
-                    )?),
-                    #[cfg(not(feature = "layout-detection"))]
-                    CustomModelVariant::PpDocLayoutV3
-                    | CustomModelVariant::YoloDocLayNet
-                    | CustomModelVariant::YoloDocStructBench
-                    | CustomModelVariant::Yolox { .. } => {
-                        return Err(LayoutError::ModelDownload(
-                            "this custom model variant requires the ORT-backed \
-                             `layout-detection` feature (unsupported under the pure-Rust \
-                             `layout-tract` engine)"
-                                .into(),
-                        ));
-                    }
-                }
+                model_from_custom_variant(path, variant, config.acceleration.as_ref(), thread_budget)?
             }
         };
 
@@ -470,6 +415,72 @@ fn validate_layout_peak(
     security_limits: &crate::extractors::security::SecurityLimits,
 ) -> crate::Result<()> {
     validate_layout_batch_peak(&[image], security_limits)
+}
+
+/// Builds the [`LayoutModel`] for a [`ModelBackend::Custom`] path, dispatching on
+/// [`CustomModelVariant`]. Split out of [`LayoutEngine::from_config_with_thread_budget`]
+/// so that method stays a single per-backend match.
+fn model_from_custom_variant(
+    path: &std::path::Path,
+    variant: &CustomModelVariant,
+    accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
+    thread_budget: usize,
+) -> Result<Box<dyn LayoutModel>, LayoutError> {
+    let path_str = path.to_string_lossy();
+    Ok(match variant {
+        CustomModelVariant::RtDetr => Box::new(RtDetrModel::from_file(&path_str, accel, thread_budget)?),
+        #[cfg(feature = "layout-detection")]
+        CustomModelVariant::PpDocLayoutV3 => Box::new(PpDocLayoutV3Model::from_file_with_thread_budget(
+            &path_str,
+            accel,
+            thread_budget,
+        )?),
+        #[cfg(feature = "layout-detection")]
+        CustomModelVariant::YoloDocLayNet => Box::new(YoloModel::from_file(
+            &path_str,
+            YoloVariant::DocLayNet,
+            YOLO_DOC_LAY_NET_INPUT_SIDE,
+            YOLO_DOC_LAY_NET_INPUT_SIDE,
+            "Custom-YOLO-DocLayNet",
+            accel,
+            thread_budget,
+        )?),
+        #[cfg(feature = "layout-detection")]
+        CustomModelVariant::YoloDocStructBench => Box::new(YoloModel::from_file(
+            &path_str,
+            YoloVariant::DocStructBench,
+            YOLO_DOC_STRUCT_BENCH_INPUT_SIDE,
+            YOLO_DOC_STRUCT_BENCH_INPUT_SIDE,
+            "Custom-DocLayout-YOLO",
+            accel,
+            thread_budget,
+        )?),
+        #[cfg(feature = "layout-detection")]
+        CustomModelVariant::Yolox {
+            input_width,
+            input_height,
+        } => Box::new(YoloModel::from_file(
+            &path_str,
+            YoloVariant::Yolox,
+            *input_width,
+            *input_height,
+            "Custom-YOLOX",
+            accel,
+            thread_budget,
+        )?),
+        #[cfg(not(feature = "layout-detection"))]
+        CustomModelVariant::PpDocLayoutV3
+        | CustomModelVariant::YoloDocLayNet
+        | CustomModelVariant::YoloDocStructBench
+        | CustomModelVariant::Yolox { .. } => {
+            return Err(LayoutError::ModelDownload(
+                "this custom model variant requires the ORT-backed \
+                 `layout-detection` feature (unsupported under the pure-Rust \
+                 `layout-tract` engine)"
+                    .into(),
+            ));
+        }
+    })
 }
 
 fn layout_model_workspace_bytes() -> crate::Result<u64> {
