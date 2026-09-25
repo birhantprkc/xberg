@@ -12,6 +12,7 @@ use crate::pdf::structure::constants::{COALESCE_THRESHOLD, MAX_GLYPH_JITTER_PT, 
 use crate::pdf::text::{contains_html_markup, fix_pdf_control_chars};
 use crate::types::{PageBoundary, PageContent};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use xberg_native_pdf::document::ReadingOrder;
 
 /// Per-page fabricated-mapping character counts `(fabricated, total)`, indexed by zero-based
@@ -477,6 +478,7 @@ fn rebuild_text_from_fragmented_spans(spans: &[xberg_native_pdf::layout::TextSpa
         return String::new();
     }
 
+    let notes = numeric_notes(spans);
     let mut sorted: Vec<&xberg_native_pdf::layout::TextSpan> = spans.iter().collect();
     sorted.sort_by(|a, b| b.bbox.y.partial_cmp(&a.bbox.y).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -502,15 +504,109 @@ fn rebuild_text_from_fragmented_spans(spans: &[xberg_native_pdf::layout::TextSpa
         let font_size = group.iter().map(|s| s.font_size).fold(0.0_f32, f32::max);
         let space_threshold = font_size * 0.5;
         let mut prev_end_x = f32::NEG_INFINITY;
-        for span in group.iter() {
-            if prev_end_x.is_finite() && span.bbox.x - prev_end_x > space_threshold {
+        let mut previous = None;
+        for (index, span) in group.iter().enumerate() {
+            if (prev_end_x.is_finite() && span.bbox.x - prev_end_x > space_threshold)
+                || previous.is_some_and(|prev| {
+                    needs_numeric_script_boundary(prev, span, &notes, group.get(index + 1).copied())
+                })
+            {
                 result.push(' ');
             }
             result.push_str(&span.text);
             prev_end_x = span.bbox.x + span.bbox.width;
+            previous = Some(*span);
         }
     }
     result
+}
+
+// A small digit beside another digit can be a footnote or a power. Require a
+// matching, smaller note below the reference before changing an existing join.
+// Inspect only nearby spans and keep one definition per number, so dense pages
+// do not turn this into an all-pairs scan.
+fn numeric_notes(spans: &[xberg_native_pdf::layout::TextSpan]) -> HashMap<&str, &xberg_native_pdf::layout::TextSpan> {
+    let mut notes: HashMap<&str, &xberg_native_pdf::layout::TextSpan> = HashMap::new();
+    for (index, marker) in spans.iter().enumerate() {
+        let number = marker.text.trim();
+        if number.is_empty()
+            || number.len() > 3
+            || !number.bytes().all(|c| c.is_ascii_digit())
+            || !is_unrotated(marker)
+            || !is_ltr_writing_mode(marker)
+        {
+            continue;
+        }
+        let Some(body) = spans
+            .iter()
+            .skip(index + 1)
+            .take(4)
+            .find(|span| !span.text.trim().is_empty())
+        else {
+            continue;
+        };
+        let gap = body.bbox.x - (marker.bbox.x + marker.bbox.width);
+        if !is_unrotated(body)
+            || !is_ltr_writing_mode(body)
+            || !body.text.trim_start().starts_with(char::is_alphabetic)
+            || body.text.split_whitespace().count() < 2
+            || marker.font_size > body.font_size
+            || gap < -0.1 * body.font_size
+            || gap > body.font_size
+            || (marker.bbox.y - body.bbox.y).abs() > body.font_size * 0.75
+        {
+            continue;
+        }
+        notes
+            .entry(number)
+            .and_modify(|previous| {
+                if body.bbox.y < previous.bbox.y {
+                    *previous = body;
+                }
+            })
+            .or_insert(body);
+    }
+    notes
+}
+
+fn needs_numeric_script_boundary(
+    base: &xberg_native_pdf::layout::TextSpan,
+    script: &xberg_native_pdf::layout::TextSpan,
+    notes: &HashMap<&str, &xberg_native_pdf::layout::TextSpan>,
+    following: Option<&xberg_native_pdf::layout::TextSpan>,
+) -> bool {
+    let Some((prose, number)) = base.text.trim_end().rsplit_once(char::is_whitespace) else {
+        return false;
+    };
+    let Some(note) = notes.get(script.text.as_str()) else {
+        return false;
+    };
+    if base.text.ends_with(char::is_whitespace)
+        || !prose.chars().any(char::is_alphabetic)
+        || !number.chars().all(|c| c.is_ascii_digit())
+        || !is_unrotated(base)
+        || !is_unrotated(script)
+        || !is_ltr_writing_mode(base)
+        || !is_ltr_writing_mode(script)
+        || note.font_size >= base.font_size * 0.9
+        || base.bbox.y - note.bbox.y < base.font_size * 1.5
+        || (script.font_size >= base.font_size * 0.8 && script.text_rise.abs() < 0.10)
+    {
+        return false;
+    }
+    // A matching footnote number can also occur as a power on the same page.
+    // An adjacent operator is evidence of an expression, not a note reference.
+    if following.is_some_and(|next| {
+        next.text.trim_start().starts_with(['+', '-', '−', '×', '÷', '=', '^'])
+            && (next.bbox.y - base.bbox.y).abs() <= base.font_size * 0.5
+            && (next.bbox.x - (script.bbox.x + script.bbox.width)).abs() <= base.font_size
+    }) {
+        return false;
+    }
+    let gap = script.bbox.x - (base.bbox.x + base.bbox.width);
+    gap >= -0.1 * base.font_size
+        && gap <= 0.25 * base.font_size
+        && (base.bbox.y - script.bbox.y).abs() <= base.font_size * 0.5
 }
 
 const INLINE_FRAGMENT_GAP_RATIO: f32 = 0.1;
@@ -522,6 +618,7 @@ const ROW_RESET_MIN_BACKTRACK_EMS: f32 = 4.0;
 struct OrderedSpan<'a> {
     span: &'a xberg_native_pdf::layout::TextSpan,
     glue_to_previous: bool,
+    following: Option<&'a xberg_native_pdf::layout::TextSpan>,
 }
 
 /// Do the two spans share a line?
@@ -602,7 +699,10 @@ fn find_inline_fragment_anchor(
         .map(|(candidate_index, _)| candidate_index)
 }
 
-fn order_spans_with_inline_fragments(spans: &[xberg_native_pdf::layout::TextSpan]) -> Vec<OrderedSpan<'_>> {
+fn order_spans_with_inline_fragments<'a>(
+    spans: &'a [xberg_native_pdf::layout::TextSpan],
+    notes: &HashMap<&str, &xberg_native_pdf::layout::TextSpan>,
+) -> Vec<OrderedSpan<'a>> {
     let mut anchors = vec![None; spans.len()];
     for index in 0..spans.len() {
         anchors[index] = find_inline_fragment_anchor(index, spans, &anchors);
@@ -634,10 +734,12 @@ fn order_spans_with_inline_fragments(spans: &[xberg_native_pdf::layout::TextSpan
         ordered.push(OrderedSpan {
             span,
             glue_to_previous: false,
+            following: spans.get(index + 1),
         });
         ordered.extend(children[index].iter().map(|child| OrderedSpan {
             span: &spans[*child],
-            glue_to_previous: true,
+            glue_to_previous: !needs_numeric_script_boundary(span, &spans[*child], notes, spans.get(*child + 1)),
+            following: spans.get(*child + 1),
         }));
     }
     ordered
@@ -649,6 +751,7 @@ fn append_span_separator(
     current: OrderedSpan<'_>,
     paragraph_gap_threshold: f32,
     allow_ltr_row_resets: bool,
+    notes: &HashMap<&str, &xberg_native_pdf::layout::TextSpan>,
 ) {
     if current.glue_to_previous {
         return;
@@ -688,6 +791,11 @@ fn append_span_separator(
         return;
     }
 
+    if needs_numeric_script_boundary(previous, span, notes, current.following) {
+        text.push(' ');
+        return;
+    }
+
     if span.split_boundary_before {
         if !previous.text.ends_with(char::is_whitespace) && !span.text.starts_with(char::is_whitespace) {
             text.push(' ');
@@ -724,7 +832,8 @@ fn assemble_page_text(spans: &[xberg_native_pdf::layout::TextSpan]) -> String {
         "paragraph break detection initialized"
     );
 
-    let ordered = order_spans_with_inline_fragments(spans);
+    let notes = numeric_notes(spans);
+    let ordered = order_spans_with_inline_fragments(spans, &notes);
     let allow_ltr_row_resets = !spans
         .iter()
         .any(|span| span.rtl_draw_logical || has_rtl_or_bidi_content(&span.text));
@@ -734,7 +843,14 @@ fn assemble_page_text(spans: &[xberg_native_pdf::layout::TextSpan]) -> String {
     for current in ordered {
         let span = current.span;
         if let Some(prev) = prev_span {
-            append_span_separator(&mut text, prev, current, paragraph_gap_threshold, allow_ltr_row_resets);
+            append_span_separator(
+                &mut text,
+                prev,
+                current,
+                paragraph_gap_threshold,
+                allow_ltr_row_resets,
+                &notes,
+            );
         }
         text.push_str(&span.text);
         prev_span = Some(span);
@@ -2509,6 +2625,104 @@ mod tests {
             bbox: Rect { x, y, width, height },
             font_size,
             ..TextSpan::default()
+        }
+    }
+
+    #[test]
+    fn numeric_footnote_is_not_glued_to_prose() {
+        let spans = vec![
+            span_with_width("Il successivo comma 3", 121.1, 317.57, 135.52274, 12.96, 12.96),
+            span_with_width("5", 256.73, 317.57, 4.26, 8.52, 8.52),
+            span_with_width("5", 85.104, 148.10, 3.24, 6.48, 6.48),
+            span_with_width("L’articolo 16", 91.464, 144.62, 52.917, 9.96, 9.96),
+        ];
+        assert!(assemble_page_text(&spans).starts_with("Il successivo comma 3 5\n"));
+        assert!(rebuild_text_from_fragmented_spans(&spans).starts_with("Il successivo comma 3 5\n"));
+    }
+
+    #[test]
+    fn numeric_footnote_text_rise_gets_a_separator() {
+        let body = span_with_width("comma 3", 10.0, 100.0, 40.0, 12.0, 12.0);
+        let mut marker = span_with_width("5", 50.1, 100.0, 5.0, 12.0, 12.0);
+        marker.text_rise = 0.3;
+        let note = [
+            span_with_width("5", 10.0, 20.0, 4.0, 6.0, 6.0),
+            span_with_width("A supporting note", 15.0, 20.0, 60.0, 8.0, 8.0),
+        ];
+        assert!(assemble_page_text(&[body, marker, note[0].clone(), note[1].clone()]).starts_with("comma 3 5\n"));
+    }
+
+    #[test]
+    fn numeric_footnote_keeps_detached_marker_at_its_anchor() {
+        let spans = vec![
+            span_with_width("comma 3", 100.0, 100.0, 60.0, 12.0, 12.0),
+            span_with_width("Next paragraph", 100.0, 70.0, 70.0, 12.0, 12.0),
+            span_with_width("5", 160.1, 100.0, 4.0, 8.0, 8.0),
+            span_with_width("5", 100.0, 20.0, 4.0, 6.0, 6.0),
+            span_with_width("A supporting note", 105.0, 20.0, 60.0, 8.0, 8.0),
+        ];
+        assert!(assemble_page_text(&spans).starts_with("comma 3 5\n\nNext paragraph\n"));
+    }
+
+    #[test]
+    fn raised_exponent_in_prose_keeps_its_existing_join() {
+        let spans = vec![
+            span_with_width("compute 2", 100.0, 100.0, 60.0, 12.0, 12.0),
+            span_with_width("3", 160.1, 104.0, 4.0, 8.0, 8.0),
+        ];
+        assert_eq!(assemble_page_text(&spans), "compute 23");
+    }
+
+    #[test]
+    fn exponent_with_a_matching_note_number_keeps_its_join() {
+        let spans = vec![
+            span_with_width("The theorem says that 1", 100.0, 100.0, 120.0, 12.0, 12.0),
+            span_with_width("2", 220.1, 100.0, 4.0, 8.0, 8.0),
+            span_with_width(" + 1", 224.1, 100.0, 20.0, 12.0, 12.0),
+            span_with_width("2", 100.0, 20.0, 4.0, 6.0, 6.0),
+            span_with_width("An unrelated footnote", 105.0, 20.0, 60.0, 8.0, 8.0),
+        ];
+        assert!(assemble_page_text(&spans).starts_with("The theorem says that 12 + 1\n"));
+        assert!(rebuild_text_from_fragmented_spans(&spans).starts_with("The theorem says that 12 + 1\n"));
+    }
+
+    #[test]
+    fn numeric_note_evidence_must_be_smaller_and_below_the_reference() {
+        let body = span_with_width("comma 3", 100.0, 100.0, 60.0, 12.0, 12.0);
+        let marker = span_with_width("5", 160.1, 100.0, 4.0, 8.0, 8.0);
+        for (y, size) in [(200.0, 8.0), (20.0, 12.0)] {
+            let definitions = [
+                span_with_width("5", 100.0, y, 4.0, 6.0, 6.0),
+                span_with_width("A numbered paragraph", 105.0, y, 60.0, size, size),
+            ];
+            let notes = numeric_notes(&definitions);
+            assert!(!needs_numeric_script_boundary(&body, &marker, &notes, None));
+        }
+        let definitions = [
+            span_with_width("5", 100.0, 20.0, 4.0, 6.0, 6.0),
+            span_with_width("A supporting note", 105.0, 20.0, 60.0, 8.0, 8.0),
+        ];
+        let notes = numeric_notes(&definitions);
+        let distant = span_with_width("5", 343.0, 100.0, 4.0, 8.0, 8.0);
+        assert!(!needs_numeric_script_boundary(&body, &distant, &notes, None));
+        let spaced_body = span_with_width("comma 3 ", 100.0, 100.0, 60.0, 12.0, 12.0);
+        assert!(!needs_numeric_script_boundary(&spaced_body, &marker, &notes, None));
+    }
+
+    #[test]
+    fn numeric_footnote_controls_keep_existing_joins() {
+        for (body, script, size, expected) in [
+            ("3", "5", 12.0, "35"),
+            ("x", "2", 8.0, "x2"),
+            ("there are 2", "2", 8.0, "there are 22"),
+            ("2", "32+1", 8.0, "232+1"),
+        ] {
+            let spans = vec![
+                span_with_width(body, 10.0, 100.0, 40.0, 12.0, 12.0),
+                span_with_width(script, 50.1, 100.0, 8.0, size, size),
+            ];
+            assert_eq!(assemble_page_text(&spans), expected);
+            assert_eq!(rebuild_text_from_fragmented_spans(&spans), expected);
         }
     }
 
