@@ -1762,7 +1762,14 @@ impl ImageExtractor {
             ocr_result
         };
 
+        // Only the GH#1789 numeric repair below mutates this, and that is gated on
+        // `ocr` + `pdf`; an unconditional `mut` is a dead `mut` on every narrower leg,
+        // which the formula-recognition+pdf clippy gate rejects. Same shape as
+        // `ocr_tables`/`ocr_internal_document` just below. ~keep
+        #[cfg(all(feature = "ocr", feature = "pdf"))]
         let mut ocr_content = ocr_result.content;
+        #[cfg(not(all(feature = "ocr", feature = "pdf")))]
+        let ocr_content = ocr_result.content;
         let ocr_metadata = ocr_result.metadata;
         let ocr_elements = ocr_result.ocr_elements;
         let ocr_formulas = ocr_result.formulas;
