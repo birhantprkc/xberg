@@ -1007,42 +1007,29 @@ mod tests {
     }
 
     // =========================================================================
-    // GH#1782 — a page mixing a few readable lines with a Type 3 font that has
-    // no ToUnicode and procedural (non-AGL) /Differences glyph names. Fixtures
-    // are the reporter's `repro-type3-with-{2,6}-readable-lines.pdf` (sha256
-    // `580aa659c982190b2e4439e67b835c7049dbf88ad1c1f68fca74a9e63f046fd9` and
-    // `dff0a78726f6c1f308b3519bfa5c85e656079a53254825e818cd300a4d37d620`,
-    // verified against the values quoted in the issue), pinned unmodified.
+    // GH#1782 — a page mixing a few readable lines with a Type 3 font that has no ToUnicode
+    // and procedural (non-AGL) /Differences glyph names. Fixtures are the reporter's
+    // `repro-type3-with-{2,6}-readable-lines.pdf`, pinned unmodified, verified against issue.
     //
-    // What this session's `best_mapping_provenance`/`resolve_base_encoding_map`
-    // fixes achieve, verified below: every span painted by the Type 3 font now
-    // carries `MappingProvenance::Fallback` (previously `EncodingName`, which
-    // told every consumer — including this file's own fabricated-ratio gate —
-    // that the text was safely mappable). That is a real, tested improvement.
+    // What this session's `best_mapping_provenance`/`resolve_base_encoding_map` fixes
+    // achieve, verified below: every span painted by the Type 3 font now carries
+    // `MappingProvenance::Fallback` (previously `EncodingName`, telling every consumer,
+    // including this file's fabricated-ratio gate, that the text was safely mappable).
     //
-    // What it does NOT achieve on these exact fixtures, measured and NOT
-    // shipped: `fabricated_char_counts` (above) counts *decoded Unicode
-    // characters*, not glyphs painted. A glyph whose code has no mapping now
-    // correctly decodes to nothing (previously it fabricated a plausible-
-    // looking StandardEncoding punctuation character or bare control code) —
-    // but "nothing" contributes zero to both the fabricated numerator and the
-    // total denominator, so a page can be entirely built from unmapped glyphs
-    // and still measure a LOW fabricated ratio, because there is barely any
-    // decoded text of any kind to count. Root cause: font_dict.rs's
-    // `char_to_unicode` correctly returns `None` for these codes, but
-    // `extractors/text/{advance.rs,mod.rs,clustering.rs}` all then call
-    // `fallback_char_to_unicode` (fonts/unicode_decode.rs:130), whose final
-    // `char::from_u32(char_code)` catch-all (unicode_decode.rs:139-143)
-    // reinterprets the raw, meaningless Type 3 procedure code as if it were
-    // itself a Unicode codepoint — the true source of the "symbol characters"
-    // GH#1780/#1782 describe. That reinterpretation is shared by every font,
-    // not Type 3-specific, and fixing it is a separate, larger change than
-    // this session's scope: flipping `extraction_method` for these fixtures
-    // needs a page-fabrication signal built on GLYPH COUNT attributed to a
-    // Fallback-provenance font, not decoded character count, since the
-    // decoded count is structurally blind to glyphs that (correctly, now)
-    // decode to nothing. NO-SHIP for the ratio-based routing flip; the
-    // provenance/encoding correctness fixes below stand on their own. ~keep
+    // What it does NOT achieve on these exact two fixtures, measured: their Type 3 text is a
+    // small share of the page (19.7% / 7.6% of non-whitespace chars, see
+    // `gh1782_ratio_based_routing_does_not_yet_flag_these_fixtures`), so the ratio stays under
+    // the 0.5 default and the page correctly stays native, matching the issue's own
+    // description of a short Type 3 fragment under a longer readable body as intentional.
+    // This is NOT a "decodes to nothing, invisible to the ratio" gap: `char::from_u32`'s
+    // raw-codepoint catch-all (fonts/unicode_decode.rs:139-143, shared by every font) still
+    // fills the span's text, so a Fallback-provenance glyph counts fully into
+    // `fabricated_char_counts`' numerator, in direct proportion to how much of the page the
+    // font paints. A page shaped like the real-world document (Type 3 dominant, short header)
+    // measures 83.3% and IS flagged (`gh1782_majority_share_page_is_flagged_fabricated`), so
+    // the reported 106/143-page residual (median 98% share) is expected to clear this ratio
+    // under this fix already, without a separate glyph-count signal. The real, non-shareable
+    // document could not be re-run to confirm the exact count. ~keep
     // =========================================================================
 
     fn type3_fixture(name: &str) -> PdfDocument {
@@ -1137,6 +1124,29 @@ mod tests {
             "a page of plain Type 1 text with no Type 3 font must never be flagged \
              fabricated — false positives here would route ordinary native-text \
              documents to OCR needlessly"
+        );
+    }
+
+    /// GH#1782 residual, measured: unlike the two boundary fixtures above (19.7%/7.6% ratio,
+    /// both intentionally under 0.5), a page whose Type 3 text dominates — matching the
+    /// reporter's real-world document, where the font carries a median 98% of a page's
+    /// glyphs — clears the ratio easily and IS flagged. `gh1782-majority-share.pdf` mirrors
+    /// that shape (40 lines of the font under one readable header line) and measures an
+    /// 83.3% ratio (310/372 chars). See the module comment above for why this is possible. ~keep
+    #[test]
+    fn gh1782_majority_share_page_is_flagged_fabricated() {
+        let doc = type3_fixture("gh1782-majority-share.pdf");
+        let thresholds = crate::core::config::OcrQualityThresholds::default();
+        let fabricated = fabricated_provenance_page_indices(
+            &doc,
+            thresholds.min_provenance_fallback_ratio,
+            thresholds.min_total_non_whitespace,
+        );
+        assert_eq!(
+            fabricated,
+            vec![0],
+            "a page whose unmapped-Type3 text dominates (matching the reported real-world \
+             median 98% share) must be flagged fabricated by the existing ratio-based check"
         );
     }
 }

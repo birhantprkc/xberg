@@ -1223,6 +1223,11 @@ struct ImageXObjectMetadata {
     rendering_intent: crate::color::RenderingIntent,
     is_jbig2: bool,
     is_jpx: bool,
+    /// Set when `color_space` above is a placeholder because the JPXDecode
+    /// image named no `/ColorSpace` (see `resolve_image_xobject_metadata`).
+    /// The caller must replace it with the colour space `decode_jpx_image`
+    /// actually decoded before storing it on the returned `PdfImage`. ~keep
+    jpx_color_space_is_placeholder: bool,
     is_jpeg_only: bool,
     is_jpeg_chain: bool,
     is_ccitt: bool,
@@ -1246,10 +1251,29 @@ fn resolve_image_xobject_metadata(
         is_image_mask,
     } = resolve_image_dimensions(doc, dict)?;
 
+    let ImageFilterInfo {
+        is_jbig2,
+        is_jpx,
+        is_jpeg_only,
+        is_jpeg_chain,
+        is_ccitt,
+        ccitt_params,
+    } = resolve_image_filter_info(dict, width, height);
+
     let default_mask_color_space = Object::Name("DeviceGray".to_string());
+    // ISO 32000-1 Table 89 permits /ColorSpace to be omitted for a JPXDecode
+    // image: the codestream carries its own colour space, matching the
+    // precedent for /BitsPerComponent defaulting to 8 above. The placeholder
+    // here is never read for pixel interpretation -- decode_jpx_image derives
+    // the real component count from the codestream and the caller overwrites
+    // `color_space` with it once decoding is done -- it only needs to parse
+    // into a valid ColorSpace so the rest of this function can run. ~keep
+    let default_jpx_color_space = Object::Name("DeviceRGB".to_string());
+    let color_space_missing_ok_for_jpx = is_jpx && !is_image_mask;
     let color_space_obj = match dict.get("ColorSpace") {
         Some(color_space) => color_space,
         None if is_image_mask => &default_mask_color_space,
+        None if color_space_missing_ok_for_jpx => &default_jpx_color_space,
         None => return Err(Error::Image("Image missing /ColorSpace".to_string())),
     };
 
@@ -1268,15 +1292,6 @@ fn resolve_image_xobject_metadata(
         .map(crate::color::RenderingIntent::from_pdf_name)
         .unwrap_or_default();
 
-    let ImageFilterInfo {
-        is_jbig2,
-        is_jpx,
-        is_jpeg_only,
-        is_jpeg_chain,
-        is_ccitt,
-        ccitt_params,
-    } = resolve_image_filter_info(dict, width, height);
-
     Ok(ImageXObjectMetadata {
         width,
         height,
@@ -1288,6 +1303,7 @@ fn resolve_image_xobject_metadata(
         rendering_intent,
         is_jbig2,
         is_jpx,
+        jpx_color_space_is_placeholder: dict.get("ColorSpace").is_none() && color_space_missing_ok_for_jpx,
         is_jpeg_only,
         is_jpeg_chain,
         is_ccitt,
@@ -1322,13 +1338,14 @@ pub fn extract_image_from_xobject(
         width,
         height,
         bits_per_component,
-        color_space,
+        mut color_space,
         resolved_color_space,
         indexed_resolution,
         direct_icc_profile,
         rendering_intent,
         is_jbig2,
         is_jpx,
+        jpx_color_space_is_placeholder,
         is_jpeg_only,
         is_jpeg_chain,
         is_ccitt,
@@ -1351,7 +1368,20 @@ pub fn extract_image_from_xobject(
     let data = if is_jbig2 {
         decode_jbig2_image(xobject, obj_ref, dict, doc, width, height)?
     } else if is_jpx {
-        decode_jpx_image(xobject, obj_ref, doc, &color_space)?
+        let jpx_data = decode_jpx_image(xobject, obj_ref, doc, &color_space)?;
+        // The placeholder colour space set above (dict named no /ColorSpace)
+        // was never the real one; replace it with what the codestream
+        // actually decoded to, so downstream consumers of `color_space` (the
+        // colour-key /Mask component count, in particular) see the real
+        // component count rather than the placeholder's. ~keep
+        if jpx_color_space_is_placeholder && let ImageData::Raw { format, .. } = &jpx_data {
+            color_space = match format {
+                PixelFormat::Grayscale => ColorSpace::DeviceGray,
+                PixelFormat::RGB => ColorSpace::DeviceRGB,
+                PixelFormat::CMYK => ColorSpace::DeviceCMYK,
+            };
+        }
+        jpx_data
     } else if is_jpeg_only || is_jpeg_chain {
         let decoded = if let (Some(d), Some(ref_id)) = (doc.as_ref(), obj_ref) {
             d.decode_stream_with_encryption(xobject, ref_id)?
