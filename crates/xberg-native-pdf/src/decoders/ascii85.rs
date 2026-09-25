@@ -13,7 +13,9 @@ use crate::error::{Error, Result};
 pub struct Ascii85Decoder;
 
 impl StreamDecoder for Ascii85Decoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is ignored: ASCII85 output is at most 4/5 of input
+    // length, so it can never exceed the cap that already bounded the input. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         let mut acc: u32 = 0;
         let mut count = 0;
@@ -89,7 +91,7 @@ mod tests {
         let decoder = Ascii85Decoder;
         // "Test" encoded in ASCII85 (4 bytes = 1 complete group) ~keep
         let input = b"<+U,m";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Test");
     }
 
@@ -97,7 +99,7 @@ mod tests {
     fn test_ascii85_decode_z_special_case() {
         let decoder = Ascii85Decoder;
         let input = b"z";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"\x00\x00\x00\x00");
     }
 
@@ -105,7 +107,7 @@ mod tests {
     fn test_ascii85_decode_multiple_z() {
         let decoder = Ascii85Decoder;
         let input = b"zz";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"\x00\x00\x00\x00\x00\x00\x00\x00");
     }
 
@@ -113,7 +115,7 @@ mod tests {
     fn test_ascii85_decode_with_whitespace() {
         let decoder = Ascii85Decoder;
         let input = b"<+U ,m";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Test");
     }
 
@@ -121,7 +123,7 @@ mod tests {
     fn test_ascii85_decode_with_end_marker() {
         let decoder = Ascii85Decoder;
         let input = b"<+U,m~>";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Test");
     }
 
@@ -129,7 +131,7 @@ mod tests {
     fn test_ascii85_decode_empty() {
         let decoder = Ascii85Decoder;
         let input = b"";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"");
     }
 
@@ -137,7 +139,7 @@ mod tests {
     fn test_ascii85_decode_padding() {
         let decoder = Ascii85Decoder;
         let input = b"!!";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert!(!output.is_empty());
     }
 
@@ -145,7 +147,7 @@ mod tests {
     fn test_ascii85_decode_invalid_character() {
         let decoder = Ascii85Decoder;
         let input = b"Hello\x00";
-        let result = decoder.decode(input);
+        let result = decoder.decode(input, 0);
         assert!(result.is_err());
     }
 
@@ -154,7 +156,7 @@ mod tests {
         let decoder = Ascii85Decoder;
         // 'z' in the middle of a group is invalid ~keep
         let input = b"!z";
-        let result = decoder.decode(input);
+        let result = decoder.decode(input, 0);
         assert!(result.is_err());
     }
 
@@ -163,7 +165,7 @@ mod tests {
         let decoder = Ascii85Decoder;
         // Single character (not 'z') is invalid ~keep
         let input = b"!";
-        let result = decoder.decode(input);
+        let result = decoder.decode(input, 0);
         assert!(result.is_err());
     }
 

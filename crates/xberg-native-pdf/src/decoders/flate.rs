@@ -211,7 +211,10 @@ impl FlateDecoder {
 }
 
 impl StreamDecoder for FlateDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is ignored here: this decoder already enforces its own,
+    // independently configured `max_decompressed_bytes` mid-decode via `.take(limit)` in
+    // every strategy below, and predates the trait-level cap. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         let limit = self.max_decompressed_bytes;
 
         let zlib_err = match try_zlib_decode(input, limit)? {
@@ -472,7 +475,7 @@ mod tests {
         encoder.write_all(original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -485,7 +488,7 @@ mod tests {
         encoder.write_all(original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -498,7 +501,7 @@ mod tests {
         encoder.write_all(&original).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -510,7 +513,7 @@ mod tests {
         // SPEC COMPLIANCE: We now correctly reject invalid compressed data
         // instead of returning it as raw data (which violated PDF spec) ~keep
         let invalid = b"This is not zlib compressed data";
-        let result = decoder.decode(invalid);
+        let result = decoder.decode(invalid, 0);
         assert!(result.is_err());
 
         if let Err(e) = result {
@@ -548,7 +551,7 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         let decoder = FlateDecoder::with_limit(1024);
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -560,7 +563,7 @@ mod tests {
         let compressed = encoder.finish().unwrap();
 
         let decoder = FlateDecoder::with_limit(10);
-        let result = decoder.decode(&compressed);
+        let result = decoder.decode(&compressed, 0);
         assert!(result.is_err(), "expected rejection when output exceeds custom limit");
     }
 

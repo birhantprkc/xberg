@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 pub struct AsciiHexDecoder;
 
 impl StreamDecoder for AsciiHexDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is ignored: ASCIIHex output is at most half of
+    // input length, so it can never exceed the cap that already bounded the input. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         let mut chars = input
             .iter()
@@ -58,7 +60,7 @@ mod tests {
     fn test_ascii_hex_decode_simple() {
         let decoder = AsciiHexDecoder;
         let input = b"48656C6C6F";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Hello");
     }
 
@@ -66,7 +68,7 @@ mod tests {
     fn test_ascii_hex_decode_with_whitespace() {
         let decoder = AsciiHexDecoder;
         let input = b"48 65 6C 6C 6F";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Hello");
     }
 
@@ -74,7 +76,7 @@ mod tests {
     fn test_ascii_hex_decode_odd_length() {
         let decoder = AsciiHexDecoder;
         let input = b"486";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"H`");
     }
 
@@ -82,7 +84,7 @@ mod tests {
     fn test_ascii_hex_decode_with_end_marker() {
         let decoder = AsciiHexDecoder;
         let input = b"48656C6C6F>";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Hello");
     }
 
@@ -90,7 +92,7 @@ mod tests {
     fn test_ascii_hex_decode_lowercase() {
         let decoder = AsciiHexDecoder;
         let input = b"48656c6c6f";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Hello");
     }
 
@@ -98,7 +100,7 @@ mod tests {
     fn test_ascii_hex_decode_mixed_case() {
         let decoder = AsciiHexDecoder;
         let input = b"48656C6c6F";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"Hello");
     }
 
@@ -106,7 +108,7 @@ mod tests {
     fn test_ascii_hex_decode_empty() {
         let decoder = AsciiHexDecoder;
         let input = b"";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"");
     }
 
@@ -114,7 +116,7 @@ mod tests {
     fn test_ascii_hex_decode_invalid_digit() {
         let decoder = AsciiHexDecoder;
         let input = b"4G";
-        let result = decoder.decode(input);
+        let result = decoder.decode(input, 0);
         assert!(result.is_err());
     }
 

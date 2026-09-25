@@ -11,7 +11,7 @@
 //! - Clear code is 256, EOD code is 257
 //! - First available code is 258
 
-use crate::decoders::StreamDecoder;
+use crate::decoders::{StreamDecoder, check_output_cap};
 use crate::error::{Error, Result};
 
 /// LZWDecode filter implementation.
@@ -20,10 +20,15 @@ use crate::error::{Error, Result};
 pub struct LzwDecoder;
 
 impl StreamDecoder for LzwDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
-        match decode_lzw_weezl(input) {
-            Ok(data) => Ok(data),
-            Err(_) => decode_lzw_custom(input),
+    fn decode(&self, input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>> {
+        match decode_lzw_weezl(input, max_output_bytes) {
+            WeezlAttempt::Recovered(data) => Ok(data),
+            // A cap violation is not a "this decoder can't handle it" failure the custom
+            // fallback might succeed at differently — it is a real property of the stream's
+            // expansion, so re-decoding the same input through an independent implementation
+            // would only repeat the same bounded allocation for no benefit. ~keep
+            WeezlAttempt::CapExceeded(err) => Err(err),
+            WeezlAttempt::Failed => decode_lzw_custom(input, max_output_bytes),
         }
     }
 
@@ -32,18 +37,68 @@ impl StreamDecoder for LzwDecoder {
     }
 }
 
-/// Decode using weezl crate (well-tested LZW implementation).
-fn decode_lzw_weezl(input: &[u8]) -> Result<Vec<u8>> {
-    use weezl::{BitOrder, decode::Decoder as WeezlDecoder};
+/// Bytes decoded per `weezl` chunk before the output is re-checked against
+/// `max_output_bytes`. Bounds how far a bounded decode can overshoot the cap. ~keep
+const WEEZL_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Outcome of a weezl decode attempt: a clean decode, a decode that exceeded
+/// `max_output_bytes`, or a genuine decode failure worth retrying with the custom decoder.
+/// `Failed` carries no payload: the failure is already logged via `tracing::warn!` at the
+/// point it occurs, and the caller retries with an independent decoder rather than
+/// reporting this error, so keeping it around would just be dead weight. ~keep
+enum WeezlAttempt {
+    Recovered(Vec<u8>),
+    CapExceeded(Error),
+    Failed,
+}
+
+/// Decode using the weezl crate (well-tested LZW implementation), decoding in bounded
+/// chunks via `decode_bytes` rather than `Decoder::decode`'s single unbounded call so a
+/// dense LZW stream aborts mid-decode instead of materialising its full expansion before
+/// anything checks it (GH#1764).
+fn decode_lzw_weezl(input: &[u8], max_output_bytes: usize) -> WeezlAttempt {
+    use weezl::{BitOrder, LzwStatus, decode::Decoder as WeezlDecoder};
 
     // PDF uses MSB bit order, 8-bit minimum code size ~keep
     let mut decoder = WeezlDecoder::new(BitOrder::Msb, 8);
+    let mut output = Vec::new();
+    let mut chunk = vec![0u8; WEEZL_CHUNK_BYTES];
+    let mut remaining = input;
 
-    match decoder.decode(input) {
-        Ok(output) => Ok(output),
-        Err(e) => {
-            tracing::warn!(filter = "LZWDecode", error = ?e, "weezl decode failed, falling back to custom decoder");
-            Err(Error::Decode(format!("LZWDecode error: {:?}", e)))
+    loop {
+        let result = decoder.decode_bytes(remaining, &mut chunk);
+        output.extend_from_slice(&chunk[..result.consumed_out]);
+        remaining = &remaining[result.consumed_in..];
+
+        if let Err(err) = check_output_cap("LZWDecode", output.len(), max_output_bytes) {
+            return WeezlAttempt::CapExceeded(err);
+        }
+
+        match result.status {
+            Ok(LzwStatus::Done) => return WeezlAttempt::Recovered(output),
+            Ok(LzwStatus::Ok) => continue,
+            Ok(LzwStatus::NoProgress) => {
+                tracing::warn!(
+                    filter = "LZWDecode",
+                    "weezl decode stalled before an end-of-data marker, falling back to custom decoder"
+                );
+                return WeezlAttempt::Failed;
+            }
+            Err(e) => {
+                tracing::warn!(filter = "LZWDecode", error = ?e, "weezl decode failed, falling back to custom decoder");
+                return WeezlAttempt::Failed;
+            }
+        }
+    }
+}
+
+/// EarlyChange=1: increase the code size one code earlier than GIF/TIFF would (before
+/// reading, when `next_code` has just reached `2^code_bits - 1`), per the PDF spec.
+fn maybe_increase_code_size(code_bits: &mut u8, next_code: u16, max_code_bits: u8) {
+    if *code_bits < max_code_bits && next_code > 0 {
+        let increase_at = (1 << *code_bits) - 1;
+        if next_code == increase_at {
+            *code_bits += 1;
         }
     }
 }
@@ -51,7 +106,7 @@ fn decode_lzw_weezl(input: &[u8]) -> Result<Vec<u8>> {
 /// Custom LZW decoder for PDF (handles edge cases).
 ///
 /// This implementation follows the PDF spec exactly, including EarlyChange behavior.
-fn decode_lzw_custom(input: &[u8]) -> Result<Vec<u8>> {
+fn decode_lzw_custom(input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>> {
     const CLEAR_CODE: u16 = 256;
     const EOD_CODE: u16 = 257;
     const FIRST_CODE: u16 = 258;
@@ -65,15 +120,7 @@ fn decode_lzw_custom(input: &[u8]) -> Result<Vec<u8>> {
     let mut prev_code: Option<u16> = None;
 
     loop {
-        // EarlyChange=1: Check if we need to increase code size BEFORE reading
-        // PDF's EarlyChange=1 means: increase code size when next_code == 2^code_bits - 1
-        // This is "one code early" compared to standard LZW (which waits until 2^code_bits) ~keep
-        if code_bits < MAX_CODE_BITS && next_code > 0 {
-            let increase_at = (1 << code_bits) - 1;
-            if next_code == increase_at {
-                code_bits += 1;
-            }
-        }
+        maybe_increase_code_size(&mut code_bits, next_code, MAX_CODE_BITS);
 
         let code = match bit_reader.read_bits(code_bits) {
             Some(c) => c as u16,
@@ -112,6 +159,11 @@ fn decode_lzw_custom(input: &[u8]) -> Result<Vec<u8>> {
         };
 
         output.extend_from_slice(&string);
+
+        // GH#1764: a table entry can be as long as the whole 4096-code table allows, so
+        // checking after every emitted code (rather than only at the end) bounds a bounded
+        // decode's overshoot to one entry's length instead of the stream's full expansion. ~keep
+        check_output_cap("LZWDecode", output.len(), max_output_bytes)?;
 
         if let Some(prev) = prev_code
             && next_code < 4096
@@ -207,7 +259,7 @@ mod tests {
         let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
         let compressed = encoder.encode(original).unwrap();
 
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -219,7 +271,7 @@ mod tests {
         let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
         let compressed = encoder.encode(original).unwrap();
 
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -231,7 +283,7 @@ mod tests {
         let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
         let compressed = encoder.encode(&original).unwrap();
 
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -240,7 +292,7 @@ mod tests {
         let decoder = LzwDecoder;
 
         let invalid = b"This is not LZW compressed data";
-        let result = decoder.decode(invalid);
+        let result = decoder.decode(invalid, 0);
         assert!(result.is_err());
     }
 
@@ -248,5 +300,51 @@ mod tests {
     fn test_lzw_decoder_name() {
         let decoder = LzwDecoder;
         assert_eq!(decoder.name(), "LZWDecode");
+    }
+
+    /// GH#1764: `decode` must abort once output crosses `max_output_bytes`, not after
+    /// building the stream's full expansion. A 10,000,000 byte input built from a
+    /// two-byte repeat compresses extremely well under LZW, so decoding it fully needs
+    /// far more work and memory than a 100,000 byte cap should ever allow the decoder
+    /// to reach. Proving `bytes_at_abort` stayed within a small multiple of the cap
+    /// (and well under the full expansion) proves the decoder stopped early rather than
+    /// building the whole 10 MB before the caller's post-hoc check would have rejected it.
+    #[test]
+    fn test_lzw_decode_aborts_before_building_full_expansion() {
+        let decoder = LzwDecoder;
+        let original = b"AB".repeat(5_000_000);
+        let full_expansion = original.len();
+        let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
+        let compressed = encoder.encode(&original).unwrap();
+        let cap = 100_000;
+
+        let start = std::time::Instant::now();
+        let result = decoder.decode(&compressed, cap);
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("decode must reject output exceeding the cap");
+        let message = err.to_string();
+        let reported_bytes: usize = message
+            .split("output size ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("error message did not report an observed size: {message}"));
+
+        assert!(
+            reported_bytes < cap + WEEZL_CHUNK_BYTES,
+            "decode reported {reported_bytes} bytes at abort, more than one weezl chunk past \
+             the {cap} byte cap; the decoder built more output than the cap allows before checking"
+        );
+        assert!(
+            reported_bytes < full_expansion / 10,
+            "decode reported {reported_bytes} bytes, within an order of magnitude of the full \
+             {full_expansion} byte expansion; the abort did not happen early"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "decode took {elapsed:?} to abort a 100 KB-capped stream whose full decode is \
+             {full_expansion} bytes; that is too slow for an early abort"
+        );
     }
 }

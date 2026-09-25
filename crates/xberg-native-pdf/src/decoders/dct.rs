@@ -13,7 +13,9 @@ use crate::error::Result;
 pub struct DctDecoder;
 
 impl StreamDecoder for DctDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is ignored: this is a pass-through, so output
+    // never exceeds input length. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         Ok(input.to_vec())
     }
 
@@ -30,7 +32,7 @@ mod tests {
     fn test_dct_decode_passthrough() {
         let decoder = DctDecoder;
         let jpeg_data = b"\xFF\xD8\xFF\xE0\x00\x10JFIF";
-        let output = decoder.decode(jpeg_data).unwrap();
+        let output = decoder.decode(jpeg_data, 0).unwrap();
         assert_eq!(output, jpeg_data);
     }
 
@@ -38,7 +40,7 @@ mod tests {
     fn test_dct_decode_empty() {
         let decoder = DctDecoder;
         let input = b"";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"");
     }
 

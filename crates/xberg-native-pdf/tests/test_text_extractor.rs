@@ -193,7 +193,7 @@ fn test_brotli_decode_roundtrip() {
     }
 
     let decoder = BrotliDecoder;
-    let decoded = decoder.decode(&compressed).unwrap();
+    let decoded = decoder.decode(&compressed, 0).unwrap();
     assert_eq!(decoded, original.to_vec());
 }
 

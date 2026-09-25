@@ -28,7 +28,7 @@ fn test_flate_decoder_integration() {
     encoder.write_all(original).unwrap();
     let compressed = encoder.finish().unwrap();
 
-    let decoded = decoder.decode(&compressed).unwrap();
+    let decoded = decoder.decode(&compressed, 0).unwrap();
     assert_eq!(decoded, original);
 }
 
@@ -43,7 +43,7 @@ fn test_ascii_hex_decoder_integration() {
     ];
 
     for (input, expected) in test_cases {
-        let decoded = decoder.decode(input).unwrap();
+        let decoded = decoder.decode(input, 0).unwrap();
         assert_eq!(decoded, expected);
     }
 }
@@ -52,10 +52,10 @@ fn test_ascii_hex_decoder_integration() {
 fn test_ascii85_decoder_integration() {
     let decoder = Ascii85Decoder;
 
-    let decoded = decoder.decode(b"z").unwrap();
+    let decoded = decoder.decode(b"z", 0).unwrap();
     assert_eq!(decoded, b"\x00\x00\x00\x00");
 
-    let decoded = decoder.decode(b"<+U,m").unwrap();
+    let decoded = decoder.decode(b"<+U,m", 0).unwrap();
     assert_eq!(decoded, b"Test");
 }
 
@@ -67,7 +67,7 @@ fn test_lzw_decoder_integration() {
     let mut encoder = LzwEncoder::new(BitOrder::Msb, 8);
     let compressed = encoder.encode(original).unwrap();
 
-    let decoded = decoder.decode(&compressed).unwrap();
+    let decoded = decoder.decode(&compressed, 0).unwrap();
     assert_eq!(decoded, original);
 }
 
@@ -76,11 +76,11 @@ fn test_runlength_decoder_integration() {
     let decoder = RunLengthDecoder;
 
     let input = vec![2, b'A', b'B', b'C'];
-    let decoded = decoder.decode(&input).unwrap();
+    let decoded = decoder.decode(&input, 0).unwrap();
     assert_eq!(decoded, b"ABC");
 
     let input = vec![250, b'X'];
-    let decoded = decoder.decode(&input).unwrap();
+    let decoded = decoder.decode(&input, 0).unwrap();
     assert_eq!(decoded, b"XXXXXXX");
 }
 
@@ -89,7 +89,7 @@ fn test_dct_decoder_integration() {
     let decoder = DctDecoder;
 
     let jpeg_data = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01";
-    let decoded = decoder.decode(jpeg_data).unwrap();
+    let decoded = decoder.decode(jpeg_data, 0).unwrap();
     assert_eq!(decoded, jpeg_data);
 }
 

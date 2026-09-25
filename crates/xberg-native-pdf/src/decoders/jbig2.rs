@@ -37,7 +37,9 @@ use crate::error::Result;
 pub struct Jbig2Decoder;
 
 impl StreamDecoder for Jbig2Decoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is ignored: this is a pass-through, so output
+    // never exceeds input length. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         tracing::debug!(filter = "JBIG2Decode", bytes = input.len(), "pass-through");
         Ok(input.to_vec())
     }
@@ -55,7 +57,7 @@ mod tests {
     fn test_jbig2_decode_passthrough() {
         let decoder = Jbig2Decoder;
         let jbig2_data = b"\x97\x4A\x42\x32\x0D\x0A\x1A\x0A";
-        let output = decoder.decode(jbig2_data).unwrap();
+        let output = decoder.decode(jbig2_data, 0).unwrap();
         assert_eq!(output, jbig2_data);
     }
 
@@ -63,7 +65,7 @@ mod tests {
     fn test_jbig2_decode_empty() {
         let decoder = Jbig2Decoder;
         let input = b"";
-        let output = decoder.decode(input).unwrap();
+        let output = decoder.decode(input, 0).unwrap();
         assert_eq!(output, b"");
     }
 
