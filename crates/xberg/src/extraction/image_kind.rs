@@ -31,8 +31,14 @@ const MAX_CLASSIFY_PIXELS: u64 = 64 * 1024 * 1024;
 
 /// Grouped arguments for [`classify`].
 ///
-/// Not FFI-exposed (`classify` itself is `alef(skip)`); grouping simply keeps the
-/// function under the workspace's six-parameter limit.
+/// Not FFI-exposed; grouping simply keeps `classify` under the workspace's
+/// six-parameter limit. `alef(skip)` on `classify` does NOT propagate to this
+/// struct -- alef generates a binding type for any reachable `pub` struct -- so
+/// the skip has to be repeated here, or every language package grows an
+/// `ImageClassifyInput` for a purely internal parameter bag. It stays `pub`
+/// rather than `pub(crate)` because tests/image_classification.rs is a separate
+/// crate and constructs it. ~keep
+#[cfg_attr(alef, alef(skip))]
 pub struct ImageClassifyInput<'a> {
     /// Raw image bytes (should be decodable to standard formats).
     pub bytes: &'a [u8],
