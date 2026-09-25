@@ -14827,6 +14827,14 @@ xberg_image_preprocessing_config_binarization_method(XBERGAlefHandle handle);
 int32_t xberg_image_preprocessing_config_invert_colors(XBERGAlefHandle handle);
 
 /**
+ * Get the `normalize_shaded_rows` field from a `ImagePreprocessingConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t
+xberg_image_preprocessing_config_normalize_shaded_rows(XBERGAlefHandle handle);
+
+/**
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */

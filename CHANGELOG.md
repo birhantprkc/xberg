@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+
 - **(ocr): `TesseractConfig::thresholding_method` is an integer selecting the binarization algorithm, where it used to be a `bool`.** The field was sent to Tesseract as the string `"true"` or `"false"`, which its integer parameter parser cannot read -- and `SetVariable` reports no error for a value it fails to parse, so the check around that call never fired. The setting therefore did nothing at all, and methods 1 (LeptonicaOtsu) and 2 (Sauvola) were unreachable: on the reporting document Tesseract's own CLI reads 135 of 138 values at method 1 where xberg read 120. Valid values are 0 (Otsu, the default and the previous effective behaviour), 1 and 2, and they are now validated rather than passed through. Configuration files and any caller that supplies a map or dictionary are unaffected -- a legacy `false` still deserializes to 0 and `true` to 1, the method its old documentation described. This is a breaking change only for callers that assign the field in typed code, in Rust or in a generated binding, where `true` becomes `1`. (GH#1784)
 
 ### Fixed

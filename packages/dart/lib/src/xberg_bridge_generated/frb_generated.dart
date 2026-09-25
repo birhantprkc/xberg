@@ -20181,8 +20181,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ImagePreprocessingConfig dco_decode_image_preprocessing_config(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 7)
-      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
+    if (arr.length != 8)
+      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
     return ImagePreprocessingConfig(
       targetDpi: dco_decode_i_64(arr[0]),
       autoRotate: dco_decode_bool(arr[1]),
@@ -20191,6 +20191,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       contrastEnhance: dco_decode_bool(arr[4]),
       binarizationMethod: dco_decode_String(arr[5]),
       invertColors: dco_decode_bool(arr[6]),
+      normalizeShadedRows: dco_decode_bool(arr[7]),
     );
   }
 
@@ -24173,7 +24174,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       tesseditCharBlacklist: dco_decode_String(arr[17]),
       tesseditUsePrimaryParamsModel: dco_decode_bool(arr[18]),
       textordSpaceSizeIsVariable: dco_decode_bool(arr[19]),
-      thresholdingMethod: dco_decode_bool(arr[20]),
+      thresholdingMethod: dco_decode_i_64(arr[20]),
     );
   }
 
@@ -29403,6 +29404,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_contrastEnhance = sse_decode_bool(deserializer);
     var var_binarizationMethod = sse_decode_String(deserializer);
     var var_invertColors = sse_decode_bool(deserializer);
+    var var_normalizeShadedRows = sse_decode_bool(deserializer);
     return ImagePreprocessingConfig(
       targetDpi: var_targetDpi,
       autoRotate: var_autoRotate,
@@ -29411,6 +29413,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       contrastEnhance: var_contrastEnhance,
       binarizationMethod: var_binarizationMethod,
       invertColors: var_invertColors,
+      normalizeShadedRows: var_normalizeShadedRows,
     );
   }
 
@@ -35276,7 +35279,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_tesseditCharBlacklist = sse_decode_String(deserializer);
     var var_tesseditUsePrimaryParamsModel = sse_decode_bool(deserializer);
     var var_textordSpaceSizeIsVariable = sse_decode_bool(deserializer);
-    var var_thresholdingMethod = sse_decode_bool(deserializer);
+    var var_thresholdingMethod = sse_decode_i_64(deserializer);
     return TesseractConfig(
       language: var_language,
       psm: var_psm,
@@ -40268,6 +40271,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self.contrastEnhance, serializer);
     sse_encode_String(self.binarizationMethod, serializer);
     sse_encode_bool(self.invertColors, serializer);
+    sse_encode_bool(self.normalizeShadedRows, serializer);
   }
 
   @protected
@@ -45322,7 +45326,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.tesseditCharBlacklist, serializer);
     sse_encode_bool(self.tesseditUsePrimaryParamsModel, serializer);
     sse_encode_bool(self.textordSpaceSizeIsVariable, serializer);
-    sse_encode_bool(self.thresholdingMethod, serializer);
+    sse_encode_i_64(self.thresholdingMethod, serializer);
   }
 
   @protected

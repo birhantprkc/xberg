@@ -402,16 +402,6 @@ values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too
 
 [[entries]]
 relative_path = "poly.toml"
-key_path = "per-file-ignores.**/*.test.js"
-values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
-
-[[entries]]
-relative_path = "poly.toml"
-key_path = "per-file-ignores.**/*.test.mjs"
-values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
-
-[[entries]]
-relative_path = "poly.toml"
 key_path = "per-file-ignores.**/*.test.ts"
 values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 
@@ -438,11 +428,6 @@ values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too
 [[entries]]
 relative_path = "poly.toml"
 key_path = "per-file-ignores.**/*_test.go"
-values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
-
-[[entries]]
-relative_path = "poly.toml"
-key_path = "per-file-ignores.**/*_test.py"
 values = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 
 [[entries]]
@@ -1955,11 +1940,6 @@ values = ["RET504"]
 
 [[entries]]
 relative_path = "poly.toml"
-key_path = "per-file-ignores.packages/python/build.py"
-values = ["INP001"]
-
-[[entries]]
-relative_path = "poly.toml"
 key_path = "per-file-ignores.poly.toml"
 values = ["file-too-long"]
 
@@ -2017,35 +1997,6 @@ values = ["file-too-long"]
 relative_path = "poly.toml"
 key_path = "per-file-ignores.tools/benchmark-harness/guardrails.json"
 values = ["file-too-long"]
-
-[[entries]]
-relative_path = "poly.toml"
-key_path = "per-file-ignores.tools/benchmark-harness/python_baselines/*.py"
-values = [
-  "ANN001",
-  "ANN201",
-  "ANN202",
-  "ARG001",
-  "BLE001",
-  "C901",
-  "D103",
-  "G004",
-  "INP001",
-  "PERF401",
-  "PLC0415",
-  "PLR0911",
-  "PLR0912",
-  "PLR0915",
-  "PLW2901",
-  "PTH123",
-  "S607",
-  "T201",
-]
-
-[[entries]]
-relative_path = "poly.toml"
-key_path = "per-file-ignores.tools/benchmark-harness/scripts/*.php"
-values = ["no-unescaped-output"]
 
 [[entries]]
 relative_path = "poly.toml"

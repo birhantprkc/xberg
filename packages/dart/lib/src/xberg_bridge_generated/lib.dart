@@ -10314,6 +10314,15 @@ sealed class ImageOutputFormat with _$ImageOutputFormat {
 /// for different document types.
 class ImagePreprocessingConfig {
   /// Target DPI for the image (300 is standard, 600 for small text).
+  ///
+  /// For a PDF page, this resamples the already-rendered raster; it does not make the page
+  /// re-render at a higher native resolution. A value above what
+  /// `image::preprocessing::calculate_target_dpi`'s memory/dimension clamp allows is
+  /// silently capped (GH#1786: 400 and 600 both clamped to the same ~372 on a Letter page
+  /// and produced byte-identical output), so upscaling interpolated pixels this way adds no
+  /// detail. To change the actual PDF render resolution, set `images.target_dpi` on
+  /// [`ExtractionConfig`](crate::core::config::ExtractionConfig) instead
+  /// (`image::dpi::effective_pdf_render_dpi`).
   final PlatformInt64 targetDpi;
 
   /// Auto-detect and correct image rotation.
@@ -10336,6 +10345,16 @@ class ImagePreprocessingConfig {
   /// Invert colors (white text on black → black on white).
   final bool invertColors;
 
+  /// Normalize shaded table rows (e.g. a subtotal row on a light or dark fill) before
+  /// binarization, so each shaded band is stretched to its own dark-text-on-white
+  /// polarity instead of being lost to a single whole-page threshold (GH#1785).
+  ///
+  /// This is a per-band step, not a replacement for `binarization_method`: no single
+  /// whole-page method recovers every fill color, and the per-band step itself can
+  /// regress a row style it does not fully model (e.g. a mid-grey fill with white
+  /// text), so it defaults to `false` rather than being enabled unconditionally.
+  final bool normalizeShadedRows;
+
   const ImagePreprocessingConfig({
     required this.targetDpi,
     required this.autoRotate,
@@ -10344,6 +10363,7 @@ class ImagePreprocessingConfig {
     required this.contrastEnhance,
     required this.binarizationMethod,
     required this.invertColors,
+    required this.normalizeShadedRows,
   });
 
   @override
@@ -10354,7 +10374,8 @@ class ImagePreprocessingConfig {
       denoise.hashCode ^
       contrastEnhance.hashCode ^
       binarizationMethod.hashCode ^
-      invertColors.hashCode;
+      invertColors.hashCode ^
+      normalizeShadedRows.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -10367,7 +10388,8 @@ class ImagePreprocessingConfig {
           denoise == other.denoise &&
           contrastEnhance == other.contrastEnhance &&
           binarizationMethod == other.binarizationMethod &&
-          invertColors == other.invertColors;
+          invertColors == other.invertColors &&
+          normalizeShadedRows == other.normalizeShadedRows;
 }
 
 class ImagePreprocessingMetadata {
@@ -18117,6 +18139,13 @@ class TesseractConfig {
   /// it would with no `TesseractConfig` at all — see issue #1573. Setting any other
   /// field on this struct no longer changes that behaviour.
   ///
+  /// A rendered PDF page (`force_ocr` / `force_ocr_pages` / scanned-page OCR) does **not**
+  /// currently get a context-appropriate default here: it falls through to the engine's
+  /// generic automatic-layout PSM (3) even though standalone image OCR of the same raster
+  /// would use PSM 11 (GH#1786). Measurements on this repository's own synthetic table
+  /// fixtures gave contradictory results across font/tessdata combinations (see GH#1786's
+  /// resolution notes) — table-heavy pages may benefit from setting `psm: 11` explicitly.
+  ///
   /// Common explicit values:
   /// - 3: Fully automatic page segmentation (native engine default)
   /// - 6: Assume a single uniform block of text (WASM engine default — avoids
@@ -18192,8 +18221,13 @@ class TesseractConfig {
   /// Variable-width space detection
   final bool textordSpaceSizeIsVariable;
 
-  /// Use adaptive thresholding method
-  final bool thresholdingMethod;
+  /// Tesseract image-binarization method (0-2): 0 = Otsu (default), 1 = LeptonicaOtsu,
+  /// 2 = Sauvola. Sent to Tesseract's integer `thresholding_method` engine variable.
+  ///
+  /// GH#1784: used to be a `bool` sent as `"true"`/`"false"`, silently ignored by
+  /// Tesseract's integer parser. A config for the old field still deserializes: `false` ->
+  /// `0` (Otsu, the prior no-op), `true` -> `1` (LeptonicaOtsu, the old "adaptive" doc).
+  final PlatformInt64 thresholdingMethod;
 
   const TesseractConfig({
     required this.language,
