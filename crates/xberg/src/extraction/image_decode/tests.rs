@@ -549,7 +549,7 @@ fn direct_image_decode_api_calls_are_audited() {
             .expect("source path under root")
             .to_string_lossy()
             .replace('\\', "/");
-        if test_only_sources.contains(&relative.as_str()) {
+        if test_only_sources.contains(&relative.as_str()) || is_test_submodule(&relative) {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("read Rust source");
@@ -563,6 +563,18 @@ fn direct_image_decode_api_calls_are_audited() {
         BTreeMap::new(),
         "direct image decoder calls must live in an audited wrapper"
     );
+}
+
+/// A file that is only ever compiled as a `#[cfg(test)] mod tests;` submodule.
+///
+/// The audit walks source files, not modules, so it cannot see the `#[cfg(test)]` that gates
+/// them. While a test module lived inline in its parent file the surrounding `cfg` kept it out
+/// of scope; the GH#1567 paydown moved 18 such modules into sibling `tests.rs` files, and each
+/// one then read as production code calling a decoder unguarded. Keyed on the convention rather
+/// than on a path list, so the next split does not reopen this. ~keep
+fn is_test_submodule(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name == "tests.rs" || name.ends_with("_tests.rs")
 }
 
 fn decoder_audit_violations(relative: &str, source: &str) -> Vec<String> {
