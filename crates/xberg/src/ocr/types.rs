@@ -190,11 +190,20 @@ pub struct TesseractConfig {
     /// `SecurityLimits::default()` on every route -- a caller who raised the limit to admit
     /// a large scan was still refused at 100 MiB.
     ///
-    /// `#[serde(skip)]` because it is injected at runtime, never read from a config file,
-    /// and deliberately absent from `hash_config` (`ocr::processor::config`): limits gate
-    /// whether a decode is attempted and never change the text Tesseract produces, so
-    /// folding them into the cache key would split cache entries that are identical in
-    /// content. `None` means `SecurityLimits::default()`, never "disable the check". ~keep
+    /// `#[serde(skip)]` because it is injected at runtime and never read from a config file.
+    ///
+    /// These ARE part of the OCR cache key (`hash_security_limits` in
+    /// `ocr::processor::config`), and must stay there. This doc previously argued the opposite
+    /// -- that limits only gate whether a decode is attempted and never change the text
+    /// Tesseract produces, so hashing them would split entries identical in content. The first
+    /// half is true and the conclusion still does not follow: the gate lives inside
+    /// `perform_ocr`, which runs only on a cache MISS, so a request carrying a strict limit was
+    /// served an earlier permissive request's cached result and the limit never applied at all.
+    /// That is a silent policy bypass, and it made `issue_1651_ocr_security_limits` flaky --
+    /// whichever sibling test populated the entry first decided the outcome. Ordinary callers
+    /// share one default `SecurityLimits`, so cache reuse is unaffected in practice.
+    ///
+    /// `None` means `SecurityLimits::default()`, never "disable the check". ~keep
     #[serde(skip)]
     pub security_limits: Option<crate::extractors::security::SecurityLimits>,
 }
