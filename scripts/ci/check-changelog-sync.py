@@ -39,7 +39,10 @@ from pathlib import Path
 REPO_CHANGELOG = Path("CHANGELOG.md")
 DOCS_CHANGELOG = Path("docs-site/src/content/docs/changelog.md")
 
-VERSION_HEADING = re.compile(r"^## \[?(\d+\.\d+\.\d+)\]?")
+# `Unreleased` counts as a section: it is published to the docs site like any other, and
+# leaving it out meant `sync` started copying at the first numeric heading, so the docs
+# kept a stale Unreleased section that neither the check nor --fix ever touched. ~keep
+VERSION_HEADING = re.compile(r"^## \[?(\d+\.\d+\.\d+|Unreleased)\]?")
 
 # How many differing lines to show before truncating a body mismatch report.
 MAX_DIFF_LINES = 12
@@ -57,7 +60,10 @@ def _sections(lines: list[str]) -> dict[str, list[str]]:
         match = VERSION_HEADING.match(line)
         if match:
             current = match.group(1)
-            sections[current] = []
+            # The heading line goes INTO the body, not just its captured version. Keying on the
+            # version alone meant the rest of the line -- the release date -- was never compared,
+            # so a wrong or missing date passed as "byte-identical". ~keep
+            sections[current] = [line]
         elif current is not None:
             sections[current].append(line)
     return sections
@@ -115,7 +121,7 @@ def check(repo_path: Path, docs_path: Path) -> int:
 
 
 def sync(repo_path: Path, docs_path: Path) -> None:
-    """Replace the docs' numeric release sections with the canonical repo sections."""
+    """Replace the docs' release sections, Unreleased included, with the canonical repo ones."""
     repo_lines = repo_path.read_text(encoding="utf-8").splitlines()
     docs_lines = docs_path.read_text(encoding="utf-8").splitlines()
     repo_start = next(index for index, line in enumerate(repo_lines) if VERSION_HEADING.match(line))
