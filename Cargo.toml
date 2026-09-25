@@ -62,7 +62,13 @@ chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "color", "suggestions"] }
 comrak = { version = "0.55", default-features = false }
 console_error_panic_hook = "0.1"
-crawlberg = { version = "1.7.2", default-features = false }
+# ~keep held at 1.7.1: 1.7.2 relocated CrawlConfig within its crate, and alef can no longer
+# resolve the nested config types by path -- it sanitizes CrawlConfig.{browser,proxy,ssrf,
+# content,document_content_encoding,crawl_strategy} to `String`, degrading those fields in
+# every binding. Bracketed on an otherwise identical tree: `alef verify` exits 0 with 1.7.1
+# and 1 with 8 lossy_sanitized_surface violations on 1.7.2. Raise it only together with an
+# alef that maps those types, and re-check `alef verify`. Verified 2026-09-25.
+crawlberg = { version = "1.7.1", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 dbase = "0.8"
 flate2 = "1.1"
