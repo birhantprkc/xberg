@@ -292,10 +292,8 @@ impl TreeBuilder {
     /// `Title`, `Heading`, `Paragraph`, `ListStart`, `ListItem`, and `QuoteStart`.
     fn handle_structural_element(&mut self, elem: &InternalElement) {
         match elem.kind {
-            ElementKind::Title => {
-                if self.title.is_none() && !elem.text.is_empty() {
-                    self.title = Some(elem.text.clone());
-                }
+            ElementKind::Title if self.title.is_none() && !elem.text.is_empty() => {
+                self.title = Some(elem.text.clone());
             }
 
             ElementKind::Heading { level } => {
@@ -381,13 +379,11 @@ impl TreeBuilder {
                 self.push(node);
             }
 
-            ElementKind::OcrText { .. } => {
-                if !elem.text.is_empty() {
-                    let node = JsonNode::Paragraph {
-                        text: elem.text.clone(),
-                    };
-                    self.push(node);
-                }
+            ElementKind::OcrText { .. } if !elem.text.is_empty() => {
+                let node = JsonNode::Paragraph {
+                    text: elem.text.clone(),
+                };
+                self.push(node);
             }
 
             ElementKind::PageBreak => {

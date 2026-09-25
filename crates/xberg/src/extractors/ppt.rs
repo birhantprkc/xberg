@@ -82,14 +82,14 @@ async fn run_ppt_extraction(
         }
         let content_owned = content.to_vec();
         let span = tracing::Span::current();
-        return tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
+        tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
             let _guard = span.entered();
             crate::extraction::ppt::extract_ppt_text_with_options(&content_owned, include_master_slides, extract_images)
         })
         .await
-        .map_err(|e| crate::error::XbergError::parsing(format!("PPT extraction task failed: {e}")))?;
+        .map_err(|e| crate::error::XbergError::parsing(format!("PPT extraction task failed: {e}")))?
     } else {
-        return crate::extraction::ppt::extract_ppt_text_with_options(content, include_master_slides, extract_images);
+        crate::extraction::ppt::extract_ppt_text_with_options(content, include_master_slides, extract_images)
     }
 
     #[cfg(not(feature = "tokio-runtime"))]
