@@ -688,7 +688,19 @@ fn post_process_table_inner(
         return None;
     }
 
-    prune_spurious_interior_column(&mut processed, layout_guided, column_positions);
+    prune_spurious_interior_column(&mut processed, layout_guided, column_positions.as_deref_mut());
+
+    // An OCR-split row label (e.g. "ENDING FUND BALANCE" splitting into "ENDING" + "FUND
+    // BALANCE" because the horizontal gap between the two word-groups exceeds
+    // `CELL_MERGE_GAP_HEIGHT_RATIO * median word height`) mints its own near-empty column
+    // that would otherwise trip the column-sparsity gate just below and reject the entire
+    // table, even though every other column is well-formed (xberg-io/xberg#1797). Fold such
+    // a column into its left neighbour BEFORE that gate runs. Scoped to `!layout_guided`
+    // (the OCR path): a layout-guided region already has `prune_spurious_interior_column`
+    // above for its own narrower stray-column shape. ~keep
+    if !layout_guided {
+        fold_sparse_word_columns_left(&mut processed, column_positions);
+    }
 
     let data_row_count = processed.len() - 1;
     if data_row_count > 0 {
@@ -700,7 +712,7 @@ fn post_process_table_inner(
             let too_sparse = if layout_guided {
                 empty_count * 20 > data_row_count * 19
             } else {
-                empty_count * 4 > data_row_count * 3
+                column_is_sparse_for_ocr(empty_count, data_row_count)
             };
             // A column with its own non-empty header label (e.g. a bank statement's "DEPOSIT",
             // populated on only a minority of transaction rows) is a legitimate, intentionally
@@ -1304,6 +1316,105 @@ fn merge_interior_column(table: &mut [Vec<String>], column: usize) {
         } else {
             format!("{existing} {text}")
         };
+    }
+}
+
+/// Whether an OCR-path (`!layout_guided`) column counts as "mostly empty", under the exact
+/// same ratio the column-sparsity rejection gate applies just after
+/// [`fold_sparse_word_columns_left`] runs. Kept as one function so the fold's eligibility bar
+/// and the rejection bar can never drift apart (xberg-io/xberg#1797).
+fn column_is_sparse_for_ocr(empty_count: usize, data_row_count: usize) -> bool {
+    empty_count * 4 > data_row_count * 3
+}
+
+/// Whether `cell` reads as label/word content -- as opposed to a numeric/currency amount
+/// fragment, which a digit-width drift split ([`crate::table_core::merge_disjoint_numeric_columns`]'s
+/// target) would produce. Requiring an alphabetic character is the logical inverse of the
+/// crate-private `table_core::looks_like_amount`'s narrow amount charset (any letter already
+/// disqualifies a cell from that charset), spelled out directly so an ambiguous cell that is
+/// neither clearly a word nor clearly a number (e.g. a lone "-") is excluded from
+/// [`fold_sparse_word_columns_left`] rather than assumed eligible.
+fn is_word_label_cell(cell: &str) -> bool {
+    cell.chars().any(|ch| ch.is_alphabetic())
+}
+
+/// Fold column `column` into column `column - 1` in place, space-joining whichever of the two
+/// cells in each row are non-empty (order preserved: left cell's text first). Unlike
+/// [`merge_interior_column`]'s either/or merge (built for columns that are known to be
+/// mutually exclusive per row), a split-label fold routinely has content on BOTH sides in the
+/// one row that split (the label's first word-group in `column - 1`, its second word-group in
+/// `column`), so both must be concatenated rather than one replacing the other.
+fn fold_column_into_left_neighbor(table: &mut [Vec<String>], column: usize) {
+    for row in table.iter_mut() {
+        let text = row.remove(column);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let left = row[column - 1].trim();
+        row[column - 1] = if left.is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("{left} {trimmed}")
+        };
+    }
+}
+
+/// Fold an un-headed, mostly-empty, purely word-valued interior column into its LEFT
+/// neighbour (xberg-io/xberg#1797).
+///
+/// A row label that OCR splits across a horizontal gap wider than
+/// `CELL_MERGE_GAP_HEIGHT_RATIO * median word height` (e.g. "ENDING FUND BALANCE" splitting
+/// into "ENDING" + "FUND BALANCE") mints its own column in
+/// `group_words_into_cell_tokens`/`detect_columns` that is empty in every other data row. The
+/// column-sparsity gate that runs immediately after this function then rejects the ENTIRE
+/// table over that one artifact column, even though every other column is well-formed.
+/// Folding it into its left neighbour before that gate runs recovers the table without
+/// weakening the gate for a genuinely malformed grid.
+///
+/// Eligibility mirrors the column-sparsity gate's own bar exactly ([`column_is_sparse_for_ocr`])
+/// plus two guards that keep this narrow:
+/// - the column has no header label of its own (a legitimately sparse HEADED column, e.g. a
+///   bank statement's "DEPOSIT", must not be folded away -- mirrors the same rule the
+///   sparsity gate and `prune_spurious_interior_column` both already apply);
+/// - every non-empty cell in the column reads as a word ([`is_word_label_cell`]) -- a sparse
+///   NUMERIC column split by digit-width drift is
+///   [`crate::table_core::merge_disjoint_numeric_columns`]'s job, not this one, and folding a
+///   numeric fragment into a label column would corrupt it.
+///
+/// Column 0 is never eligible (no left neighbour to fold into), which is what keeps
+/// xberg-io/xberg#1570's numbered-list column 0 out of this fold's reach. Runs only for
+/// `!layout_guided`: the `layout_guided` path already has `prune_spurious_interior_column` for
+/// its own narrower stray-column shape.
+fn fold_sparse_word_columns_left(table: &mut [Vec<String>], mut column_positions: Option<&mut Vec<u32>>) {
+    let Some(header) = table.first() else {
+        return;
+    };
+    let data_row_count = table.len().saturating_sub(1);
+    if header.len() < 2 || data_row_count == 0 {
+        return;
+    }
+
+    let mut column = 1;
+    while column < table[0].len() {
+        let header_has_label = table[0].get(column).is_some_and(|cell| !cell.trim().is_empty());
+        let non_empty_cells: Vec<String> = table[1..]
+            .iter()
+            .filter_map(|row| row.get(column).map(|cell| cell.trim().to_string()))
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        let empty_count = data_row_count - non_empty_cells.len();
+        let eligible = !header_has_label
+            && column_is_sparse_for_ocr(empty_count, data_row_count)
+            && !non_empty_cells.is_empty()
+            && non_empty_cells.iter().all(|cell| is_word_label_cell(cell));
+
+        if eligible {
+            fold_column_into_left_neighbor(table, column);
+            drop_column_position(column_positions.as_deref_mut(), column);
+        } else {
+            column += 1;
+        }
     }
 }
 
@@ -4783,5 +4894,251 @@ mod tests {
             "six drawn rules elsewhere on the page must not stand in for evidence that this \
              three-row region is a table"
         );
+    }
+
+    /// Word-geometry fixture for a scanned government schedule table (GH#1797): a header row
+    /// plus six data rows, one numeric column per fiscal amount, and a row label ("ENDING FUND
+    /// BALANCE") that OCR splits into two word-groups separated by a gap well above
+    /// `CELL_MERGE_GAP_HEIGHT_RATIO * median height` -- exactly the shape the issue describes:
+    /// "ENDING" and "FUND BALANCE" land far enough apart that `group_words_into_cell_tokens`
+    /// mints a genuinely separate column for the second word-group, empty in every other data
+    /// row. Built directly with `HocrWord`/geometry and run through the real
+    /// `cluster_words_into_table_regions` / `reconstruct_table` / `post_process_table` pipeline,
+    /// matching the Tesseract route's own call shape (`post_process_table(table, false, false)`),
+    /// following the #1570 fixture's convention.
+    #[cfg(feature = "ocr")]
+    fn schedule_table_with_split_label_words() -> Vec<HocrWord> {
+        fn hocr_word(text: &str, left: u32, top: u32, width: u32, height: u32) -> HocrWord {
+            HocrWord {
+                text: text.to_string(),
+                left,
+                top,
+                width,
+                height,
+                confidence: 95.0,
+            }
+        }
+
+        vec![
+            // Header row.
+            hocr_word("DESCRIPTION", 100, 40, 110, 24),
+            hocr_word("PRIOR", 600, 40, 70, 24),
+            hocr_word("CURRENT", 750, 40, 90, 24),
+            hocr_word("NEXT", 900, 40, 60, 24),
+            // "Revenues"
+            hocr_word("Revenues", 100, 100, 90, 24),
+            hocr_word("$50,000", 600, 100, 70, 24),
+            hocr_word("$55,000", 750, 100, 70, 24),
+            hocr_word("$60,000", 900, 100, 70, 24),
+            // "Expenditures"
+            hocr_word("Expenditures", 100, 140, 120, 24),
+            hocr_word("$40,000", 600, 140, 70, 24),
+            hocr_word("$45,000", 750, 140, 70, 24),
+            hocr_word("$48,000", 900, 140, 70, 24),
+            // "Transfers In" -- merges into one cell token (8px internal gap); not the row
+            // under test, present so the fixture is not artificially all-single-word labels.
+            hocr_word("Transfers", 100, 180, 90, 24),
+            hocr_word("In", 198, 180, 25, 24),
+            hocr_word("$5,000", 600, 180, 60, 24),
+            hocr_word("$6,000", 750, 180, 60, 24),
+            hocr_word("$7,000", 900, 180, 60, 24),
+            // "Interest"
+            hocr_word("Interest", 100, 220, 80, 24),
+            hocr_word("$1,000", 600, 220, 60, 24),
+            hocr_word("$1,200", 750, 220, 60, 24),
+            hocr_word("$1,500", 900, 220, 60, 24),
+            // "Refunds"
+            hocr_word("Refunds", 100, 260, 80, 24),
+            hocr_word("$2,000", 600, 260, 60, 24),
+            hocr_word("$2,500", 750, 260, 60, 24),
+            hocr_word("$3,000", 900, 260, 60, 24),
+            // "ENDING FUND BALANCE" -- split by a 130px gap (>> 0.6 * 24 = 14.4px) into
+            // "ENDING" and "FUND BALANCE" ("FUND"/"BALANCE" themselves merge, gap 8px).
+            hocr_word("ENDING", 100, 300, 70, 24),
+            hocr_word("FUND", 300, 300, 50, 24),
+            hocr_word("BALANCE", 358, 300, 90, 24),
+            hocr_word("$113,000", 600, 300, 80, 24),
+            hocr_word("$123,700", 750, 300, 80, 24),
+            hocr_word("$136,700", 900, 300, 80, 24),
+        ]
+    }
+
+    /// GH#1797: a schedule table whose only flaw is one row's row-label being OCR-split across
+    /// a wide horizontal gap must not be rejected wholesale -- the split-off word group ("FUND
+    /// BALANCE") should be folded back into the label column, not treated as its own doomed
+    /// near-empty column.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn gh1797_schedule_table_with_split_ending_balance_label_is_rescued() {
+        let words = schedule_table_with_split_label_words();
+        let regions = crate::table_core::cluster_words_into_table_regions(&words);
+        let region = regions
+            .into_iter()
+            .find(|region| region.len() >= crate::table_core::MIN_TABLE_CANDIDATE_WORDS)
+            .expect("the schedule table must cluster into its own table-candidate region");
+        assert_eq!(
+            region.len(),
+            31,
+            "all 31 words of the header + 6 data rows must cluster together"
+        );
+
+        let table = reconstruct_table(&region, 50, 0.5);
+        assert!(
+            !table.is_empty(),
+            "precondition: the schedule must reconstruct into a non-empty grid"
+        );
+        assert_eq!(
+            table.len(),
+            7,
+            "precondition: header + 6 data rows must survive reconstruction"
+        );
+        assert_eq!(
+            table[0].len(),
+            5,
+            "precondition: the ENDING/FUND BALANCE gap mints a 5th, near-empty column \
+             (matches the bug report's mechanism)"
+        );
+        assert_eq!(
+            table[6][0], "ENDING",
+            "precondition: the first word-group of the split label lands in column 0"
+        );
+        assert_eq!(
+            table[6][1], "FUND BALANCE",
+            "precondition: the second word-group mints its own column, empty in every other row"
+        );
+
+        let result = post_process_table(table, false, false);
+        let processed =
+            result.expect("GH#1797: a schedule table must not be rejected wholesale over one OCR-split label column");
+
+        assert_eq!(
+            processed.len(),
+            7,
+            "header + all 6 data rows must survive post-processing"
+        );
+        assert_eq!(
+            processed[0],
+            vec!["DESCRIPTION", "PRIOR", "CURRENT", "NEXT"],
+            "the split-off column must be folded away, leaving exactly 4 columns"
+        );
+        assert_eq!(processed[1], vec!["Revenues", "$50,000", "$55,000", "$60,000"]);
+        assert_eq!(processed[2], vec!["Expenditures", "$40,000", "$45,000", "$48,000"]);
+        assert_eq!(processed[3], vec!["Transfers In", "$5,000", "$6,000", "$7,000"]);
+        assert_eq!(processed[4], vec!["Interest", "$1,000", "$1,200", "$1,500"]);
+        assert_eq!(processed[5], vec!["Refunds", "$2,000", "$2,500", "$3,000"]);
+        assert_eq!(
+            processed[6],
+            vec!["ENDING FUND BALANCE", "$113,000", "$123,700", "$136,700"],
+            "the split label must be rejoined into one cell and every numeric column left \
+             undisturbed"
+        );
+    }
+
+    /// Generalization fixture for GH#1797: the same split-label mechanism, but the split
+    /// row sits in the MIDDLE of the table (not the last row) and splits a different label
+    /// ("TOTAL EXPENDITURES") at a different column position, checking the fold does not
+    /// depend on the split column being adjacent to the last row.
+    #[cfg(feature = "ocr")]
+    fn schedule_table_with_middle_row_split_label_words() -> Vec<HocrWord> {
+        fn hocr_word(text: &str, left: u32, top: u32, width: u32, height: u32) -> HocrWord {
+            HocrWord {
+                text: text.to_string(),
+                left,
+                top,
+                width,
+                height,
+                confidence: 95.0,
+            }
+        }
+
+        vec![
+            // Header row.
+            hocr_word("DESCRIPTION", 100, 40, 110, 24),
+            hocr_word("PRIOR", 600, 40, 70, 24),
+            hocr_word("CURRENT", 750, 40, 90, 24),
+            hocr_word("NEXT", 900, 40, 60, 24),
+            // "Revenues"
+            hocr_word("Revenues", 100, 100, 90, 24),
+            hocr_word("$70,000", 600, 100, 70, 24),
+            hocr_word("$72,000", 750, 100, 70, 24),
+            hocr_word("$75,000", 900, 100, 70, 24),
+            // "TOTAL EXPENDITURES" -- split by a 130px gap into "TOTAL" and "EXPENDITURES",
+            // the middle data row rather than the last.
+            hocr_word("TOTAL", 100, 140, 60, 24),
+            hocr_word("EXPENDITURES", 290, 140, 140, 24),
+            hocr_word("$65,000", 600, 140, 70, 24),
+            hocr_word("$66,500", 750, 140, 70, 24),
+            hocr_word("$68,000", 900, 140, 70, 24),
+            // "Transfers In"
+            hocr_word("Transfers", 100, 180, 90, 24),
+            hocr_word("In", 198, 180, 25, 24),
+            hocr_word("$3,000", 600, 180, 60, 24),
+            hocr_word("$3,200", 750, 180, 60, 24),
+            hocr_word("$3,400", 900, 180, 60, 24),
+            // "Interest"
+            hocr_word("Interest", 100, 220, 80, 24),
+            hocr_word("$800", 600, 220, 50, 24),
+            hocr_word("$900", 750, 220, 50, 24),
+            hocr_word("$950", 900, 220, 50, 24),
+            // "Refunds"
+            hocr_word("Refunds", 100, 260, 80, 24),
+            hocr_word("$1,200", 600, 260, 60, 24),
+            hocr_word("$1,300", 750, 260, 60, 24),
+            hocr_word("$1,400", 900, 260, 60, 24),
+        ]
+    }
+
+    /// GH#1797 generalization check: the fold must also rescue a split label sitting in a
+    /// middle data row (not just the last row), splitting different text at a different
+    /// x-position -- proving the fold is not tuned to the one shape of the primary fixture.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn gh1797_schedule_table_with_middle_row_split_label_is_rescued() {
+        let words = schedule_table_with_middle_row_split_label_words();
+        let regions = crate::table_core::cluster_words_into_table_regions(&words);
+        let region = regions
+            .into_iter()
+            .find(|region| region.len() >= crate::table_core::MIN_TABLE_CANDIDATE_WORDS)
+            .expect("the schedule table must cluster into its own table-candidate region");
+        assert_eq!(
+            region.len(),
+            26,
+            "all 26 words of the header + 5 data rows must cluster together"
+        );
+
+        let table = reconstruct_table(&region, 50, 0.5);
+        assert_eq!(
+            table.len(),
+            6,
+            "precondition: header + 5 data rows must survive reconstruction"
+        );
+        assert_eq!(
+            table[0].len(),
+            5,
+            "precondition: the TOTAL/EXPENDITURES gap mints a 5th, near-empty column"
+        );
+        assert_eq!(
+            table[2][1], "EXPENDITURES",
+            "precondition: the split-off word group lands in its own column, in the middle row"
+        );
+
+        let processed = post_process_table(table, false, false)
+            .expect("GH#1797: a middle-row split label must also be rescued, not just a last-row one");
+
+        assert_eq!(
+            processed.len(),
+            6,
+            "header + all 5 data rows must survive post-processing"
+        );
+        assert_eq!(processed[0], vec!["DESCRIPTION", "PRIOR", "CURRENT", "NEXT"]);
+        assert_eq!(processed[1], vec!["Revenues", "$70,000", "$72,000", "$75,000"]);
+        assert_eq!(
+            processed[2],
+            vec!["TOTAL EXPENDITURES", "$65,000", "$66,500", "$68,000"],
+            "the middle row's split label must be rejoined into one cell"
+        );
+        assert_eq!(processed[3], vec!["Transfers In", "$3,000", "$3,200", "$3,400"]);
+        assert_eq!(processed[4], vec!["Interest", "$800", "$900", "$950"]);
+        assert_eq!(processed[5], vec!["Refunds", "$1,200", "$1,300", "$1,400"]);
     }
 }
