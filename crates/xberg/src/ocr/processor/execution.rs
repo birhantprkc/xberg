@@ -1545,7 +1545,7 @@ pub(super) fn perform_ocr(
     });
 
     let images_config = extraction_config.and_then(|extraction_config| extraction_config.images.as_ref());
-    let known_source_dpi = resolve_known_source_dpi(config.source_dpi, image_bytes);
+    let known_source_dpi = resolve_known_source_dpi(config.source_dpi, image_bytes, orig_width, orig_height);
     let prepared_image = prepare_ocr_image(
         rgb_data,
         orig_width,
@@ -2302,7 +2302,16 @@ fn process_image_resolved(
 ) -> Result<OcrExtractionResult, OcrError> {
     let image_hash = crate::cache::blake3_hash_bytes(image_bytes);
 
-    let config_str = hash_config(config);
+    // #1787: the cache key must fold in the tessdata directory OCR will actually run against,
+    // not only the optional `config.tessdata_path` override — otherwise two calls that resolve
+    // to different directories through `TESSDATA_PREFIX` or another fallback in the search
+    // chain (see `resolve_tessdata_path`) hash identically and share a cache entry even though
+    // a different tessdata model produced the cached text. Resolved once, up front, so the
+    // lookup below is keyed on the same directory `perform_ocr` will use on a miss.
+    let languages: Vec<String> = config.language.split('+').map(|lang| lang.trim().to_string()).collect();
+    let resolved_tessdata_path = resolve_tessdata_path(&languages, config.tessdata_path.as_deref())?;
+
+    let config_str = hash_config(config, &resolved_tessdata_path);
 
     // `output_format` is part of the cache identity: it selects the renderer and
     // therefore the `content` and `mime_type` of the result. Omitting it served a
@@ -2458,6 +2467,7 @@ mod tests {
     use crate::ocr::hocr_parser::{
         HOCR_FONT_SIZE_ATTRIBUTE, parse_hocr_to_internal_document_with_page_offset_and_stats,
     };
+    use serial_test::serial;
     use tempfile::tempdir;
 
     #[cfg(feature = "bundle-tessdata-eng")]
@@ -3385,7 +3395,14 @@ mod tests {
     /// `use_cache: false` call) that has no equivalent before this change, so there is
     /// nothing "unfixed" to run it against — the bypass plumbing this proves either exists
     /// or the test cannot be written.
+    // `#[serial]`: this test resolves tessdata through the default (no-override) path, which
+    // reads the process-global `XBERG_CACHE_DIR`/`TESSDATA_PREFIX` env vars that
+    // `tesseract_backend::tests` mutates with `std::env::set_var` under its own `#[serial]`
+    // tests. Joining the same lock group prevents this test from resolving a directory that
+    // mutation is deleting mid-scan (an uncaught C++ `filesystem_error` aborting the whole
+    // test process, not a logic bug in the code under test). ~keep
     #[test]
+    #[serial]
     fn process_image_with_cache_does_not_read_or_write_the_cache_when_use_cache_is_false() {
         let api = match xberg_tesseract::TesseractAPI::new() {
             Ok(api) => api,
@@ -3410,7 +3427,10 @@ mod tests {
         // enabled, carrying an obviously-wrong marker. If the bypass ever regresses into a
         // read, this is what would come back instead of a fresh OCR result.
         let image_hash = crate::cache::blake3_hash_bytes(&image_bytes);
-        let config_str = hash_config(&config);
+        let languages: Vec<String> = config.language.split('+').map(|lang| lang.trim().to_string()).collect();
+        let resolved_tessdata_path =
+            resolve_tessdata_path(&languages, config.tessdata_path.as_deref()).expect("tessdata must resolve");
+        let config_str = hash_config(&config, &resolved_tessdata_path);
         let marker = OcrExtractionResult {
             content: "STALE MARKER: use_cache=false must never return this".to_string(),
             mime_type: "text/plain".to_string(),
@@ -3436,6 +3456,121 @@ mod tests {
         assert_eq!(
             stats.total_files, 1,
             "use_cache=false must not write a new cache entry (only the pre-seeded marker file may exist)"
+        );
+    }
+
+    /// Copies a real, working `eng.traineddata` (resolved the same way production OCR does)
+    /// into a fresh temp directory, so tests can build two DIFFERENT resolved tessdata
+    /// directories that both OCR successfully, without depending on any specific host path.
+    /// Returns `None` when no Tesseract/tessdata is available in this environment.
+    /// Deliberately does NOT go through `resolve_tessdata_path(_, None)`: that resolution
+    /// reads the process-global `XBERG_CACHE_DIR`/`TESSDATA_PREFIX` env vars, which other
+    /// tests in this binary (`ocr::tesseract_backend::tests`) mutate with `std::env::set_var`
+    /// while running concurrently. A test that raced that mutation could resolve a directory
+    /// another thread deletes mid-scan, crashing the whole process with an uncaught C++
+    /// `filesystem_error` out of Tesseract's own `GetAvailableLanguagesAsVector` — not a
+    /// logic bug in the code under test, just an unsafe shared-state race. Sourcing real
+    /// `eng.traineddata` bytes from the sibling `xberg-tesseract` build's own `OUT_DIR`
+    /// instead (mirroring `tesseract_backend::tests::real_eng_traineddata_bytes_from_sibling_build_dir`)
+    /// avoids touching that shared state at all.
+    fn real_eng_traineddata_bytes_from_sibling_build_dir() -> Option<Vec<u8>> {
+        let this_out_dir = std::path::PathBuf::from(env!("OUT_DIR"));
+        let build_dir = this_out_dir.parent()?.parent()?;
+        let mut entries: Vec<_> = std::fs::read_dir(build_dir).ok()?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("xberg-tesseract-") {
+                continue;
+            }
+            let candidate = entry.path().join("out").join("eng.traineddata");
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    fn copy_working_eng_tessdata_into(dest_dir: &std::path::Path) -> Option<()> {
+        let bytes = real_eng_traineddata_bytes_from_sibling_build_dir()?;
+        std::fs::write(dest_dir.join("eng.traineddata"), bytes).ok()
+    }
+
+    /// Regression test for #1787 part 2: two `TesseractConfig`s that are identical except for
+    /// resolving to different tessdata directories (via the `tessdata_path` override here, which
+    /// exercises the same `resolve_tessdata_path` call `TESSDATA_PREFIX` also goes through) must
+    /// not share a cache entry. Before the fix, `hash_config` only ever saw `config.tessdata_path`
+    /// itself, so this collided and the second call silently read the first directory's result.
+    #[test]
+    fn process_image_with_cache_does_not_share_entries_across_different_resolved_tessdata_directories() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        if copy_working_eng_tessdata_into(dir_a.path()).is_none()
+            || copy_working_eng_tessdata_into(dir_b.path()).is_none()
+        {
+            return; // no Tesseract/tessdata available in this environment
+        }
+
+        let cache_dir = tempdir().unwrap();
+        let cache = OcrCache::new(Some(cache_dir.path().to_path_buf())).unwrap();
+        let api_pool = TesseractApiPool::new();
+        let image_bytes = tiny_test_png_bytes();
+
+        let config_a = TesseractConfig {
+            output_format: "text".to_string(),
+            enable_table_detection: false,
+            use_cache: true,
+            tessdata_path: Some(dir_a.path().to_path_buf()),
+            ..TesseractConfig::default()
+        };
+        let config_b = TesseractConfig {
+            tessdata_path: Some(dir_b.path().to_path_buf()),
+            ..config_a.clone()
+        };
+
+        process_image_with_cache(&image_bytes, &config_a, &cache, &api_pool, None)
+            .expect("OCR against dir_a must succeed");
+        process_image_with_cache(&image_bytes, &config_b, &cache, &api_pool, None)
+            .expect("OCR against dir_b must succeed");
+
+        let stats = cache.get_stats().unwrap();
+        assert_eq!(
+            stats.total_files, 2,
+            "two different resolved tessdata directories must write two separate cache entries \
+             (#1787), not share one"
+        );
+    }
+
+    /// Negative control for the test above: it must not become so specific that two calls
+    /// resolving to the SAME tessdata directory stop sharing a cache entry.
+    #[test]
+    fn process_image_with_cache_still_shares_entries_for_the_same_resolved_tessdata_directory() {
+        let dir_a = tempdir().unwrap();
+        if copy_working_eng_tessdata_into(dir_a.path()).is_none() {
+            return; // no Tesseract/tessdata available in this environment
+        }
+
+        let cache_dir = tempdir().unwrap();
+        let cache = OcrCache::new(Some(cache_dir.path().to_path_buf())).unwrap();
+        let api_pool = TesseractApiPool::new();
+        let image_bytes = tiny_test_png_bytes();
+
+        let config = TesseractConfig {
+            output_format: "text".to_string(),
+            enable_table_detection: false,
+            use_cache: true,
+            tessdata_path: Some(dir_a.path().to_path_buf()),
+            ..TesseractConfig::default()
+        };
+
+        process_image_with_cache(&image_bytes, &config, &cache, &api_pool, None).expect("first OCR call must succeed");
+        process_image_with_cache(&image_bytes, &config, &cache, &api_pool, None).expect("second OCR call must succeed");
+
+        let stats = cache.get_stats().unwrap();
+        assert_eq!(
+            stats.total_files, 1,
+            "two calls resolving to the same tessdata directory must share one cache entry, \
+             not write a second"
         );
     }
 
@@ -4256,7 +4391,7 @@ mod tests {
         fn should_prefer_explicit_source_dpi_over_embedded_png_density() {
             let png = png_with_phys_density(TEST_IMAGE_SIDE, TEST_IMAGE_SIDE, REPORTER_FIXTURE_PPU);
 
-            let resolved = resolve_known_source_dpi(Some(150.0), &png);
+            let resolved = resolve_known_source_dpi(Some(150.0), &png, TEST_IMAGE_SIDE, TEST_IMAGE_SIDE);
 
             assert_eq!(
                 resolved,
@@ -4269,7 +4404,8 @@ mod tests {
         fn should_decode_source_density_from_embedded_png_metadata() {
             let png = png_with_phys_density(TEST_IMAGE_SIDE, TEST_IMAGE_SIDE, REPORTER_FIXTURE_PPU);
 
-            let resolved = resolve_known_source_dpi(None, &png).expect("pHYs density must be detected");
+            let resolved = resolve_known_source_dpi(None, &png, TEST_IMAGE_SIDE, TEST_IMAGE_SIDE)
+                .expect("pHYs density must be detected");
 
             assert!(
                 (resolved - EXPECTED_DPI_FROM_REPORTER_FIXTURE).abs() < DPI_TOLERANCE,
@@ -4282,7 +4418,7 @@ mod tests {
             let png = encode_png(TEST_IMAGE_SIDE, TEST_IMAGE_SIDE);
 
             assert_eq!(
-                resolve_known_source_dpi(None, &png),
+                resolve_known_source_dpi(None, &png, TEST_IMAGE_SIDE, TEST_IMAGE_SIDE),
                 None,
                 "a PNG without density metadata must not fabricate a source DPI"
             );
@@ -4293,7 +4429,7 @@ mod tests {
         #[test]
         fn should_skip_resize_when_target_dpi_matches_known_png_density() {
             let png = png_with_phys_density(TEST_IMAGE_SIDE, TEST_IMAGE_SIDE, REPORTER_FIXTURE_PPU);
-            let known_source_dpi = resolve_known_source_dpi(None, &png);
+            let known_source_dpi = resolve_known_source_dpi(None, &png, TEST_IMAGE_SIDE, TEST_IMAGE_SIDE);
             let images_config = images_config_without_auto_adjust();
             let preprocessing = preprocessing_targeting(300);
 
@@ -4323,7 +4459,7 @@ mod tests {
         #[test]
         fn should_resize_correctly_for_a_different_target_dpi() {
             let png = png_with_phys_density(TEST_IMAGE_SIDE, TEST_IMAGE_SIDE, REPORTER_FIXTURE_PPU);
-            let known_source_dpi = resolve_known_source_dpi(None, &png);
+            let known_source_dpi = resolve_known_source_dpi(None, &png, TEST_IMAGE_SIDE, TEST_IMAGE_SIDE);
             let images_config = images_config_without_auto_adjust();
             let preprocessing = preprocessing_targeting(150);
 
@@ -4349,7 +4485,7 @@ mod tests {
         #[test]
         fn should_default_to_72_dpi_when_png_has_no_density_metadata() {
             let png = encode_png(TEST_IMAGE_SIDE, TEST_IMAGE_SIDE);
-            let known_source_dpi = resolve_known_source_dpi(None, &png);
+            let known_source_dpi = resolve_known_source_dpi(None, &png, TEST_IMAGE_SIDE, TEST_IMAGE_SIDE);
             assert_eq!(known_source_dpi, None);
 
             let images_config = images_config_without_auto_adjust();
