@@ -27,17 +27,46 @@ thread_local! {
         const { std::sync::atomic::AtomicUsize::new(0) };
 }
 
-/// Below this raster coverage a page is text with a figure, never a scan.
-const IMAGE_COVERAGE_MIN: f32 = 0.80;
+/// Below this raster coverage, no image on the page can plausibly carry its content at any
+/// size, so scoring is skipped outright (performance floor only -- see [`page_signals`]).
+/// Set below the lowest coverage GH#1793 measured on a real image-only page (22%, 112 pages,
+/// median 66%) with a comfortable margin, so a genuine partial scan is never skipped before
+/// its text layer is inspected. The real scan/not-a-scan decision for coverage between this
+/// floor and [`IMAGE_COVERAGE_FULL`] is made by [`is_header_sized_text`], not by this value. ~keep
+const IMAGE_COVERAGE_MIN: f32 = 0.15;
+
+/// At or above this coverage, the image spans (near) the whole visible page and
+/// [`SCORE_FULL_PAGE_RASTER`] applies unconditionally, whether or not native text sits over
+/// it (GH#1779: a decorative full-bleed background under a real page of text must still
+/// register this much suspicion -- just not enough to clear the default threshold on its
+/// own, since it also fails [`is_header_sized_text`]). Between [`IMAGE_COVERAGE_MIN`] and
+/// this value, the same base score applies only when the native text IS header-sized, or the
+/// page is body text with a figure (GH#1793's `control-native-text-with-figure`), not a scan. ~keep
+const IMAGE_COVERAGE_FULL: f32 = 0.80;
 
 /// Fraction of glyphs in render mode 3 (invisible) that marks an OCR sidecar.
 const INVISIBLE_TEXT_MIN: f32 = 0.50;
+
+/// Max fraction of the page a header/footer-style text layer may cover before it counts as
+/// substantive content rather than a scan's running header, footer, or stamp.
+///
+/// Measured, not assumed (`cargo test gh1793_probe` while developing this fix, since the
+/// naive guess of using `xberg_native_pdf`'s own `sparse_text_max` calibration (0.10) turned
+/// out to sit on the wrong side of a real control): GH#1779's reproducer (an 8-word header and
+/// footer) measures `text_area_ratio` 0.0043 and GH#1752's reproducer (a 9-character corner
+/// stamp) measures 0.0011, while GH#1793's `control-native-text-with-figure` (12 lines of real
+/// body text next to a figure, the case this constant must NOT flag) measures 0.087 and
+/// GH#1779's decorative-background control (30 lines) measures 0.256. `0.02` sits with a
+/// comfortable order-of-magnitude margin on both sides of that gap. ~keep
+const TEXT_AREA_HEADER_MAX: f32 = 0.02;
 
 /// A full-page raster alone. Below every usable threshold: a slide with a
 /// full-bleed background image scores exactly this.
 const SCORE_FULL_PAGE_RASTER: f32 = 0.50;
 
-/// Added when the text layer is hidden or absent.
+/// Added when the text layer is hidden, absent, or accounts for only a header/footer-sized
+/// share of the page (see [`is_header_sized_text`]) -- none of which is content substantial
+/// enough to make the page anything other than a scan.
 const SCORE_NO_VISIBLE_TEXT: f32 = 0.35;
 
 /// Added for CCITT/JBIG2: bilevel fax codecs, not emitted by authoring tools.
@@ -56,6 +85,13 @@ pub(crate) struct PageScanSignals {
     pub invisible_text_ratio: f32,
     /// Number of glyphs in the native text layer.
     pub glyph_count: usize,
+    /// Sum of native text bounding-box area intersected with the page, over page area, in
+    /// `[0, 1]` (`PageSignals::text_area_ratio` from `xberg_native_pdf`). The discriminator
+    /// between a scan's header/footer/stamp and a real page of native text: a header covers a
+    /// tiny fraction of the page regardless of how many glyphs it has, while a real page of
+    /// text covers a substantial fraction regardless of how little image sits under it. See
+    /// [`is_header_sized_text`]. ~keep
+    pub text_area_ratio: f32,
     /// Dominant raster codec on the page.
     pub codec: ImageCodecClass,
     /// Whether the document producer looks like scanner software.
@@ -85,15 +121,36 @@ impl ScanDetection {
     }
 }
 
+/// Whether `signals`'s native text layer is no bigger than a header, footer, or stamp: either
+/// there is none at all, or what there is covers at most [`TEXT_AREA_HEADER_MAX`] of the page.
+/// This is an AREA question, not a count question -- GH#1793's real pages carried 41-92 native
+/// glyphs each and were still header-sized, while GH#1779's decorative-background control is
+/// header-sized by neither measure. A page failing this check has native text that accounts
+/// for real page content, not a label on top of a scan. ~keep
+fn is_header_sized_text(signals: &PageScanSignals) -> bool {
+    signals.glyph_count == 0 || signals.text_area_ratio <= TEXT_AREA_HEADER_MAX
+}
+
 /// Grade one page's evidence. Pure, so it is testable without a [`PdfDocument`].
 pub(crate) fn score_page(signals: &PageScanSignals) -> f32 {
     if signals.image_coverage < IMAGE_COVERAGE_MIN {
         return 0.0;
     }
 
+    let full_page = signals.image_coverage >= IMAGE_COVERAGE_FULL;
+    let header_sized_text = is_header_sized_text(signals);
+
+    // Below full-page coverage, only a page whose native text is header-sized can be a
+    // (partial-coverage) scan at all -- GH#1793. A page with substantial native text next to
+    // a sub-full-page image is body text with a figure, at any coverage (GH#1793's
+    // `control-native-text-with-figure`, GH#1752 review's `a_text_page_with_a_figure_is_not_a_scan`).
+    if !full_page && !header_sized_text {
+        return 0.0;
+    }
+
     let mut score = SCORE_FULL_PAGE_RASTER;
 
-    if signals.glyph_count == 0 || signals.invisible_text_ratio >= INVISIBLE_TEXT_MIN {
+    if header_sized_text || signals.invisible_text_ratio >= INVISIBLE_TEXT_MIN {
         score += SCORE_NO_VISIBLE_TEXT;
     }
 
@@ -158,6 +215,7 @@ fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageScanSignals>
         image_coverage: coverage,
         invisible_text_ratio: signals.invisible_text_ratio,
         glyph_count: signals.text_glyph_count,
+        text_area_ratio: signals.text_area_ratio,
         codec: signals.codec,
         producer_prior: signals.producer_prior,
     })
@@ -501,18 +559,34 @@ mod tests {
             image_coverage: 1.0,
             invisible_text_ratio: 0.0,
             glyph_count: 0,
+            text_area_ratio: 0.0,
             codec: ImageCodecClass::Dct,
             producer_prior: ProducerPrior::Unknown,
         }
     }
 
     #[test]
-    fn sub_threshold_image_coverage_scores_zero() {
+    fn sub_floor_image_coverage_scores_zero() {
         let signals = PageScanSignals {
-            image_coverage: 0.79,
+            image_coverage: IMAGE_COVERAGE_MIN - 0.01,
             ..bare_scan()
         };
         assert_score(score_page(&signals), 0.0);
+    }
+
+    /// GH#1793: a page whose image covers less than the old 80% floor -- down to the
+    /// reporter's measured range (22-76%) -- must still be scored, not zeroed outright,
+    /// when its native text is header-sized. This is the same case as [`bare_scan`] (no
+    /// text at all is trivially header-sized) at a coverage the OLD floor would have
+    /// zeroed before ever inspecting the text layer.
+    #[test]
+    fn sub_full_page_coverage_with_header_sized_text_still_scores_as_a_scan() {
+        let signals = PageScanSignals {
+            image_coverage: 0.66, // the reporter's measured median (#1793)
+            ..bare_scan()
+        };
+        assert_score(score_page(&signals), 0.85);
+        assert!(f64::from(score_page(&signals)) >= DEFAULT_SCANNED_MIN_CONFIDENCE);
     }
 
     #[test]
@@ -521,25 +595,46 @@ mod tests {
             image_coverage: 0.30,
             invisible_text_ratio: 0.0,
             glyph_count: 2000,
+            text_area_ratio: 0.45, // a real page of text, not header-sized (GH#1793 review)
             codec: ImageCodecClass::Dct,
             producer_prior: ProducerPrior::Unknown,
         };
         assert_score(score_page(&signals), 0.0);
     }
 
-    /// The born-digital slide with a full-bleed background image: its text is
-    /// *visible*, so it must stay below any usable threshold.
+    /// The born-digital slide with a full-bleed background image and a real page of
+    /// *visible*, non-header-sized text under it (GH#1779's `control-decorative-background`):
+    /// it must stay below any usable threshold, exactly as it did before the fix.
     #[test]
     fn full_bleed_slide_with_visible_text_scores_below_default_threshold() {
         let signals = PageScanSignals {
             image_coverage: 1.0,
             invisible_text_ratio: 0.0,
             glyph_count: 133,
+            text_area_ratio: 0.30, // a real amount of visible body text, not header-sized
             codec: ImageCodecClass::Dct,
             producer_prior: ProducerPrior::Unknown,
         };
         assert_score(score_page(&signals), SCORE_FULL_PAGE_RASTER);
         assert!(f64::from(score_page(&signals)) < DEFAULT_SCANNED_MIN_CONFIDENCE);
+    }
+
+    /// GH#1779: a full-page raster with only a header/footer-sized native text layer (a
+    /// running header, page number, or Bates stamp) must clear the default threshold, unlike
+    /// the decorative-background case above -- this is the separation the issue's fix exists
+    /// to create.
+    #[test]
+    fn full_bleed_page_with_header_sized_text_clears_the_default_threshold() {
+        let signals = PageScanSignals {
+            image_coverage: 1.0,
+            invisible_text_ratio: 0.0,
+            glyph_count: 47,       // the corpus's smallest visible-text case (issue #1752)
+            text_area_ratio: 0.02, // a header/footer/stamp, well under TEXT_AREA_HEADER_MAX
+            codec: ImageCodecClass::Dct,
+            producer_prior: ProducerPrior::Unknown,
+        };
+        assert_score(score_page(&signals), 0.85);
+        assert!(f64::from(score_page(&signals)) >= DEFAULT_SCANNED_MIN_CONFIDENCE);
     }
 
     /// The reporter's case: full-page raster under an invisible OCR sidecar.
@@ -549,6 +644,8 @@ mod tests {
             image_coverage: 1.0,
             invisible_text_ratio: 1.0,
             glyph_count: 217,
+            text_area_ratio: 0.40, // a full invisible sidecar covers real area; irrelevant to
+            // the outcome since invisible_text_ratio alone already qualifies for the bonus
             codec: ImageCodecClass::Other,
             producer_prior: ProducerPrior::Unknown,
         };
@@ -603,6 +700,7 @@ mod tests {
             image_coverage: 1.0,
             invisible_text_ratio: 1.0,
             glyph_count: 0,
+            text_area_ratio: 0.0,
             codec: ImageCodecClass::Ccitt,
             producer_prior: ProducerPrior::Scanner,
         };
@@ -619,8 +717,14 @@ mod tests {
     /// a no-op dressed as a behaviour change. Pinned so that stays visible to whoever
     /// proposes the move. ~keep
     /// Every `(codec, producer_prior)` score for one `(image_coverage, glyph_count,
-    /// invisible_text_ratio)` combination, for [`score_page_reaches_exactly_the_documented_set_of_scores`].
-    fn scores_over_codec_and_producer(image_coverage: f32, glyph_count: usize, invisible_text_ratio: f32) -> Vec<f32> {
+    /// invisible_text_ratio, text_area_ratio)` combination, for
+    /// [`score_page_reaches_exactly_the_documented_set_of_scores`].
+    fn scores_over_codec_and_producer(
+        image_coverage: f32,
+        glyph_count: usize,
+        invisible_text_ratio: f32,
+        text_area_ratio: f32,
+    ) -> Vec<f32> {
         let codecs = [
             ImageCodecClass::Dct,
             ImageCodecClass::Other,
@@ -636,6 +740,7 @@ mod tests {
                         image_coverage,
                         invisible_text_ratio,
                         glyph_count,
+                        text_area_ratio,
                         codec,
                         producer_prior,
                     })
@@ -644,12 +749,37 @@ mod tests {
             .collect()
     }
 
+    /// Every distinct score `score_page` can return, over the whole signal matrix, now
+    /// including [`is_header_sized_text`]'s `text_area_ratio` axis (GH#1779/#1793). The set
+    /// itself is unchanged by that fix -- `text_area_ratio` only widens which *combinations*
+    /// of the other signals reach the same eight non-zero sums, it does not introduce new
+    /// magnitudes -- but the reachability of each one now depends on coverage tier and
+    /// header-sizedness together, not on coverage and glyph presence alone. ~keep
     #[test]
     fn score_page_reaches_exactly_the_documented_set_of_scores() {
         let mut reachable: Vec<f32> = Vec::new();
-        for image_coverage in [0.0, IMAGE_COVERAGE_MIN - 0.01, IMAGE_COVERAGE_MIN, 1.0] {
-            for (glyph_count, invisible_text_ratio) in [(0, 0.0), (250, 0.0), (250, INVISIBLE_TEXT_MIN), (250, 1.0)] {
-                for score in scores_over_codec_and_producer(image_coverage, glyph_count, invisible_text_ratio) {
+        let coverage_tiers = [
+            0.0,
+            IMAGE_COVERAGE_MIN - 0.01,
+            IMAGE_COVERAGE_MIN,
+            IMAGE_COVERAGE_FULL - 0.01,
+            IMAGE_COVERAGE_FULL,
+            1.0,
+        ];
+        let text_combos = [
+            // (glyph_count, invisible_text_ratio, text_area_ratio)
+            (0, 0.0, 0.0),                           // no text at all: header-sized via glyph_count
+            (250, 0.0, TEXT_AREA_HEADER_MAX),        // header-sized via area, at the boundary (GH#1779/#1793)
+            (250, 0.0, TEXT_AREA_HEADER_MAX + 0.01), // just over the boundary: not header-sized
+            (250, 0.0, 1.0),                         // a full page of visible text: not header-sized
+            (250, INVISIBLE_TEXT_MIN, 1.0),          // invisible sidecar at the ratio floor
+            (250, 1.0, 1.0),                         // fully invisible sidecar
+        ];
+        for image_coverage in coverage_tiers {
+            for (glyph_count, invisible_text_ratio, text_area_ratio) in text_combos {
+                for score in
+                    scores_over_codec_and_producer(image_coverage, glyph_count, invisible_text_ratio, text_area_ratio)
+                {
                     if !reachable.iter().any(|seen| (seen - score).abs() < 1e-5) {
                         reachable.push(score);
                     }
@@ -669,22 +799,25 @@ mod tests {
         }
     }
 
-    /// `0.65` -- the ceiling a full-page raster with a visible text layer is said to hit --
-    /// needs a bilevel codec *and* a scanner producer *and* visible text simultaneously.
+    /// `0.65` -- the ceiling a full-page raster with a *non-header-sized* visible text layer
+    /// is said to hit -- needs a bilevel codec *and* a scanner producer *and* substantial
+    /// (non-header-sized) visible text simultaneously.
     ///
-    /// Drop any one of the three and the page scores at most `0.60`. That conjunction is
-    /// why the value is unreached in practice: a CCITT/JBIG2 page written by scanner
-    /// software does not also carry *visible* native glyphs -- if it carries a text layer at
-    /// all it is an invisible OCR sidecar, which takes [`SCORE_NO_VISIBLE_TEXT`] and lands
-    /// at `0.85` or above instead. Measured over the 12,526-page PDF corpus, no page scored
-    /// `0.55`, `0.60` or `0.65`; all 30 pages of the full-page-raster-with-visible-text
-    /// class scored exactly [`SCORE_FULL_PAGE_RASTER`] (issue #1752). ~keep
+    /// Drop any one of the three and the page scores at most `0.60`. Before GH#1752's fix,
+    /// this conjunction was claimed unreachable in practice because *any* visible text at all
+    /// blocked [`SCORE_NO_VISIBLE_TEXT`] -- but GH#1752's own reproducer (a full-page CCITT
+    /// scan, scanner producer, and a 9-character corner stamp) showed real pages do carry
+    /// visible text here: a header, footer, or stamp. The fix narrows the ceiling's third leg
+    /// from "any visible text" to "non-header-sized visible text" (see
+    /// [`is_header_sized_text`]): a stamp-sized text layer now takes the `0.35` bonus like an
+    /// invisible sidecar does, landing at `1.0` instead of `0.65`. ~keep
     #[test]
-    fn a_score_of_0_65_requires_bilevel_codec_and_scanner_producer_and_visible_text_at_once() {
+    fn a_score_of_0_65_requires_bilevel_codec_and_scanner_producer_and_non_header_sized_text_at_once() {
         let all_three = PageScanSignals {
             image_coverage: 1.0,
             invisible_text_ratio: 0.0,
             glyph_count: 250,
+            text_area_ratio: 0.5, // substantial, non-header-sized visible text
             codec: ImageCodecClass::Ccitt,
             producer_prior: ProducerPrior::Scanner,
         };
@@ -713,37 +846,56 @@ mod tests {
             }),
             1.0,
         );
+        // GH#1752: a header/footer/stamp-sized text layer -- what the issue's own reproducer
+        // actually carries -- takes the bonus too, so the ceiling is never hit in practice. ~keep
+        assert_score(
+            score_page(&PageScanSignals {
+                text_area_ratio: 0.02,
+                ..all_three
+            }),
+            1.0,
+        );
     }
 
-    /// The shape the corpus actually produces: a born-digital page whose figure covers the
-    /// sheet, carrying a small but *visible* text layer -- a caption, a heading, a running
-    /// footer. Every such page scores [`SCORE_FULL_PAGE_RASTER`] regardless of how little
-    /// text it carries, because nothing in the matrix reads "few visible glyphs".
-    ///
-    /// The three smallest in the corpus were a 4-glyph section heading over two screenshots,
-    /// a 27-glyph figure caption, and a 47-glyph newspaper footer over a full-page
-    /// advertisement; the counts run from there to 2698 with no gap to cut at (issue #1752).
-    /// ~keep
+    /// GH#1779/#1793/#1752: a born-digital page whose figure covers the sheet, carrying a
+    /// small visible text layer -- a caption, a heading, a running footer, a corner stamp --
+    /// scores by how much of the page that text COVERS, not by how many glyphs it has. The
+    /// three smallest counts on record (a 4-glyph section heading, a 27-glyph figure caption,
+    /// a 47-glyph newspaper footer -- issue #1752) are all header/footer-sized by area and now
+    /// score [`SCORE_FULL_PAGE_RASTER`] `+` [`SCORE_NO_VISIBLE_TEXT`]; a page with the same
+    /// glyph counts but substantial area coverage (a caption is not the same thing as a
+    /// half-page pull-quote) stays at [`SCORE_FULL_PAGE_RASTER`] alone, unchanged from before
+    /// the fix.
     #[test]
-    fn a_full_bleed_page_scores_the_same_however_little_visible_text_it_carries() {
-        let scores: Vec<f32> = [4, 27, 47, 133, 687, 2698]
-            .into_iter()
-            .map(|glyph_count| {
-                score_page(&PageScanSignals {
-                    image_coverage: 1.0,
-                    invisible_text_ratio: 0.0,
-                    glyph_count,
-                    codec: ImageCodecClass::Dct,
-                    producer_prior: ProducerPrior::Authoring,
-                })
-            })
-            .collect();
-
-        for score in &scores {
-            assert_score(*score, SCORE_FULL_PAGE_RASTER);
+    fn a_full_bleed_page_scores_by_text_area_not_by_glyph_count() {
+        for glyph_count in [4, 27, 47, 133, 687, 2698] {
+            let header_sized = score_page(&PageScanSignals {
+                image_coverage: 1.0,
+                invisible_text_ratio: 0.0,
+                glyph_count,
+                text_area_ratio: 0.02,
+                codec: ImageCodecClass::Dct,
+                producer_prior: ProducerPrior::Authoring,
+            });
+            assert_score(header_sized, 0.85);
             assert!(
-                f64::from(*score) < DEFAULT_SCANNED_MIN_CONFIDENCE,
-                "a full-bleed page scored {score}, at or above the default threshold"
+                f64::from(header_sized) >= DEFAULT_SCANNED_MIN_CONFIDENCE,
+                "{glyph_count} header-sized glyphs scored {header_sized}, below the default threshold"
+            );
+
+            let substantial = score_page(&PageScanSignals {
+                image_coverage: 1.0,
+                invisible_text_ratio: 0.0,
+                glyph_count,
+                text_area_ratio: 0.40,
+                codec: ImageCodecClass::Dct,
+                producer_prior: ProducerPrior::Authoring,
+            });
+            assert_score(substantial, SCORE_FULL_PAGE_RASTER);
+            assert!(
+                f64::from(substantial) < DEFAULT_SCANNED_MIN_CONFIDENCE,
+                "{glyph_count} glyphs covering a substantial area scored {substantial}, at or \
+                 above the default threshold"
             );
         }
     }
