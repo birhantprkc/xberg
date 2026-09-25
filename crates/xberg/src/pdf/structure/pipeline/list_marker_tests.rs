@@ -148,3 +148,12 @@ fn author_initials_are_not_list_markers() {
     assert!(looks_like_list_item("a. first item"));
     assert!(looks_like_list_item("A. Compare input, output / behavior"));
 }
+
+#[test]
+fn arrow_bullets_are_recognized_only_at_the_start() {
+    assert!(is_bare_list_marker("➢"));
+    assert!(is_bare_detached_list_marker("➢"));
+    assert!(looks_like_list_item("➢ First item"));
+    assert!(!looks_like_list_item("Follow A ➢ B"));
+    assert!(!is_bare_list_marker("➢ First item"));
+}

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- PDF arrow bullets (`➢`) now produce list items in Markdown and document structure instead of joining the preceding paragraph. (GH#1790)
+
 ## [1.2.9] - 2026-09-24
 
 ### Added
