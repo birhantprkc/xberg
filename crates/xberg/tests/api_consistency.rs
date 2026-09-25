@@ -230,6 +230,11 @@ fn test_extraction_config_no_unknown_fields_in_default() {
         "force_ocr",
         "ocr_strategy",
         "disable_ocr",
+        // GH#1752 split three behaviours out of "is an `ocr` block present": each is an
+        // Option<bool> whose None reproduces the previous derived behaviour. ~keep
+        "ocr_near_empty_fallback",
+        "ocr_scanned_page_quality_gate",
+        "ocr_embedded_images",
         "chunking",
         "content_filter",
         "images",
