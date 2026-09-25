@@ -50,6 +50,12 @@ fn hash_config_for_schema(config: &TesseractConfig, resolved_tessdata_path: &str
                 preprocessing.denoise as u8,
                 preprocessing.contrast_enhance as u8,
                 preprocessing.invert_colors as u8,
+                // GH#1785 added this and it rewrites `gray` before binarization, so it changes
+                // the raster OCR reads. Omitting it here would serve an un-normalized result to
+                // a caller that asked for normalization -- the same defect as #687's
+                // `hocr_font_info`, and it would make the feature silently inert whenever an
+                // entry already existed. ~keep
+                preprocessing.normalize_shaded_rows as u8,
             ]);
             hash_bytes(&mut hasher, preprocessing.binarization_method.as_bytes());
         }
@@ -73,6 +79,42 @@ fn hash_config_for_schema(config: &TesseractConfig, resolved_tessdata_path: &str
     for (name, value) in tesseract_variable_set(config) {
         hash_bytes(&mut hasher, name.as_bytes());
         hash_bytes(&mut hasher, value.as_bytes());
+    }
+
+    // `security_limits` bounds the image decode inside `perform_ocr`, which runs only on a
+    // cache MISS -- so without it in the key, a request carrying a strict limit is served the
+    // result of an earlier permissive request and the limit never applies. That is both a
+    // silent policy bypass and the cause of a flaky `issue_1651_ocr_security_limits`: which of
+    // its sibling tests populated the entry first decided whether the limit was enforced. ~keep
+    match config.security_limits.as_ref() {
+        Some(limits) => {
+            hasher.update(&[1]);
+            for value in [
+                limits.max_archive_size,
+                limits.max_compression_ratio,
+                limits.max_files_in_archive,
+                limits.max_nesting_depth,
+                limits.max_entity_length,
+                limits.max_content_size,
+                limits.max_iterations,
+                limits.max_xml_depth,
+                limits.max_table_cells,
+            ] {
+                hasher.update(&value.to_le_bytes());
+            }
+            match limits.max_pages {
+                Some(pages) => {
+                    hasher.update(&[1]);
+                    hasher.update(&pages.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+        None => {
+            hasher.update(&[0]);
+        }
     }
 
     hasher.update(&[config.auto_rotate as u8]);
@@ -295,6 +337,70 @@ mod tests {
             hash_config(&config, "/tessdata/fast"),
             hash_config(&config, "/tessdata/fast"),
             "two calls resolving to the same tessdata directory must still hit the same cache entry"
+        );
+    }
+
+    /// GH#1785 added `normalize_shaded_rows`, which rewrites the grayscale raster before
+    /// binarization and so changes the text OCR returns. It was not in the cache key, which made
+    /// the whole feature silently inert whenever an entry for the same image already existed:
+    /// turning it on served the un-normalized result back.
+    #[test]
+    fn should_distinguish_cache_keys_by_normalize_shaded_rows() {
+        let mut off = create_test_config();
+        off.preprocessing = Some(crate::types::ImagePreprocessingConfig {
+            normalize_shaded_rows: false,
+            ..Default::default()
+        });
+        let mut on = off.clone();
+        on.preprocessing = Some(crate::types::ImagePreprocessingConfig {
+            normalize_shaded_rows: true,
+            ..Default::default()
+        });
+
+        assert_ne!(
+            hash_config(&off, TEST_TESSDATA_PATH),
+            hash_config(&on, TEST_TESSDATA_PATH),
+            "normalize_shaded_rows changes the raster OCR reads, so it must change the cache key"
+        );
+    }
+
+    /// `security_limits` bounds the decode inside `perform_ocr`, which runs only on a cache MISS.
+    /// Leaving it out of the key let a request carrying a strict limit be served the result an
+    /// earlier permissive request had cached, so the limit never applied.
+    #[test]
+    fn should_distinguish_cache_keys_by_security_limits() {
+        let permissive = create_test_config();
+        let mut strict = permissive.clone();
+        strict.security_limits = Some(crate::extractors::security::SecurityLimits {
+            max_content_size: 1,
+            ..Default::default()
+        });
+
+        assert_ne!(
+            hash_config(&permissive, TEST_TESSDATA_PATH),
+            hash_config(&strict, TEST_TESSDATA_PATH),
+            "a configured security limit must not reuse an unrestricted run's cached result"
+        );
+    }
+
+    /// Negative control for the two tests above: the added fields must not be hashed so loosely
+    /// that two identical configurations stop sharing an entry, which would disable the cache.
+    #[test]
+    fn identical_limits_and_preprocessing_still_share_a_cache_key() {
+        let mut config = create_test_config();
+        config.security_limits = Some(crate::extractors::security::SecurityLimits {
+            max_content_size: 4096,
+            ..Default::default()
+        });
+        config.preprocessing = Some(crate::types::ImagePreprocessingConfig {
+            normalize_shaded_rows: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            hash_config(&config, TEST_TESSDATA_PATH),
+            hash_config(&config.clone(), TEST_TESSDATA_PATH),
+            "two identical configurations must still hit the same cache entry"
         );
     }
 
