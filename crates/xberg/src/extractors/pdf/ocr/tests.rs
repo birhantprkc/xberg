@@ -3789,6 +3789,63 @@ mod tests {
         );
     }
 
+    /// GH#1796: `render_full_pdf_ocr_batch` (the `force_ocr` whole-document route) rendered
+    /// every batch with a plain sequential `for` loop, unlike its sibling
+    /// `render_selected_pages_from_document` above (the `force_ocr_pages` route), fixed for
+    /// #1666 to dispatch across the thread pool via `.par_iter()`. Same mechanism-proof shape
+    /// as `parallel_render_dispatches_across_more_than_one_thread`: a dedicated, pre-warmed
+    /// 4-thread named pool, page renders recorded by OS thread name and scoped to this pool's
+    /// own prefix (#1747), asserting more than one of the pool's own threads actually rendered
+    /// a page rather than inferring parallelism from wall-clock duration. Fails against the
+    /// unfixed sequential loop: every page renders on the single thread that called
+    /// `pool.install`, so `observed.len() == 1`. ~keep
+    #[cfg(all(feature = "pdf", any(feature = "ocr", feature = "ocr-pipeline")))]
+    #[test]
+    #[serial_test::serial]
+    fn parallel_full_ocr_batch_render_dispatches_across_more_than_one_thread() {
+        clear_render_call_thread_ids();
+
+        let page_count = 20;
+        let pdf = build_minimal_multi_page_pdf(page_count);
+        let (doc, discovered_page_count, page_rotations) =
+            open_pdf_for_full_ocr(&pdf).expect("opening the fixture for full-document OCR must succeed");
+        assert_eq!(discovered_page_count, page_count, "the fixture must report every page");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|index| format!("{RENDER_POOL_PREFIX}-{index}"))
+            .build()
+            .expect("building a dedicated 4-thread pool must succeed");
+        pool.broadcast(|_| ());
+        let result = pool.install(|| {
+            render_full_pdf_ocr_batch(
+                &doc,
+                &page_rotations,
+                0..page_count,
+                &crate::extractors::security::SecurityLimits::default(),
+                None,
+            )
+        });
+        assert!(result.is_ok(), "rendering the fixture must succeed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), page_count, "every requested page must come back");
+
+        let recorded = RENDER_CALL_THREAD_NAMES.get().unwrap().lock().unwrap().clone();
+        let observed: std::collections::BTreeSet<&String> = recorded
+            .iter()
+            .filter(|name| name.starts_with(RENDER_POOL_PREFIX))
+            .collect();
+        assert!(
+            observed.len() > 1,
+            "expected force_ocr's whole-document batch render to be observed on more than one \
+             of this pool's own named threads (mechanism proof that rendering dispatched in \
+             parallel), got {} of the pool's threads: {:?}; every thread recorded in this \
+             process: {:?}",
+            observed.len(),
+            observed,
+            recorded
+        );
+    }
+
     #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
     #[test]
     fn estimate_png_encode_page_peak_bytes_matches_hand_computed_accounting() {
