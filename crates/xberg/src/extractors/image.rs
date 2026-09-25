@@ -2779,6 +2779,10 @@ mod tests {
     /// `OcrConfig.backend_options["use_cache"]`, the channel `TesseractBackend::config_to_tesseract`
     /// already reads (`use_cache_from_backend_options`) — this test proves the image extractor
     /// actually sets it, using a capturing mock backend so no real Tesseract/tessdata is needed.
+    // Gated on the module, not on each test: every item below is a helper for the two
+    // `ocr` tests, so a feature combination that keeps no tests leaves them all dead and
+    // fails the narrow `formula-recognition,pdf` clippy leg under `-D warnings`. ~keep
+    #[cfg(feature = "ocr")]
     mod use_cache_propagation {
         use super::*;
         use crate::core::config::OcrConfig;
@@ -2850,7 +2854,6 @@ mod tests {
                 .and_then(serde_json::Value::as_bool)
         }
 
-        #[cfg(feature = "ocr")]
         #[tokio::test]
         async fn top_level_use_cache_false_disables_the_ocr_backend_cache() {
             const NAME: &str = "capturing-1787a-disables-cache-test";
@@ -2892,7 +2895,6 @@ mod tests {
         /// (`true`) must not have anything injected into `backend_options` — the OCR-specific
         /// cache setting they may have configured on `tesseract_config.use_cache` directly must
         /// keep governing, unmodified by this propagation.
-        #[cfg(feature = "ocr")]
         #[tokio::test]
         async fn default_top_level_use_cache_leaves_backend_options_untouched() {
             const NAME: &str = "capturing-1787a-default-cache-test";
