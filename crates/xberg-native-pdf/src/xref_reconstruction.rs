@@ -38,6 +38,103 @@ fn trace_trailer_parse_failure(error: &nom::Err<nom::error::Error<&[u8]>>, input
     }
 }
 
+// SPEC COMPLIANCE FIX: Validate that this is actually an object header
+// PDF Spec: ISO 32000-1:2008, Section 7.5.4 - Cross-Reference Table
+//
+// Previous implementation would add ANY "N G obj" pattern to the xref table,
+// even if it appeared inside strings, comments, or corrupted data.
+//
+// This creates security risks:
+// 1. False positives can point to invalid object locations
+// 2. Can cause crashes when trying to parse non-object data as objects
+// 3. Malicious PDFs can craft fake object headers to confuse parsers
+//
+// Correct behavior: Validate that the pattern is followed by valid object syntax ~keep
+/// Whether the bytes following one `N G obj` regex match actually look like
+/// the start of a PDF object, so a false positive inside a string/comment/
+/// corrupted data is never added to the xref table. Split out of
+/// [`reconstruct_xref`] to keep it short.
+fn object_header_is_valid(contents: &[u8], offset: u64, match_byte_len: usize, obj_num: u32, gen_num: u16) -> bool {
+    let validation_start = offset + match_byte_len as u64;
+    if validation_start >= contents.len() as u64 {
+        return true;
+    }
+    let remaining = &contents[validation_start as usize..];
+
+    let mut i = 0;
+    while i < remaining.len() && remaining[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= remaining.len() {
+        return true;
+    }
+
+    let next_byte = remaining[i];
+
+    // Valid object should start with:
+    // - << (dictionary)
+    // - [ (array)
+    // - < (hex string or dict - ambiguous at this point)
+    // - ( (literal string)
+    // - / (name)
+    // - t, f, n (true, false, null)
+    // - digit or - (number) ~keep
+    let is_valid_object_start =
+        matches!(next_byte, b'<' | b'[' | b'(' | b'/' | b't' | b'f' | b'n' | b'-') || next_byte.is_ascii_digit();
+
+    if !is_valid_object_start {
+        tracing::trace!(
+            offset,
+            next_byte = format_args!(
+                "0x{:02x} '{}'",
+                next_byte,
+                if next_byte.is_ascii_graphic() {
+                    next_byte as char
+                } else {
+                    '?'
+                }
+            ),
+            "skipping false positive object header"
+        );
+        return false;
+    }
+
+    tracing::trace!(object_id = obj_num, generation = gen_num, offset, "validated object");
+    true
+}
+
+/// Parse and validate one `N G obj` regex capture into an xref entry, or
+/// `None` if the capture is malformed or fails [`object_header_is_valid`].
+/// Split out of [`reconstruct_xref`] to keep it short.
+fn parse_object_candidate(contents: &[u8], capture: &regex::bytes::Captures) -> Option<(u32, XRefEntry)> {
+    let full_match = capture.get(0)?;
+    let obj_num_bytes = capture.get(1)?.as_bytes();
+    let gen_num_bytes = capture.get(2)?.as_bytes();
+
+    let obj_num: u32 = match std::str::from_utf8(obj_num_bytes).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => {
+            tracing::warn!(offset = full_match.start(), "failed to parse object number");
+            return None;
+        }
+    };
+
+    let gen_num: u16 = match std::str::from_utf8(gen_num_bytes).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => {
+            tracing::warn!(offset = full_match.start(), "failed to parse generation number");
+            return None;
+        }
+    };
+
+    let offset = full_match.start() as u64;
+    if !object_header_is_valid(contents, offset, full_match.as_bytes().len(), obj_num, gen_num) {
+        return None;
+    }
+
+    Some((obj_num, XRefEntry::uncompressed(offset, gen_num)))
+}
+
 /// Reconstruct the cross-reference table by scanning the entire PDF file.
 ///
 /// This function scans for "N G obj" patterns throughout the file and builds
@@ -92,97 +189,10 @@ pub fn reconstruct_xref<R: Read + Seek>(reader: &mut R) -> Result<(CrossRefTable
     let mut objects_found = 0;
 
     for capture in RE_OBJ_PATTERN.captures_iter(&contents) {
-        let full_match = match capture.get(0) {
-            Some(m) => m,
-            None => continue,
-        };
-        let obj_num_bytes = match capture.get(1) {
-            Some(m) => m.as_bytes(),
-            None => continue,
-        };
-        let gen_num_bytes = match capture.get(2) {
-            Some(m) => m.as_bytes(),
-            None => continue,
-        };
-
-        let obj_num: u32 = match std::str::from_utf8(obj_num_bytes).ok().and_then(|s| s.parse().ok()) {
-            Some(n) => n,
-            None => {
-                tracing::warn!(offset = full_match.start(), "failed to parse object number");
-                continue;
-            }
-        };
-
-        let gen_num: u16 = match std::str::from_utf8(gen_num_bytes).ok().and_then(|s| s.parse().ok()) {
-            Some(n) => n,
-            None => {
-                tracing::warn!(offset = full_match.start(), "failed to parse generation number");
-                continue;
-            }
-        };
-
-        let offset = full_match.start() as u64;
-
-        // SPEC COMPLIANCE FIX: Validate that this is actually an object header
-        // PDF Spec: ISO 32000-1:2008, Section 7.5.4 - Cross-Reference Table
-        //
-        // Previous implementation would add ANY "N G obj" pattern to the xref table,
-        // even if it appeared inside strings, comments, or corrupted data.
-        //
-        // This creates security risks:
-        // 1. False positives can point to invalid object locations
-        // 2. Can cause crashes when trying to parse non-object data as objects
-        // 3. Malicious PDFs can craft fake object headers to confuse parsers
-        //
-        // Correct behavior: Validate that the pattern is followed by valid object syntax ~keep
-
-        let validation_start = offset + full_match.as_bytes().len() as u64;
-        if validation_start < contents.len() as u64 {
-            let remaining = &contents[validation_start as usize..];
-
-            let mut i = 0;
-            while i < remaining.len() && remaining[i].is_ascii_whitespace() {
-                i += 1;
-            }
-
-            if i < remaining.len() {
-                let next_byte = remaining[i];
-
-                // Valid object should start with:
-                // - << (dictionary)
-                // - [ (array)
-                // - < (hex string or dict - ambiguous at this point)
-                // - ( (literal string)
-                // - / (name)
-                // - t, f, n (true, false, null)
-                // - digit or - (number) ~keep
-                let is_valid_object_start = matches!(next_byte, b'<' | b'[' | b'(' | b'/' | b't' | b'f' | b'n' | b'-')
-                    || next_byte.is_ascii_digit();
-
-                if !is_valid_object_start {
-                    tracing::trace!(
-                        offset,
-                        next_byte = format_args!(
-                            "0x{:02x} '{}'",
-                            next_byte,
-                            if next_byte.is_ascii_graphic() {
-                                next_byte as char
-                            } else {
-                                '?'
-                            }
-                        ),
-                        "skipping false positive object header"
-                    );
-                    continue;
-                }
-
-                tracing::trace!(object_id = obj_num, generation = gen_num, offset, "validated object");
-            }
+        if let Some((obj_num, entry)) = parse_object_candidate(&contents, &capture) {
+            xref.add_entry(obj_num, entry);
+            objects_found += 1;
         }
-
-        let entry = XRefEntry::uncompressed(offset, gen_num);
-        xref.add_entry(obj_num, entry);
-        objects_found += 1;
     }
 
     tracing::info!(count = objects_found, "reconstructed xref");
@@ -196,6 +206,78 @@ pub fn reconstruct_xref<R: Read + Seek>(reader: &mut R) -> Result<(CrossRefTable
     let (trailer, synthetic) = find_trailer(&contents, reader, &xref)?;
 
     Ok((xref, trailer, synthetic))
+}
+
+/// Parse one `trailer` keyword match: if it parses to a /Root-bearing
+/// dictionary, record it as the new `best_trailer`; otherwise salvage any
+/// /Encrypt, /ID, /Info entries it carries. Split out of [`find_trailer`] to
+/// keep it short.
+fn process_trailer_match(
+    contents: &[u8],
+    mat: regex::bytes::Match,
+    best_trailer: &mut Option<(Object, usize)>,
+    salvaged: &mut HashMap<String, (Object, usize)>,
+) {
+    let trailer_start = mat.start();
+    tracing::debug!(offset = trailer_start, "found trailer keyword");
+
+    let trailer_keyword_end = trailer_start + 7; // len("trailer") ~keep
+    let input = &contents[trailer_keyword_end..];
+    let (_, obj) = match parse_object(input) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            trace_trailer_parse_failure(&e, input.len(), trailer_keyword_end);
+            return;
+        }
+    };
+
+    // Only accept a parsed trailer that actually carries /Root.
+    // A Linearized file's sparse end-of-file trailer legitimately
+    // omits /Root — the Catalog is reachable via the linearization
+    // parameters / first xref chain, not the trailing trailer
+    // (issue #509). Accepting a /Root-less trailer here would
+    // short-circuit Catalog discovery and fail downstream with
+    // "Trailer missing /Root entry". The *last* /Root-bearing
+    // trailer still wins for /Root itself. ~keep
+    if obj.as_dict().is_some_and(|d| d.get("Root").is_some()) {
+        *best_trailer = Some((obj, trailer_start));
+        return;
+    }
+
+    if let Some(d) = obj.as_dict() {
+        for key in ["Encrypt", "ID", "Info"] {
+            if let Some(v) = d.get(key) {
+                salvaged.insert(key.to_string(), (v.clone(), trailer_start));
+            }
+        }
+    }
+    tracing::debug!(
+        offset = trailer_start,
+        "parsed trailer has no /Root, skipping (Catalog located by object scan; \
+         /Encrypt /ID /Info preserved)"
+    );
+}
+
+/// Merge `salvaged` /Encrypt, /ID, /Info entries into a /Root-bearing
+/// `trailer`, using most-recent-occurrence-wins (ISO 32000-1 §7.5.5): a
+/// salvaged value overrides the trailer's only when it was parsed from a
+/// *later* offset, and always fills a key the trailer lacks. Split out of
+/// [`find_trailer`] to keep it short.
+fn merge_salvaged_into_trailer(trailer: &mut Object, salvaged: &HashMap<String, (Object, usize)>, best_off: usize) {
+    if salvaged.is_empty() {
+        return;
+    }
+    let Object::Dictionary(d) = trailer else {
+        return;
+    };
+    for (key, (value, off)) in salvaged {
+        match d.get(key) {
+            Some(_) if *off <= best_off => {} // existing is newer/equal ~keep
+            _ => {
+                d.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 /// Find and parse the trailer dictionary.
@@ -227,63 +309,10 @@ fn find_trailer<R: Read + Seek>(
     // earlier in the file. ~keep
     let mut salvaged: HashMap<String, (Object, usize)> = HashMap::new();
     for mat in RE_TRAILER.find_iter(contents) {
-        let trailer_start = mat.start();
-        tracing::debug!(offset = trailer_start, "found trailer keyword");
-
-        let trailer_keyword_end = trailer_start + 7; // len("trailer") ~keep
-        let input = &contents[trailer_keyword_end..];
-        match parse_object(input) {
-            Ok((_, obj)) => {
-                // Only accept a parsed trailer that actually carries /Root.
-                // A Linearized file's sparse end-of-file trailer legitimately
-                // omits /Root — the Catalog is reachable via the linearization
-                // parameters / first xref chain, not the trailing trailer
-                // (issue #509). Accepting a /Root-less trailer here would
-                // short-circuit Catalog discovery and fail downstream with
-                // "Trailer missing /Root entry". The *last* /Root-bearing
-                // trailer still wins for /Root itself. ~keep
-                if obj.as_dict().is_some_and(|d| d.get("Root").is_some()) {
-                    best_trailer = Some((obj, trailer_start));
-                } else {
-                    if let Some(d) = obj.as_dict() {
-                        for key in ["Encrypt", "ID", "Info"] {
-                            if let Some(v) = d.get(key) {
-                                salvaged.insert(key.to_string(), (v.clone(), trailer_start));
-                            }
-                        }
-                    }
-                    tracing::debug!(
-                        offset = trailer_start,
-                        "parsed trailer has no /Root, skipping (Catalog located by object scan; \
-                         /Encrypt /ID /Info preserved)"
-                    );
-                }
-            }
-            Err(e) => {
-                trace_trailer_parse_failure(&e, input.len(), trailer_keyword_end);
-            }
-        }
+        process_trailer_match(contents, mat, &mut best_trailer, &mut salvaged);
     }
     if let Some((mut trailer, best_off)) = best_trailer {
-        // Merge salvaged /Encrypt /ID /Info from /Root-less trailers using
-        // most-recent-occurrence-wins (ISO 32000-1 §7.5.5): a salvaged value
-        // overrides the /Root-bearing trailer's only when it was parsed from
-        // a *later* offset (a newer incremental update — e.g. a sparse
-        // trailer that adds encryption or rotates the file ID), and always
-        // fills a key the /Root-bearing trailer lacks. An earlier /Root-less
-        // value never clobbers a newer explicit one. ~keep
-        if !salvaged.is_empty()
-            && let Object::Dictionary(d) = &mut trailer
-        {
-            for (key, (value, off)) in &salvaged {
-                match d.get(key) {
-                    Some(_) if *off <= best_off => {} // existing is newer/equal ~keep
-                    _ => {
-                        d.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
+        merge_salvaged_into_trailer(&mut trailer, &salvaged, best_off);
         tracing::info!("successfully parsed trailer dictionary (last /Root-bearing occurrence)");
         // A parsed /Root-bearing trailer needs no synthesis. ~keep
         return Ok((trailer, Vec::new()));
@@ -383,35 +412,18 @@ fn reconstruct_minimal_trailer<R: Read + Seek>(
     Ok((Object::Dictionary(trailer_dict), synthetic))
 }
 
-/// Rebuild a Catalog (and, if needed, a page-tree root) from the surviving page
-/// objects of a truncated file, returning the Root reference and the SYNTHETIC
-/// objects to inject.
-///
-/// Two cases, in order of fidelity:
-///  1. A `/Type /Pages` node survived (the page-tree root, or any internal node).
-///     Prefer a root - a `/Pages` with no `/Parent` - and point a synthesized
-///     Catalog at it, preserving the file's own tree and its inherited attributes.
-///  2. No `/Pages` survived: collect every `/Type /Page` object and hang them off
-///     a synthesized flat `/Pages` node, then a Catalog. Page order follows object
-///     number (the conventional page order). The flat node carries a default
-///     `/MediaBox` so a page that relied on inheritance from its lost parent still
-///     has a media box to fall back to.
-///
-/// Returns `Error::InvalidPdf` only when NEITHER a `/Pages` nor any `/Type /Page`
-/// survived - there is genuinely nothing to show.
-fn synthesize_catalog_from_pages<R: Read + Seek>(
+/// Scan the surviving uncompressed objects for a `/Type /Pages` node
+/// (preferring a genuine root — one with no `/Parent`) and every
+/// `/Type /Page` object, in deterministic low-object-number-first order.
+/// Split out of [`synthesize_catalog_from_pages`] to keep it short. ~keep
+fn find_surviving_pages_and_page_objects<R: Read + Seek>(
     reader: &mut R,
     xref: &CrossRefTable,
-) -> Result<(ObjectRef, Vec<(ObjectRef, Object)>)> {
-    // Free object numbers for the objects we invent: above every surviving one. ~keep
-    let max_obj = xref.all_object_numbers().max().unwrap_or(0);
-    let catalog_num = max_obj + 1;
-
+) -> (Option<u32>, Option<u32>, Vec<u32>) {
     // Deterministic, low-first scan (the same bound the Catalog scan uses). ~keep
     const MAX_SCAN: usize = 4096;
     let obj_nums = xref.smallest_object_numbers(MAX_SCAN);
 
-    // Look for a surviving /Type /Pages node - prefer a genuine ROOT (no /Parent). ~keep
     let mut pages_root: Option<u32> = None;
     let mut pages_any: Option<u32> = None;
     let mut page_objs: Vec<u32> = Vec::new();
@@ -437,6 +449,61 @@ fn synthesize_catalog_from_pages<R: Read + Seek>(
             _ => {}
         }
     }
+    (pages_root, pages_any, page_objs)
+}
+
+/// Build a flat single-level `/Pages` dictionary over `page_objs`, in object
+/// order, with a fallback US Letter `/MediaBox` for pages that inherited
+/// their size from a now-lost parent. Split out of
+/// [`synthesize_catalog_from_pages`] to keep it short.
+fn build_orphan_pages_dict(page_objs: &[u32]) -> Object {
+    let kids: Vec<Object> = page_objs
+        .iter()
+        .map(|&n| Object::Reference(ObjectRef::new(n, 0)))
+        .collect();
+    let mut pages = HashMap::new();
+    pages.insert("Type".to_string(), Object::Name("Pages".to_string()));
+    pages.insert("Count".to_string(), Object::Integer(page_objs.len() as i64));
+    pages.insert("Kids".to_string(), Object::Array(kids));
+    // Fallback media box for any page that inherited its size from the lost parent. ~keep
+    pages.insert(
+        "MediaBox".to_string(),
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]),
+    );
+    Object::Dictionary(pages)
+}
+
+/// Rebuild a Catalog (and, if needed, a page-tree root) from the surviving page
+/// objects of a truncated file, returning the Root reference and the SYNTHETIC
+/// objects to inject.
+///
+/// Two cases, in order of fidelity:
+///  1. A `/Type /Pages` node survived (the page-tree root, or any internal node).
+///     Prefer a root - a `/Pages` with no `/Parent` - and point a synthesized
+///     Catalog at it, preserving the file's own tree and its inherited attributes.
+///  2. No `/Pages` survived: collect every `/Type /Page` object and hang them off
+///     a synthesized flat `/Pages` node, then a Catalog. Page order follows object
+///     number (the conventional page order). The flat node carries a default
+///     `/MediaBox` so a page that relied on inheritance from its lost parent still
+///     has a media box to fall back to.
+///
+/// Returns `Error::InvalidPdf` only when NEITHER a `/Pages` nor any `/Type /Page`
+/// survived - there is genuinely nothing to show.
+fn synthesize_catalog_from_pages<R: Read + Seek>(
+    reader: &mut R,
+    xref: &CrossRefTable,
+) -> Result<(ObjectRef, Vec<(ObjectRef, Object)>)> {
+    // Free object numbers for the objects we invent: above every surviving one. ~keep
+    let max_obj = xref.all_object_numbers().max().unwrap_or(0);
+    let catalog_num = max_obj + 1;
+
+    // Look for a surviving /Type /Pages node - prefer a genuine ROOT (no /Parent). ~keep
+    let (pages_root, pages_any, mut page_objs) = find_surviving_pages_and_page_objects(reader, xref);
 
     // Case 1: a /Pages node survived - point a Catalog at the best one. ~keep
     if let Some(root) = pages_root.or(pages_any) {
@@ -472,29 +539,11 @@ fn synthesize_catalog_from_pages<R: Read + Seek>(
         "recovery: synthesizing flat /Pages over orphan pages"
     );
     let pages_num = max_obj + 2;
-    let kids: Vec<Object> = page_objs
-        .iter()
-        .map(|&n| Object::Reference(ObjectRef::new(n, 0)))
-        .collect();
-    let mut pages = HashMap::new();
-    pages.insert("Type".to_string(), Object::Name("Pages".to_string()));
-    pages.insert("Count".to_string(), Object::Integer(page_objs.len() as i64));
-    pages.insert("Kids".to_string(), Object::Array(kids));
-    // Fallback media box for any page that inherited its size from the lost parent. ~keep
-    pages.insert(
-        "MediaBox".to_string(),
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(612),
-            Object::Integer(792),
-        ]),
-    );
     let catalog = catalog_dict(ObjectRef::new(pages_num, 0));
     Ok((
         ObjectRef::new(catalog_num, 0),
         vec![
-            (ObjectRef::new(pages_num, 0), Object::Dictionary(pages)),
+            (ObjectRef::new(pages_num, 0), build_orphan_pages_dict(&page_objs)),
             (ObjectRef::new(catalog_num, 0), catalog),
         ],
     ))
@@ -508,18 +557,45 @@ fn catalog_dict(pages: ObjectRef) -> Object {
     Object::Dictionary(d)
 }
 
-/// Recover pages packed inside object streams when no uncompressed page survived.
-///
-/// Decompresses every surviving `/Type /ObjStm` and injects ALL objects it
-/// contains (at their real numbers) so their cross-references resolve, then
-/// anchors a Root: a real Catalog if one was packed in, otherwise a synthesized
-/// Catalog over the ObjStm's own `/Pages` root or a flat `/Pages` of the packed
-/// page dictionaries. `None` when no ObjStm yields a page.
-fn recover_from_objstms<R: Read + Seek>(
+/// Classify one object stream member by its `/Type` (`Catalog`, `Pages`, or
+/// `Page`), recording it into `catalog`/`pages_root`/`pages_any`/`page_objs`.
+/// Split out of [`recover_from_objstms`] to keep it short.
+fn classify_objstm_member(
+    num: u32,
+    obj: &Object,
+    catalog: &mut Option<u32>,
+    pages_root: &mut Option<u32>,
+    pages_any: &mut Option<u32>,
+    page_objs: &mut Vec<u32>,
+) {
+    match obj.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()) {
+        Some("Catalog") => {
+            catalog.get_or_insert(num);
+        }
+        Some("Pages") => {
+            pages_any.get_or_insert(num);
+            if obj.as_dict().and_then(|d| d.get("Parent")).is_none() {
+                pages_root.get_or_insert(num);
+            }
+        }
+        Some("Page") => page_objs.push(num),
+        _ => {}
+    }
+}
+
+/// Decompress every surviving `/Type /ObjStm` and inject all objects it
+/// contains (at their real numbers), classifying each by type along the way.
+/// Split out of [`recover_from_objstms`] to keep it short.
+fn scan_objstms_for_catalog_and_pages<R: Read + Seek>(
     reader: &mut R,
     xref: &CrossRefTable,
-    catalog_num: u32,
-) -> Option<(ObjectRef, Vec<(ObjectRef, Object)>)> {
+) -> (
+    Vec<(ObjectRef, Object)>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Vec<u32>,
+) {
     const MAX_SCAN: usize = 4096;
     let mut injected: Vec<(ObjectRef, Object)> = Vec::new();
     let mut catalog: Option<u32> = None;
@@ -555,22 +631,52 @@ fn recover_from_objstms<R: Read + Seek>(
         let mut contained: Vec<(u32, Object)> = contained.into_iter().collect();
         contained.sort_by_key(|(num, _)| *num);
         for (num, obj) in contained {
-            match obj.as_dict().and_then(|d| d.get("Type")).and_then(|t| t.as_name()) {
-                Some("Catalog") => {
-                    catalog.get_or_insert(num);
-                }
-                Some("Pages") => {
-                    pages_any.get_or_insert(num);
-                    if obj.as_dict().and_then(|d| d.get("Parent")).is_none() {
-                        pages_root.get_or_insert(num);
-                    }
-                }
-                Some("Page") => page_objs.push(num),
-                _ => {}
-            }
+            classify_objstm_member(num, &obj, &mut catalog, &mut pages_root, &mut pages_any, &mut page_objs);
             injected.push((ObjectRef::new(num, 0), obj));
         }
     }
+
+    (injected, catalog, pages_root, pages_any, page_objs)
+}
+
+/// Build a flat single-level `/Pages` dictionary over `page_objs` (ObjStm
+/// recovery variant — see [`build_orphan_pages_dict`] for the uncompressed
+/// scan's equivalent). Split out of [`recover_from_objstms`] to keep it short.
+fn build_objstm_pages_dict(page_objs: &[u32]) -> Object {
+    let kids: Vec<Object> = page_objs
+        .iter()
+        .map(|&n| Object::Reference(ObjectRef::new(n, 0)))
+        .collect();
+    let mut pages = HashMap::new();
+    pages.insert("Type".to_string(), Object::Name("Pages".to_string()));
+    pages.insert("Count".to_string(), Object::Integer(page_objs.len() as i64));
+    pages.insert("Kids".to_string(), Object::Array(kids));
+    pages.insert(
+        "MediaBox".to_string(),
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ]),
+    );
+    Object::Dictionary(pages)
+}
+
+/// Recover pages packed inside object streams when no uncompressed page survived.
+///
+/// Decompresses every surviving `/Type /ObjStm` and injects ALL objects it
+/// contains (at their real numbers) so their cross-references resolve, then
+/// anchors a Root: a real Catalog if one was packed in, otherwise a synthesized
+/// Catalog over the ObjStm's own `/Pages` root or a flat `/Pages` of the packed
+/// page dictionaries. `None` when no ObjStm yields a page.
+fn recover_from_objstms<R: Read + Seek>(
+    reader: &mut R,
+    xref: &CrossRefTable,
+    catalog_num: u32,
+) -> Option<(ObjectRef, Vec<(ObjectRef, Object)>)> {
+    let (mut injected, catalog, pages_root, pages_any, mut page_objs) =
+        scan_objstms_for_catalog_and_pages(reader, xref);
 
     // A real Catalog was packed in - use it directly. ~keep
     if let Some(cat) = catalog {
@@ -601,24 +707,7 @@ fn recover_from_objstms<R: Read + Seek>(
     );
     let synth_catalog = free_base;
     let pages_num = free_base + 1;
-    let kids: Vec<Object> = page_objs
-        .iter()
-        .map(|&n| Object::Reference(ObjectRef::new(n, 0)))
-        .collect();
-    let mut pages = HashMap::new();
-    pages.insert("Type".to_string(), Object::Name("Pages".to_string()));
-    pages.insert("Count".to_string(), Object::Integer(page_objs.len() as i64));
-    pages.insert("Kids".to_string(), Object::Array(kids));
-    pages.insert(
-        "MediaBox".to_string(),
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(612),
-            Object::Integer(792),
-        ]),
-    );
-    injected.push((ObjectRef::new(pages_num, 0), Object::Dictionary(pages)));
+    injected.push((ObjectRef::new(pages_num, 0), build_objstm_pages_dict(&page_objs)));
     injected.push((
         ObjectRef::new(synth_catalog, 0),
         catalog_dict(ObjectRef::new(pages_num, 0)),

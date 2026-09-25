@@ -712,7 +712,6 @@ root = "packages/elixir"
 "crates/xberg-cli/src/main.rs" = ["file-too-long", "function-too-long", "type-too-long"]
 "crates/xberg-cli/tests/commands_test.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/src/annotation_types.rs" = ["file-too-long"]
-"crates/xberg-native-pdf/src/annotations.rs" = ["function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/src/content/operators.rs" = ["file-too-long", "type-too-long"]
 "crates/xberg-native-pdf/src/content/parser.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/converters/text_post_processor.rs" = [
@@ -747,7 +746,7 @@ root = "packages/elixir"
   "function-too-long",
   "nesting-too-deep",
 ]
-"crates/xberg-native-pdf/src/document/open.rs" = ["cyclomatic-complexity", "function-too-long"]
+"crates/xberg-native-pdf/src/document/open.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/src/document/pages.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
@@ -761,7 +760,6 @@ root = "packages/elixir"
   "function-too-long",
   "nesting-too-deep",
 ]
-"crates/xberg-native-pdf/src/document/redaction.rs" = ["cyclomatic-complexity", "function-too-long"]
 "crates/xberg-native-pdf/src/document/span_postprocess.rs" = [
   "cyclomatic-complexity",
   "file-too-long",
@@ -807,7 +805,6 @@ root = "packages/elixir"
   "function-too-long",
   "nesting-too-deep",
 ]
-"crates/xberg-native-pdf/src/extractors/text/tj_arrays.rs" = ["function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/src/extractors/text/xobjects.rs" = [
   "cyclomatic-complexity",
   "function-too-long",
@@ -836,8 +833,6 @@ root = "packages/elixir"
   "file-too-long",
   "function-too-long",
 ]
-"crates/xberg-native-pdf/src/redaction/serialize.rs" = ["function-too-long"]
-"crates/xberg-native-pdf/src/redaction/text_engine.rs" = ["function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/src/rendering/mesh_shading.rs" = ["file-too-long", "function-too-long", "too-many-parameters"]
 "crates/xberg-native-pdf/src/rendering/page_renderer.rs" = [
   "cyclomatic-complexity",
@@ -883,11 +878,9 @@ root = "packages/elixir"
 "crates/xberg-native-pdf/src/structure/table_extractor.rs" = ["file-too-long", "function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/src/structure/traversal.rs" = ["file-too-long", "function-too-long"]
 "crates/xberg-native-pdf/src/text/bidi.rs" = ["cyclomatic-complexity", "file-too-long"]
-"crates/xberg-native-pdf/src/text/kangxi.rs" = ["function-too-long"]
 "crates/xberg-native-pdf/src/text/word_boundary.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/src/xfa/parser.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/src/xref.rs" = ["cyclomatic-complexity", "file-too-long", "function-too-long"]
-"crates/xberg-native-pdf/src/xref_reconstruction.rs" = ["function-too-long", "nesting-too-deep"]
 "crates/xberg-native-pdf/tests/extraction_api_regression.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/tests/test_46_round2_qa_pass.rs" = ["file-too-long"]
 "crates/xberg-native-pdf/tests/test_46_round3_qa_pass.rs" = ["file-too-long"]

@@ -54,11 +54,7 @@ pub(crate) fn write_pdf_string(output: &mut Vec<u8>, s: &[u8]) {
     }
 }
 
-/// Serialize one content-stream [`Operator`] to bytes (operands then
-/// operator keyword, ISO 32000-1 §7.8.2). Non-string operators are
-/// emitted byte-for-byte as before; strings go through
-/// [`write_pdf_string`] for binary safety.
-pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
+fn serialize_graphics_state_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
     match op {
         Operator::SaveState => output.extend_from_slice(b"q\n"),
         Operator::RestoreState => output.extend_from_slice(b"Q\n"),
@@ -96,7 +92,13 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
         Operator::SetExtGState { dict_name } => {
             output.extend_from_slice(format!("/{} gs\n", dict_name).as_bytes());
         }
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_path_construction_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
+    match op {
         Operator::MoveTo { x, y } => {
             output.extend_from_slice(format!("{:.6} {:.6} m\n", x, y).as_bytes());
         }
@@ -118,7 +120,13 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
         Operator::Rectangle { x, y, width, height } => {
             output.extend_from_slice(format!("{:.6} {:.6} {:.6} {:.6} re\n", x, y, width, height).as_bytes());
         }
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_path_painting_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
+    match op {
         Operator::Stroke => output.extend_from_slice(b"S\n"),
         Operator::Fill => output.extend_from_slice(b"f\n"),
         Operator::FillEvenOdd => output.extend_from_slice(b"f*\n"),
@@ -128,13 +136,17 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
         Operator::FillStrokeEvenOdd => output.extend_from_slice(b"B*\n"),
         Operator::CloseFillStrokeEvenOdd => output.extend_from_slice(b"b*\n"),
         Operator::EndPath => output.extend_from_slice(b"n\n"),
-
         Operator::ClipNonZero => output.extend_from_slice(b"W\n"),
         Operator::ClipEvenOdd => output.extend_from_slice(b"W*\n"),
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_text_state_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
+    match op {
         Operator::BeginText => output.extend_from_slice(b"BT\n"),
         Operator::EndText => output.extend_from_slice(b"ET\n"),
-
         Operator::Tc { char_space } => {
             output.extend_from_slice(format!("{:.6} Tc\n", char_space).as_bytes());
         }
@@ -156,7 +168,13 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
         Operator::Ts { rise } => {
             output.extend_from_slice(format!("{:.6} Ts\n", rise).as_bytes());
         }
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_text_positioning_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
+    match op {
         Operator::Td { tx, ty } => {
             output.extend_from_slice(format!("{:.6} {:.6} Td\n", tx, ty).as_bytes());
         }
@@ -167,7 +185,13 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
             output.extend_from_slice(format!("{:.6} {:.6} {:.6} {:.6} {:.6} {:.6} Tm\n", a, b, c, d, e, f).as_bytes());
         }
         Operator::TStar => output.extend_from_slice(b"T*\n"),
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_text_showing_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
+    match op {
         Operator::Tj { text } => {
             write_pdf_string(output, text);
             output.extend_from_slice(b" Tj\n");
@@ -197,7 +221,13 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
             write_pdf_string(output, text);
             output.extend_from_slice(b" \"\n");
         }
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_color_operator(output: &mut Vec<u8>, op: &Operator) -> bool {
+    match op {
         Operator::SetStrokeColorSpace { name } => {
             output.extend_from_slice(format!("/{} CS\n", name).as_bytes());
         }
@@ -252,11 +282,16 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
         Operator::SetFillCmyk { c, m, y, k } => {
             output.extend_from_slice(format!("{:.6} {:.6} {:.6} {:.6} k\n", c, m, y, k).as_bytes());
         }
+        _ => return false,
+    }
+    true
+}
 
+fn serialize_remaining_operator(output: &mut Vec<u8>, op: &Operator) {
+    match op {
         Operator::Do { name } => {
             output.extend_from_slice(format!("/{} Do\n", name).as_bytes());
         }
-
         Operator::BeginMarkedContent { tag } => {
             output.extend_from_slice(format!("/{} BMC\n", tag).as_bytes());
         }
@@ -266,11 +301,9 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
             output.extend_from_slice(b" BDC\n");
         }
         Operator::EndMarkedContent => output.extend_from_slice(b"EMC\n"),
-
         Operator::PaintShading { name } => {
             output.extend_from_slice(format!("/{} sh\n", name).as_bytes());
         }
-
         Operator::InlineImage { dict, data } => {
             output.extend_from_slice(b"BI\n");
             // Sorted for the same reason as `Object::Dictionary` below: the
@@ -290,7 +323,6 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
             output.extend_from_slice(data);
             output.extend_from_slice(b"\nEI\n");
         }
-
         Operator::Other { name, operands } => {
             for operand in operands.iter() {
                 serialize_object(output, operand);
@@ -299,7 +331,37 @@ pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
             output.extend_from_slice(name.as_bytes());
             output.push(b'\n');
         }
+        _ => {}
     }
+}
+
+/// Serialize one content-stream [`Operator`] to bytes (operands then
+/// operator keyword, ISO 32000-1 §7.8.2). Non-string operators are
+/// emitted byte-for-byte as before; strings go through
+/// [`write_pdf_string`] for binary safety.
+pub(crate) fn serialize_operator(output: &mut Vec<u8>, op: &Operator) {
+    if serialize_graphics_state_operator(output, op) {
+        return;
+    }
+    if serialize_path_construction_operator(output, op) {
+        return;
+    }
+    if serialize_path_painting_operator(output, op) {
+        return;
+    }
+    if serialize_text_state_operator(output, op) {
+        return;
+    }
+    if serialize_text_positioning_operator(output, op) {
+        return;
+    }
+    if serialize_text_showing_operator(output, op) {
+        return;
+    }
+    if serialize_color_operator(output, op) {
+        return;
+    }
+    serialize_remaining_operator(output, op);
 }
 
 /// Serialize a PDF [`Object`] to bytes. Strings go through

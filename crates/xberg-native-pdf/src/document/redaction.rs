@@ -74,21 +74,13 @@ impl PdfDocument {
         Ok(h + f)
     }
 
-    /// Helper to remove repeated text in a specific page area.
-    fn remove_repeated_text(&self, area: PageArea, threshold: f32) -> Result<usize> {
+    /// Erase every span carrying a spec-compliant `/Artifact` pagination tag
+    /// matching `area` (Tagged PDF, 100% accurate). Split out of
+    /// [`Self::remove_repeated_text`] to keep it short. ~keep
+    fn remove_spec_compliant_pagination_artifacts(&self, area: PageArea, page_count: usize) -> Result<usize> {
         use crate::extractors::text::{ArtifactType, PaginationSubtype};
-        use std::collections::{HashMap, HashSet};
-
-        let page_count = self.page_count()?;
-        if page_count < 1 {
-            return Ok(0);
-        }
 
         let mut removed_count = 0;
-
-        // 1. Spec-Compliant Removal (Priority)
-        // If the PDF uses /Artifact tags (Tagged PDF), we use those directly as they are 100% accurate.
-        // ~keep
         for page_idx in 0..page_count {
             let spans = self.extract_spans(page_idx)?;
             for span in spans {
@@ -106,36 +98,21 @@ impl PdfDocument {
                 }
             }
         }
+        Ok(removed_count)
+    }
 
-        if removed_count > 0 {
-            tracing::info!(target: LOG_TARGET,
-                count = removed_count,
-                area = if area == PageArea::Header { "headers" } else { "footers" },
-                "removed spec-compliant artifacts"
-            );
-            return Ok(removed_count);
-        }
+    /// Collect every span's text that falls in `area`'s zone (top/bottom 15%
+    /// of the page), keyed by its trimmed text, with the `(page, bbox)` of
+    /// each occurrence. Split out of [`Self::remove_repeated_text`] to keep
+    /// it short. ~keep
+    fn collect_zone_text_occurrences(
+        &self,
+        area: PageArea,
+        page_count: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<(usize, crate::geometry::Rect)>>> {
+        use std::collections::HashMap;
 
-        if page_count < 2 {
-            return Ok(0);
-        }
-
-        // Each entry records the IN-ZONE occurrences of a repeated string as
-        // (page, bbox). Keeping the bbox (not just the page set) lets us both
-        // (a) erase only the header/footer occurrence and never an identically
-        // worded span elsewhere on the page, and (b) require the occurrences to
-        // share a position before treating the string as chrome. ~keep
         let mut occurrences: HashMap<String, Vec<(usize, crate::geometry::Rect)>> = HashMap::new();
-
-        // Sanitize threshold to avoid min_occurrences becoming 0 for invalid inputs. ~keep
-        let clamped_threshold = if threshold.is_finite() {
-            threshold.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let raw_min = (page_count as f32 * clamped_threshold).ceil();
-        let min_occurrences = if raw_min < 1.0 { 1 } else { raw_min as usize };
-
         for page_idx in 0..page_count {
             let height = self.get_page_media_box(page_idx)?.3;
             let zone = match area {
@@ -158,6 +135,19 @@ impl PdfDocument {
                 }
             }
         }
+        Ok(occurrences)
+    }
+
+    /// Erase every occurrence group that repeats on at least `min_occurrences`
+    /// distinct pages AND stays position-locked within tolerance (a genuine
+    /// running header/footer, not a recurring form label). Split out of
+    /// [`Self::remove_repeated_text`] to keep it short. ~keep
+    fn erase_position_locked_occurrences(
+        &self,
+        occurrences: std::collections::HashMap<String, Vec<(usize, crate::geometry::Rect)>>,
+        min_occurrences: usize,
+    ) -> Result<usize> {
+        use std::collections::HashSet;
 
         // Genuine running headers/footers are position-locked: the same string
         // lands at the same x/y on every page. A form label or instruction that
@@ -169,6 +159,7 @@ impl PdfDocument {
         const POS_TOL_X: f32 = 40.0;
         const POS_TOL_Y: f32 = 24.0;
 
+        let mut removed_count = 0;
         for (_text, occs) in occurrences {
             let distinct_pages: HashSet<usize> = occs.iter().map(|(p, _)| *p).collect();
             if distinct_pages.len() < min_occurrences {
@@ -194,6 +185,49 @@ impl PdfDocument {
         }
 
         Ok(removed_count)
+    }
+
+    /// Helper to remove repeated text in a specific page area.
+    fn remove_repeated_text(&self, area: PageArea, threshold: f32) -> Result<usize> {
+        let page_count = self.page_count()?;
+        if page_count < 1 {
+            return Ok(0);
+        }
+
+        // 1. Spec-Compliant Removal (Priority)
+        // If the PDF uses /Artifact tags (Tagged PDF), we use those directly as they are 100% accurate.
+        // ~keep
+        let removed_count = self.remove_spec_compliant_pagination_artifacts(area, page_count)?;
+        if removed_count > 0 {
+            tracing::info!(target: LOG_TARGET,
+                count = removed_count,
+                area = if area == PageArea::Header { "headers" } else { "footers" },
+                "removed spec-compliant artifacts"
+            );
+            return Ok(removed_count);
+        }
+
+        if page_count < 2 {
+            return Ok(0);
+        }
+
+        // Sanitize threshold to avoid min_occurrences becoming 0 for invalid inputs. ~keep
+        let clamped_threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let raw_min = (page_count as f32 * clamped_threshold).ceil();
+        let min_occurrences = if raw_min < 1.0 { 1 } else { raw_min as usize };
+
+        // Each entry records the IN-ZONE occurrences of a repeated string as
+        // (page, bbox). Keeping the bbox (not just the page set) lets us both
+        // (a) erase only the header/footer occurrence and never an identically
+        // worded span elsewhere on the page, and (b) require the occurrences to
+        // share a position before treating the string as chrome. ~keep
+        let occurrences = self.collect_zone_text_occurrences(area, page_count)?;
+
+        self.erase_position_locked_occurrences(occurrences, min_occurrences)
     }
 
     /// Erase existing header content.

@@ -256,6 +256,277 @@ fn emit_runs(out: &mut Vec<Operator>, res: &TextPruneResult) {
     }
 }
 
+fn apply_graphics_state_operator(stack: &mut GraphicsStateStack, out: &mut Vec<Operator>, op: &Operator) -> bool {
+    match op {
+        Operator::SaveState | Operator::RestoreState | Operator::Cm { .. } => {
+            super::classify::apply_ctm(stack, op);
+            out.push(op.clone());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Handle `BT`/`ET`/`Tf`/`Tc`/`Tw`/`Tz`/`TL`/`Ts`: update `ts` and pass the operator through unchanged.
+fn apply_text_state_operator(ts: &mut TextState, out: &mut Vec<Operator>, op: &Operator) -> bool {
+    match op {
+        Operator::BeginText => {
+            ts.tm = Matrix::identity();
+            ts.tlm = Matrix::identity();
+            out.push(op.clone());
+        }
+        Operator::EndText => out.push(op.clone()),
+        Operator::Tf { font, size } => {
+            ts.font = font.clone();
+            ts.tfs = *size;
+            out.push(op.clone());
+        }
+        Operator::Tc { char_space } => {
+            ts.tc = *char_space;
+            out.push(op.clone());
+        }
+        Operator::Tw { word_space } => {
+            ts.tw = *word_space;
+            out.push(op.clone());
+        }
+        Operator::Tz { scale } => {
+            ts.th = *scale / 100.0;
+            out.push(op.clone());
+        }
+        Operator::TL { leading } => {
+            ts.leading = *leading;
+            out.push(op.clone());
+        }
+        Operator::Ts { rise } => {
+            ts.trise = *rise;
+            out.push(op.clone());
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Handle `Td`/`TD`/`Tm`/`T*`: update `ts` and pass the operator through unchanged.
+fn apply_text_positioning_operator(ts: &mut TextState, out: &mut Vec<Operator>, op: &Operator) -> bool {
+    match op {
+        Operator::Td { tx, ty } => {
+            ts.tlm = Matrix {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: *tx,
+                f: *ty,
+            }
+            .multiply(&ts.tlm);
+            ts.tm = ts.tlm;
+            out.push(op.clone());
+        }
+        Operator::TD { tx, ty } => {
+            ts.leading = -*ty;
+            ts.tlm = Matrix {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: *tx,
+                f: *ty,
+            }
+            .multiply(&ts.tlm);
+            ts.tm = ts.tlm;
+            out.push(op.clone());
+        }
+        Operator::Tm { a, b, c, d, e, f } => {
+            let m = Matrix {
+                a: *a,
+                b: *b,
+                c: *c,
+                d: *d,
+                e: *e,
+                f: *f,
+            };
+            ts.tm = m;
+            ts.tlm = m;
+            out.push(op.clone());
+        }
+        Operator::TStar => {
+            ts.tlm = Matrix {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: -ts.leading,
+            }
+            .multiply(&ts.tlm);
+            ts.tm = ts.tlm;
+            out.push(op.clone());
+        }
+        _ => return false,
+    }
+    true
+}
+
+struct RedactionParams<'a> {
+    fonts: &'a dyn FontMetrics,
+    regions: &'a RegionSet,
+    min_padding: f32,
+}
+
+struct RedactionOutput<'a> {
+    result: &'a mut TextEngineResult,
+    out: &'a mut Vec<Operator>,
+}
+
+fn handle_tj_operator(
+    ts: &mut TextState,
+    stack: &GraphicsStateStack,
+    params: &RedactionParams,
+    output: &mut RedactionOutput,
+    op: &Operator,
+    text: &[u8],
+) {
+    if refuse_unsupported(params.fonts, &ts.font, params.regions, output.result, output.out, op) {
+        return;
+    }
+    let ctm = stack.current().ctm;
+    let res = show_string(text, ts, &ctm, params.fonts, params.regions, params.min_padding);
+    account(output.result, text.len(), &res);
+    emit_runs(output.out, &res);
+}
+
+fn handle_quote_operator(
+    ts: &mut TextState,
+    stack: &GraphicsStateStack,
+    params: &RedactionParams,
+    output: &mut RedactionOutput,
+    op: &Operator,
+    text: &[u8],
+) {
+    if refuse_unsupported(params.fonts, &ts.font, params.regions, output.result, output.out, op) {
+        return;
+    }
+    // `'` = T* then show. ~keep
+    ts.tlm = Matrix {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: -ts.leading,
+    }
+    .multiply(&ts.tlm);
+    ts.tm = ts.tlm;
+    let ctm = stack.current().ctm;
+    let res = show_string(text, ts, &ctm, params.fonts, params.regions, params.min_padding);
+    account(output.result, text.len(), &res);
+    emit_runs(output.out, &res);
+}
+
+fn handle_double_quote_operator(
+    ts: &mut TextState,
+    stack: &GraphicsStateStack,
+    params: &RedactionParams,
+    output: &mut RedactionOutput,
+    op: &Operator,
+    spacing_and_text: (f32, f32, &[u8]),
+) {
+    let (word_space, char_space, text) = spacing_and_text;
+    if refuse_unsupported(params.fonts, &ts.font, params.regions, output.result, output.out, op) {
+        return;
+    }
+    ts.tw = word_space;
+    ts.tc = char_space;
+    ts.tlm = Matrix {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: -ts.leading,
+    }
+    .multiply(&ts.tlm);
+    ts.tm = ts.tlm;
+    let ctm = stack.current().ctm;
+    let res = show_string(text, ts, &ctm, params.fonts, params.regions, params.min_padding);
+    account(output.result, text.len(), &res);
+    emit_runs(output.out, &res);
+}
+
+#[derive(Default)]
+struct TjArrayAccumulator {
+    survived_runs: TextPruneResult,
+    tj_orig: usize,
+    any_removed: bool,
+}
+
+fn accumulate_tj_array_string(
+    ts: &mut TextState,
+    ctm: &Matrix,
+    params: &RedactionParams,
+    acc: &mut TjArrayAccumulator,
+    s: &[u8],
+) {
+    acc.tj_orig += s.len();
+    let r = show_string(s, ts, ctm, params.fonts, params.regions, params.min_padding);
+    if r.glyphs_removed > 0 {
+        acc.any_removed = true;
+    }
+    for c in &r.removed_codes {
+        if !acc.survived_runs.removed_codes.contains(c) {
+            acc.survived_runs.removed_codes.push(*c);
+        }
+    }
+    acc.survived_runs.glyphs_removed += r.glyphs_removed;
+    acc.survived_runs.runs.extend(r.runs);
+}
+
+fn handle_tj_array_operator(
+    ts: &mut TextState,
+    stack: &GraphicsStateStack,
+    params: &RedactionParams,
+    output: &mut RedactionOutput,
+    op: &Operator,
+    array: &[TextElement],
+) {
+    if refuse_unsupported(params.fonts, &ts.font, params.regions, output.result, output.out, op) {
+        return;
+    }
+    // Concatenate the string elements (offsets are positional
+    // hints we deliberately discard on rewrite). Per
+    // §9.4.4 a positive TJ number moves left by n/1000·Tfs·Th. ~keep
+    let ctm = stack.current().ctm;
+    let mut acc = TjArrayAccumulator::default();
+    for el in array {
+        match el {
+            TextElement::String(s) => {
+                accumulate_tj_array_string(ts, &ctm, params, &mut acc, s);
+            }
+            TextElement::Offset(off) => {
+                let dx = (-*off / 1000.0) * ts.tfs * ts.th;
+                ts.tm = Matrix {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: dx,
+                    f: 0.0,
+                }
+                .multiply(&ts.tm);
+            }
+        }
+    }
+    account(output.result, acc.tj_orig, &acc.survived_runs);
+    if acc.any_removed {
+        emit_runs(output.out, &acc.survived_runs);
+    } else {
+        // Nothing redacted in this TJ — emit it byte-identical
+        // (perf + minimal diff; no side channel since nothing
+        // was removed). ~keep
+        output.out.push(op.clone());
+    }
+}
+
 /// Redact text in `ops` that intersects `regions` (page space).
 ///
 /// Non-text operators pass through unchanged; the graphics-state CTM and
@@ -273,203 +544,51 @@ pub fn redact_text_stream(
     let mut ts = TextState::default();
     let mut out: Vec<Operator> = Vec::with_capacity(ops.len());
     let mut result = TextEngineResult::default();
+    let params = RedactionParams {
+        fonts,
+        regions,
+        min_padding,
+    };
 
     for op in ops {
+        if apply_graphics_state_operator(&mut stack, &mut out, op) {
+            continue;
+        }
+        if apply_text_state_operator(&mut ts, &mut out, op) {
+            continue;
+        }
+        if apply_text_positioning_operator(&mut ts, &mut out, op) {
+            continue;
+        }
+        let mut output = RedactionOutput {
+            result: &mut result,
+            out: &mut out,
+        };
         match op {
-            Operator::SaveState | Operator::RestoreState | Operator::Cm { .. } => {
-                super::classify::apply_ctm(&mut stack, op);
-                out.push(op.clone());
-            }
-            Operator::BeginText => {
-                ts.tm = Matrix::identity();
-                ts.tlm = Matrix::identity();
-                out.push(op.clone());
-            }
-            Operator::EndText => out.push(op.clone()),
-            Operator::Tf { font, size } => {
-                ts.font = font.clone();
-                ts.tfs = *size;
-                out.push(op.clone());
-            }
-            Operator::Tc { char_space } => {
-                ts.tc = *char_space;
-                out.push(op.clone());
-            }
-            Operator::Tw { word_space } => {
-                ts.tw = *word_space;
-                out.push(op.clone());
-            }
-            Operator::Tz { scale } => {
-                ts.th = *scale / 100.0;
-                out.push(op.clone());
-            }
-            Operator::TL { leading } => {
-                ts.leading = *leading;
-                out.push(op.clone());
-            }
-            Operator::Ts { rise } => {
-                ts.trise = *rise;
-                out.push(op.clone());
-            }
-            Operator::Td { tx, ty } => {
-                ts.tlm = Matrix {
-                    a: 1.0,
-                    b: 0.0,
-                    c: 0.0,
-                    d: 1.0,
-                    e: *tx,
-                    f: *ty,
-                }
-                .multiply(&ts.tlm);
-                ts.tm = ts.tlm;
-                out.push(op.clone());
-            }
-            Operator::TD { tx, ty } => {
-                ts.leading = -*ty;
-                ts.tlm = Matrix {
-                    a: 1.0,
-                    b: 0.0,
-                    c: 0.0,
-                    d: 1.0,
-                    e: *tx,
-                    f: *ty,
-                }
-                .multiply(&ts.tlm);
-                ts.tm = ts.tlm;
-                out.push(op.clone());
-            }
-            Operator::Tm { a, b, c, d, e, f } => {
-                let m = Matrix {
-                    a: *a,
-                    b: *b,
-                    c: *c,
-                    d: *d,
-                    e: *e,
-                    f: *f,
-                };
-                ts.tm = m;
-                ts.tlm = m;
-                out.push(op.clone());
-            }
-            Operator::TStar => {
-                ts.tlm = Matrix {
-                    a: 1.0,
-                    b: 0.0,
-                    c: 0.0,
-                    d: 1.0,
-                    e: 0.0,
-                    f: -ts.leading,
-                }
-                .multiply(&ts.tlm);
-                ts.tm = ts.tlm;
-                out.push(op.clone());
-            }
             Operator::Tj { text } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
-                }
-                let ctm = stack.current().ctm;
-                let res = show_string(text, &mut ts, &ctm, fonts, regions, min_padding);
-                account(&mut result, text.len(), &res);
-                emit_runs(&mut out, &res);
+                handle_tj_operator(&mut ts, &stack, &params, &mut output, op, text);
             }
             Operator::Quote { text } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
-                }
-                // `'` = T* then show. ~keep
-                ts.tlm = Matrix {
-                    a: 1.0,
-                    b: 0.0,
-                    c: 0.0,
-                    d: 1.0,
-                    e: 0.0,
-                    f: -ts.leading,
-                }
-                .multiply(&ts.tlm);
-                ts.tm = ts.tlm;
-                let ctm = stack.current().ctm;
-                let res = show_string(text, &mut ts, &ctm, fonts, regions, min_padding);
-                account(&mut result, text.len(), &res);
-                emit_runs(&mut out, &res);
+                handle_quote_operator(&mut ts, &stack, &params, &mut output, op, text);
             }
             Operator::DoubleQuote {
                 word_space,
                 char_space,
                 text,
             } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
-                }
-                ts.tw = *word_space;
-                ts.tc = *char_space;
-                ts.tlm = Matrix {
-                    a: 1.0,
-                    b: 0.0,
-                    c: 0.0,
-                    d: 1.0,
-                    e: 0.0,
-                    f: -ts.leading,
-                }
-                .multiply(&ts.tlm);
-                ts.tm = ts.tlm;
-                let ctm = stack.current().ctm;
-                let res = show_string(text, &mut ts, &ctm, fonts, regions, min_padding);
-                account(&mut result, text.len(), &res);
-                emit_runs(&mut out, &res);
+                handle_double_quote_operator(
+                    &mut ts,
+                    &stack,
+                    &params,
+                    &mut output,
+                    op,
+                    (*word_space, *char_space, text),
+                );
             }
             Operator::TJ { array } => {
-                if refuse_unsupported(fonts, &ts.font, regions, &mut result, &mut out, op) {
-                    continue;
-                }
-                // Concatenate the string elements (offsets are positional
-                // hints we deliberately discard on rewrite). Per
-                // §9.4.4 a positive TJ number moves left by n/1000·Tfs·Th. ~keep
-                let ctm = stack.current().ctm;
-                let mut any_removed = false;
-                let mut tj_orig = 0usize;
-                let mut survived_runs = TextPruneResult::default();
-                for el in array {
-                    match el {
-                        TextElement::String(s) => {
-                            tj_orig += s.len();
-                            let r = show_string(s, &mut ts, &ctm, fonts, regions, min_padding);
-                            if r.glyphs_removed > 0 {
-                                any_removed = true;
-                            }
-                            for c in &r.removed_codes {
-                                if !survived_runs.removed_codes.contains(c) {
-                                    survived_runs.removed_codes.push(*c);
-                                }
-                            }
-                            survived_runs.glyphs_removed += r.glyphs_removed;
-                            survived_runs.runs.extend(r.runs);
-                        }
-                        TextElement::Offset(off) => {
-                            let dx = (-*off / 1000.0) * ts.tfs * ts.th;
-                            ts.tm = Matrix {
-                                a: 1.0,
-                                b: 0.0,
-                                c: 0.0,
-                                d: 1.0,
-                                e: dx,
-                                f: 0.0,
-                            }
-                            .multiply(&ts.tm);
-                        }
-                    }
-                }
-                account(&mut result, tj_orig, &survived_runs);
-                if any_removed {
-                    emit_runs(&mut out, &survived_runs);
-                } else {
-                    // Nothing redacted in this TJ — emit it byte-identical
-                    // (perf + minimal diff; no side channel since nothing
-                    // was removed). ~keep
-                    out.push(op.clone());
-                }
+                handle_tj_array_operator(&mut ts, &stack, &params, &mut output, op, array);
             }
-            other => out.push(other.clone()),
+            other => output.out.push(other.clone()),
         }
     }
 

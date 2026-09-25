@@ -7,6 +7,16 @@
 
 use super::*;
 
+/// Text-state snapshot needed to size and advance one `TJ` show-string's
+/// glyphs, captured once per array so per-character work doesn't re-borrow
+/// `self.state_stack`.
+struct TjCharacterMetrics {
+    font_size: f32,
+    horizontal_scaling: f32,
+    char_space: f32,
+    word_space: f32,
+}
+
 impl<'doc> TextExtractor<'doc> {
     /// Get the current artifact type from the marked content stack.
     pub(super) fn current_artifact_type(&self) -> Option<ArtifactType> {
@@ -206,155 +216,16 @@ impl<'doc> TextExtractor<'doc> {
             _element_count += 1;
             match element {
                 TextElement::String(s) => {
-                    if let Some(ref name) = font_name
-                        && let Some(font) = self.fonts.get(name)
-                    {
-                        let width_table = Self::simple_widths(
-                            self.cached_extraction_widths.as_deref(),
-                            font,
-                            !Self::has_following_tj_displacement(array, idx),
-                        );
-                        for &byte in s.iter() {
-                            // Normalize character code through encoding.
-                            // This ensures word boundary detection works on actual characters,
-                            // not raw byte codes from custom encodings ~keep
-                            let char_code = font.get_encoded_char(byte).map(|ch| ch as u32).unwrap_or(byte as u32);
-
-                            let glyph_width = width_table[byte as usize];
-
-                            let is_ligature = Self::is_ligature_code(char_code);
-
-                            // Create CharacterInfo for this character
-                            // The tj_offset will be applied when we encounter the next Offset element
-                            // ~keep
-                            let char_info = CharacterInfo {
-                                code: char_code,
-                                glyph_id: None, // Could be enhanced to extract actual GID ~keep
-                                width: glyph_width,
-                                x_position: self.current_x_position,
-                                tj_offset: None,
-                                font_size,
-                                is_ligature,
-                                original_ligature: None,
-                                protected_from_split: false,
-                            };
-
-                            self.tj_character_array.push(char_info);
-
-                            let char_advance = glyph_width * horizontal_scaling
-                                + char_space
-                                + (if byte == 0x20 { word_space } else { 0.0 });
-                            self.current_x_position += char_advance;
-                        }
-                    }
-
-                    let repair_zero_widths = !Self::has_following_tj_displacement(array, idx);
-                    self.append_advance_buffer(&mut buffer, s, repair_zero_widths)?;
+                    let metrics = TjCharacterMetrics {
+                        font_size,
+                        horizontal_scaling,
+                        char_space,
+                        word_space,
+                    };
+                    self.process_tj_string_element(array, idx, s, &metrics, font_name.as_deref(), &mut buffer)?;
                 }
                 TextElement::Offset(offset) => {
-                    // Track TJ offset for statistical analysis
-                    // Per ISO 32000-1:2008 Section 9.4.4, collect all TJ values
-                    // to detect justified vs normal text through coefficient of variation ~keep
-                    if self.tj_offset_history.len() < 10000 {
-                        // Keep history reasonable size (first 10k offsets per document)
-                        // and update the running accumulators. ~keep
-                        let x = *offset as f64;
-                        self.tj_sum += x;
-                        self.tj_sum_sq += x * x;
-                        self.tj_offset_history.push(*offset);
-                        self.tj_stats_len = self.tj_offset_history.len();
-                    }
-
-                    // Associate TJ offset with the last character
-                    // The offset applies AFTER the previous string, affecting spacing to next string
-                    // ~keep
-                    if !self.tj_character_array.is_empty() {
-                        let last_idx = self.tj_character_array.len() - 1;
-                        self.tj_character_array[last_idx].tj_offset = Some(*offset as i32);
-                    }
-
-                    // Check if this offset indicates a word boundary
-                    // Per PDF spec: negative offsets increase spacing
-                    // Use geometry-based adaptive threshold ~keep
-                    let threshold = self.calculate_adaptive_tj_threshold();
-                    if *offset < threshold {
-                        // Note: split-word symptoms ("diffe rent", "cha nge",
-                        // "equivalen t") are handled at the higher level by the
-                        // intra-word kerning guard in `should_insert_space`. An
-                        // earlier TJ-side guard here (commit b2c6484) used a
-                        // letter-letter + |offset| < space-glyph-width rule, but
-                        // that rule misclassified real inter-word gaps in
-                        // tightly-justified PDFs (LaTeX academic papers, Docling
-                        // output) where producers encode word boundaries as TJ
-                        // offsets smaller than a full space glyph. The
-                        // span-merge-time guard has more context (full bbox,
-                        // WordBoundaryDetector) and avoids that false positive. ~keep
-                        //
-                        // Check if buffer ends with space BEFORE flushing
-                        // This prevents double spaces when TJ processor inserts space
-                        // AND span merging would insert space at the same boundary. ~keep
-                        let buffer_ends_with_space = !buffer.unicode.is_empty()
-                            && buffer
-                                .unicode
-                                .chars()
-                                .next_back()
-                                .map(|c| c.is_whitespace())
-                                .unwrap_or(false);
-
-                        self.flush_tj_buffer(buffer)?;
-
-                        // Check if the next element in the TJ array is a string
-                        // that starts with whitespace. If so, DON'T insert a space to avoid doubling.
-                        // This prevents patterns like "word " + " next" = "word next" (double space)
-                        // ~keep
-                        let next_element_starts_with_space = if idx + 1 < array.len() {
-                            if let TextElement::String(next_s) = &array[idx + 1] {
-                                next_s
-                                    .first()
-                                    .is_some_and(|&byte| byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-
-                        if !buffer_ends_with_space && !next_element_starts_with_space {
-                            self.insert_space_as_span()?;
-                        }
-
-                        // Apply the TJ offset to the text matrix BEFORE
-                        // creating the new buffer so its `user_pos_x`
-                        // captures the actual draw position of the next
-                        // string. Otherwise the buffer anchors at the
-                        // pre-offset position and every subsequent span
-                        // on the line inherits the missing tx. ~keep
-                        self.advance_position_for_offset(*offset)?;
-
-                        buffer = TjBuffer::new(
-                            self.state_stack.current(),
-                            self.current_mcid,
-                            self.cached_current_font.clone(),
-                        );
-                    } else {
-                        // Sub-threshold offset: matrix advances but the
-                        // current buffer keeps accumulating, so apply
-                        // the offset unconditionally here as well. ~keep
-                        self.advance_position_for_offset(*offset)?;
-                        // Fold the same displacement into the buffer's
-                        // advance record. Historically only the text matrix
-                        // moved, so these kerning/word-space offsets were
-                        // dropped from `char_widths`/`accumulated_width` —
-                        // leaving the span's reconstructed per-glyph positions
-                        // drifting behind the true render (poppler/PDFium/
-                        // pymupdf all fold the offset into the advance). On
-                        // justified body text drawn as one continuous buffer,
-                        // the many small post-space offsets accumulate into a
-                        // multi-point undershoot. Folding keeps
-                        // `sum(char_widths) == accumulated_width == matrix
-                        // advance` by construction. ~keep
-                        self.fold_offset_into_buffer(&mut buffer, *offset);
-                    }
+                    buffer = self.process_tj_offset_element(array, idx, *offset, buffer)?;
                 }
             }
         }
@@ -364,6 +235,195 @@ impl<'doc> TextExtractor<'doc> {
         }
 
         Ok(())
+    }
+
+    /// Track per-character info for one `TJ` show-string element and append
+    /// it to the accumulating buffer. Split out of
+    /// [`Self::process_tj_array_tiebreaker`] to keep it short. ~keep
+    fn process_tj_string_element(
+        &mut self,
+        array: &[TextElement],
+        idx: usize,
+        s: &[u8],
+        metrics: &TjCharacterMetrics,
+        font_name: Option<&str>,
+        buffer: &mut TjBuffer,
+    ) -> Result<()> {
+        if let Some(name) = font_name
+            && let Some(font) = self.fonts.get(name)
+        {
+            let width_table = Self::simple_widths(
+                self.cached_extraction_widths.as_deref(),
+                font,
+                !Self::has_following_tj_displacement(array, idx),
+            );
+            for &byte in s.iter() {
+                // Normalize character code through encoding.
+                // This ensures word boundary detection works on actual characters,
+                // not raw byte codes from custom encodings ~keep
+                let char_code = font.get_encoded_char(byte).map(|ch| ch as u32).unwrap_or(byte as u32);
+
+                let glyph_width = width_table[byte as usize];
+
+                let is_ligature = Self::is_ligature_code(char_code);
+
+                // Create CharacterInfo for this character
+                // The tj_offset will be applied when we encounter the next Offset element
+                // ~keep
+                let char_info = CharacterInfo {
+                    code: char_code,
+                    glyph_id: None, // Could be enhanced to extract actual GID ~keep
+                    width: glyph_width,
+                    x_position: self.current_x_position,
+                    tj_offset: None,
+                    font_size: metrics.font_size,
+                    is_ligature,
+                    original_ligature: None,
+                    protected_from_split: false,
+                };
+
+                self.tj_character_array.push(char_info);
+
+                let char_advance = glyph_width * metrics.horizontal_scaling
+                    + metrics.char_space
+                    + (if byte == 0x20 { metrics.word_space } else { 0.0 });
+                self.current_x_position += char_advance;
+            }
+        }
+
+        let repair_zero_widths = !Self::has_following_tj_displacement(array, idx);
+        self.append_advance_buffer(buffer, s, repair_zero_widths)
+    }
+
+    /// Apply one `TJ` numeric offset: update the running statistics, decide
+    /// whether it is a word boundary, and either flush `buffer` into a span
+    /// (returning a fresh one) or fold the offset into it. Split out of
+    /// [`Self::process_tj_array_tiebreaker`] to keep it short. ~keep
+    fn process_tj_offset_element(
+        &mut self,
+        array: &[TextElement],
+        idx: usize,
+        offset: f32,
+        mut buffer: TjBuffer,
+    ) -> Result<TjBuffer> {
+        // Track TJ offset for statistical analysis
+        // Per ISO 32000-1:2008 Section 9.4.4, collect all TJ values
+        // to detect justified vs normal text through coefficient of variation ~keep
+        if self.tj_offset_history.len() < 10000 {
+            // Keep history reasonable size (first 10k offsets per document)
+            // and update the running accumulators. ~keep
+            let x = offset as f64;
+            self.tj_sum += x;
+            self.tj_sum_sq += x * x;
+            self.tj_offset_history.push(offset);
+            self.tj_stats_len = self.tj_offset_history.len();
+        }
+
+        // Associate TJ offset with the last character
+        // The offset applies AFTER the previous string, affecting spacing to next string
+        // ~keep
+        if !self.tj_character_array.is_empty() {
+            let last_idx = self.tj_character_array.len() - 1;
+            self.tj_character_array[last_idx].tj_offset = Some(offset as i32);
+        }
+
+        // Check if this offset indicates a word boundary
+        // Per PDF spec: negative offsets increase spacing
+        // Use geometry-based adaptive threshold ~keep
+        let threshold = self.calculate_adaptive_tj_threshold();
+        if offset < threshold {
+            self.flush_buffer_at_tj_word_boundary(array, idx, offset, buffer)
+        } else {
+            // Sub-threshold offset: matrix advances but the
+            // current buffer keeps accumulating, so apply
+            // the offset unconditionally here as well. ~keep
+            self.advance_position_for_offset(offset)?;
+            // Fold the same displacement into the buffer's
+            // advance record. Historically only the text matrix
+            // moved, so these kerning/word-space offsets were
+            // dropped from `char_widths`/`accumulated_width` —
+            // leaving the span's reconstructed per-glyph positions
+            // drifting behind the true render (poppler/PDFium/
+            // pymupdf all fold the offset into the advance). On
+            // justified body text drawn as one continuous buffer,
+            // the many small post-space offsets accumulate into a
+            // multi-point undershoot. Folding keeps
+            // `sum(char_widths) == accumulated_width == matrix
+            // advance` by construction. ~keep
+            self.fold_offset_into_buffer(&mut buffer, offset);
+            Ok(buffer)
+        }
+    }
+
+    /// A `TJ` offset past the word-boundary threshold: flush the current
+    /// buffer into a span, insert a space unless one is already implied, and
+    /// start a fresh buffer positioned after the offset. Split out of
+    /// [`Self::process_tj_offset_element`] to keep it short. ~keep
+    fn flush_buffer_at_tj_word_boundary(
+        &mut self,
+        array: &[TextElement],
+        idx: usize,
+        offset: f32,
+        buffer: TjBuffer,
+    ) -> Result<TjBuffer> {
+        // Note: split-word symptoms ("diffe rent", "cha nge",
+        // "equivalen t") are handled at the higher level by the
+        // intra-word kerning guard in `should_insert_space`. An
+        // earlier TJ-side guard here (commit b2c6484) used a
+        // letter-letter + |offset| < space-glyph-width rule, but
+        // that rule misclassified real inter-word gaps in
+        // tightly-justified PDFs (LaTeX academic papers, Docling
+        // output) where producers encode word boundaries as TJ
+        // offsets smaller than a full space glyph. The
+        // span-merge-time guard has more context (full bbox,
+        // WordBoundaryDetector) and avoids that false positive. ~keep
+        //
+        // Check if buffer ends with space BEFORE flushing
+        // This prevents double spaces when TJ processor inserts space
+        // AND span merging would insert space at the same boundary. ~keep
+        let buffer_ends_with_space = !buffer.unicode.is_empty()
+            && buffer
+                .unicode
+                .chars()
+                .next_back()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(false);
+
+        self.flush_tj_buffer(buffer)?;
+
+        // Check if the next element in the TJ array is a string
+        // that starts with whitespace. If so, DON'T insert a space to avoid doubling.
+        // This prevents patterns like "word " + " next" = "word next" (double space)
+        // ~keep
+        let next_element_starts_with_space = if idx + 1 < array.len() {
+            if let TextElement::String(next_s) = &array[idx + 1] {
+                next_s
+                    .first()
+                    .is_some_and(|&byte| byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !buffer_ends_with_space && !next_element_starts_with_space {
+            self.insert_space_as_span()?;
+        }
+
+        // Apply the TJ offset to the text matrix BEFORE
+        // creating the new buffer so its `user_pos_x`
+        // captures the actual draw position of the next
+        // string. Otherwise the buffer anchors at the
+        // pre-offset position and every subsequent span
+        // on the line inherits the missing tx. ~keep
+        self.advance_position_for_offset(offset)?;
+
+        Ok(TjBuffer::new(
+            self.state_stack.current(),
+            self.current_mcid,
+            self.cached_current_font.clone(),
+        ))
     }
 
     /// Process TJ array using primary detection mode.
