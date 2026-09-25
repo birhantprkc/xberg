@@ -2339,15 +2339,16 @@ impl InternalDocumentExtractor for ImageExtractor {
             exif: extraction_metadata.exif_data,
         };
 
-        let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
-            content,
-            &format_str,
-            Some(extraction_metadata.width),
-            Some(extraction_metadata.height),
-            None,
-            None,
-            false,
-        );
+        let (image_kind, kind_confidence) =
+            crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                bytes: content,
+                format: &format_str,
+                width: Some(extraction_metadata.width),
+                height: Some(extraction_metadata.height),
+                colorspace: None,
+                bits_per_component: None,
+                is_mask: false,
+            });
 
         let extracted_image = crate::types::ExtractedImage {
             data: bytes::Bytes::copy_from_slice(content),

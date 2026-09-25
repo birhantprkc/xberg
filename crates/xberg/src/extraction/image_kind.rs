@@ -29,36 +29,49 @@ const LOW_ENTROPY_THRESHOLD: f64 = 3.0;
 /// multi-gigabyte decoded allocation.
 const MAX_CLASSIFY_PIXELS: u64 = 64 * 1024 * 1024;
 
+/// Grouped arguments for [`classify`].
+///
+/// Not FFI-exposed (`classify` itself is `alef(skip)`); grouping simply keeps the
+/// function under the workspace's six-parameter limit.
+pub struct ImageClassifyInput<'a> {
+    /// Raw image bytes (should be decodable to standard formats).
+    pub bytes: &'a [u8],
+    /// Image format (e.g., "jpeg", "png", "ccitt").
+    pub format: &'a str,
+    /// Image width in pixels.
+    pub width: Option<u32>,
+    /// Image height in pixels.
+    pub height: Option<u32>,
+    /// Colorspace name (e.g., "RGB", "CMYK", "Gray", "Indexed").
+    pub colorspace: Option<&'a str>,
+    /// Bits per color component (e.g., 1, 8, 16).
+    pub bits_per_component: Option<u32>,
+    /// Whether this image is a transparency or alpha mask.
+    pub is_mask: bool,
+}
+
 /// Classify an image based on its metadata and visual properties.
 ///
 /// Uses a rule cascade over already-captured signals: dimensions, aspect ratio,
 /// colorspace, bits-per-component, format, and histogram entropy on a downsampled
 /// 64×64 thumbnail.
 ///
-/// # Arguments
-///
-/// * `bytes` — Raw image bytes (should be decodable to standard formats)
-/// * `format` — Image format (e.g., "jpeg", "png", "ccitt")
-/// * `width` — Image width in pixels
-/// * `height` — Image height in pixels
-/// * `colorspace` — Colorspace name (e.g., "RGB", "CMYK", "Gray", "Indexed")
-/// * `bits_per_component` — Bits per color component (e.g., 1, 8, 16)
-/// * `is_mask` — Whether this image is a transparency or alpha mask
-///
 /// # Returns
 ///
 /// A tuple of `(ImageKind, confidence)` where confidence is in [0.0, 1.0].
 /// Returns `(Unknown, 0.0)` if bytes cannot be decoded.
 #[cfg_attr(alef, alef(skip))]
-pub fn classify(
-    bytes: &[u8],
-    format: &str,
-    width: Option<u32>,
-    height: Option<u32>,
-    colorspace: Option<&str>,
-    bits_per_component: Option<u32>,
-    is_mask: bool,
-) -> (ImageKind, f32) {
+pub fn classify(input: ImageClassifyInput<'_>) -> (ImageKind, f32) {
+    let ImageClassifyInput {
+        bytes,
+        format,
+        width,
+        height,
+        colorspace,
+        bits_per_component,
+        is_mask,
+    } = input;
+
     if is_mask {
         return (ImageKind::Mask, 0.95);
     }

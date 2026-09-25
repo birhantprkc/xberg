@@ -308,7 +308,15 @@ impl JupyterExtractor {
 
             let format = mime_type.trim_start_matches("image/").replace("svg+xml", "svg");
             let (image_kind, kind_confidence) =
-                crate::extraction::image_kind::classify(&decoded, &format, None, None, None, None, false);
+                crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                    bytes: &decoded,
+                    format: &format,
+                    width: None,
+                    height: None,
+                    colorspace: None,
+                    bits_per_component: None,
+                    is_mask: false,
+                });
 
             images.push(ExtractedImage {
                 data: Bytes::from(decoded),
@@ -569,8 +577,17 @@ impl JupyterExtractor {
                             _ => "unknown",
                         };
 
-                        let (image_kind, kind_confidence) =
-                            crate::extraction::image_kind::classify(&decoded, format, None, None, None, None, false);
+                        let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
+                            crate::extraction::image_kind::ImageClassifyInput {
+                                bytes: &decoded,
+                                format,
+                                width: None,
+                                height: None,
+                                colorspace: None,
+                                bits_per_component: None,
+                                is_mask: false,
+                            },
+                        );
 
                         images.push(ExtractedImage {
                             data: Bytes::from(decoded),
@@ -604,7 +621,15 @@ impl JupyterExtractor {
                     budget.account_text(svg_markup.len())?;
                     let svg_bytes = svg_markup.into_bytes();
                     let (image_kind, kind_confidence) =
-                        crate::extraction::image_kind::classify(&svg_bytes, "svg", None, None, None, None, false);
+                        crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                            bytes: &svg_bytes,
+                            format: "svg",
+                            width: None,
+                            height: None,
+                            colorspace: None,
+                            bits_per_component: None,
+                            is_mask: false,
+                        });
 
                     images.push(ExtractedImage {
                         data: Bytes::from(svg_bytes),

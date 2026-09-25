@@ -260,7 +260,15 @@ impl EpubExtractor {
                     .unwrap_or("png");
 
                 let (image_kind, kind_confidence) =
-                    crate::extraction::image_kind::classify(&buf, fmt, None, None, None, None, false);
+                    crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                        bytes: &buf,
+                        format: fmt,
+                        width: None,
+                        height: None,
+                        colorspace: None,
+                        bits_per_component: None,
+                        is_mask: false,
+                    });
 
                 let image = crate::types::ExtractedImage {
                     data: bytes::Bytes::from(buf),
@@ -465,7 +473,15 @@ impl EpubExtractor {
 
                             if let Some((data, format)) = image_data {
                                 let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
-                                    &data, &format, None, None, None, None, false,
+                                    crate::extraction::image_kind::ImageClassifyInput {
+                                        bytes: &data,
+                                        format: &format,
+                                        width: None,
+                                        height: None,
+                                        colorspace: None,
+                                        bits_per_component: None,
+                                        is_mask: false,
+                                    },
                                 );
 
                                 let image = crate::types::ExtractedImage {

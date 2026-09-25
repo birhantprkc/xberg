@@ -7,56 +7,120 @@ use image::{ImageBuffer, Rgba};
 
 #[test]
 fn test_classify_returns_mask_for_is_mask_true() {
-    let (kind, conf) = classify(&[], "jpeg", Some(100), Some(100), None, None, true);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "jpeg",
+        width: Some(100),
+        height: Some(100),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: true,
+    });
     assert_eq!(kind, ImageKind::Mask);
     assert_eq!(conf, 0.95);
 }
 
 #[test]
 fn test_classify_returns_icon_for_small_square() {
-    let (kind, conf) = classify(&[], "png", Some(48), Some(48), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "png",
+        width: Some(48),
+        height: Some(48),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Icon);
     assert_eq!(conf, 0.85);
 }
 
 #[test]
 fn test_classify_returns_decoration_for_tiny_strip() {
-    let (kind, conf) = classify(&[], "png", Some(10), Some(100), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "png",
+        width: Some(10),
+        height: Some(100),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Decoration);
     assert_eq!(conf, 0.80);
 }
 
 #[test]
 fn test_classify_returns_textblock_for_gray_1bpp() {
-    let (kind, conf) = classify(&[], "png", Some(200), Some(200), Some("Gray"), Some(1), false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "png",
+        width: Some(200),
+        height: Some(200),
+        colorspace: Some("Gray"),
+        bits_per_component: Some(1),
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::TextBlock);
     assert_eq!(conf, 0.75);
 }
 
 #[test]
 fn test_classify_returns_photograph_for_cmyk_8bpp() {
-    let (kind, conf) = classify(&[], "jpeg", Some(800), Some(800), Some("CMYK"), Some(8), false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "jpeg",
+        width: Some(800),
+        height: Some(800),
+        colorspace: Some("CMYK"),
+        bits_per_component: Some(8),
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Photograph);
     assert_eq!(conf, 0.70);
 }
 
 #[test]
 fn test_classify_returns_photograph_for_large_jpeg() {
-    let (kind, conf) = classify(&[], "jpeg", Some(1000), Some(1000), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "jpeg",
+        width: Some(1000),
+        height: Some(1000),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Photograph);
     assert_eq!(conf, 0.85);
 }
 
 #[test]
 fn test_classify_returns_diagram_for_flate_indexed() {
-    let (kind, conf) = classify(&[], "flate", Some(200), Some(200), Some("Indexed"), None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "flate",
+        width: Some(200),
+        height: Some(200),
+        colorspace: Some("Indexed"),
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Diagram);
     assert_eq!(conf, 0.65);
 }
 
 #[test]
 fn test_classify_returns_mask_for_ccitt() {
-    let (kind, conf) = classify(&[], "ccitt", Some(200), Some(200), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "ccitt",
+        width: Some(200),
+        height: Some(200),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Mask);
     assert_eq!(conf, 0.85);
 }
@@ -78,7 +142,15 @@ fn test_classify_returns_photograph_for_high_entropy_thumbnail() {
     img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
         .unwrap();
 
-    let (kind, conf) = classify(&bytes, "png", Some(100), Some(100), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &bytes,
+        format: "png",
+        width: Some(100),
+        height: Some(100),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Photograph);
     assert!(conf >= 0.6, "confidence {} should be >= 0.6", conf);
 }
@@ -112,7 +184,15 @@ fn test_classify_returns_chart_for_low_entropy_small_image() {
     img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
         .unwrap();
 
-    let (kind, conf) = classify(&bytes, "png", Some(256), Some(256), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &bytes,
+        format: "png",
+        width: Some(256),
+        height: Some(256),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Chart);
     assert!(conf >= 0.55, "confidence {} should be >= 0.55", conf);
 }
@@ -120,7 +200,15 @@ fn test_classify_returns_chart_for_low_entropy_small_image() {
 #[test]
 fn test_classify_returns_unknown_for_truncated_bytes() {
     let truncated = vec![0x89, 0x50, 0x4E, 0x47];
-    let (kind, conf) = classify(&truncated, "png", Some(100), Some(100), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &truncated,
+        format: "png",
+        width: Some(100),
+        height: Some(100),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Unknown);
     assert_eq!(conf, 0.50);
 }
@@ -159,8 +247,16 @@ fn test_classify_never_panics_on_garbage_input() {
         ),
     ];
 
-    for (bytes, fmt, w, h, cs, bpc, is_mask) in test_cases {
-        let _ = classify(bytes, fmt, w, h, cs, bpc, is_mask);
+    for (bytes, format, width, height, colorspace, bits_per_component, is_mask) in test_cases {
+        let _ = classify(ImageClassifyInput {
+            bytes,
+            format,
+            width,
+            height,
+            colorspace,
+            bits_per_component,
+            is_mask,
+        });
     }
 }
 
@@ -570,7 +666,15 @@ fn test_cluster_tiles_is_deterministic() {
 #[test]
 fn test_classify_skips_entropy_for_oversized_image() {
     let bytes = b"\x89PNG\r\n\x1a\nbogus body".to_vec();
-    let (kind, conf) = classify(&bytes, "png", Some(20_000), Some(20_000), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &bytes,
+        format: "png",
+        width: Some(20_000),
+        height: Some(20_000),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Unknown);
     assert_eq!(conf, 0.50);
 }
@@ -618,7 +722,15 @@ fn test_cluster_tiles_isolates_clusters_per_page() {
 #[test]
 fn test_classify_does_not_panic_on_zero_dimensions() {
     let bytes = b"\x89PNG\r\n\x1a\nbody".to_vec();
-    let (kind, conf) = classify(&bytes, "png", Some(0), Some(0), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &bytes,
+        format: "png",
+        width: Some(0),
+        height: Some(0),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Unknown);
     assert_eq!(conf, 0.0);
 }

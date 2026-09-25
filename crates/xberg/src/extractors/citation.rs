@@ -14,7 +14,7 @@ use ahash::AHashSet;
 use async_trait::async_trait;
 
 #[cfg(feature = "office")]
-use biblib::{CitationParser, EndNoteXmlParser, PubMedParser, RisParser};
+use biblib::{Author, Citation, CitationParser, EndNoteXmlParser, PubMedParser, RisParser};
 #[cfg_attr(alef, alef(skip))]
 /// Citation format extractor for RIS, PubMed/MEDLINE, and EndNote XML formats.
 ///
@@ -80,14 +80,6 @@ impl InternalDocumentExtractor for CitationExtractor {
     ) -> Result<InternalDocument> {
         let citation_str = String::from_utf8_lossy(content);
 
-        let mut citations_vec = Vec::new();
-        let mut authors_set = AHashSet::new();
-        let mut years_set = AHashSet::new();
-        let mut dois_vec = Vec::new();
-        let mut keywords_set = AHashSet::new();
-        let mut formatted_content = String::new();
-        let mut citation_details: Vec<String> = Vec::new();
-
         let (parse_result, format_string) = match mime_type {
             "application/x-research-info-systems" => (RisParser::new().parse(&citation_str), "RIS"),
             "application/x-pubmed" => (PubMedParser::new().parse(&citation_str), "PubMed"),
@@ -97,115 +89,8 @@ impl InternalDocumentExtractor for CitationExtractor {
 
         let mut builder = InternalDocumentBuilder::new("citation");
 
-        match parse_result {
-            Ok(citations) => {
-                for citation in &citations {
-                    citations_vec.push(citation.title.clone());
-                    let entry_start = formatted_content.len();
-
-                    for author in &citation.authors {
-                        let author_name = if let Some(given) = &author.given_name {
-                            format!("{} {}", given, author.name)
-                        } else {
-                            author.name.clone()
-                        };
-                        if !author_name.is_empty() {
-                            authors_set.insert(author_name);
-                        }
-                    }
-
-                    if let Some(date) = &citation.date
-                        && date.year > 0
-                    {
-                        years_set.insert(date.year as u32);
-                    }
-
-                    if let Some(doi) = &citation.doi
-                        && !doi.is_empty()
-                    {
-                        dois_vec.push(doi.clone());
-                        builder.push_uri(ExtractedUri::citation(
-                            format!("https://doi.org/{}", doi),
-                            Some(citation.title.clone()),
-                        ));
-                    }
-
-                    for keyword in &citation.keywords {
-                        if !keyword.is_empty() {
-                            keywords_set.insert(keyword.clone());
-                        }
-                    }
-
-                    if !citation.title.is_empty() {
-                        formatted_content.push_str(&format!("Title: {}\n", citation.title));
-                    }
-
-                    if !citation.authors.is_empty() {
-                        let author_strings: Vec<String> = citation
-                            .authors
-                            .iter()
-                            .map(|a| {
-                                if let Some(given) = &a.given_name {
-                                    format!("{} {}", given, a.name)
-                                } else {
-                                    a.name.clone()
-                                }
-                            })
-                            .collect();
-                        formatted_content.push_str(&format!("Authors: {}\n", author_strings.join(", ")));
-                    }
-
-                    if let Some(journal) = &citation.journal {
-                        formatted_content.push_str(&format!("Journal: {}\n", journal));
-                    }
-
-                    if let Some(date) = &citation.date {
-                        formatted_content.push_str(&format!("Year: {}\n", date.year));
-                    }
-
-                    if let Some(volume) = &citation.volume {
-                        formatted_content.push_str(&format!("Volume: {}", volume));
-                        if let Some(issue) = &citation.issue {
-                            formatted_content.push_str(&format!(", Issue: {}", issue));
-                        }
-                        if let Some(pages) = &citation.pages {
-                            formatted_content.push_str(&format!(", Pages: {}", pages));
-                        }
-                        formatted_content.push('\n');
-                    }
-
-                    if let Some(doi) = &citation.doi {
-                        formatted_content.push_str(&format!("DOI: {}\n", doi));
-                    }
-
-                    if let Some(pmid) = &citation.pmid {
-                        formatted_content.push_str(&format!("PMID: {}\n", pmid));
-                    }
-
-                    if let Some(abstract_text) = &citation.abstract_text
-                        && !abstract_text.is_empty()
-                    {
-                        formatted_content.push_str(&format!("Abstract: {}\n", abstract_text));
-                    }
-
-                    if !citation.keywords.is_empty() {
-                        formatted_content.push_str(&format!("Keywords: {}\n", citation.keywords.join(", ")));
-                    }
-
-                    citation_details.push(formatted_content[entry_start..].trim().to_string());
-
-                    formatted_content.push_str("---\n");
-                }
-
-                for (i, (title, detail)) in citations_vec.iter().zip(citation_details.iter()).enumerate() {
-                    let key = if title.is_empty() {
-                        format!("citation_{}", i + 1)
-                    } else {
-                        title.clone()
-                    };
-                    builder.push_citation(detail, &key, None);
-                }
-            }
+        let accumulation = match parse_result {
+            Ok(citations) => process_parsed_citations(&citations, &mut builder),
             Err(_err) => {
                 #[cfg(feature = "otel")]
                 tracing::warn!("Citation parsing failed, returning raw content: {}", _err);
@@ -213,49 +98,13 @@ impl InternalDocumentExtractor for CitationExtractor {
                     "citation",
                     "Citation parsing failed; returning raw text as a fallback",
                 ));
-                formatted_content = citation_str.to_string();
+                let formatted_content = citation_str.to_string();
                 builder.push_code(&formatted_content, None, None, None);
+                CitationAccumulation::default()
             }
-        }
-
-        let mut authors_list: Vec<String> = authors_set.into_iter().collect();
-        authors_list.sort();
-        let meta_authors = if authors_list.is_empty() {
-            None
-        } else {
-            Some(authors_list.clone())
         };
 
-        let year_range = if !years_set.is_empty() {
-            let min_year = years_set.iter().min().copied();
-            let max_year = years_set.iter().max().copied();
-            let mut years_sorted: Vec<u32> = years_set.into_iter().collect();
-            years_sorted.sort_unstable();
-            Some(YearRange {
-                min: min_year,
-                max: max_year,
-                years: years_sorted,
-            })
-        } else {
-            None
-        };
-
-        let mut keywords_list: Vec<String> = keywords_set.into_iter().collect();
-        keywords_list.sort();
-        let meta_keywords = if keywords_list.is_empty() {
-            None
-        } else {
-            Some(keywords_list.clone())
-        };
-
-        let citation_metadata = CitationMetadata {
-            citation_count: citations_vec.len(),
-            format: Some(format_string.to_string()),
-            authors: authors_list,
-            year_range,
-            dois: dois_vec,
-            keywords: keywords_list,
-        };
+        let (citation_metadata, meta_authors, meta_keywords) = build_citation_metadata(accumulation, format_string);
 
         let mut doc = builder.build();
         doc.mime_type = mime_type.to_string();
@@ -280,6 +129,216 @@ impl InternalDocumentExtractor for CitationExtractor {
     fn priority(&self) -> i32 {
         60
     }
+}
+
+/// Accumulated bibliography data gathered while walking a parsed citation list.
+#[cfg(feature = "office")]
+#[derive(Default)]
+struct CitationAccumulation {
+    citations_vec: Vec<String>,
+    authors_set: AHashSet<String>,
+    years_set: AHashSet<u32>,
+    dois_vec: Vec<String>,
+    keywords_set: AHashSet<String>,
+}
+
+/// Render an author's display name, preferring "given family" when a given name is present.
+#[cfg(feature = "office")]
+fn format_author_name(author: &Author) -> String {
+    if let Some(given) = &author.given_name {
+        format!("{} {}", given, author.name)
+    } else {
+        author.name.clone()
+    }
+}
+
+/// Render the human-readable citation block used both as bibliography detail text
+/// and as the source for `InternalDocumentBuilder::push_citation`.
+#[cfg(feature = "office")]
+fn format_citation_block(citation: &Citation) -> String {
+    let mut formatted = String::new();
+
+    if !citation.title.is_empty() {
+        formatted.push_str(&format!("Title: {}\n", citation.title));
+    }
+
+    if !citation.authors.is_empty() {
+        let author_strings: Vec<String> = citation.authors.iter().map(format_author_name).collect();
+        formatted.push_str(&format!("Authors: {}\n", author_strings.join(", ")));
+    }
+
+    if let Some(journal) = &citation.journal {
+        formatted.push_str(&format!("Journal: {}\n", journal));
+    }
+
+    if let Some(date) = &citation.date {
+        formatted.push_str(&format!("Year: {}\n", date.year));
+    }
+
+    if let Some(volume) = &citation.volume {
+        formatted.push_str(&format!("Volume: {}", volume));
+        if let Some(issue) = &citation.issue {
+            formatted.push_str(&format!(", Issue: {}", issue));
+        }
+        if let Some(pages) = &citation.pages {
+            formatted.push_str(&format!(", Pages: {}", pages));
+        }
+        formatted.push('\n');
+    }
+
+    if let Some(doi) = &citation.doi {
+        formatted.push_str(&format!("DOI: {}\n", doi));
+    }
+
+    if let Some(pmid) = &citation.pmid {
+        formatted.push_str(&format!("PMID: {}\n", pmid));
+    }
+
+    if let Some(abstract_text) = &citation.abstract_text
+        && !abstract_text.is_empty()
+    {
+        formatted.push_str(&format!("Abstract: {}\n", abstract_text));
+    }
+
+    if !citation.keywords.is_empty() {
+        formatted.push_str(&format!("Keywords: {}\n", citation.keywords.join(", ")));
+    }
+
+    formatted.trim().to_string()
+}
+
+/// Fold one citation's authors, publication year, DOI, and keywords into the running
+/// accumulators, record its DOI as an extracted URI, and return its formatted detail text.
+#[cfg(feature = "office")]
+fn accumulate_citation(
+    citation: &Citation,
+    authors_set: &mut AHashSet<String>,
+    years_set: &mut AHashSet<u32>,
+    dois_vec: &mut Vec<String>,
+    keywords_set: &mut AHashSet<String>,
+    builder: &mut InternalDocumentBuilder,
+) -> String {
+    for author in &citation.authors {
+        let author_name = format_author_name(author);
+        if !author_name.is_empty() {
+            authors_set.insert(author_name);
+        }
+    }
+
+    if let Some(date) = &citation.date
+        && date.year > 0
+    {
+        years_set.insert(date.year as u32);
+    }
+
+    if let Some(doi) = &citation.doi
+        && !doi.is_empty()
+    {
+        dois_vec.push(doi.clone());
+        builder.push_uri(ExtractedUri::citation(
+            format!("https://doi.org/{}", doi),
+            Some(citation.title.clone()),
+        ));
+    }
+
+    for keyword in &citation.keywords {
+        if !keyword.is_empty() {
+            keywords_set.insert(keyword.clone());
+        }
+    }
+
+    format_citation_block(citation)
+}
+
+/// Walk every parsed citation, accumulating bibliography metadata and pushing each
+/// citation's detail text into `builder`.
+#[cfg(feature = "office")]
+fn process_parsed_citations(citations: &[Citation], builder: &mut InternalDocumentBuilder) -> CitationAccumulation {
+    let mut citations_vec = Vec::new();
+    let mut authors_set = AHashSet::new();
+    let mut years_set = AHashSet::new();
+    let mut dois_vec = Vec::new();
+    let mut keywords_set = AHashSet::new();
+    let mut citation_details: Vec<String> = Vec::new();
+
+    for citation in citations {
+        citations_vec.push(citation.title.clone());
+        let detail = accumulate_citation(
+            citation,
+            &mut authors_set,
+            &mut years_set,
+            &mut dois_vec,
+            &mut keywords_set,
+            builder,
+        );
+        citation_details.push(detail);
+    }
+
+    for (i, (title, detail)) in citations_vec.iter().zip(citation_details.iter()).enumerate() {
+        let key = if title.is_empty() {
+            format!("citation_{}", i + 1)
+        } else {
+            title.clone()
+        };
+        builder.push_citation(detail, &key, None);
+    }
+
+    CitationAccumulation {
+        citations_vec,
+        authors_set,
+        years_set,
+        dois_vec,
+        keywords_set,
+    }
+}
+
+/// Derive the final `CitationMetadata` plus the top-level author/keyword metadata lists
+/// from an accumulation gathered by `process_parsed_citations`.
+#[cfg(feature = "office")]
+fn build_citation_metadata(
+    accumulation: CitationAccumulation,
+    format_string: &str,
+) -> (CitationMetadata, Option<Vec<String>>, Option<Vec<String>>) {
+    let mut authors_list: Vec<String> = accumulation.authors_set.into_iter().collect();
+    authors_list.sort();
+    let meta_authors = if authors_list.is_empty() {
+        None
+    } else {
+        Some(authors_list.clone())
+    };
+
+    let year_range = if !accumulation.years_set.is_empty() {
+        let min_year = accumulation.years_set.iter().min().copied();
+        let max_year = accumulation.years_set.iter().max().copied();
+        let mut years_sorted: Vec<u32> = accumulation.years_set.into_iter().collect();
+        years_sorted.sort_unstable();
+        Some(YearRange {
+            min: min_year,
+            max: max_year,
+            years: years_sorted,
+        })
+    } else {
+        None
+    };
+
+    let mut keywords_list: Vec<String> = accumulation.keywords_set.into_iter().collect();
+    keywords_list.sort();
+    let meta_keywords = if keywords_list.is_empty() {
+        None
+    } else {
+        Some(keywords_list.clone())
+    };
+
+    let citation_metadata = CitationMetadata {
+        citation_count: accumulation.citations_vec.len(),
+        format: Some(format_string.to_string()),
+        authors: authors_list,
+        year_range,
+        dois: accumulation.dois_vec,
+        keywords: keywords_list,
+    };
+
+    (citation_metadata, meta_authors, meta_keywords)
 }
 
 #[cfg(all(test, feature = "office"))]
