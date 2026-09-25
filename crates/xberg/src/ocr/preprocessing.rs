@@ -1,4 +1,5 @@
 use crate::ocr::error::OcrError;
+use crate::ocr::shaded_rows::normalize_shaded_rows;
 use crate::types::ImagePreprocessingConfig;
 use xberg_tesseract::Pix;
 
@@ -35,6 +36,14 @@ pub(crate) fn preprocess_pix(pix: Pix, config: &ImagePreprocessingConfig) -> Res
     let gray = pix
         .to_grayscale()
         .map_err(preprocessing_error("convert to grayscale"))?;
+    // ~keep normalize_shaded_rows only touches `gray`; the `contrast_enhance` path with
+    // binarization disabled below reconverts from the original `pix` and does not see it
+    // (GH#1785 scope: the fix targets the binarized path, which is the config default).
+    let gray = if config.normalize_shaded_rows {
+        apply_optional(gray, "normalize shaded rows", normalize_shaded_rows)
+    } else {
+        gray
+    };
     let polarity_stats = gray
         .grayscale_stats(LIGHT_PIXEL_VALUE_THRESHOLD, POLARITY_SAMPLE_STRIDE)
         .ok();
@@ -107,13 +116,33 @@ fn binarize(pix: &Pix, method: &str) -> xberg_tesseract::Result<Pix> {
         "adaptive" if pix.width().min(pix.height()) >= ADAPTIVE_TILE_SIZE => {
             pix.adaptive_threshold(ADAPTIVE_TILE_SIZE, ADAPTIVE_TILE_SIZE)
         }
-        "adaptive" => pix.otsu_threshold(),
+        "adaptive" => {
+            tracing::warn!(
+                requested_binarization_method = "adaptive",
+                width = pix.width(),
+                height = pix.height(),
+                minimum_dimension = ADAPTIVE_TILE_SIZE,
+                fallback_binarization_method = "otsu",
+                "image too small for adaptive binarization; falling back to Otsu threshold"
+            );
+            pix.otsu_threshold()
+        }
         "sauvola" if pix.width().min(pix.height()) > SAUVOLA_WINDOW_HALF_SIZE * 2 + 2 => {
             let tile_columns = tile_count(pix.width());
             let tile_rows = tile_count(pix.height());
             pix.sauvola_threshold(SAUVOLA_WINDOW_HALF_SIZE, SAUVOLA_FACTOR, tile_columns, tile_rows)
         }
-        "sauvola" => pix.otsu_threshold(),
+        "sauvola" => {
+            tracing::warn!(
+                requested_binarization_method = "sauvola",
+                width = pix.width(),
+                height = pix.height(),
+                minimum_dimension = SAUVOLA_WINDOW_HALF_SIZE * 2 + 2,
+                fallback_binarization_method = "otsu",
+                "image too small for Sauvola binarization; falling back to Otsu threshold"
+            );
+            pix.otsu_threshold()
+        }
         _ => Err(xberg_tesseract::TesseractError::InvalidParameterError),
     }
 }
@@ -245,5 +274,144 @@ mod tests {
         let result = preprocess_pix(pix, &config);
 
         assert!(matches!(result, Err(OcrError::InvalidConfiguration(_))));
+    }
+
+    /// A `tracing` `Layer` that records every emitted event's level and formatted
+    /// `message` field, for GH#1785's silent-adaptive/Sauvola-fallback regression tests.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for EventCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            struct MessageVisitor(String);
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push((*event.metadata().level(), visitor.0));
+        }
+    }
+
+    fn warn_messages(capture: &EventCapture) -> Vec<String> {
+        capture
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+
+    /// GH#1785: an image too small for `adaptive` binarization silently fell back to
+    /// Otsu with no observable signal, so a caller who asked for `adaptive` had no way
+    /// to tell their request was downgraded. `preprocessing.rs:107-121`'s fallback arm
+    /// must now emit a WARN naming both the requested and the fallback method.
+    #[test]
+    fn should_warn_when_adaptive_binarization_falls_back_to_otsu_for_a_small_image() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let small_dimension = ADAPTIVE_TILE_SIZE - 1;
+        let config = ImagePreprocessingConfig {
+            deskew: false,
+            binarization_method: "adaptive".to_string(),
+            ..Default::default()
+        };
+        let pix = Pix::from_raw_rgb(
+            &vec![200u8; (small_dimension * small_dimension * 3) as usize],
+            small_dimension as u32,
+            small_dimension as u32,
+        )
+        .unwrap();
+
+        let result = tracing::subscriber::with_default(subscriber, || preprocess_pix(pix, &config));
+
+        assert!(result.is_ok(), "the fallback must still produce a usable image");
+        let messages = warn_messages(&capture);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("adaptive binarization") && message.contains("Otsu")),
+            "expected a WARN naming the adaptive-to-Otsu fallback, got: {messages:?}"
+        );
+    }
+
+    /// GH#1785: the same silent downgrade for `sauvola` on a small image.
+    #[test]
+    fn should_warn_when_sauvola_binarization_falls_back_to_otsu_for_a_small_image() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let small_dimension = SAUVOLA_WINDOW_HALF_SIZE * 2 + 2;
+        let config = ImagePreprocessingConfig {
+            deskew: false,
+            binarization_method: "sauvola".to_string(),
+            ..Default::default()
+        };
+        let pix = Pix::from_raw_rgb(
+            &vec![200u8; (small_dimension * small_dimension * 3) as usize],
+            small_dimension as u32,
+            small_dimension as u32,
+        )
+        .unwrap();
+
+        let result = tracing::subscriber::with_default(subscriber, || preprocess_pix(pix, &config));
+
+        assert!(result.is_ok(), "the fallback must still produce a usable image");
+        let messages = warn_messages(&capture);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Sauvola binarization") && message.contains("Otsu")),
+            "expected a WARN naming the Sauvola-to-Otsu fallback, got: {messages:?}"
+        );
+    }
+
+    /// Negative control for the two tests above: an image large enough for adaptive
+    /// binarization must NOT emit the fallback warning, proving the assertion is
+    /// actually sensitive to image size rather than passing unconditionally.
+    #[test]
+    fn should_not_warn_when_adaptive_binarization_succeeds_for_a_large_enough_image() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let large_dimension = ADAPTIVE_TILE_SIZE * 4;
+        let config = ImagePreprocessingConfig {
+            deskew: false,
+            binarization_method: "adaptive".to_string(),
+            ..Default::default()
+        };
+        let pix = Pix::from_raw_rgb(
+            &vec![200u8; (large_dimension * large_dimension * 3) as usize],
+            large_dimension as u32,
+            large_dimension as u32,
+        )
+        .unwrap();
+
+        let result = tracing::subscriber::with_default(subscriber, || preprocess_pix(pix, &config));
+
+        assert!(result.is_ok());
+        let messages = warn_messages(&capture);
+        assert!(
+            !messages.iter().any(|message| message.contains("falling back to Otsu")),
+            "a large-enough image must not trigger the small-image fallback warning: {messages:?}"
+        );
     }
 }

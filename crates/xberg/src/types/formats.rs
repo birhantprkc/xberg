@@ -396,6 +396,16 @@ pub struct ImagePreprocessingConfig {
 
     /// Invert colors (white text on black → black on white).
     pub invert_colors: bool,
+
+    /// Normalize shaded table rows (e.g. a subtotal row on a light or dark fill) before
+    /// binarization, so each shaded band is stretched to its own dark-text-on-white
+    /// polarity instead of being lost to a single whole-page threshold (GH#1785).
+    ///
+    /// This is a per-band step, not a replacement for `binarization_method`: no single
+    /// whole-page method recovers every fill color, and the per-band step itself can
+    /// regress a row style it does not fully model (e.g. a mid-grey fill with white
+    /// text), so it defaults to `false` rather than being enabled unconditionally.
+    pub normalize_shaded_rows: bool,
 }
 
 impl Default for ImagePreprocessingConfig {
@@ -408,6 +418,7 @@ impl Default for ImagePreprocessingConfig {
             contrast_enhance: false,
             binarization_method: "otsu".to_string(),
             invert_colors: false,
+            normalize_shaded_rows: false,
         }
     }
 }
