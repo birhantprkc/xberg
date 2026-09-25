@@ -195,57 +195,115 @@ pub fn render_json(doc: &InternalDocument) -> String {
     })
 }
 
-/// Build the `JsonDocument` from an `InternalDocument`.
-fn build_json_document(doc: &InternalDocument) -> JsonDocument {
-    let mut title: Option<String> = None;
-    let mut section_stack: Vec<OpenSection> = Vec::new();
-    let mut root_body: Vec<JsonNode> = Vec::new();
-    let mut state = RenderState::default();
-    let mut open_list: Option<OpenList> = None;
-    let mut open_blockquote: Option<Vec<JsonNode>> = None;
-    let footnotes = FootnoteCollector::new(doc);
+/// Accumulates the JSON section tree while walking `doc.elements`, holding all of the
+/// mutable state a single pass over the element list threads through: the in-progress
+/// title, the stack of open headings, the finished root-level nodes, the container-nesting
+/// tracker, and the in-progress list/blockquote accumulators.
+struct TreeBuilder {
+    title: Option<String>,
+    section_stack: Vec<OpenSection>,
+    root_body: Vec<JsonNode>,
+    state: RenderState,
+    open_list: Option<OpenList>,
+    open_blockquote: Option<Vec<JsonNode>>,
+}
 
-    for (elem_index, elem) in doc.elements.iter().enumerate() {
-        if !is_body_element(elem) {
-            continue;
+impl TreeBuilder {
+    fn new() -> Self {
+        Self {
+            title: None,
+            section_stack: Vec::new(),
+            root_body: Vec::new(),
+            state: RenderState::default(),
+            open_list: None,
+            open_blockquote: None,
         }
+    }
 
-        if is_container_end(elem) {
-            match elem.kind {
-                ElementKind::ListEnd => {
-                    if let Some(list) = open_list.take() {
-                        let node = JsonNode::List {
-                            ordered: list.ordered,
-                            items: list.items,
-                        };
-                        push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-                    }
+    /// Push a node to the current target (innermost open section, or root body).
+    fn push(&mut self, node: JsonNode) {
+        push_to_current(
+            &mut self.root_body,
+            &mut self.section_stack,
+            &mut self.open_blockquote,
+            node,
+        );
+    }
+
+    /// Flush an open list accumulator into the current target.
+    fn flush_list(&mut self) {
+        flush_list(
+            &mut self.open_list,
+            &mut self.root_body,
+            &mut self.section_stack,
+            &mut self.open_blockquote,
+        );
+    }
+
+    /// Close all open sections whose level >= `target_level`.
+    fn close_sections_to_level(&mut self, target_level: u8) {
+        close_sections_to_level(&mut self.section_stack, &mut self.root_body, target_level);
+    }
+
+    /// Handle a `ListEnd`/`QuoteEnd`/other container-closing element.
+    fn close_open_container(&mut self, elem: &InternalElement) {
+        match elem.kind {
+            ElementKind::ListEnd => {
+                if let Some(list) = self.open_list.take() {
+                    let node = JsonNode::List {
+                        ordered: list.ordered,
+                        items: list.items,
+                    };
+                    self.push(node);
                 }
-                ElementKind::QuoteEnd => {
-                    if let Some(bq_body) = open_blockquote.take() {
-                        let node = JsonNode::Blockquote { body: bq_body };
-                        push_to_current(&mut root_body, &mut section_stack, &mut None, node);
-                    }
-                }
-                _ => {}
             }
-            handle_container_end(&elem.kind, &mut state);
-            continue;
+            ElementKind::QuoteEnd => {
+                if let Some(bq_body) = self.open_blockquote.take() {
+                    let node = JsonNode::Blockquote { body: bq_body };
+                    push_to_current(&mut self.root_body, &mut self.section_stack, &mut None, node);
+                }
+            }
+            _ => {}
         }
+        handle_container_end(&elem.kind, &mut self.state);
+    }
 
+    /// Handle one non-container-end body element, updating the tree accordingly.
+    ///
+    /// `elem.kind`'s variants are partitioned, without overlap, across
+    /// [`Self::handle_structural_element`], [`Self::handle_simple_element`] (which delegates
+    /// part of its share to [`Self::handle_simple_text_element`]), and
+    /// [`Self::handle_referencing_element`] (which delegates part of its share to
+    /// [`Self::handle_footnote_and_metadata_element`]) -- exactly one leaf arm actually acts
+    /// on any given element, the rest fall through their own catch-all arm.
+    fn handle_body_element(
+        &mut self,
+        doc: &InternalDocument,
+        elem_index: usize,
+        elem: &InternalElement,
+        footnotes: &FootnoteCollector,
+    ) {
+        self.handle_structural_element(elem);
+        self.handle_simple_element(elem);
+        self.handle_referencing_element(doc, elem_index, elem, footnotes);
+    }
+
+    /// Handle the elements that directly shape the section/list/blockquote nesting state:
+    /// `Title`, `Heading`, `Paragraph`, `ListStart`, `ListItem`, and `QuoteStart`.
+    fn handle_structural_element(&mut self, elem: &InternalElement) {
         match elem.kind {
             ElementKind::Title => {
-                if title.is_none() && !elem.text.is_empty() {
-                    title = Some(elem.text.clone());
+                if self.title.is_none() && !elem.text.is_empty() {
+                    self.title = Some(elem.text.clone());
                 }
             }
 
             ElementKind::Heading { level } => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
 
-                close_sections_to_level(&mut section_stack, &mut root_body, level);
+                self.close_sections_to_level(level);
 
-                section_stack.push(OpenSection {
+                self.section_stack.push(OpenSection {
                     heading: elem.text.clone(),
                     level,
                     body: Vec::new(),
@@ -254,18 +312,19 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
 
             ElementKind::Paragraph => {
                 if elem.text.is_empty() {
-                    continue;
+                    return;
                 }
                 let node = JsonNode::Paragraph {
                     text: elem.text.clone(),
                 };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
             ElementKind::ListStart { ordered } => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                state.push_container(NestingKind::List { ordered, item_count: 0 }, elem.depth);
-                open_list = Some(OpenList {
+                self.flush_list();
+                self.state
+                    .push_container(NestingKind::List { ordered, item_count: 0 }, elem.depth);
+                self.open_list = Some(OpenList {
                     ordered,
                     items: Vec::new(),
                 });
@@ -279,37 +338,155 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                     Some(label) if !label.is_empty() => format!("{label} {}", elem.text),
                     _ => elem.text.clone(),
                 };
-                if let Some(ref mut list) = open_list {
+                if let Some(ref mut list) = self.open_list {
                     list.items.push(item_text);
                 } else {
                     let node = JsonNode::List {
                         ordered,
                         items: vec![item_text],
                     };
-                    push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                    self.push(node);
                 }
             }
 
+            ElementKind::QuoteStart => {
+                self.flush_list();
+                self.state.push_container(NestingKind::BlockQuote, elem.depth);
+                self.open_blockquote = Some(Vec::new());
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Handle the elements whose `JsonNode` needs nothing beyond the element itself: `Code`,
+    /// `Formula`, `OcrText`, `PageBreak`, and `CommentRef`.
+    fn handle_simple_element(&mut self, elem: &InternalElement) {
+        match elem.kind {
             ElementKind::Code => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 let language = get_language(elem).map(|s| s.to_string());
                 let node = JsonNode::Code {
                     text: elem.text.clone(),
                     language,
                 };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
             ElementKind::Formula => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 let node = JsonNode::Formula {
                     text: elem.text.clone(),
                 };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
+            ElementKind::OcrText { .. } => {
+                if !elem.text.is_empty() {
+                    let node = JsonNode::Paragraph {
+                        text: elem.text.clone(),
+                    };
+                    self.push(node);
+                }
+            }
+
+            ElementKind::PageBreak => {
+                self.flush_list();
+                let node = JsonNode::PageBreak { page: elem.page };
+                self.push(node);
+            }
+
+            ElementKind::CommentRef => {
+                // Not tracked by `FootnoteCollector`, so there is no sequential number —
+                // the anchor id is the only stable link to the definition.
+                let node = JsonNode::CommentRef {
+                    id: elem.anchor.clone(),
+                };
+                self.push(node);
+            }
+
+            _ => {}
+        }
+
+        self.handle_simple_text_element(elem);
+    }
+
+    /// Handle the remaining self-contained elements: `Citation`, `Slide`, `DefinitionTerm`,
+    /// `DefinitionDescription`, `Admonition`, and `RawBlock`.
+    fn handle_simple_text_element(&mut self, elem: &InternalElement) {
+        match elem.kind {
+            ElementKind::Citation => {
+                self.flush_list();
+                let node = JsonNode::Citation {
+                    text: elem.text.clone(),
+                    id: elem.anchor.clone(),
+                };
+                self.push(node);
+            }
+
+            ElementKind::Slide { number } => {
+                self.flush_list();
+                let node = JsonNode::Slide {
+                    number,
+                    title: if elem.text.is_empty() {
+                        None
+                    } else {
+                        Some(elem.text.clone())
+                    },
+                };
+                self.push(node);
+            }
+
+            ElementKind::DefinitionTerm => {
+                self.flush_list();
+                let node = JsonNode::DefinitionTerm {
+                    text: elem.text.clone(),
+                };
+                self.push(node);
+            }
+
+            ElementKind::DefinitionDescription => {
+                self.flush_list();
+                let node = JsonNode::DefinitionDescription {
+                    text: elem.text.clone(),
+                };
+                self.push(node);
+            }
+
+            ElementKind::Admonition => {
+                self.flush_list();
+                let node = JsonNode::Admonition {
+                    kind: get_admonition_kind(elem).to_string(),
+                    title: get_admonition_title(elem).map(|t| t.to_string()),
+                    text: elem.text.clone(),
+                };
+                self.push(node);
+            }
+
+            ElementKind::RawBlock => {
+                self.flush_list();
+                let node = JsonNode::RawBlock {
+                    text: elem.text.clone(),
+                    format: get_attribute(elem, "format"),
+                };
+                self.push(node);
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Handle the elements whose `JsonNode` is built from `doc`: `Table` and `Image`.
+    fn handle_referencing_element(
+        &mut self,
+        doc: &InternalDocument,
+        elem_index: usize,
+        elem: &InternalElement,
+        footnotes: &FootnoteCollector,
+    ) {
+        match elem.kind {
             ElementKind::Table { table_index } => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 if let Some(table) = doc.tables.get(table_index as usize) {
                     let (headers, rows) = if table.cells.is_empty() {
                         (Vec::new(), Vec::new())
@@ -323,12 +500,12 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                         rows,
                         caption: None,
                     };
-                    push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                    self.push(node);
                 }
             }
 
             ElementKind::Image { image_index } => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 let image = doc.images.get(image_index as usize);
                 let alt = image.and_then(|img| img.description.clone());
                 let src = image.and_then(|img| {
@@ -339,124 +516,52 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                     }
                 });
                 let node = JsonNode::Image { alt, src };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
-            ElementKind::QuoteStart => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                state.push_container(NestingKind::BlockQuote, elem.depth);
-                open_blockquote = Some(Vec::new());
-            }
+            _ => {}
+        }
 
-            ElementKind::OcrText { .. } => {
-                if !elem.text.is_empty() {
-                    let node = JsonNode::Paragraph {
-                        text: elem.text.clone(),
-                    };
-                    push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-                }
-            }
+        self.handle_footnote_and_metadata_element(elem_index, elem, footnotes);
+    }
 
-            ElementKind::PageBreak => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::PageBreak { page: elem.page };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
+    /// Handle the elements whose `JsonNode` is built from `footnotes` or `elem` alone:
+    /// `FootnoteRef`, `FootnoteDefinition`, `CommentDefinition`, and `MetadataBlock`.
+    fn handle_footnote_and_metadata_element(
+        &mut self,
+        elem_index: usize,
+        elem: &InternalElement,
+        footnotes: &FootnoteCollector,
+    ) {
+        match elem.kind {
             ElementKind::FootnoteRef => {
                 let node = JsonNode::FootnoteRef {
                     number: footnotes.ref_number(elem_index as u32),
                     id: elem.anchor.clone(),
                 };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
             ElementKind::FootnoteDefinition => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 let node = JsonNode::FootnoteDefinition {
                     text: elem.text.clone(),
                     id: elem.anchor.clone(),
                 };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::CommentRef => {
-                // Not tracked by `FootnoteCollector`, so there is no sequential number —
-                // the anchor id is the only stable link to the definition.
-                let node = JsonNode::CommentRef {
-                    id: elem.anchor.clone(),
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
             ElementKind::CommentDefinition => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 let node = JsonNode::CommentDefinition {
                     text: elem.text.clone(),
                     id: elem.anchor.clone(),
                 };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::Citation => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::Citation {
-                    text: elem.text.clone(),
-                    id: elem.anchor.clone(),
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::Slide { number } => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::Slide {
-                    number,
-                    title: if elem.text.is_empty() {
-                        None
-                    } else {
-                        Some(elem.text.clone())
-                    },
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::DefinitionTerm => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::DefinitionTerm {
-                    text: elem.text.clone(),
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::DefinitionDescription => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::DefinitionDescription {
-                    text: elem.text.clone(),
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::Admonition => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::Admonition {
-                    kind: get_admonition_kind(elem).to_string(),
-                    title: get_admonition_title(elem).map(|t| t.to_string()),
-                    text: elem.text.clone(),
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
-            }
-
-            ElementKind::RawBlock => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
-                let node = JsonNode::RawBlock {
-                    text: elem.text.clone(),
-                    format: get_attribute(elem, "format"),
-                };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
             ElementKind::MetadataBlock => {
-                flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+                self.flush_list();
                 let entries: Vec<JsonMetadataEntry> = parse_metadata_entries(&elem.text)
                     .into_iter()
                     .map(|(key, value)| JsonMetadataEntry {
@@ -470,58 +575,83 @@ fn build_json_document(doc: &InternalDocument) -> JsonDocument {
                     None
                 };
                 let node = JsonNode::MetadataBlock { entries, text };
-                push_to_current(&mut root_body, &mut section_stack, &mut open_blockquote, node);
+                self.push(node);
             }
 
-            ElementKind::ListEnd | ElementKind::QuoteEnd | ElementKind::GroupStart | ElementKind::GroupEnd => {}
+            _ => {}
         }
     }
 
-    flush_list(&mut open_list, &mut root_body, &mut section_stack, &mut open_blockquote);
+    /// Finish the tree: flush any still-open list/blockquote/sections, append footnote and
+    /// comment definitions the per-element pass skipped, and build the final `JsonDocument`.
+    fn finish(mut self, doc: &InternalDocument) -> JsonDocument {
+        self.flush_list();
 
-    if let Some(bq_body) = open_blockquote.take() {
-        let node = JsonNode::Blockquote { body: bq_body };
-        push_to_current(&mut root_body, &mut section_stack, &mut None, node);
-    }
+        if let Some(bq_body) = self.open_blockquote.take() {
+            let node = JsonNode::Blockquote { body: bq_body };
+            push_to_current(&mut self.root_body, &mut self.section_stack, &mut None, node);
+        }
 
-    close_sections_to_level(&mut section_stack, &mut root_body, 0);
+        self.close_sections_to_level(0);
 
-    // Footnote definitions live on `ContentLayer::Footnote`, not `ContentLayer::Body`,
-    // so the per-element loop above never sees them: `is_body_element` filters them
-    // out before the `ElementKind::FootnoteDefinition` arm is reached. That filter is
-    // correct — a definition is document furniture, not body flow, and must not be
-    // interleaved into whatever section happened to be open when its reference
-    // occurred — but it also meant the definition a `[^n]` marker points at was
-    // dropped entirely (xberg-io/xberg#288). Collect the ones the main loop skipped
-    // and append them once, in document order, at the very end, mirroring how the
-    // Markdown renderer (`comrak_bridge::render_markdown`) emits collected footnote
-    // definitions after the rest of the tree instead of inline. ~keep
-    for elem in &doc.elements {
-        if elem.kind == ElementKind::FootnoteDefinition && !is_body_element(elem) {
-            root_body.push(JsonNode::FootnoteDefinition {
-                text: elem.text.clone(),
-                id: elem.anchor.clone(),
-            });
+        // Footnote definitions live on `ContentLayer::Footnote`, not `ContentLayer::Body`,
+        // so the per-element loop above never sees them: `is_body_element` filters them
+        // out before the `ElementKind::FootnoteDefinition` arm is reached. That filter is
+        // correct — a definition is document furniture, not body flow, and must not be
+        // interleaved into whatever section happened to be open when its reference
+        // occurred — but it also meant the definition a `[^n]` marker points at was
+        // dropped entirely (xberg-io/xberg#288). Collect the ones the main loop skipped
+        // and append them once, in document order, at the very end, mirroring how the
+        // Markdown renderer (`comrak_bridge::render_markdown`) emits collected footnote
+        // definitions after the rest of the tree instead of inline. ~keep
+        for elem in &doc.elements {
+            if elem.kind == ElementKind::FootnoteDefinition && !is_body_element(elem) {
+                self.root_body.push(JsonNode::FootnoteDefinition {
+                    text: elem.text.clone(),
+                    id: elem.anchor.clone(),
+                });
+            }
+        }
+
+        // Comment definitions (#300) live on `ContentLayer::Footnote` too, so they hit
+        // the same `is_body_element` filter as footnote definitions above — collect
+        // them the same way instead of silently dropping the comment body. ~keep
+        for elem in &doc.elements {
+            if elem.kind == ElementKind::CommentDefinition && !is_body_element(elem) {
+                self.root_body.push(JsonNode::CommentDefinition {
+                    text: elem.text.clone(),
+                    id: elem.anchor.clone(),
+                });
+            }
+        }
+
+        JsonDocument {
+            title: self.title,
+            body: self.root_body,
+            annotations: doc.annotations.clone(),
         }
     }
+}
 
-    // Comment definitions (#300) live on `ContentLayer::Footnote` too, so they hit
-    // the same `is_body_element` filter as footnote definitions above — collect
-    // them the same way instead of silently dropping the comment body. ~keep
-    for elem in &doc.elements {
-        if elem.kind == ElementKind::CommentDefinition && !is_body_element(elem) {
-            root_body.push(JsonNode::CommentDefinition {
-                text: elem.text.clone(),
-                id: elem.anchor.clone(),
-            });
+/// Build the `JsonDocument` from an `InternalDocument`.
+fn build_json_document(doc: &InternalDocument) -> JsonDocument {
+    let mut tree = TreeBuilder::new();
+    let footnotes = FootnoteCollector::new(doc);
+
+    for (elem_index, elem) in doc.elements.iter().enumerate() {
+        if !is_body_element(elem) {
+            continue;
         }
+
+        if is_container_end(elem) {
+            tree.close_open_container(elem);
+            continue;
+        }
+
+        tree.handle_body_element(doc, elem_index, elem, &footnotes);
     }
 
-    JsonDocument {
-        title,
-        body: root_body,
-        annotations: doc.annotations.clone(),
-    }
+    tree.finish(doc)
 }
 
 /// Read a named attribute off an element, if present.

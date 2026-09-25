@@ -52,9 +52,9 @@ static KANGXI_TO_UNIFIED: [u32; 214] = [
     0x9F52, 0x9F8D, 0x9F9C, 0x9FA0,
 ];
 
-/// Map CJK Radicals Supplement (U+2E80–U+2EFF) to CJK Unified Ideographs.
-/// Only maps characters that have clear unified equivalents.
-fn kangxi_supplement_to_unified(cp: u32) -> Option<char> {
+/// First half of the CJK Radicals Supplement mapping table (U+2E80–U+2EA9).
+/// Split from [`kangxi_supplement_to_unified`] to keep each lookup function short.
+fn kangxi_supplement_to_unified_part1(cp: u32) -> Option<u32> {
     let unified = match cp {
         0x2E80 => 0x2E81_u32,
         0x2E81 => 0x5382,
@@ -96,6 +96,15 @@ fn kangxi_supplement_to_unified(cp: u32) -> Option<char> {
         0x2EA7 => 0x5FC3,
         0x2EA8 => 0x5FC3,
         0x2EA9 => 0x5FC3,
+        _ => return None,
+    };
+    Some(unified)
+}
+
+/// Second half of the CJK Radicals Supplement mapping table (U+2EAA–U+2ECE).
+/// Split from [`kangxi_supplement_to_unified`] to keep each lookup function short.
+fn kangxi_supplement_to_unified_part2(cp: u32) -> Option<u32> {
+    let unified = match cp {
         0x2EAA => 0x6208,
         0x2EAB => 0x6236,
         0x2EAC => 0x793A,
@@ -135,6 +144,13 @@ fn kangxi_supplement_to_unified(cp: u32) -> Option<char> {
         0x2ECE => 0x9F9C,
         _ => return None,
     };
+    Some(unified)
+}
+
+/// Map CJK Radicals Supplement (U+2E80–U+2EFF) to CJK Unified Ideographs.
+/// Only maps characters that have clear unified equivalents.
+fn kangxi_supplement_to_unified(cp: u32) -> Option<char> {
+    let unified = kangxi_supplement_to_unified_part1(cp).or_else(|| kangxi_supplement_to_unified_part2(cp))?;
     // Don't return self-mapping (e.g., 0x2E80 → 0x2E81) ~keep
     if unified >= 0x4E00 {
         char::from_u32(unified)

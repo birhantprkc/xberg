@@ -1,12 +1,20 @@
 //! Integration test for image classification and clustering.
 
 use bytes::Bytes;
-use xberg::extraction::image_kind::{classify, cluster_tiles};
+use xberg::extraction::image_kind::{ImageClassifyInput, classify, cluster_tiles};
 use xberg::types::{ExtractedImage, ImageKind};
 
 #[test]
 fn test_classify_simple() {
-    let (kind, conf) = classify(&[], "jpeg", Some(1000), Some(1000), None, None, false);
+    let (kind, conf) = classify(ImageClassifyInput {
+        bytes: &[],
+        format: "jpeg",
+        width: Some(1000),
+        height: Some(1000),
+        colorspace: None,
+        bits_per_component: None,
+        is_mask: false,
+    });
     assert_eq!(kind, ImageKind::Photograph);
     assert!(conf > 0.8, "confidence should be > 0.8 for large JPEG");
 }

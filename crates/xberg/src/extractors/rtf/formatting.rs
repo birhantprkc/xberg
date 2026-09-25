@@ -5,14 +5,15 @@
 /// `(old_offset, new_offset)` pairs that covers every byte boundary in the
 /// input. Callers can use [`map_offset`] to translate an arbitrary input byte
 /// offset to the corresponding output byte offset.
-pub(crate) fn normalize_whitespace_with_mapping(s: &str) -> (String, Vec<(usize, usize)>) {
-    let mut mapping: Vec<(usize, usize)> = Vec::new();
+struct LineInfo<'a> {
+    trimmed: &'a str,
+    /// Byte offset of `trimmed` within the original string `s`.
+    start_in_s: usize,
+}
 
-    struct LineInfo<'a> {
-        trimmed: &'a str,
-        /// Byte offset of `trimmed` within the original string `s`.
-        start_in_s: usize,
-    }
+/// Split `s` into non-blank lines (with internal blank runs collapsed to a single blank
+/// line) and trim leading/trailing blank lines.
+fn collect_kept_lines(s: &str) -> Vec<LineInfo<'_>> {
     let mut kept_lines: Vec<LineInfo> = Vec::new();
     let mut last_blank = false;
     let mut line_start = 0usize;
@@ -39,7 +40,12 @@ pub(crate) fn normalize_whitespace_with_mapping(s: &str) -> (String, Vec<(usize,
     while kept_lines.last().is_some_and(|l| l.trimmed.is_empty()) {
         kept_lines.pop();
     }
+    kept_lines
+}
 
+/// Join the kept lines with `\n`, producing the joined text and an offset mapping from `s`.
+fn join_kept_lines(s: &str, kept_lines: &[LineInfo<'_>]) -> (String, Vec<(usize, usize)>) {
+    let mut mapping: Vec<(usize, usize)> = Vec::new();
     let mut joined = String::with_capacity(s.len());
     let mut new_pos = 0usize;
     for (li, line_info) in kept_lines.iter().enumerate() {
@@ -56,7 +62,11 @@ pub(crate) fn normalize_whitespace_with_mapping(s: &str) -> (String, Vec<(usize,
         }
     }
     mapping.push((s.len(), new_pos));
+    (joined, mapping)
+}
 
+/// Collapse consecutive spaces/tabs into a single space, producing an offset mapping.
+fn collapse_inline_whitespace(joined: &str) -> (String, Vec<(usize, usize)>) {
     let mut result = String::with_capacity(joined.len());
     let mut mapping2: Vec<(usize, usize)> = Vec::new();
     let mut last_was_space = false;
@@ -86,11 +96,12 @@ pub(crate) fn normalize_whitespace_with_mapping(s: &str) -> (String, Vec<(usize,
         }
     }
     mapping2.push((joined_byte, result_byte));
+    (result, mapping2)
+}
 
-    let trimmed_result = result.trim();
-    let trim_start = result.len() - result.trim_start().len();
-    let trimmed_owned = trimmed_result.to_string();
-
+/// Drop a single space immediately before punctuation (or after `|`), producing an offset
+/// mapping from `trimmed_owned`.
+fn strip_space_before_punctuation(trimmed_owned: &str) -> (String, Vec<(usize, usize)>) {
     let chars_vec: Vec<char> = trimmed_owned.chars().collect();
     let mut cleaned = String::with_capacity(trimmed_owned.len());
     let mut mapping3: Vec<(usize, usize)> = Vec::new();
@@ -119,18 +130,42 @@ pub(crate) fn normalize_whitespace_with_mapping(s: &str) -> (String, Vec<(usize,
         ci += 1;
     }
     mapping3.push((trimmed_byte, cleaned_byte));
+    (cleaned, mapping3)
+}
 
+/// Compose the three stage mappings into a single `s`-to-`cleaned` offset mapping.
+fn compose_final_mapping(
+    mapping: &[(usize, usize)],
+    mapping2: &[(usize, usize)],
+    mapping3: &[(usize, usize)],
+    trim_start: usize,
+) -> Vec<(usize, usize)> {
     let mut final_mapping: Vec<(usize, usize)> = Vec::new();
-    for &(s_off, joined_off) in &mapping {
-        let result_off = apply_mapping(&mapping2, joined_off);
+    for &(s_off, joined_off) in mapping {
+        let result_off = apply_mapping(mapping2, joined_off);
         if result_off < trim_start {
             final_mapping.push((s_off, 0));
             continue;
         }
         let trimmed_off = result_off - trim_start;
-        let cleaned_off = apply_mapping(&mapping3, trimmed_off);
+        let cleaned_off = apply_mapping(mapping3, trimmed_off);
         final_mapping.push((s_off, cleaned_off));
     }
+    final_mapping
+}
+
+pub(crate) fn normalize_whitespace_with_mapping(s: &str) -> (String, Vec<(usize, usize)>) {
+    let kept_lines = collect_kept_lines(s);
+    let (joined, mapping) = join_kept_lines(s, &kept_lines);
+    let (result, mapping2) = collapse_inline_whitespace(&joined);
+
+    let trimmed_result = result.trim();
+    let trim_start = result.len() - result.trim_start().len();
+    let trimmed_owned = trimmed_result.to_string();
+
+    let (cleaned, mapping3) = strip_space_before_punctuation(&trimmed_owned);
+
+    let final_mapping = compose_final_mapping(&mapping, &mapping2, &mapping3, trim_start);
 
     (cleaned, final_mapping)
 }

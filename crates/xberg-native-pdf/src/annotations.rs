@@ -148,6 +148,23 @@ pub enum LinkAction {
     },
 }
 
+struct FlatAnnotationFields {
+    annotation_type: String,
+    subtype: Option<String>,
+    subtype_enum: AnnotationSubtype,
+    contents: Option<String>,
+    rect: Option<[f64; 4]>,
+    author: Option<String>,
+    creation_date: Option<String>,
+    modification_date: Option<String>,
+    subject: Option<String>,
+    flags: AnnotationFlags,
+    color: Option<Vec<f64>>,
+    opacity: Option<f64>,
+    border: Option<[f64; 3]>,
+    interior_color: Option<Vec<f64>>,
+}
+
 impl PdfDocument {
     /// Get all annotations for a specific page.
     ///
@@ -218,24 +235,61 @@ impl PdfDocument {
             .as_dict()
             .ok_or_else(|| crate::error::Error::InvalidPdf("Annotation is not a dictionary".to_string()))?;
 
+        let f = Self::parse_flat_annotation_fields(dict);
+        let quad_points = if f.subtype_enum.is_text_markup() {
+            Self::parse_quad_points(dict.get("QuadPoints"))
+        } else {
+            None
+        };
+        let (destination, action) = self.parse_link_destination_and_action(dict, f.subtype_enum);
+        let (field_type, field_name, field_value, default_value, field_flags, options, appearance_state) =
+            if f.subtype_enum == AnnotationSubtype::Widget {
+                self.parse_widget_fields(dict)
+            } else {
+                (None, None, None, None, None, None, None)
+            };
+
+        Ok(Annotation {
+            annotation_type: f.annotation_type,
+            subtype: f.subtype,
+            subtype_enum: f.subtype_enum,
+            contents: f.contents,
+            rect: f.rect,
+            author: f.author,
+            creation_date: f.creation_date,
+            modification_date: f.modification_date,
+            subject: f.subject,
+            destination,
+            action,
+            quad_points,
+            color: f.color,
+            opacity: f.opacity,
+            flags: f.flags,
+            border: f.border,
+            interior_color: f.interior_color,
+            field_type,
+            field_name,
+            field_value,
+            default_value,
+            field_flags,
+            options,
+            appearance_state,
+            raw_dict: Some(dict.clone()),
+        })
+    }
+
+    fn parse_flat_annotation_fields(dict: &std::collections::HashMap<String, Object>) -> FlatAnnotationFields {
         let annotation_type = dict
             .get("Type")
             .and_then(|t| t.as_name())
             .unwrap_or("Unknown")
             .to_string();
-
         let subtype = dict.get("Subtype").and_then(|s| s.as_name()).map(|s| s.to_string());
-
         let subtype_enum = subtype
             .as_deref()
             .map(AnnotationSubtype::from_pdf_name)
             .unwrap_or(AnnotationSubtype::Unknown);
-
-        let contents = dict.get("Contents").and_then(|c| match c {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
-            _ => None,
-        });
-
+        let contents = Self::pdf_string_field(dict, "Contents");
         let rect = dict.get("Rect").and_then(|r| match r {
             Object::Array(arr) if arr.len() == 4 => {
                 let mut rect_arr = [0.0; 4];
@@ -250,27 +304,10 @@ impl PdfDocument {
             }
             _ => None,
         });
-
-        let author = dict.get("T").and_then(|t| match t {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
-            _ => None,
-        });
-
-        let creation_date = dict.get("CreationDate").and_then(|d| match d {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
-            _ => None,
-        });
-
-        let modification_date = dict.get("M").and_then(|d| match d {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
-            _ => None,
-        });
-
-        let subject = dict.get("Subj").and_then(|s| match s {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
-            _ => None,
-        });
-
+        let author = Self::pdf_string_field(dict, "T");
+        let creation_date = Self::pdf_string_field(dict, "CreationDate");
+        let modification_date = Self::pdf_string_field(dict, "M");
+        let subject = Self::pdf_string_field(dict, "Subj");
         let flags = dict
             .get("F")
             .and_then(|f| match f {
@@ -278,15 +315,12 @@ impl PdfDocument {
                 _ => None,
             })
             .unwrap_or_default();
-
         let color = Self::parse_number_array(dict.get("C"));
-
         let opacity = dict.get("CA").and_then(|o| match o {
             Object::Real(f) => Some(*f),
             Object::Integer(n) => Some(*n as f64),
             _ => None,
         });
-
         let border = dict.get("Border").and_then(|b| match b {
             Object::Array(arr) if arr.len() >= 3 => {
                 let mut border_arr = [0.0; 3];
@@ -301,31 +335,9 @@ impl PdfDocument {
             }
             _ => None,
         });
-
         let interior_color = Self::parse_number_array(dict.get("IC"));
 
-        let quad_points = if subtype_enum.is_text_markup() {
-            Self::parse_quad_points(dict.get("QuadPoints"))
-        } else {
-            None
-        };
-
-        let (destination, action) = if subtype_enum == AnnotationSubtype::Link {
-            let dest = dict.get("Dest").and_then(|d| self.parse_destination(d).ok());
-            let act = dict.get("A").and_then(|a| self.parse_action(a).ok());
-            (dest, act)
-        } else {
-            (None, None)
-        };
-
-        let (field_type, field_name, field_value, default_value, field_flags, options, appearance_state) =
-            if subtype_enum == AnnotationSubtype::Widget {
-                self.parse_widget_fields(dict)
-            } else {
-                (None, None, None, None, None, None, None)
-            };
-
-        Ok(Annotation {
+        FlatAnnotationFields {
             annotation_type,
             subtype,
             subtype_enum,
@@ -335,23 +347,25 @@ impl PdfDocument {
             creation_date,
             modification_date,
             subject,
-            destination,
-            action,
-            quad_points,
+            flags,
             color,
             opacity,
-            flags,
             border,
             interior_color,
-            field_type,
-            field_name,
-            field_value,
-            default_value,
-            field_flags,
-            options,
-            appearance_state,
-            raw_dict: Some(dict.clone()),
-        })
+        }
+    }
+
+    fn parse_link_destination_and_action(
+        &self,
+        dict: &std::collections::HashMap<String, Object>,
+        subtype_enum: AnnotationSubtype,
+    ) -> (Option<LinkDestination>, Option<LinkAction>) {
+        if subtype_enum != AnnotationSubtype::Link {
+            return (None, None);
+        }
+        let dest = dict.get("Dest").and_then(|d| self.parse_destination(d).ok());
+        let act = dict.get("A").and_then(|a| self.parse_action(a).ok());
+        (dest, act)
     }
 
     /// Parse Widget annotation fields (form fields).
@@ -370,69 +384,89 @@ impl PdfDocument {
         Option<String>,
     ) {
         let mut ft = dict.get("FT").and_then(|f| f.as_name()).map(|s| s.to_string());
-
         let mut field_flags = dict.get("Ff").and_then(|f| match f {
             Object::Integer(n) => Some(*n as u32),
             _ => None,
         });
-
         let mut field_value = Self::parse_string_value(dict.get("V"));
-
         let mut default_value = Self::parse_string_value(dict.get("DV"));
 
-        // Walk up /Parent chain to inherit missing fields (PDF spec 12.7.3.1) ~keep
-        if ft.is_none() || field_flags.is_none() || field_value.is_none() || default_value.is_none() {
-            let mut parent_ref = dict
-                .get("Parent")
-                .and_then(|p| if let Object::Reference(r) = p { Some(*r) } else { None });
-            let mut depth = 0;
-            while let Some(pref) = parent_ref {
-                if depth >= 10 {
-                    break;
-                }
-                depth += 1;
-                match self.load_object(pref) {
-                    Ok(parent_obj) => {
-                        if let Some(parent_dict) = parent_obj.as_dict() {
-                            if ft.is_none() {
-                                ft = parent_dict.get("FT").and_then(|f| f.as_name()).map(|s| s.to_string());
-                            }
-                            if field_flags.is_none() {
-                                field_flags = parent_dict.get("Ff").and_then(|f| match f {
-                                    Object::Integer(n) => Some(*n as u32),
-                                    _ => None,
-                                });
-                            }
-                            if field_value.is_none() {
-                                field_value = Self::parse_string_value(parent_dict.get("V"));
-                            }
-                            if default_value.is_none() {
-                                default_value = Self::parse_string_value(parent_dict.get("DV"));
-                            }
-                            parent_ref = parent_dict
-                                .get("Parent")
-                                .and_then(|p| if let Object::Reference(r) = p { Some(*r) } else { None });
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => {
-                        break;
-                    }
-                }
-            }
-        }
+        self.inherit_widget_parent_fields(dict, &mut ft, &mut field_flags, &mut field_value, &mut default_value);
 
-        let field_name = dict.get("T").and_then(|t| match t {
-            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
-            _ => None,
-        });
-
+        let field_name = Self::pdf_string_field(dict, "T");
         let appearance_state = dict.get("AS").and_then(|a| a.as_name()).map(|s| s.to_string());
-
         let options = Self::parse_options_array(dict.get("Opt"));
 
-        let field_type = match ft.as_deref() {
+        let field_type =
+            Self::resolve_widget_field_type(ft.as_deref(), field_flags, &appearance_state, &field_value, &options);
+
+        (
+            field_type,
+            field_name,
+            field_value,
+            default_value,
+            field_flags,
+            options,
+            appearance_state,
+        )
+    }
+
+    /// Walk up /Parent to inherit unset fields (PDF spec 12.7.3.1). ~keep
+    fn inherit_widget_parent_fields(
+        &self,
+        dict: &std::collections::HashMap<String, Object>,
+        ft: &mut Option<String>,
+        field_flags: &mut Option<u32>,
+        field_value: &mut Option<String>,
+        default_value: &mut Option<String>,
+    ) {
+        if ft.is_some() && field_flags.is_some() && field_value.is_some() && default_value.is_some() {
+            return;
+        }
+        let mut parent_ref = dict
+            .get("Parent")
+            .and_then(|p| if let Object::Reference(r) = p { Some(*r) } else { None });
+        let mut depth = 0;
+        while let Some(pref) = parent_ref {
+            if depth >= 10 {
+                break;
+            }
+            depth += 1;
+            let Ok(parent_obj) = self.load_object(pref) else {
+                break;
+            };
+            let Some(parent_dict) = parent_obj.as_dict() else {
+                break;
+            };
+            if ft.is_none() {
+                *ft = parent_dict.get("FT").and_then(|f| f.as_name()).map(|s| s.to_string());
+            }
+            if field_flags.is_none() {
+                *field_flags = parent_dict.get("Ff").and_then(|f| match f {
+                    Object::Integer(n) => Some(*n as u32),
+                    _ => None,
+                });
+            }
+            if field_value.is_none() {
+                *field_value = Self::parse_string_value(parent_dict.get("V"));
+            }
+            if default_value.is_none() {
+                *default_value = Self::parse_string_value(parent_dict.get("DV"));
+            }
+            parent_ref = parent_dict
+                .get("Parent")
+                .and_then(|p| if let Object::Reference(r) = p { Some(*r) } else { None });
+        }
+    }
+
+    fn resolve_widget_field_type(
+        ft: Option<&str>,
+        field_flags: Option<u32>,
+        appearance_state: &Option<String>,
+        field_value: &Option<String>,
+        options: &Option<Vec<String>>,
+    ) -> Option<WidgetFieldType> {
+        match ft {
             Some("Tx") => Some(WidgetFieldType::Text),
             Some("Btn") => {
                 let ff = field_flags.unwrap_or(0);
@@ -458,17 +492,14 @@ impl PdfDocument {
             }),
             Some("Sig") => Some(WidgetFieldType::Signature),
             _ => None,
-        };
+        }
+    }
 
-        (
-            field_type,
-            field_name,
-            field_value,
-            default_value,
-            field_flags,
-            options,
-            appearance_state,
-        )
+    fn pdf_string_field(dict: &std::collections::HashMap<String, Object>, key: &str) -> Option<String> {
+        dict.get(key).and_then(|v| match v {
+            Object::String(s) => Some(String::from_utf8_lossy(s).to_string()),
+            _ => None,
+        })
     }
 
     /// Parse a string value from various PDF object types.

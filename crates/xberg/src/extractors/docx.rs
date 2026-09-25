@@ -1138,7 +1138,15 @@ impl InternalDocumentExtractor for DocxExtractor {
             let page_number = Some(drawing_page_nums.get(idx).copied().unwrap_or(1) as u32);
 
             let (image_kind, kind_confidence) =
-                crate::extraction::image_kind::classify(&data, format.as_ref(), width, height, None, None, false);
+                crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                    bytes: &data,
+                    format: format.as_ref(),
+                    width,
+                    height,
+                    colorspace: None,
+                    bits_per_component: None,
+                    is_mask: false,
+                });
 
             extracted_images.push(ExtractedImage {
                 data,

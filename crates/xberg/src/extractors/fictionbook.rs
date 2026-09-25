@@ -516,7 +516,15 @@ impl FictionBookExtractor {
                             let description = if id.is_empty() { None } else { Some(id) };
 
                             let (image_kind, kind_confidence) = crate::extraction::image_kind::classify(
-                                &decoded, &format, None, None, None, None, false,
+                                crate::extraction::image_kind::ImageClassifyInput {
+                                    bytes: &decoded,
+                                    format: &format,
+                                    width: None,
+                                    height: None,
+                                    colorspace: None,
+                                    bits_per_component: None,
+                                    is_mask: false,
+                                },
                             );
 
                             images.push(ExtractedImage {

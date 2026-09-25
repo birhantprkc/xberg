@@ -6,7 +6,7 @@
 use crate::Result;
 use crate::core::config::ExtractionConfig;
 use crate::core::diagnostics::push_warning;
-use crate::extraction::hwp::model::{CharShape, HwpDocument, SummaryInfo};
+use crate::extraction::hwp::model::{CharShape, HwpDocument, HwpImage, Paragraph, SummaryInfo};
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::types::ExtractedImage;
 use crate::types::document_structure::{AnnotationKind, TextAnnotation};
@@ -91,37 +91,7 @@ fn build_hwp_internal_document(hwp_doc: &HwpDocument) -> InternalDocument {
 
     for section in &hwp_doc.sections {
         for para in &section.paragraphs {
-            if let Some(ref t) = para.text
-                && !t.content.is_empty()
-            {
-                // The parser converts an equation record to LaTeX and splices it
-                // into this text between `$` delimiters. A paragraph that holds
-                // nothing else is an equation object, so it becomes a formula.
-                // Math mixed with prose stays in the sentence: `char_shape_runs`
-                // are byte offsets into this string, so lifting a span out would
-                // move every annotation after it.
-                if let Some(latex) = standalone_equation(&t.content) {
-                    builder.push_formula(latex, None, None);
-                    continue;
-                }
-                // Math mixed with prose stays in the sentence, because
-                // `char_shape_runs` are byte offsets into this string and
-                // lifting a span out would move every annotation after it. The
-                // equation is still one of the document's formulas, so it is
-                // recorded in the side channel, which leaves the text alone.
-                for latex in &para.equations {
-                    builder.record_formula(latex, None);
-                }
-                let annotations = apply_char_shapes(&t.content, &para.char_shape_runs, &hwp_doc.char_shapes);
-                if para.outline_level > 0 {
-                    let idx = builder.push_heading(para.outline_level, &t.content, None, None);
-                    if !annotations.is_empty() {
-                        builder.set_annotations(idx, annotations);
-                    }
-                } else {
-                    builder.push_paragraph(&t.content, annotations, None, None);
-                }
-            }
+            push_hwp_paragraph(&mut builder, para, &hwp_doc.char_shapes);
         }
 
         // #105/#236 — tables were previously not read from the parsed model at all.
@@ -132,7 +102,51 @@ fn build_hwp_internal_document(hwp_doc: &HwpDocument) -> InternalDocument {
         }
     }
 
-    for (idx, image) in hwp_doc.images.iter().enumerate() {
+    push_hwp_images(&mut builder, &hwp_doc.images);
+
+    builder.build()
+}
+
+/// Push one paragraph's formula, heading, or prose content (with its annotations) into
+/// `builder`. A paragraph with no text, or empty text, contributes nothing.
+fn push_hwp_paragraph(builder: &mut InternalDocumentBuilder, para: &Paragraph, char_shapes: &[CharShape]) {
+    let Some(ref t) = para.text else {
+        return;
+    };
+    if t.content.is_empty() {
+        return;
+    }
+
+    // The parser converts an equation record to LaTeX and splices it into this text
+    // between `$` delimiters. A paragraph that holds nothing else is an equation
+    // object, so it becomes a formula. Math mixed with prose stays in the sentence:
+    // `char_shape_runs` are byte offsets into this string, so lifting a span out
+    // would move every annotation after it.
+    if let Some(latex) = standalone_equation(&t.content) {
+        builder.push_formula(latex, None, None);
+        return;
+    }
+    // Math mixed with prose stays in the sentence, because `char_shape_runs` are
+    // byte offsets into this string and lifting a span out would move every
+    // annotation after it. The equation is still one of the document's formulas, so
+    // it is recorded in the side channel, which leaves the text alone.
+    for latex in &para.equations {
+        builder.record_formula(latex, None);
+    }
+    let annotations = apply_char_shapes(&t.content, &para.char_shape_runs, char_shapes);
+    if para.outline_level > 0 {
+        let idx = builder.push_heading(para.outline_level, &t.content, None, None);
+        if !annotations.is_empty() {
+            builder.set_annotations(idx, annotations);
+        }
+    } else {
+        builder.push_paragraph(&t.content, annotations, None, None);
+    }
+}
+
+/// Push every parsed HWP image into `builder` as an `ExtractedImage`.
+fn push_hwp_images(builder: &mut InternalDocumentBuilder, images: &[HwpImage]) {
+    for (idx, image) in images.iter().enumerate() {
         let format = match infer::get(&image.data) {
             Some(info) => Cow::Owned(info.mime_type().to_string()),
             None => Cow::Borrowed("application/octet-stream"),
@@ -161,8 +175,6 @@ fn build_hwp_internal_document(hwp_doc: &HwpDocument) -> InternalDocument {
         };
         builder.push_image(None, extracted, None, None);
     }
-
-    builder.build()
 }
 
 /// Maps the parsed `SummaryInformation` stream to the common `Metadata` DTO (#105).

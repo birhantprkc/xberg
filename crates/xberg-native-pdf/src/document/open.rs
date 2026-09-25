@@ -5,6 +5,8 @@
 //! `impl` is the same inherent impl and sees the parent's private items unchanged. ~keep
 
 use super::*;
+use crate::content::{Operator, TextElement};
+use crate::extractors::auto::{ImageCodecClass, PageSignals, ProducerPrior, ReasonCode};
 
 impl PdfDocument {
     /// Open a PDF document from in-memory bytes.
@@ -86,16 +88,93 @@ impl PdfDocument {
         let (major, minor, header_offset) = parse_header(&mut reader, true)?;
         let version = (major, minor);
 
-        // Xref came from full-file reconstruction, not a parsed xref (see
-        // the `xref_reconstructed` field doc for what this gates). ~keep
+        let (mut xref, trailer, mut xref_reconstructed, mut synthetic_objects) =
+            Self::load_initial_xref_and_trailer(&mut reader)?;
+
+        if header_offset > 0 {
+            Self::adjust_xref_for_header_offset(&mut reader, &mut xref, &trailer, header_offset);
+        }
+
+        // Validate the /Root catalog is actually loadable. If not, the xref data is
+        // corrupt despite parsing successfully — fall back to reconstruction. ~keep
+        let (xref, trailer) = if validate_root_loadable(&mut reader, &xref, &trailer) {
+            (xref, trailer)
+        } else {
+            tracing::warn!(target: LOG_TARGET, "Root object not loadable after xref parse, falling back to xref reconstruction");
+            match Self::try_reconstruct_xref(&mut reader) {
+                Ok((x, t, syn)) => {
+                    xref_reconstructed = true;
+                    synthetic_objects = syn;
+                    (x, t)
+                }
+                Err(_) => (xref, trailer),
+            }
+        };
+
+        let prepopulated_scan = Self::build_prepopulated_scan(&xref, xref_reconstructed);
+
+        // The reader ends here: the document keeps the bytes and reads them by
+        // offset, so nothing downstream shares a cursor. ~keep
+        let PdfReader::Memory(buffered) = reader;
+        let source_bytes = buffered.into_inner().into_inner();
+
+        // Note: Encryption initialization was originally lazy, but decode_stream_with_encryption
+        // only has &self access which prevents initialization.
+        // We now initialize eagerly to ensure the handler is ready when needed. ~keep
+        let document = Self::build_document(
+            (source_bytes, version, xref, trailer),
+            (header_offset, xref_reconstructed, prepopulated_scan),
+        );
+
+        // Seed any SYNTHETIC recovery objects (a Catalog / page-tree root rebuilt
+        // for a truncated file) into the object cache. They have no byte offset,
+        // so `load_object` - which checks the cache before the xref - is the only
+        // way to reach them. Done before encryption init so the /Root resolves. ~keep
+        if !synthetic_objects.is_empty() {
+            let mut cache = document.object_cache.lock_or_recover();
+            for (obj_ref, obj) in synthetic_objects {
+                cache.insert(obj_ref, obj);
+            }
+        }
+
+        document.recover_object_streams_if_reconstructed(); // GH#1774 ~keep
+
+        if let Err(error) = document.ensure_encryption_initialized() {
+            trace_recoverable_pdf_error("initialize_encryption", &error);
+            // We continue anyway, as it might just be an unsupported security handler
+            // and maybe we can still read parts of the file (or fail later) ~keep
+        }
+
+        Ok(document)
+    }
+
+    /// A reconstruction scan already located every uncompressed "N G obj" in
+    /// the file, so a later full-file rescan (on the first object miss) would
+    /// find nothing new. Pre-seed the scan-offset cache so that miss is O(1);
+    /// only when reconstructed, since a normal (parsed) xref may be
+    /// legitimately partial and the full scan is the intended recovery path. ~keep
+    fn build_prepopulated_scan(xref: &CrossRefTable, xref_reconstructed: bool) -> Option<HashMap<u32, u64>> {
+        if !xref_reconstructed {
+            return None;
+        }
+        Some(
+            xref.all_object_numbers()
+                .filter_map(|id| {
+                    xref.get(id).and_then(|e| {
+                        (e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed).then_some((id, e.offset))
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn load_initial_xref_and_trailer<R: Read + Seek>(
+        reader: &mut R,
+    ) -> Result<(CrossRefTable, Object, bool, Vec<(ObjectRef, Object)>)> {
         let mut xref_reconstructed = false;
-        // SYNTHETIC objects a recovery invented (a rebuilt Catalog / page-tree
-        // root for a truncated file). They have no byte offset, so they are
-        // seeded into the object cache after the document is built. Empty in the
-        // ordinary case. ~keep
         let mut synthetic_objects: Vec<(ObjectRef, Object)> = Vec::new();
 
-        let (mut xref, trailer) = match Self::try_open_regular(&mut reader) {
+        let (xref, trailer) = match Self::try_open_regular(reader) {
             Ok((xref, trailer)) => {
                 // Success with regular parsing
                 // However, if the xref is suspiciously small (< 5 entries), it's likely corrupted
@@ -103,7 +182,7 @@ impl PdfDocument {
                 if xref.is_empty() {
                     tracing::warn!(target: LOG_TARGET, "Regular xref parsing succeeded but table is empty, attempting reconstruction");
                     xref_reconstructed = true;
-                    let (x, t, syn) = Self::try_reconstruct_xref(&mut reader)?;
+                    let (x, t, syn) = Self::try_reconstruct_xref(reader)?;
                     synthetic_objects = syn;
                     (x, t)
                 } else {
@@ -115,8 +194,7 @@ impl PdfDocument {
             }
             Err(e) => {
                 trace_xref_parse_failure(&e);
-
-                match Self::try_reconstruct_xref(&mut reader) {
+                match Self::try_reconstruct_xref(reader) {
                     Ok((reconstructed_xref, reconstructed_trailer, syn)) => {
                         tracing::info!(target: LOG_TARGET, "Successfully reconstructed xref table");
                         xref_reconstructed = true;
@@ -139,85 +217,52 @@ impl PdfDocument {
             }
         };
 
-        // If PDF header is not at byte 0 (garbage-prepended), xref offsets may need adjustment.
-        // The xref offsets are relative to the original PDF start, but file positions are
-        // shifted by header_offset bytes. ~keep
-        if header_offset > 0 {
-            // Probe an object to decide whether xref offsets are off by
-            // header_offset. Prefer /Root (common case), but the probe MUST
-            // be seek-validatable: `validate_object_at_offset` returns true
-            // for *compressed* entries without seeking, so a /Root that
-            // lives in an object stream would falsely report "no shift
-            // needed" and leave every uncompressed offset wrong. Use /Root
-            // only when its entry is in-use + uncompressed; otherwise (no
-            // /Root — or a compressed /Root) fall back to the
-            // first in-use uncompressed object. ~keep
-            let probe = get_root_ref_from_trailer(&trailer)
-                .filter(|r| {
-                    xref.get(r.id)
-                        .is_some_and(|e| e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed)
-                })
-                .or_else(|| first_in_use_uncompressed(&xref));
-            if let Some(probe_ref) = probe
-                && !validate_object_at_offset(&mut reader, &xref, probe_ref)
-            {
-                tracing::warn!(target: LOG_TARGET,
-                    "Probe object {} not loadable at xref offset, adjusting all offsets by header_offset={}",
-                    probe_ref.id,
-                    header_offset
-                );
-                xref.shift_offsets(header_offset);
-            }
+        Ok((xref, trailer, xref_reconstructed, synthetic_objects))
+    }
+
+    /// If PDF header is not at byte 0 (garbage-prepended), xref offsets may need adjustment.
+    /// The xref offsets are relative to the original PDF start, but file positions are
+    /// shifted by header_offset bytes. ~keep
+    fn adjust_xref_for_header_offset<R: Read + Seek>(
+        reader: &mut R,
+        xref: &mut CrossRefTable,
+        trailer: &Object,
+        header_offset: u64,
+    ) {
+        // Probe an object to decide whether xref offsets are off by
+        // header_offset. Prefer /Root (common case), but the probe MUST
+        // be seek-validatable: `validate_object_at_offset` returns true
+        // for *compressed* entries without seeking, so a /Root that
+        // lives in an object stream would falsely report "no shift
+        // needed" and leave every uncompressed offset wrong. Use /Root
+        // only when its entry is in-use + uncompressed; otherwise (no
+        // /Root — or a compressed /Root) fall back to the
+        // first in-use uncompressed object. ~keep
+        let probe = get_root_ref_from_trailer(trailer)
+            .filter(|r| {
+                xref.get(r.id)
+                    .is_some_and(|e| e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed)
+            })
+            .or_else(|| first_in_use_uncompressed(xref));
+        if let Some(probe_ref) = probe
+            && !validate_object_at_offset(reader, xref, probe_ref)
+        {
+            tracing::warn!(target: LOG_TARGET,
+                "Probe object {} not loadable at xref offset, adjusting all offsets by header_offset={}",
+                probe_ref.id,
+                header_offset
+            );
+            xref.shift_offsets(header_offset);
         }
+    }
 
-        // Validate the /Root catalog is actually loadable. If not, the xref data is
-        // corrupt despite parsing successfully — fall back to reconstruction. ~keep
-        let (xref, trailer) = if !validate_root_loadable(&mut reader, &xref, &trailer) {
-            tracing::warn!(target: LOG_TARGET, "Root object not loadable after xref parse, falling back to xref reconstruction");
-            match Self::try_reconstruct_xref(&mut reader) {
-                Ok((x, t, syn)) => {
-                    xref_reconstructed = true;
-                    synthetic_objects = syn;
-                    (x, t)
-                }
-                Err(_) => (xref, trailer),
-            }
-        } else {
-            (xref, trailer)
-        };
-
-        // A reconstruction scan already located every uncompressed
-        // "N G obj" in the file, so a later scan_for_object full-file rescan
-        // (on the first object miss) would find nothing new — it just repeats
-        // the work, the ~25 s "first extract_text" cost on corrupt-xref
-        // polyglots. Pre-seed the scan-offset cache from the reconstructed
-        // table so that first miss is O(1). Only do this when reconstructed:
-        // a normal (parsed) xref may be legitimately partial, and there the
-        // full scan is the intended recovery path. ~keep
-        let prepopulated_scan: Option<HashMap<u32, u64>> = if xref_reconstructed {
-            Some(
-                xref.all_object_numbers()
-                    .filter_map(|id| {
-                        xref.get(id).and_then(|e| {
-                            (e.in_use && e.entry_type == crate::xref::XRefEntryType::Uncompressed)
-                                .then_some((id, e.offset))
-                        })
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
-
-        // The reader ends here: the document keeps the bytes and reads them by
-        // offset, so nothing downstream shares a cursor. ~keep
-        let PdfReader::Memory(buffered) = reader;
-        let source_bytes = buffered.into_inner().into_inner();
-
-        // Note: Encryption initialization was originally lazy, but decode_stream_with_encryption
-        // only has &self access which prevents initialization.
-        // We now initialize eagerly to ensure the handler is ready when needed. ~keep
-        let document = Self {
+    fn build_document(
+        parsed: (Vec<u8>, (u8, u8), CrossRefTable, Object),
+        recovery: (u64, bool, Option<HashMap<u32, u64>>),
+    ) -> Self {
+        let (source_bytes, version, xref, trailer) = parsed;
+        let (header_offset, xref_reconstructed, prepopulated_scan) = recovery;
+        Self {
             source_bytes,
             version,
             xref,
@@ -274,28 +319,7 @@ impl PdfDocument {
             accumulated_warnings: Mutex::new(Vec::new()),
             warning_sink: crate::extractors::warnings::WarningSink::new(),
             recovery: std::sync::Arc::default(),
-        };
-
-        // Seed any SYNTHETIC recovery objects (a Catalog / page-tree root rebuilt
-        // for a truncated file) into the object cache. They have no byte offset,
-        // so `load_object` - which checks the cache before the xref - is the only
-        // way to reach them. Done before encryption init so the /Root resolves. ~keep
-        if !synthetic_objects.is_empty() {
-            let mut cache = document.object_cache.lock_or_recover();
-            for (obj_ref, obj) in synthetic_objects {
-                cache.insert(obj_ref, obj);
-            }
         }
-
-        document.recover_object_streams_if_reconstructed(); // GH#1774 ~keep
-
-        if let Err(error) = document.ensure_encryption_initialized() {
-            trace_recoverable_pdf_error("initialize_encryption", &error);
-            // We continue anyway, as it might just be an unsupported security handler
-            // and maybe we can still read parts of the file (or fail later) ~keep
-        }
-
-        Ok(document)
     }
 
     /// Try to open the PDF using regular xref parsing.
@@ -338,46 +362,35 @@ impl PdfDocument {
         if self.encryption_handler.lock_or_recover().is_some() {
             return Ok(());
         }
-
-        let (encrypt_ref, file_id) = {
-            let trailer_dict = match self.trailer.as_dict() {
-                Some(d) => d,
-                None => return Ok(()),
-            };
-
-            let encrypt_entry = match trailer_dict.get("Encrypt") {
-                Some(obj) => obj,
-                None => {
-                    tracing::debug!(target: LOG_TARGET, "PDF is not encrypted (no /Encrypt entry)");
-                    return Ok(());
-                }
-            };
-
-            let encrypt_ref = encrypt_entry.clone();
-
-            let file_id = match trailer_dict.get("ID") {
-                Some(Object::Array(arr)) => {
-                    if let Some(first_id) = arr.first() {
-                        if let Some(id_bytes) = first_id.as_string() {
-                            id_bytes.to_vec()
-                        } else {
-                            tracing::warn!(target: LOG_TARGET, "Invalid /ID array entry (not a string), using empty file ID");
-                            vec![]
-                        }
-                    } else {
-                        tracing::warn!(target: LOG_TARGET, "Empty /ID array, using empty file ID");
+        let Some(trailer_dict) = self.trailer.as_dict() else {
+            return Ok(());
+        };
+        let encrypt_ref = match trailer_dict.get("Encrypt") {
+            Some(obj) => obj.clone(),
+            None => {
+                tracing::debug!(target: LOG_TARGET, "PDF is not encrypted (no /Encrypt entry)");
+                return Ok(());
+            }
+        };
+        let file_id = match trailer_dict.get("ID") {
+            Some(Object::Array(arr)) => match arr.first() {
+                Some(first_id) => match first_id.as_string() {
+                    Some(id_bytes) => id_bytes.to_vec(),
+                    None => {
+                        tracing::warn!(target: LOG_TARGET, "Invalid /ID array entry (not a string), using empty file ID");
                         vec![]
                     }
-                }
-                _ => {
-                    tracing::warn!(target: LOG_TARGET, "Missing or invalid /ID entry in trailer, using empty file ID");
+                },
+                None => {
+                    tracing::warn!(target: LOG_TARGET, "Empty /ID array, using empty file ID");
                     vec![]
                 }
-            };
-
-            (encrypt_ref, file_id)
+            },
+            _ => {
+                tracing::warn!(target: LOG_TARGET, "Missing or invalid /ID entry in trailer, using empty file ID");
+                vec![]
+            }
         };
-
         let encrypt_obj = match encrypt_ref {
             Object::Dictionary(_) => encrypt_ref,
             Object::Reference(obj_ref) => {
@@ -396,15 +409,12 @@ impl PdfDocument {
                 )));
             }
         };
-
-        let encrypt_obj = if let Some(dict) = encrypt_obj.as_dict() {
-            Object::Dictionary(resolve_encrypt_dictionary_references(dict, |reference| {
+        let encrypt_obj = match encrypt_obj.as_dict() {
+            Some(dict) => Object::Dictionary(resolve_encrypt_dictionary_references(dict, |reference| {
                 self.load_object(reference)
-            }))
-        } else {
-            encrypt_obj
+            })),
+            None => encrypt_obj,
         };
-
         let mut handler = EncryptionHandler::new(&encrypt_obj, file_id)?;
 
         match handler.authenticate(b"") {
@@ -422,7 +432,6 @@ impl PdfDocument {
                 return Err(error);
             }
         }
-
         *self.encryption_handler.lock_or_recover() = Some(handler);
         Ok(())
     }
@@ -646,30 +655,13 @@ impl PdfDocument {
         ix * iy
     }
 
-    /// Gather per-page classification signals from xberg-native-pdf
-    /// **internals** (00-common-foundation §9 — never the flattened
-    /// output string). Returns the signals plus the enriched T0.5
-    /// quality-gate verdict (research §3a) computed from the *same*
-    /// single span extraction (no double work). Pure inspection.
-    fn gather_page_signals(
+    #[allow(clippy::type_complexity)]
+    fn accumulate_text_signals(
         &self,
         page: usize,
-    ) -> Result<(
-        crate::extractors::auto::PageSignals,
-        Option<crate::extractors::auto::ReasonCode>,
-    )> {
-        use crate::content::{Operator, TextElement};
-        use crate::extractors::auto::{ImageCodecClass, PageSignals, ProducerPrior};
-
-        let (llx, lly, urx, ury) = self.get_page_media_box(page)?;
-        let rot = self.get_page_rotation(page).unwrap_or(0);
-        let (mut pw, mut ph) = ((urx - llx).abs(), (ury - lly).abs());
-        if rot % 180 != 0 {
-            std::mem::swap(&mut pw, &mut ph);
-        }
-        let page_area = (pw * ph).max(1.0);
-        let (px0, py0, px1, py1) = (llx.min(urx), lly.min(ury), llx.max(urx), lly.max(ury));
-
+        (px0, py0, px1, py1): (f32, f32, f32, f32),
+        page_area: f32,
+    ) -> (usize, f32, f32, f32, f32, String) {
         let spans = self.extract_spans(page).unwrap_or_default();
         let mut text = String::new();
         let mut glyphs = 0usize;
@@ -688,7 +680,6 @@ impl PdfDocument {
             text_area += Self::rect_isect_area(&s.bbox, px0, py0, px1, py1);
         }
         let text_area_ratio = (text_area / page_area).clamp(0.0, 1.0);
-
         let chars: Vec<char> = text.chars().collect();
         let total = chars.len().max(1);
         let bad = chars
@@ -716,23 +707,28 @@ impl PdfDocument {
             };
             (frag, rep)
         };
+        (
+            glyphs,
+            text_area_ratio,
+            garbled_ratio,
+            fragmented_word_ratio,
+            consecutive_repeat_ratio,
+            word_text,
+        )
+    }
 
-        // Classify each embedded image from the cheap Phase 1 handle enumeration
-        // (`page_image_handles`, content-stream/CTM walk only) instead of
-        // `extract_images`, which fully decodes pixel data. `handle.bbox` and
-        // `handle.filter_chain` carry everything this loop needs -- bbox is
-        // computed during the same Phase 1 walk `decode()` would later reuse
-        // unchanged, and DCTDecode/CCITTFaxDecode presence in `filter_chain`
-        // reproduces `ImageData::Jpeg` vs `ccitt_params().is_some()` exactly,
-        // since those are the same filter checks `extract_image_from_xobject`
-        // uses to pick a decode branch. The embedded-image extraction pass
-        // (`pdf/native/images.rs` in the `xberg` crate) is the only remaining
-        // caller that actually needs decoded pixels for these images (GH#1732). ~keep
-        //
-        // `extract_images` also dropped anything under `ImageExtractFilter::default()`'s
-        // 8 x 8 px floor, and scan detection relied on that: a 1 x 1 px image stretched
-        // full-bleed is a background fill, not a raster scan, and counting its bbox would
-        // send a born-digital slide with one headline to OCR. Keep the same floor here. ~keep
+    fn classify_page_images(
+        &self,
+        page: usize,
+        (px0, py0, px1, py1): (f32, f32, f32, f32),
+        page_area: f32,
+    ) -> (f32, ImageCodecClass, usize) {
+        // Uses the cheap Phase 1 handle enumeration (`page_image_handles`) instead of
+        // `extract_images`, which fully decodes pixel data; `handle.bbox`/`filter_chain`
+        // give this loop everything it needs without that cost (GH#1732 is the only
+        // caller needing decoded pixels). Keeps `extract_images`'s 8x8 px size floor:
+        // a 1x1 background-fill image stretched full-bleed would otherwise mis-route a
+        // born-digital slide to OCR. ~keep
         let images = self.page_image_handles(page).unwrap_or_default();
         let size_floor = ImageExtractFilter::default();
         let mut img_area = 0.0f32;
@@ -764,7 +760,10 @@ impl PdfDocument {
             };
         }
         let image_area_ratio = (img_area / page_area).clamp(0.0, 1.0);
+        (image_area_ratio, codec, images.len())
+    }
 
+    fn compute_invisible_text_ratio(&self, page: usize) -> f32 {
         let mut invisible = 0usize;
         let mut glyph_bytes = 0usize;
         if let Ok(data) = self.get_page_content_data(page)
@@ -804,70 +803,89 @@ impl PdfDocument {
                 }
             }
         }
-        let invisible_text_ratio = if glyph_bytes == 0 {
+        if glyph_bytes == 0 {
             0.0
         } else {
             invisible as f32 / glyph_bytes as f32
-        };
+        }
+    }
 
+    fn classify_producer_prior(&self) -> ProducerPrior {
+        let p = format!(
+            "{} {}",
+            self.document_producer().unwrap_or_default(),
+            self.document_creator().unwrap_or_default()
+        )
+        .to_lowercase();
+        const SCAN: &[&str] = &[
+            "scan",
+            "abbyy",
+            "tesseract",
+            "scansnap",
+            "finereader",
+            "ocr",
+            "lens",
+            "camscanner",
+            "kofax",
+        ];
+        const AUTH: &[&str] = &[
+            "word",
+            "libreoffice",
+            "latex",
+            "pdftex",
+            "chromium",
+            "skia",
+            "quartz",
+            "wkhtmltopdf",
+            // All three names are kept: "pdf_oxide" (upstream), "xberg-pdf-oxide" (the
+            // fork), "xberg-native-pdf" (since vendoring) all still appear in real
+            // files; dropping the older two would misclassify real documents as
+            // scanned. ~keep
+            "pdf_oxide",
+            "xberg-pdf-oxide",
+            "xberg-native-pdf",
+            "reportlab",
+            "prince",
+            "weasyprint",
+            "powerpoint",
+            "excel",
+            "indesign",
+        ];
+        if SCAN.iter().any(|k| p.contains(k)) {
+            ProducerPrior::Scanner
+        } else if AUTH.iter().any(|k| p.contains(k)) {
+            ProducerPrior::Authoring
+        } else {
+            ProducerPrior::Unknown
+        }
+    }
+
+    /// Gather per-page classification signals from xberg-native-pdf
+    /// **internals** (00-common-foundation §9 — never the flattened
+    /// output string). Returns the signals plus the enriched T0.5
+    /// quality-gate verdict (research §3a) computed from the *same*
+    /// single span extraction (no double work). Pure inspection.
+    fn gather_page_signals(&self, page: usize) -> Result<(PageSignals, Option<ReasonCode>)> {
+        let (llx, lly, urx, ury) = self.get_page_media_box(page)?;
+        let rot = self.get_page_rotation(page).unwrap_or(0);
+        let (mut pw, mut ph) = ((urx - llx).abs(), (ury - lly).abs());
+        if rot % 180 != 0 {
+            std::mem::swap(&mut pw, &mut ph);
+        }
+        let page_area = (pw * ph).max(1.0);
+        let bbox = (llx.min(urx), lly.min(ury), llx.max(urx), lly.max(ury));
+
+        let (glyphs, text_area_ratio, garbled_ratio, fragmented_word_ratio, consecutive_repeat_ratio, word_text) =
+            self.accumulate_text_signals(page, bbox, page_area);
+        let (image_area_ratio, codec, images_len) = self.classify_page_images(page, bbox, page_area);
+        let invisible_text_ratio = self.compute_invisible_text_ratio(page);
         let path_count = self.extract_paths(page).map(|p| p.len()).unwrap_or(0);
         let vector_path_density = {
-            let denom = (path_count + glyphs + images.len()).max(1) as f32;
+            let denom = (path_count + glyphs + images_len).max(1) as f32;
             (path_count as f32 / denom).clamp(0.0, 1.0)
         };
-
         let has_reliable_structure = self.mark_info().map(|m| m.is_structure_reliable()).unwrap_or(false);
-        let producer_prior = {
-            let p = format!(
-                "{} {}",
-                self.document_producer().unwrap_or_default(),
-                self.document_creator().unwrap_or_default()
-            )
-            .to_lowercase();
-            const SCAN: &[&str] = &[
-                "scan",
-                "abbyy",
-                "tesseract",
-                "scansnap",
-                "finereader",
-                "ocr",
-                "lens",
-                "camscanner",
-                "kofax",
-            ];
-            const AUTH: &[&str] = &[
-                "word",
-                "libreoffice",
-                "latex",
-                "pdftex",
-                "chromium",
-                "skia",
-                "quartz",
-                "wkhtmltopdf",
-                // All three producer strings are listed because a `/Producer` value names
-                // whichever lineage wrote the file: "pdf_oxide" for PDFs written by upstream
-                // pdf_oxide, "xberg-pdf-oxide" for the standalone fork, "xberg-native-pdf"
-                // since vendoring. The two older names are NOT dead -- PDFs carrying them
-                // already exist and keep arriving, so dropping either would reclassify real
-                // documents as scanned. All are trusted authoring tools. ~keep
-                "pdf_oxide",
-                "xberg-pdf-oxide",
-                "xberg-native-pdf",
-                "reportlab",
-                "prince",
-                "weasyprint",
-                "powerpoint",
-                "excel",
-                "indesign",
-            ];
-            if SCAN.iter().any(|k| p.contains(k)) {
-                ProducerPrior::Scanner
-            } else if AUTH.iter().any(|k| p.contains(k)) {
-                ProducerPrior::Authoring
-            } else {
-                ProducerPrior::Unknown
-            }
-        };
+        let producer_prior = self.classify_producer_prior();
         let page_is_empty = glyphs == 0 && image_area_ratio < 0.01 && path_count == 0;
 
         let signals = PageSignals {

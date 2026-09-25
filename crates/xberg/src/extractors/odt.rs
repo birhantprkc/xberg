@@ -538,7 +538,15 @@ fn handle_odt_frame(
 
         if let Some((data, format)) = extracted {
             let (image_kind, kind_confidence) =
-                crate::extraction::image_kind::classify(&data, &format, None, None, None, None, false);
+                crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                    bytes: &data,
+                    format: &format,
+                    width: None,
+                    height: None,
+                    colorspace: None,
+                    bits_per_component: None,
+                    is_mask: false,
+                });
 
             let image = ExtractedImage {
                 data: Bytes::from(data),

@@ -46,7 +46,15 @@ pub(crate) fn decode_data_uri_image(uri: &str, index: u32) -> Option<ExtractedIm
     let decoded = base64::engine::general_purpose::STANDARD.decode(&cleaned).ok()?;
 
     let (image_kind, kind_confidence) =
-        crate::extraction::image_kind::classify(&decoded, format, None, None, None, None, false);
+        crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+            bytes: &decoded,
+            format,
+            width: None,
+            height: None,
+            colorspace: None,
+            bits_per_component: None,
+            is_mask: false,
+        });
 
     Some(ExtractedImage {
         data: Bytes::from(decoded),

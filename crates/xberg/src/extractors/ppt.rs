@@ -67,6 +67,99 @@ fn leading_lines_matching(body: &str, title: &str) -> usize {
     0
 }
 
+/// Run the blocking PPT/OLE extraction, offloading to `spawn_blocking` under batch mode
+/// (tokio-runtime feature) so it does not block the async runtime; otherwise runs inline.
+async fn run_ppt_extraction(
+    content: &[u8],
+    config: &ExtractionConfig,
+    include_master_slides: bool,
+    extract_images: bool,
+) -> Result<crate::extraction::ppt::PptExtractionResult> {
+    #[cfg(feature = "tokio-runtime")]
+    if crate::core::batch_mode::is_batch_mode() {
+        if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
+            return Err(crate::error::XbergError::Cancelled);
+        }
+        let content_owned = content.to_vec();
+        let span = tracing::Span::current();
+        return tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
+            let _guard = span.entered();
+            crate::extraction::ppt::extract_ppt_text_with_options(&content_owned, include_master_slides, extract_images)
+        })
+        .await
+        .map_err(|e| crate::error::XbergError::parsing(format!("PPT extraction task failed: {e}")))?;
+    } else {
+        return crate::extraction::ppt::extract_ppt_text_with_options(content, include_master_slides, extract_images);
+    }
+
+    #[cfg(not(feature = "tokio-runtime"))]
+    {
+        if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
+            return Err(crate::error::XbergError::Cancelled);
+        }
+        crate::extraction::ppt::extract_ppt_text_with_options(content, include_master_slides, extract_images)
+    }
+}
+
+/// Build the `metadata.additional` map for `slide_count`, `extraction_method`, and
+/// `speaker_notes` (when present).
+fn build_ppt_metadata_map(
+    slide_count: usize,
+    speaker_notes: &[String],
+) -> AHashMap<Cow<'static, str>, serde_json::Value> {
+    let mut metadata_map = AHashMap::new();
+
+    metadata_map.insert(
+        Cow::Borrowed("slide_count"),
+        serde_json::Value::Number(slide_count.into()),
+    );
+    metadata_map.insert(
+        Cow::Borrowed("extraction_method"),
+        serde_json::Value::String("native_ole".to_string()),
+    );
+
+    if !speaker_notes.is_empty() {
+        metadata_map.insert(
+            Cow::Borrowed("speaker_notes"),
+            serde_json::Value::Array(
+                speaker_notes
+                    .iter()
+                    .map(|n| serde_json::Value::String(n.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    metadata_map
+}
+
+/// Build the deck's `PageStructure` (one `PageInfo` per slide), or `None` when there are no
+/// slides.
+fn build_ppt_page_structure(slide_count: usize) -> Option<PageStructure> {
+    if slide_count == 0 {
+        return None;
+    }
+    Some(PageStructure {
+        total_count: slide_count as u32,
+        unit_type: PageUnitType::Slide,
+        boundaries: None,
+        pages: Some(
+            (1..=slide_count)
+                .map(|num| PageInfo {
+                    number: num as u32,
+                    title: None,
+                    dimensions: None,
+                    image_count: None,
+                    table_count: None,
+                    hidden: None,
+                    is_blank: None,
+                    has_vector_graphics: false,
+                })
+                .collect(),
+        ),
+    })
+}
+
 impl PptExtractor {
     /// Recursively extract the deck's embedded OLE objects into `children` (GH#1660),
     /// mirroring `extraction::ooxml_embedded::extract_ooxml_embedded_objects`: one
@@ -154,57 +247,7 @@ impl PptExtractor {
         let mut builder = InternalDocumentBuilder::new("ppt");
 
         for slide in slides.iter() {
-            let trimmed = slide.text.trim();
-            // The file's own outline title (#1635) wins when it states one; the first-line
-            // guess below is the fallback for a deck whose title is drawn on the canvas and
-            // never entered in the outline view, which has no outline title to read at all.
-            let (title, header_lines): (Option<String>, usize) = match slide.title.as_deref() {
-                Some(file_title) => {
-                    let joined = join_title_paragraphs(file_title);
-                    let matched = leading_lines_matching(trimmed, &joined);
-                    (Some(joined), matched)
-                }
-                None => {
-                    let mut lines = trimmed.lines();
-                    let first_line = lines.next().unwrap_or("");
-                    if !first_line.is_empty() && first_line.len() <= 80 && lines.clone().next().is_some() {
-                        (Some(first_line.to_string()), 1)
-                    } else {
-                        (None, 0)
-                    }
-                }
-            };
-            builder.push_slide(slide.number, title.as_deref(), None);
-
-            if !trimmed.is_empty() {
-                if title.is_some() && header_lines > 0 {
-                    // Skip the lines the title already accounts for -- whether the outline
-                    // merge prepended them or the drawing already carried them -- so the
-                    // title text is never also emitted as a body paragraph.
-                    for line in trimmed.lines().skip(header_lines) {
-                        let lt = line.trim();
-                        if !lt.is_empty() {
-                            builder.push_paragraph(lt, vec![], None, None);
-                        }
-                    }
-                } else {
-                    builder.push_paragraph(trimmed, vec![], None, None);
-                }
-            }
-
-            // Inside the slide loop, so an image node sits on the slide that displays it
-            // rather than behind the last one -- which is what made a picture-only slide
-            // read as an empty slide (#1620). ~keep
-            for image in images.iter().filter(|image| image.page_number == Some(slide.number)) {
-                builder.push_image(None, image.clone(), image.page_number, None);
-            }
-
-            if let Some(notes) = slide.notes.as_deref()
-                && !notes.is_empty()
-            {
-                let key = format!("slide-{}-notes", slide.number);
-                builder.push_footnote_definition(notes, &key, None);
-            }
+            push_deck_slide(&mut builder, slide, images);
         }
 
         // A blip no live shape referenced resolves to no slide (#1620); it is still
@@ -214,6 +257,76 @@ impl PptExtractor {
         }
 
         builder.build()
+    }
+}
+
+/// Resolve a slide's title and how many of its (already-trimmed) body's leading lines that
+/// title accounts for, given the file's own outline title, if any.
+fn resolve_slide_title(file_title: Option<&str>, trimmed: &str) -> (Option<String>, usize) {
+    match file_title {
+        Some(file_title) => {
+            let joined = join_title_paragraphs(file_title);
+            let matched = leading_lines_matching(trimmed, &joined);
+            (Some(joined), matched)
+        }
+        None => {
+            let mut lines = trimmed.lines();
+            let first_line = lines.next().unwrap_or("");
+            if !first_line.is_empty() && first_line.len() <= 80 && lines.clone().next().is_some() {
+                (Some(first_line.to_string()), 1)
+            } else {
+                (None, 0)
+            }
+        }
+    }
+}
+
+/// Push a slide's body as one or more paragraphs, skipping the leading lines the title
+/// already accounts for.
+fn push_slide_body(builder: &mut InternalDocumentBuilder, trimmed: &str, title: &Option<String>, header_lines: usize) {
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if title.is_some() && header_lines > 0 {
+        // Skip the lines the title already accounts for -- whether the outline
+        // merge prepended them or the drawing already carried them -- so the
+        // title text is never also emitted as a body paragraph.
+        for line in trimmed.lines().skip(header_lines) {
+            let lt = line.trim();
+            if !lt.is_empty() {
+                builder.push_paragraph(lt, vec![], None, None);
+            }
+        }
+        return;
+    }
+
+    builder.push_paragraph(trimmed, vec![], None, None);
+}
+
+/// Push one slide's title, body, images, and speaker notes onto `builder`.
+fn push_deck_slide(builder: &mut InternalDocumentBuilder, slide: &PptSlideText, images: &[ExtractedImage]) {
+    let trimmed = slide.text.trim();
+    // The file's own outline title (#1635) wins when it states one; the first-line
+    // guess below is the fallback for a deck whose title is drawn on the canvas and
+    // never entered in the outline view, which has no outline title to read at all.
+    let (title, header_lines) = resolve_slide_title(slide.title.as_deref(), trimmed);
+    builder.push_slide(slide.number, title.as_deref(), None);
+
+    push_slide_body(builder, trimmed, &title, header_lines);
+
+    // Inside the slide loop, so an image node sits on the slide that displays it
+    // rather than behind the last one -- which is what made a picture-only slide
+    // read as an empty slide (#1620). ~keep
+    for image in images.iter().filter(|image| image.page_number == Some(slide.number)) {
+        builder.push_image(None, image.clone(), image.page_number, None);
+    }
+
+    if let Some(notes) = slide.notes.as_deref()
+        && !notes.is_empty()
+    {
+        let key = format!("slide-{}-notes", slide.number);
+        builder.push_footnote_definition(notes, &key, None);
     }
 }
 
@@ -255,38 +368,7 @@ impl InternalDocumentExtractor for PptExtractor {
         let include_master_slides = config.content_filter.as_ref().is_some_and(|f| f.include_headers);
         let extract_images = config.needs_image_data();
 
-        let result = {
-            #[cfg(feature = "tokio-runtime")]
-            if crate::core::batch_mode::is_batch_mode() {
-                if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
-                    return Err(crate::error::XbergError::Cancelled);
-                }
-                let content_owned = content.to_vec();
-                let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
-                    let _guard = span.entered();
-                    crate::extraction::ppt::extract_ppt_text_with_options(
-                        &content_owned,
-                        include_master_slides,
-                        extract_images,
-                    )
-                })
-                .await
-                .map_err(|e| crate::error::XbergError::parsing(format!("PPT extraction task failed: {e}")))?
-            } else {
-                crate::extraction::ppt::extract_ppt_text_with_options(content, include_master_slides, extract_images)
-            }
-
-            #[cfg(not(feature = "tokio-runtime"))]
-            {
-                if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
-                    return Err(crate::error::XbergError::Cancelled);
-                }
-                crate::extraction::ppt::extract_ppt_text_with_options(content, include_master_slides, extract_images)
-            }
-        }?;
-
-        let mut metadata_map = AHashMap::new();
+        let result = run_ppt_extraction(content, config, include_master_slides, extract_images).await?;
 
         let meta_title = result.metadata.title;
         let meta_subject = result.metadata.subject;
@@ -299,51 +381,8 @@ impl InternalDocumentExtractor for PptExtractor {
 
         let meta_modified_by = result.metadata.last_author;
 
-        metadata_map.insert(
-            Cow::Borrowed("slide_count"),
-            serde_json::Value::Number(result.slide_count.into()),
-        );
-        metadata_map.insert(
-            Cow::Borrowed("extraction_method"),
-            serde_json::Value::String("native_ole".to_string()),
-        );
-
-        if !result.speaker_notes.is_empty() {
-            metadata_map.insert(
-                Cow::Borrowed("speaker_notes"),
-                serde_json::Value::Array(
-                    result
-                        .speaker_notes
-                        .iter()
-                        .map(|n| serde_json::Value::String(n.clone()))
-                        .collect(),
-                ),
-            );
-        }
-
-        let page_structure = if result.slide_count > 0 {
-            Some(PageStructure {
-                total_count: result.slide_count as u32,
-                unit_type: PageUnitType::Slide,
-                boundaries: None,
-                pages: Some(
-                    (1..=result.slide_count)
-                        .map(|num| PageInfo {
-                            number: num as u32,
-                            title: None,
-                            dimensions: None,
-                            image_count: None,
-                            table_count: None,
-                            hidden: None,
-                            is_blank: None,
-                            has_vector_graphics: false,
-                        })
-                        .collect(),
-                ),
-            })
-        } else {
-            None
-        };
+        let metadata_map = build_ppt_metadata_map(result.slide_count, &result.speaker_notes);
+        let page_structure = build_ppt_page_structure(result.slide_count);
 
         let mut doc = Self::build_internal_document(&result.slides, &result.images);
         doc.mime_type = mime_type.to_string();

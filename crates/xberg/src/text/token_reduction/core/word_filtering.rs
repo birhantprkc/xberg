@@ -31,12 +31,34 @@ impl WordFilter {
             return text.to_string();
         }
 
+        let (word_freq, avg_length) = Self::compute_word_frequency_and_average_length(&words);
+        let original_count = words.len();
+        let has_cjk_content = text.chars().any(|c| c as u32 >= 0x4E00 && (c as u32) <= 0x9FFF);
+
+        let filtered_words = self.filter_words_by_frequency(&words, &word_freq, avg_length);
+
+        let fallback_threshold = if has_cjk_content {
+            original_count / 5
+        } else {
+            original_count / 3
+        };
+
+        if filtered_words.len() < fallback_threshold {
+            let fallback_words = self.fallback_filter_words(&words);
+            self.smart_join(&fallback_words, has_cjk_content)
+        } else {
+            self.smart_join(&filtered_words, has_cjk_content)
+        }
+    }
+
+    /// Builds the lowercased-clean-word frequency map and the average clean-word length
+    /// across `words`, in a single pass.
+    fn compute_word_frequency_and_average_length(words: &[String]) -> (AHashMap<String, i32>, f32) {
         let estimated_unique = (words.len() as f32 * 0.7).ceil() as usize;
         let mut word_freq = AHashMap::with_capacity(estimated_unique);
-
         let mut word_lengths = Vec::with_capacity(words.len());
 
-        for word in &words {
+        for word in words {
             let clean_word = if word.chars().all(|c| c.is_alphabetic()) {
                 word.to_lowercase()
             } else {
@@ -58,11 +80,19 @@ impl WordFilter {
             5.0
         };
 
-        let original_count = words.len();
-        let has_cjk_content = text.chars().any(|c| c as u32 >= 0x4E00 && (c as u32) <= 0x9FFF);
+        (word_freq, avg_length)
+    }
 
+    /// Keeps a word when it is important (and preservation is enabled), infrequent and at
+    /// least 80% of the average length, or at least 150% of the average length.
+    fn filter_words_by_frequency(
+        &self,
+        words: &[String],
+        word_freq: &AHashMap<String, i32>,
+        avg_length: f32,
+    ) -> Vec<String> {
         let mut filtered_words = Vec::with_capacity(words.len());
-        for word in &words {
+        for word in words {
             let clean_word = if word.chars().all(|c| c.is_alphabetic()) {
                 word.to_lowercase()
             } else {
@@ -86,33 +116,29 @@ impl WordFilter {
                 }
             }
         }
+        filtered_words
+    }
 
-        let fallback_threshold = if has_cjk_content {
-            original_count / 5
-        } else {
-            original_count / 3
-        };
+    /// Looser fallback filter used when [`Self::filter_words_by_frequency`] drops too much
+    /// of the text: keeps any word at least 3 characters long, plus important words when
+    /// preservation is enabled.
+    fn fallback_filter_words(&self, words: &[String]) -> Vec<String> {
+        let mut fallback_words = Vec::with_capacity(words.len());
+        for word in words {
+            let clean_word = if word.chars().all(|c| c.is_alphabetic()) {
+                word.to_lowercase()
+            } else {
+                word.chars().filter(|c| c.is_alphabetic()).collect::<String>()
+            };
 
-        if filtered_words.len() < fallback_threshold {
-            let mut fallback_words = Vec::with_capacity(words.len());
-            for word in &words {
-                let clean_word = if word.chars().all(|c| c.is_alphabetic()) {
-                    word.to_lowercase()
-                } else {
-                    word.chars().filter(|c| c.is_alphabetic()).collect::<String>()
-                };
-
-                if clean_word.is_empty()
-                    || clean_word.chars().count() >= 3
-                    || (self.preserve_important_words && TextAnalyzer::has_important_characteristics(word))
-                {
-                    fallback_words.push(word.clone());
-                }
+            if clean_word.is_empty()
+                || clean_word.chars().count() >= 3
+                || (self.preserve_important_words && TextAnalyzer::has_important_characteristics(word))
+            {
+                fallback_words.push(word.clone());
             }
-            self.smart_join(&fallback_words, has_cjk_content)
-        } else {
-            self.smart_join(&filtered_words, has_cjk_content)
         }
+        fallback_words
     }
 
     /// Smart joins tokens based on language type (CJK vs. other).

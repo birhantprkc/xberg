@@ -79,7 +79,39 @@ pub(crate) fn extract_frontmatter_with_warning(
 
     let rest = &content[3..];
 
-    let mut end_pos = None;
+    let Some(end) = find_frontmatter_delimiter_end(rest) else {
+        return (
+            None,
+            content.to_string(),
+            Some(crate::core::diagnostics::warning(
+                FRONTMATTER_WARNING_SOURCE,
+                "frontmatter opening delimiter (`---`) found but no matching closing delimiter; treating the \
+                 entire document as plain content"
+                    .to_string(),
+            )),
+        );
+    };
+
+    let frontmatter_str = &rest[..end];
+    let remaining = frontmatter_remaining_content(rest, end);
+
+    match serde_yaml_ng::from_str::<YamlValue>(frontmatter_str) {
+        Ok(value) => (Some(value), remaining.to_string(), None),
+        Err(err) => (
+            None,
+            content.to_string(),
+            Some(crate::core::diagnostics::warning(
+                FRONTMATTER_WARNING_SOURCE,
+                format!("frontmatter delimiters found but the YAML between them failed to parse: {err}"),
+            )),
+        ),
+    }
+}
+
+/// Find the byte offset (relative to `rest`, the content after the opening `---`) of the
+/// end of the frontmatter body -- i.e. the position right before the closing `---`/`...`
+/// delimiter line. Returns `None` if no closing delimiter is found.
+fn find_frontmatter_delimiter_end(rest: &str) -> Option<usize> {
     let mut search_start = 0;
 
     while let Some(pos) = rest[search_start..].find('\n') {
@@ -94,56 +126,35 @@ pub(crate) fn extract_frontmatter_with_warning(
         if remaining.starts_with("---") || remaining.starts_with("...") {
             let delimiter_end = after_newline + 3;
             if delimiter_end >= rest.len() || rest.as_bytes()[delimiter_end] == b'\n' {
-                end_pos = Some(absolute_pos);
-                break;
+                return Some(absolute_pos);
             }
         }
 
         search_start = after_newline;
     }
 
-    if let Some(end) = end_pos {
-        let frontmatter_str = &rest[..end];
-        let after_delimiter = end + 1;
-        let remaining_start = if after_delimiter + 3 < rest.len() {
-            let after_delim = after_delimiter + 3;
-            if after_delim < rest.len() && rest.as_bytes()[after_delim] == b'\n' {
-                after_delim + 1
-            } else {
-                after_delim
-            }
-        } else {
-            rest.len()
-        };
+    None
+}
 
-        let remaining = if remaining_start < rest.len() {
-            &rest[remaining_start..]
+/// Compute the remaining content of `rest` after the closing delimiter line that ends at
+/// byte offset `end`.
+fn frontmatter_remaining_content(rest: &str, end: usize) -> &str {
+    let after_delimiter = end + 1;
+    let remaining_start = if after_delimiter + 3 < rest.len() {
+        let after_delim = after_delimiter + 3;
+        if after_delim < rest.len() && rest.as_bytes()[after_delim] == b'\n' {
+            after_delim + 1
         } else {
-            ""
-        };
-
-        match serde_yaml_ng::from_str::<YamlValue>(frontmatter_str) {
-            Ok(value) => (Some(value), remaining.to_string(), None),
-            Err(err) => (
-                None,
-                content.to_string(),
-                Some(crate::core::diagnostics::warning(
-                    FRONTMATTER_WARNING_SOURCE,
-                    format!("frontmatter delimiters found but the YAML between them failed to parse: {err}"),
-                )),
-            ),
+            after_delim
         }
     } else {
-        (
-            None,
-            content.to_string(),
-            Some(crate::core::diagnostics::warning(
-                FRONTMATTER_WARNING_SOURCE,
-                "frontmatter opening delimiter (`---`) found but no matching closing delimiter; treating the \
-                 entire document as plain content"
-                    .to_string(),
-            )),
-        )
+        rest.len()
+    };
+
+    if remaining_start < rest.len() {
+        &rest[remaining_start..]
+    } else {
+        ""
     }
 }
 
@@ -237,18 +248,34 @@ fn toml_value_to_yaml(value: &toml::Value) -> YamlValue {
 pub(crate) fn extract_metadata_from_yaml(yaml: &YamlValue) -> Metadata {
     let mut metadata = Metadata::default();
 
+    apply_title_field(yaml, &mut metadata);
+    apply_author_fields(yaml, &mut metadata);
+    apply_date_field(yaml, &mut metadata);
+    apply_keywords_field(yaml, &mut metadata);
+    apply_description_fields(yaml, &mut metadata);
+    apply_tags_field(yaml, &mut metadata);
+    apply_language_field(yaml, &mut metadata);
+    apply_version_field(yaml, &mut metadata);
+    preserve_unknown_frontmatter_keys(yaml, &mut metadata);
+
+    metadata
+}
+
+fn apply_title_field(yaml: &YamlValue, metadata: &mut Metadata) {
     if let Some(title) = yaml.get("title").and_then(|v| v.as_str())
         && metadata.title.is_none()
     {
         metadata.title = Some(title.to_string());
     }
+}
 
-    // `author` may be a scalar ("Jane Doe") or a sequence (["Jane Doe", "John Roe"]);
-    // the plural Hugo/Jekyll `authors` key is the same shape. `Metadata::authors` is the
-    // typed home for all three. Decision: if both `author` and `authors` are present,
-    // `authors` wins for `Metadata::authors` (it is the more specific, list-oriented key),
-    // while `Metadata::created_by` is still populated from a scalar `author` regardless,
-    // preserving the pre-existing single-author behavior. ~keep
+/// `author` may be a scalar ("Jane Doe") or a sequence (["Jane Doe", "John Roe"]);
+/// the plural Hugo/Jekyll `authors` key is the same shape. `Metadata::authors` is the
+/// typed home for all three. Decision: if both `author` and `authors` are present,
+/// `authors` wins for `Metadata::authors` (it is the more specific, list-oriented key),
+/// while `Metadata::created_by` is still populated from a scalar `author` regardless,
+/// preserving the pre-existing single-author behavior. ~keep
+fn apply_author_fields(yaml: &YamlValue, metadata: &mut Metadata) {
     if let Some(author_value) = yaml.get("author") {
         if let Some(author) = author_value.as_str()
             && metadata.created_by.is_none()
@@ -265,26 +292,33 @@ pub(crate) fn extract_metadata_from_yaml(yaml: &YamlValue) -> Metadata {
     {
         metadata.authors = Some(authors);
     }
+}
 
+fn apply_date_field(yaml: &YamlValue, metadata: &mut Metadata) {
     if let Some(date) = yaml.get("date").and_then(|v| v.as_str()) {
         metadata.created_at = Some(date.to_string());
     }
+}
 
-    if let Some(keywords) = yaml.get("keywords") {
-        match keywords {
-            YamlValue::String(s) if metadata.keywords.is_none() => {
-                metadata.keywords = Some(s.split(',').map(|k| k.trim().to_string()).collect());
-            }
-            YamlValue::Sequence(seq) => {
-                let kw_vec: Vec<String> = seq.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
-                if metadata.keywords.is_none() {
-                    metadata.keywords = Some(kw_vec);
-                }
-            }
-            _ => {}
+fn apply_keywords_field(yaml: &YamlValue, metadata: &mut Metadata) {
+    let Some(keywords) = yaml.get("keywords") else {
+        return;
+    };
+    match keywords {
+        YamlValue::String(s) if metadata.keywords.is_none() => {
+            metadata.keywords = Some(s.split(',').map(|k| k.trim().to_string()).collect());
         }
+        YamlValue::Sequence(seq) => {
+            let kw_vec: Vec<String> = seq.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+            if metadata.keywords.is_none() {
+                metadata.keywords = Some(kw_vec);
+            }
+        }
+        _ => {}
     }
+}
 
+fn apply_description_fields(yaml: &YamlValue, metadata: &mut Metadata) {
     if let Some(description) = yaml.get("description").and_then(|v| v.as_str()) {
         metadata.subject = Some(description.to_string());
     }
@@ -300,47 +334,55 @@ pub(crate) fn extract_metadata_from_yaml(yaml: &YamlValue) -> Metadata {
     if let Some(category) = yaml.get("category").and_then(|v| v.as_str()) {
         metadata.category = Some(category.to_string());
     }
+}
 
-    if let Some(tags) = yaml.get("tags") {
-        match tags {
-            YamlValue::String(s) => {
-                metadata.tags = Some(s.split(',').map(|t| t.trim().to_string()).collect());
-            }
-            YamlValue::Sequence(seq) => {
-                let tags_vec: Vec<String> = seq.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
-                metadata.tags = Some(tags_vec);
-            }
-            _ => {}
+fn apply_tags_field(yaml: &YamlValue, metadata: &mut Metadata) {
+    let Some(tags) = yaml.get("tags") else {
+        return;
+    };
+    match tags {
+        YamlValue::String(s) => {
+            metadata.tags = Some(s.split(',').map(|t| t.trim().to_string()).collect());
         }
+        YamlValue::Sequence(seq) => {
+            let tags_vec: Vec<String> = seq.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect();
+            metadata.tags = Some(tags_vec);
+        }
+        _ => {}
     }
+}
 
+fn apply_language_field(yaml: &YamlValue, metadata: &mut Metadata) {
     if let Some(language) = yaml.get("language").and_then(|v| v.as_str())
         && metadata.language.is_none()
     {
         metadata.language = Some(language.to_string());
     }
+}
 
+fn apply_version_field(yaml: &YamlValue, metadata: &mut Metadata) {
     if let Some(version) = yaml.get("version").and_then(|v| v.as_str()) {
         metadata.document_version = Some(version.to_string());
     }
+}
 
-    // Preserve every top-level key without a typed field above (Hugo/Jekyll/Obsidian
-    // extras like `aliases`, `slug`, `series`, `weight`, `draft`, or arbitrary custom
-    // keys) instead of silently dropping them (xberg-io/xberg#154). YAML structure is
-    // kept faithfully — a sequence stays a `serde_json::Value::Array`, not a joined string.
-    if let YamlValue::Mapping(map) = yaml {
-        for (key, value) in map {
-            let Some(key_str) = key.as_str() else { continue };
-            if KNOWN_FRONTMATTER_KEYS.contains(&key_str) {
-                continue;
-            }
-            if let Ok(json_value) = serde_json::to_value(value) {
-                metadata.additional.insert(Cow::Owned(key_str.to_string()), json_value);
-            }
+/// Preserve every top-level key without a typed field above (Hugo/Jekyll/Obsidian
+/// extras like `aliases`, `slug`, `series`, `weight`, `draft`, or arbitrary custom
+/// keys) instead of silently dropping them (xberg-io/xberg#154). YAML structure is
+/// kept faithfully -- a sequence stays a `serde_json::Value::Array`, not a joined string.
+fn preserve_unknown_frontmatter_keys(yaml: &YamlValue, metadata: &mut Metadata) {
+    let YamlValue::Mapping(map) = yaml else {
+        return;
+    };
+    for (key, value) in map {
+        let Some(key_str) = key.as_str() else { continue };
+        if KNOWN_FRONTMATTER_KEYS.contains(&key_str) {
+            continue;
+        }
+        if let Ok(json_value) = serde_json::to_value(value) {
+            metadata.additional.insert(Cow::Owned(key_str.to_string()), json_value);
         }
     }
-
-    metadata
 }
 
 /// Convert a YAML scalar string or a sequence of strings into a `Vec<String>`.

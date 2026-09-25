@@ -356,13 +356,7 @@ pub(crate) fn register_default_extractors() -> Result<()> {
     let registry = get_document_extractor_registry();
     let mut registry = registry.write();
 
-    registry.register_internal(Arc::new(PlainTextExtractor::new()))?;
-    registry.register_internal(Arc::new(AsciiDocExtractor::new()))?;
-    registry.register_internal(Arc::new(WebVttExtractor::new()))?;
-    registry.register_internal(Arc::new(MarkdownExtractor::new()))?;
-    registry.register_internal(Arc::new(StructuredExtractor::new()))?;
-    registry.register_internal(Arc::new(CsvExtractor::new()))?;
-    registry.register_internal(Arc::new(DocTagsExtractor::new()))?;
+    register_baseline_extractors(&mut registry)?;
 
     #[cfg(feature = "sqlite")]
     registry.register_internal(Arc::new(SqliteExtractor::new()))?;
@@ -389,47 +383,10 @@ pub(crate) fn register_default_extractors() -> Result<()> {
     registry.register_internal(Arc::new(JupyterExtractor::new()))?;
 
     #[cfg(feature = "office")]
-    {
-        registry.register_internal(Arc::new(BibtexExtractor::new()))?;
-        registry.register_internal(Arc::new(CitationExtractor::new()))?;
-        registry.register_internal(Arc::new(EpubExtractor::new()))?;
-        registry.register_internal(Arc::new(FictionBookExtractor::new()))?;
-        registry.register_internal(Arc::new(RtfExtractor::new()))?;
-        registry.register_internal(Arc::new(RstExtractor::new()))?;
-        registry.register_internal(Arc::new(LatexExtractor::new()))?;
-        registry.register_internal(Arc::new(OrgModeExtractor::new()))?;
-        registry.register_internal(Arc::new(OpmlExtractor::new()))?;
-        registry.register_internal(Arc::new(TypstExtractor::new()))?;
-        registry.register_internal(Arc::new(DocExtractor::new()))?;
-        registry.register_internal(Arc::new(DocxExtractor::new()))?;
-        registry.register_internal(Arc::new(PptExtractor::new()))?;
-        registry.register_internal(Arc::new(PptxExtractor::new()))?;
-        registry.register_internal(Arc::new(OdtExtractor::new()))?;
-        registry.register_internal(Arc::new(OdpExtractor::new()))?;
-        registry.register_internal(Arc::new(DbfExtractor::new()))?;
-    }
+    register_office_extractors(&mut registry)?;
 
-    #[cfg(feature = "hwp")]
-    {
-        registry.register_internal(Arc::new(HwpExtractor::new()))?;
-    }
-
-    #[cfg(feature = "hwpx")]
-    {
-        registry.register_internal(Arc::new(HwpxExtractor::new()))?;
-    }
-
-    #[cfg(feature = "wordperfect")]
-    {
-        registry.register_internal(Arc::new(WordPerfectExtractor::new()))?;
-    }
-
-    #[cfg(feature = "iwork")]
-    {
-        registry.register_internal(Arc::new(PagesExtractor::new()))?;
-        registry.register_internal(Arc::new(NumbersExtractor::new()))?;
-        registry.register_internal(Arc::new(KeynoteExtractor::new()))?;
-    }
+    #[cfg(any(feature = "hwp", feature = "hwpx", feature = "wordperfect", feature = "iwork"))]
+    register_container_format_extractors(&mut registry)?;
 
     #[cfg(feature = "mdx")]
     registry.register_internal(Arc::new(MdxExtractor::new()))?;
@@ -460,9 +417,167 @@ pub(crate) fn register_default_extractors() -> Result<()> {
     Ok(())
 }
 
+/// Register the always-on extractors that ship regardless of feature flags.
+fn register_baseline_extractors(registry: &mut crate::plugins::registry::DocumentExtractorRegistry) -> Result<()> {
+    registry.register_internal(Arc::new(PlainTextExtractor::new()))?;
+    registry.register_internal(Arc::new(AsciiDocExtractor::new()))?;
+    registry.register_internal(Arc::new(WebVttExtractor::new()))?;
+    registry.register_internal(Arc::new(MarkdownExtractor::new()))?;
+    registry.register_internal(Arc::new(StructuredExtractor::new()))?;
+    registry.register_internal(Arc::new(CsvExtractor::new()))?;
+    registry.register_internal(Arc::new(DocTagsExtractor::new()))?;
+    Ok(())
+}
+
+#[cfg(feature = "office")]
+fn register_office_extractors(registry: &mut crate::plugins::registry::DocumentExtractorRegistry) -> Result<()> {
+    registry.register_internal(Arc::new(BibtexExtractor::new()))?;
+    registry.register_internal(Arc::new(CitationExtractor::new()))?;
+    registry.register_internal(Arc::new(EpubExtractor::new()))?;
+    registry.register_internal(Arc::new(FictionBookExtractor::new()))?;
+    registry.register_internal(Arc::new(RtfExtractor::new()))?;
+    registry.register_internal(Arc::new(RstExtractor::new()))?;
+    registry.register_internal(Arc::new(LatexExtractor::new()))?;
+    registry.register_internal(Arc::new(OrgModeExtractor::new()))?;
+    registry.register_internal(Arc::new(OpmlExtractor::new()))?;
+    registry.register_internal(Arc::new(TypstExtractor::new()))?;
+    registry.register_internal(Arc::new(DocExtractor::new()))?;
+    registry.register_internal(Arc::new(DocxExtractor::new()))?;
+    registry.register_internal(Arc::new(PptExtractor::new()))?;
+    registry.register_internal(Arc::new(PptxExtractor::new()))?;
+    registry.register_internal(Arc::new(OdtExtractor::new()))?;
+    registry.register_internal(Arc::new(OdpExtractor::new()))?;
+    registry.register_internal(Arc::new(DbfExtractor::new()))?;
+    Ok(())
+}
+
+#[cfg(any(feature = "hwp", feature = "hwpx", feature = "wordperfect", feature = "iwork"))]
+fn register_container_format_extractors(
+    registry: &mut crate::plugins::registry::DocumentExtractorRegistry,
+) -> Result<()> {
+    #[cfg(feature = "hwp")]
+    registry.register_internal(Arc::new(HwpExtractor::new()))?;
+
+    #[cfg(feature = "hwpx")]
+    registry.register_internal(Arc::new(HwpxExtractor::new()))?;
+
+    #[cfg(feature = "wordperfect")]
+    registry.register_internal(Arc::new(WordPerfectExtractor::new()))?;
+
+    #[cfg(feature = "iwork")]
+    {
+        registry.register_internal(Arc::new(PagesExtractor::new()))?;
+        registry.register_internal(Arc::new(NumbersExtractor::new()))?;
+        registry.register_internal(Arc::new(KeynoteExtractor::new()))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(unused_mut, unused_variables)]
+    fn assert_optional_format_extractors(extractor_names: &[String], expected_count: &mut usize) {
+        let mut assert_present = |name: &str| {
+            *expected_count += 1;
+            assert!(extractor_names.contains(&name.to_string()));
+        };
+
+        #[cfg(feature = "sqlite")]
+        assert_present("sqlite-extractor");
+
+        #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
+        assert_present("image-extractor");
+
+        #[cfg(feature = "xml")]
+        {
+            assert_present("xml-extractor");
+            assert_present("jats-extractor");
+            assert_present("docbook-extractor");
+        }
+
+        #[cfg(feature = "pdf")]
+        assert_present("pdf-extractor");
+
+        #[cfg(any(feature = "excel", feature = "excel-wasm"))]
+        assert_present("excel-extractor");
+
+        #[cfg(feature = "notebook")]
+        assert_present("jupyter-extractor");
+
+        #[cfg(feature = "mdx")]
+        assert_present("mdx-extractor");
+
+        #[cfg(feature = "html")]
+        assert_present("html-extractor");
+
+        #[cfg(feature = "tree-sitter")]
+        assert_present("code-extractor");
+
+        #[cfg(feature = "transcription")]
+        assert_present("transcription");
+    }
+
+    #[allow(unused_mut, unused_variables)]
+    fn assert_optional_container_extractors(extractor_names: &[String], expected_count: &mut usize) {
+        let mut assert_present = |name: &str| {
+            *expected_count += 1;
+            assert!(extractor_names.contains(&name.to_string()));
+        };
+
+        #[cfg(feature = "office")]
+        {
+            assert_present("bibtex-extractor");
+            assert_present("citation-extractor");
+            assert_present("epub-extractor");
+            assert_present("fictionbook-extractor");
+            assert_present("rtf-extractor");
+            assert_present("rst-extractor");
+            assert_present("latex-extractor");
+            assert_present("orgmode-extractor");
+            assert_present("opml-extractor");
+            assert_present("typst-extractor");
+            assert_present("dbf-extractor");
+            assert_present("doc-extractor");
+            assert_present("docx-extractor");
+            assert_present("ppt-extractor");
+            assert_present("pptx-extractor");
+            assert_present("odt-extractor");
+            assert_present("odp-extractor");
+        }
+
+        #[cfg(feature = "hwp")]
+        assert_present("hwp-extractor");
+
+        #[cfg(feature = "hwpx")]
+        assert_present("hwpx-extractor");
+
+        #[cfg(feature = "wordperfect")]
+        assert_present("wordperfect-extractor");
+
+        #[cfg(feature = "iwork")]
+        {
+            assert_present("iwork-pages-extractor");
+            assert_present("iwork-numbers-extractor");
+            assert_present("iwork-keynote-extractor");
+        }
+
+        #[cfg(feature = "email")]
+        {
+            assert_present("email-extractor");
+            assert_present("pst-extractor");
+        }
+
+        #[cfg(feature = "archives")]
+        {
+            assert_present("zip-extractor");
+            assert_present("tar-extractor");
+            assert_present("7z-extractor");
+            assert_present("gzip-extractor");
+        }
+    }
 
     #[test]
     fn test_register_default_extractors() {
@@ -477,7 +592,6 @@ mod tests {
         let reg = registry.read();
         let extractor_names = reg.list();
 
-        #[allow(unused_mut)]
         let mut expected_count = 8;
         assert!(extractor_names.contains(&"plain-text-extractor".to_string()));
         assert!(extractor_names.contains(&"asciidoc-extractor".to_string()));
@@ -488,131 +602,8 @@ mod tests {
         assert!(extractor_names.contains(&"csv-extractor".to_string()));
         assert!(extractor_names.contains(&"doctags-extractor".to_string()));
 
-        #[cfg(feature = "sqlite")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"sqlite-extractor".to_string()));
-        }
-
-        #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"image-extractor".to_string()));
-        }
-
-        #[cfg(feature = "xml")]
-        {
-            expected_count += 3;
-            assert!(extractor_names.contains(&"xml-extractor".to_string()));
-            assert!(extractor_names.contains(&"jats-extractor".to_string()));
-            assert!(extractor_names.contains(&"docbook-extractor".to_string()));
-        }
-
-        #[cfg(feature = "pdf")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"pdf-extractor".to_string()));
-        }
-
-        #[cfg(any(feature = "excel", feature = "excel-wasm"))]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"excel-extractor".to_string()));
-        }
-
-        #[cfg(feature = "notebook")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"jupyter-extractor".to_string()));
-        }
-
-        #[cfg(feature = "office")]
-        {
-            expected_count += 17;
-            assert!(extractor_names.contains(&"bibtex-extractor".to_string()));
-            assert!(extractor_names.contains(&"citation-extractor".to_string()));
-            assert!(extractor_names.contains(&"epub-extractor".to_string()));
-            assert!(extractor_names.contains(&"fictionbook-extractor".to_string()));
-            assert!(extractor_names.contains(&"rtf-extractor".to_string()));
-            assert!(extractor_names.contains(&"rst-extractor".to_string()));
-            assert!(extractor_names.contains(&"latex-extractor".to_string()));
-            assert!(extractor_names.contains(&"orgmode-extractor".to_string()));
-            assert!(extractor_names.contains(&"opml-extractor".to_string()));
-            assert!(extractor_names.contains(&"typst-extractor".to_string()));
-            assert!(extractor_names.contains(&"dbf-extractor".to_string()));
-            assert!(extractor_names.contains(&"doc-extractor".to_string()));
-            assert!(extractor_names.contains(&"docx-extractor".to_string()));
-            assert!(extractor_names.contains(&"ppt-extractor".to_string()));
-            assert!(extractor_names.contains(&"pptx-extractor".to_string()));
-            assert!(extractor_names.contains(&"odt-extractor".to_string()));
-            assert!(extractor_names.contains(&"odp-extractor".to_string()));
-        }
-
-        #[cfg(feature = "hwp")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"hwp-extractor".to_string()));
-        }
-
-        #[cfg(feature = "hwpx")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"hwpx-extractor".to_string()));
-        }
-
-        #[cfg(feature = "wordperfect")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"wordperfect-extractor".to_string()));
-        }
-
-        #[cfg(feature = "iwork")]
-        {
-            expected_count += 3;
-            assert!(extractor_names.contains(&"iwork-pages-extractor".to_string()));
-            assert!(extractor_names.contains(&"iwork-numbers-extractor".to_string()));
-            assert!(extractor_names.contains(&"iwork-keynote-extractor".to_string()));
-        }
-
-        #[cfg(feature = "mdx")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"mdx-extractor".to_string()));
-        }
-
-        #[cfg(feature = "email")]
-        {
-            expected_count += 2;
-            assert!(extractor_names.contains(&"email-extractor".to_string()));
-            assert!(extractor_names.contains(&"pst-extractor".to_string()));
-        }
-
-        #[cfg(feature = "html")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"html-extractor".to_string()));
-        }
-
-        #[cfg(feature = "tree-sitter")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"code-extractor".to_string()));
-        }
-
-        #[cfg(feature = "archives")]
-        {
-            expected_count += 4;
-            assert!(extractor_names.contains(&"zip-extractor".to_string()));
-            assert!(extractor_names.contains(&"tar-extractor".to_string()));
-            assert!(extractor_names.contains(&"7z-extractor".to_string()));
-            assert!(extractor_names.contains(&"gzip-extractor".to_string()));
-        }
-
-        #[cfg(feature = "transcription")]
-        {
-            expected_count += 1;
-            assert!(extractor_names.contains(&"transcription".to_string()));
-        }
+        assert_optional_format_extractors(&extractor_names, &mut expected_count);
+        assert_optional_container_extractors(&extractor_names, &mut expected_count);
 
         assert_eq!(
             extractor_names.len(),

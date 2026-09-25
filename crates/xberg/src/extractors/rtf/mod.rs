@@ -212,7 +212,15 @@ impl RtfExtractor {
 
         for (i, rtf_img) in rtf_images.into_iter().enumerate() {
             let (image_kind, kind_confidence) =
-                crate::extraction::image_kind::classify(&rtf_img.data, rtf_img.format, None, None, None, None, false);
+                crate::extraction::image_kind::classify(crate::extraction::image_kind::ImageClassifyInput {
+                    bytes: &rtf_img.data,
+                    format: rtf_img.format,
+                    width: None,
+                    height: None,
+                    colorspace: None,
+                    bits_per_component: None,
+                    is_mask: false,
+                });
 
             let image = ExtractedImage {
                 data: Bytes::from(rtf_img.data),

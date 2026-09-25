@@ -15,8 +15,107 @@ pub struct RtfImage {
 /// Parses the image type (`\jpegblip`, `\pngblip`, etc.), dimensions, and
 /// collects the hex-encoded image data that follows the control words.
 /// Returns the parsed image and a metadata string for text representation.
-pub(crate) fn extract_pict_image(chars: &mut std::iter::Peekable<std::str::Chars>) -> (String, Option<RtfImage>) {
+/// Skip a `\bin` payload of `count` SOURCE bytes.
+///
+/// `count` is a number of BYTES of the `\bin` payload, not a number of
+/// `char`s. Consuming `count` `chars.next()` calls OVER-consumes as
+/// soon as the payload holds any multi-byte character, running past
+/// the payload and swallowing the document text that follows it.
+///
+/// Charging each character its *source* byte width instead requires
+/// one correction: this stream comes from `String::from_utf8_lossy`
+/// (rtf/mod.rs), which rewrites each undecodable byte as U+FFFD — 3
+/// bytes encoded, but 1 byte in the file. A raw `\bin` payload is
+/// arbitrary binary, so it decodes almost entirely to U+FFFD;
+/// charging those 3 bytes each would stop after roughly a third of
+/// the payload and spill the remainder into the parser as RTF text.
+/// Charging them 1 byte is exact for the overwhelmingly common
+/// single-invalid-byte case.
+///
+/// Residual limitation: `from_utf8_lossy` emits one U+FFFD per
+/// maximal ill-formed subsequence, so a multi-byte truncated sequence
+/// also collapses to a single U+FFFD and is under-counted here. Only
+/// parsing `\bin` against the original bytes can be exact, and this
+/// parser is char-based throughout. ~keep
+fn consume_bin_payload(chars: &mut std::iter::Peekable<std::str::Chars>, count: usize) {
+    let mut consumed_bytes = 0usize;
+    while consumed_bytes < count {
+        match chars.next() {
+            Some(consumed_char) => {
+                consumed_bytes += if consumed_char == char::REPLACEMENT_CHARACTER {
+                    1
+                } else {
+                    consumed_char.len_utf8()
+                };
+            }
+            None => break,
+        }
+    }
+}
+
+/// Apply one `\pict`-group control word's effect on the in-progress image parse state.
+fn apply_pict_control_word(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    control_word: &str,
+    value: Option<i32>,
+    image_type: &mut Option<&'static str>,
+    format: &mut &'static str,
+    has_bin: &mut bool,
+) {
+    match control_word {
+        "jpegblip" => {
+            *image_type = Some("jpg");
+            *format = "jpeg";
+        }
+        "pngblip" => {
+            *image_type = Some("png");
+            *format = "png";
+        }
+        "wmetafile" => {
+            *image_type = Some("wmf");
+            *format = "wmf";
+        }
+        "dibitmap" => {
+            *image_type = Some("bmp");
+            *format = "bmp";
+        }
+        "picwgoal" | "pichgoal" => {}
+        "bin" => {
+            if let Some(count) = value {
+                let count = count.max(0) as usize;
+                consume_bin_payload(chars, count);
+                *has_bin = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the `image.<ext>` metadata string from the detected image type, defaulting to jpg.
+fn build_pict_metadata(image_type: Option<&str>) -> String {
     let mut metadata = String::new();
+    if let Some(itype) = image_type {
+        metadata.push_str("image.");
+        metadata.push_str(itype);
+    }
+    if metadata.is_empty() {
+        metadata.push_str("image.jpg");
+    }
+    metadata
+}
+
+/// Decode the collected hex digits into binary image data, if any were collected.
+fn decode_pict_image(hex_chars: &str, format: &'static str) -> Option<RtfImage> {
+    if hex_chars.is_empty() {
+        return None;
+    }
+    match hex::decode(hex_chars) {
+        Ok(data) if !data.is_empty() => Some(RtfImage { format, data }),
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_pict_image(chars: &mut std::iter::Peekable<std::str::Chars>) -> (String, Option<RtfImage>) {
     let mut image_type: Option<&str> = None;
     let mut format: &str = "jpeg";
     let mut depth = 0;
@@ -39,66 +138,14 @@ pub(crate) fn extract_pict_image(chars: &mut std::iter::Peekable<std::str::Chars
             '\\' => {
                 chars.next();
                 let (control_word, value) = parse_rtf_control_word(chars);
-
-                match control_word.as_str() {
-                    "jpegblip" => {
-                        image_type = Some("jpg");
-                        format = "jpeg";
-                    }
-                    "pngblip" => {
-                        image_type = Some("png");
-                        format = "png";
-                    }
-                    "wmetafile" => {
-                        image_type = Some("wmf");
-                        format = "wmf";
-                    }
-                    "dibitmap" => {
-                        image_type = Some("bmp");
-                        format = "bmp";
-                    }
-                    "picwgoal" | "pichgoal" => {}
-                    "bin" => {
-                        if let Some(count) = value {
-                            let count = count.max(0) as usize;
-                            // `count` is a number of BYTES of the `\bin` payload, not a number of
-                            // `char`s. Consuming `count` `chars.next()` calls OVER-consumes as
-                            // soon as the payload holds any multi-byte character, running past
-                            // the payload and swallowing the document text that follows it.
-                            //
-                            // Charging each character its *source* byte width instead requires
-                            // one correction: this stream comes from `String::from_utf8_lossy`
-                            // (rtf/mod.rs), which rewrites each undecodable byte as U+FFFD — 3
-                            // bytes encoded, but 1 byte in the file. A raw `\bin` payload is
-                            // arbitrary binary, so it decodes almost entirely to U+FFFD;
-                            // charging those 3 bytes each would stop after roughly a third of
-                            // the payload and spill the remainder into the parser as RTF text.
-                            // Charging them 1 byte is exact for the overwhelmingly common
-                            // single-invalid-byte case.
-                            //
-                            // Residual limitation: `from_utf8_lossy` emits one U+FFFD per
-                            // maximal ill-formed subsequence, so a multi-byte truncated sequence
-                            // also collapses to a single U+FFFD and is under-counted here. Only
-                            // parsing `\bin` against the original bytes can be exact, and this
-                            // parser is char-based throughout. ~keep
-                            let mut consumed_bytes = 0usize;
-                            while consumed_bytes < count {
-                                match chars.next() {
-                                    Some(consumed_char) => {
-                                        consumed_bytes += if consumed_char == char::REPLACEMENT_CHARACTER {
-                                            1
-                                        } else {
-                                            consumed_char.len_utf8()
-                                        };
-                                    }
-                                    None => break,
-                                }
-                            }
-                            _has_bin = true;
-                        }
-                    }
-                    _ => {}
-                }
+                apply_pict_control_word(
+                    chars,
+                    control_word.as_str(),
+                    value,
+                    &mut image_type,
+                    &mut format,
+                    &mut _has_bin,
+                );
             }
             ' ' | '\r' | '\n' => {
                 chars.next();
@@ -112,23 +159,8 @@ pub(crate) fn extract_pict_image(chars: &mut std::iter::Peekable<std::str::Chars
         }
     }
 
-    if let Some(itype) = image_type {
-        metadata.push_str("image.");
-        metadata.push_str(itype);
-    }
-
-    if metadata.is_empty() {
-        metadata.push_str("image.jpg");
-    }
-
-    let image = if !hex_chars.is_empty() {
-        match hex::decode(&hex_chars) {
-            Ok(data) if !data.is_empty() => Some(RtfImage { format, data }),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    let metadata = build_pict_metadata(image_type);
+    let image = decode_pict_image(&hex_chars, format);
 
     (metadata, image)
 }
