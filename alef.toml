@@ -600,10 +600,14 @@ traineddata = "traineddata"
 "tools/benchmark-harness/baselines/initial_baseline.json" = ["file-too-long"]
 "tools/benchmark-harness/guardrails.json" = ["file-too-long"]
 # --- quality-debt baseline (generated) ---
-# 576 size/complexity findings across 241 files that predate these
-# metrics. Listed per file rather than switching the rules off, so the metrics still
-# fire on every file NOT listed here -- new code stays covered, and each path below is
-# one discrete unit of work.
+# 540 size/complexity findings across 221 files that predate these metrics, listed per file
+# rather than switching the rules off, so the metrics still fire on every file NOT listed
+# here -- new code stays covered, and each path below is one discrete unit of work.
+#
+# These counts describe THIS BLOCK only. The tracked #1567 headline counts the same six
+# rules across the whole table including the ~keep sections outside this block, which is
+# currently 255 files / 659 attachments. Four different numbers have described this one
+# baseline at various times; prefer a fresh TOML parse over any of them. ~keep
 # TODO(xberg-io/xberg#1567): pay this down file by file and delete each entry as it goes green.
 # Do not add new paths here without a very good reason. ~keep
 ".github/workflows/benchmarks.yaml" = ["file-too-long"]
@@ -1134,11 +1138,8 @@ traineddata = "traineddata"
 "**/*_test.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/*_tests.rs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/test_*.py" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
-"**/*_test.py" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/conftest.py" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/*.test.ts" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
-"**/*.test.js" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
-"**/*.test.mjs" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/*.spec.ts" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/*.spec.js" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
 "**/*_test.go" = ["cyclomatic-complexity", "function-too-long", "nesting-too-deep", "too-many-parameters"]
@@ -1330,26 +1331,6 @@ traineddata = "traineddata"
   "SIM115",
   "T201",
 ]
-"tools/benchmark-harness/python_baselines/*.py" = [
-  "ANN001",
-  "ANN201",
-  "ANN202",
-  "ARG001",
-  "BLE001",
-  "C901",
-  "D103",
-  "G004",
-  "INP001",
-  "PERF401",
-  "PLC0415",
-  "PLR0911",
-  "PLR0912",
-  "PLR0915",
-  "PLW2901",
-  "PTH123",
-  "S607",
-  "T201",
-]
 "tools/benchmark-harness/scripts/*.py" = [
   "ANN001",
   "ANN201",
@@ -1390,7 +1371,6 @@ traineddata = "traineddata"
 ]
 "tools/perf/*.py" = ["D103", "T201"]
 "cli-proxy/pypi/**/*.py" = ["ANN001", "ANN202", "S310", "T201"]
-"packages/python/build.py" = ["INP001"]
 "tools/generate_test_fixtures/**/*.py" = [
   "D301",
   "ERA001",
@@ -1402,7 +1382,6 @@ traineddata = "traineddata"
   "T201",
   "TC003",
 ]
-"tools/benchmark-harness/scripts/*.php" = ["no-unescaped-output"]
 # alef-generated Python entrypoint; RET504 fires on the passthrough return alef
 # emits. Do not hand-fix generated code — suppress instead. Uses a distinct
 # glob from the builtin "**/api.py" default (same builtin key can't be
