@@ -23,7 +23,9 @@ use crate::extractors::ccitt_bilevel::{append_transition_row, transitions_to_byt
 pub struct CcittFaxDecoder;
 
 impl StreamDecoder for CcittFaxDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is ignored: this filter is a pass-through here, so
+    // output never exceeds input length. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         tracing::debug!(filter = "CCITTFaxDecode", bytes = input.len(), "pass-through");
         Ok(input.to_vec())
     }
@@ -638,7 +640,7 @@ mod tests {
     fn test_ccitt_decode_passthrough() {
         let decoder = CcittFaxDecoder;
         let ccitt_data = b"\x00\x01\x02\x03";
-        assert_eq!(decoder.decode(ccitt_data).unwrap(), ccitt_data);
+        assert_eq!(decoder.decode(ccitt_data, 0).unwrap(), ccitt_data);
     }
 
     #[test]

@@ -9,7 +9,13 @@ use super::StreamDecoder;
 pub struct BrotliDecoder;
 
 impl StreamDecoder for BrotliDecoder {
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>> {
+    // `max_output_bytes` (GH#1764) is not enforced here yet. Brotli output can expand far
+    // beyond input like RunLength/LZW, but it was not in the issue's named scope (only
+    // RunLengthDecoder and LzwDecoder) and BrotliDecode is a PDF 2.0-only filter with no
+    // corpus evidence of exploitation; the caller's post-decode ratio/size checks in
+    // decoders/mod.rs still apply after the fact. Left as a follow-up rather than folded
+    // silently into this fix. ~keep
+    fn decode(&self, input: &[u8], _max_output_bytes: usize) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         let mut reader = brotli::Decompressor::new(input, 4096);
         reader
@@ -38,7 +44,7 @@ mod tests {
         }
 
         let decoder = BrotliDecoder;
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert_eq!(decoded, original);
     }
 
@@ -50,7 +56,7 @@ mod tests {
             std::io::Write::write_all(&mut writer, b"").unwrap();
         }
         let decoder = BrotliDecoder;
-        let decoded = decoder.decode(&compressed).unwrap();
+        let decoded = decoder.decode(&compressed, 0).unwrap();
         assert!(decoded.is_empty());
     }
 }

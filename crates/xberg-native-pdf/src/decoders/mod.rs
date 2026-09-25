@@ -68,13 +68,28 @@ const DEFAULT_MAX_DECOMPRESSION_RATIO: u32 = 100;
 /// for flate. It cannot fire on a pure RunLength stream at all: the densest encoding
 /// that filter permits is a `[129, byte]` pair — 2 input bytes for 128 output bytes —
 /// so 64:1 is the most it can achieve and it never reaches the threshold. This
-/// absolute cap is therefore RunLength's only guard, and it is applied post-hoc:
-/// `decoder.decode()` builds its entire output before the check runs, so the cap
-/// rejects an allocation that already happened rather than bounding it, and raising
-/// the number raises that transient peak with it. Bounding those decoders mid-decode
-/// needs `StreamDecoder::decode` to carry the limit — tracked in GH#1764. ~keep
+/// absolute cap is therefore RunLength's only guard. `StreamDecoder::decode` carries
+/// the resolved cap (GH#1764) so `RunLengthDecoder` and `LzwDecoder` — the two filters
+/// that can expand output far beyond their input — abort mid-decode once output
+/// crosses it, instead of building the full expansion and only then having it
+/// rejected here. ~keep
 pub(crate) fn default_max_decompressed_size() -> usize {
     usize::try_from(flate::effective_limit()).unwrap_or(usize::MAX)
+}
+
+/// Shared mid-decode bound check for decoders that can expand output far beyond their
+/// input (`RunLengthDecoder`, `LzwDecoder`). Returns an error naming both the observed
+/// size and the limit as soon as `output_len` crosses `max_output_bytes`; `0` disables
+/// the check. Called after every decoded unit rather than once at the end, so the
+/// decoder can never build more than one unit past the cap (GH#1764). ~keep
+pub(crate) fn check_output_cap(filter_name: &str, output_len: usize, max_output_bytes: usize) -> Result<()> {
+    if max_output_bytes > 0 && output_len > max_output_bytes {
+        return Err(Error::Decode(format!(
+            "{filter_name}: output size {output_len} bytes exceeds the {max_output_bytes} byte \
+             safety limit; stream may be a decompression bomb"
+        )));
+    }
+    Ok(())
 }
 
 /// PDF stream filter types.
@@ -107,16 +122,24 @@ pub enum Filter {
 /// Each decoder implements a specific PDF filter algorithm and can decode
 /// compressed or encoded stream data.
 pub trait StreamDecoder {
-    /// Decode the input data.
+    /// Decode the input data, aborting once decoded output would exceed `max_output_bytes`.
     ///
     /// # Arguments
     ///
     /// * `input` - The encoded/compressed data
+    /// * `max_output_bytes` - Upper bound on decoded output size, in bytes. `0` disables
+    ///   the check, matching [`crate::parser_config::ParserOptions::max_decompressed_size`]'s
+    ///   convention. Decoders whose output cannot exceed their input (pass-through filters,
+    ///   the ASCII encodings) may ignore this parameter. `FlateDecoder` enforces its own,
+    ///   independently configured cap instead. `RunLengthDecoder` and `LzwDecoder` must honor
+    ///   it: both can expand output far beyond their input, and previously built their entire
+    ///   output before any caller checked it against a limit (GH#1764).
     ///
     /// # Returns
     ///
-    /// The decoded data or an error if decoding fails.
-    fn decode(&self, input: &[u8]) -> Result<Vec<u8>>;
+    /// The decoded data, or an error if decoding fails or `max_output_bytes` is exceeded
+    /// before decoding completes.
+    fn decode(&self, input: &[u8], max_output_bytes: usize) -> Result<Vec<u8>>;
 
     /// Get the name of this decoder (e.g., "FlateDecode").
     fn name(&self) -> &str;
@@ -264,7 +287,7 @@ fn decode_stream_with_options_and_expected_size(
     for (filter_index, filter_name) in filters.iter().enumerate() {
         let decoder = create_decoder(filter_name)?;
 
-        current = decoder.decode(&current)?;
+        current = decoder.decode(&current, max_size)?;
 
         // SECURITY: Check decompression ratio after each filter. Image callers may
         // provide the exact byte count implied by Width x Height x components x bpc
