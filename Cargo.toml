@@ -62,7 +62,7 @@ chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "color", "suggestions"] }
 comrak = { version = "0.55", default-features = false }
 console_error_panic_hook = "0.1"
-crawlberg = { version = "1.7.1", default-features = false }
+crawlberg = { version = "1.7.2", default-features = false }
 criterion = { version = "0.8", features = ["html_reports"] }
 dbase = "0.8"
 flate2 = "1.1"
@@ -120,7 +120,7 @@ similar = "3"
 sqlite-vec = "0.1"
 tar = "0.4"
 tempfile = "3.27.0"
-thiserror = "2.0.20"
+thiserror = "2.0.21"
 # `process`, `fs`, and `rt-multi-thread` are deliberately excluded from this baseline: tokio's
 # own wasm32 gate (tokio-1.x src/lib.rs) hard-`compile_error!`s unless only
 # sync/macros/io-util/rt/time are active (`process` additionally pulls mio's
