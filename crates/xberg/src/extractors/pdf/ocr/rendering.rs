@@ -651,6 +651,43 @@ pub(super) fn fallback_render_document<'a>(
     .as_ref()
 }
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
+fn render_one_full_pdf_ocr_page(
+    doc: &xberg_native_pdf::PdfDocument,
+    page_rotations: &[u32],
+    page_idx: usize,
+    security_limits: &crate::extractors::security::SecurityLimits,
+    images_config: Option<&crate::core::config::ImageExtractionConfig>,
+) -> crate::Result<EncodedPage> {
+    #[cfg(test)]
+    record_render_thread();
+    let (page_width_pt, page_height_pt) = crate::pdf::render::get_page_dimensions_pt(doc, page_idx);
+    let render_dpi =
+        crate::image::dpi::effective_pdf_render_dpi(images_config, f64::from(page_width_pt), f64::from(page_height_pt));
+    let rendered =
+        crate::pdf::render::render_page_with_safeguards(doc, page_idx, render_dpi.max(1) as u32).map_err(|e| {
+            crate::XbergError::Parsing {
+                message: format!("Failed to render page {} for OCR: {:?}", page_idx, e),
+                source: None,
+            }
+        })?;
+    let rotation = page_rotations.get(page_idx).copied().unwrap_or(0);
+    let (data, width, height) = crate::pdf::render::normalize_rendered_page_for_ocr_with_security_limits(
+        rendered.data,
+        rendered.width,
+        rendered.height,
+        rotation,
+        security_limits,
+    )?;
+    Ok((page_idx, std::sync::Arc::new(data), width, height))
+}
+/// Render every page in `page_range` for the `force_ocr` (whole-document) route, in parallel
+/// across the configured thread budget -- the same mechanism
+/// `render_selected_pages_from_document` uses for the sibling `force_ocr_pages` route (#1666).
+/// Before this fix, `force_ocr` rendered each batch with a plain sequential loop regardless of
+/// `concurrency.max_threads`, leaving rasterization a floor no thread count could lower on this
+/// route even after #1666 fixed the sibling (#1796). `.par_iter().map(...).collect()` preserves
+/// `page_range`'s order, matching the previous sequential loop's output order exactly. ~keep
+#[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 pub(super) fn render_full_pdf_ocr_batch(
     doc: &xberg_native_pdf::PdfDocument,
     page_rotations: &[u32],
@@ -658,30 +695,22 @@ pub(super) fn render_full_pdf_ocr_batch(
     security_limits: &crate::extractors::security::SecurityLimits,
     images_config: Option<&crate::core::config::ImageExtractionConfig>,
 ) -> crate::Result<Vec<EncodedPage>> {
-    let mut encoded = Vec::with_capacity(page_range.len());
-    for page_idx in page_range {
-        let (page_width_pt, page_height_pt) = crate::pdf::render::get_page_dimensions_pt(doc, page_idx);
-        let render_dpi = crate::image::dpi::effective_pdf_render_dpi(
-            images_config,
-            f64::from(page_width_pt),
-            f64::from(page_height_pt),
-        );
-        let rendered = crate::pdf::render::render_page_with_safeguards(doc, page_idx, render_dpi.max(1) as u32)
-            .map_err(|e| crate::XbergError::Parsing {
-                message: format!("Failed to render page {} for OCR: {:?}", page_idx, e),
-                source: None,
-            })?;
-        let rotation = page_rotations.get(page_idx).copied().unwrap_or(0);
-        let (data, width, height) = crate::pdf::render::normalize_rendered_page_for_ocr_with_security_limits(
-            rendered.data,
-            rendered.width,
-            rendered.height,
-            rotation,
-            security_limits,
-        )?;
-        encoded.push((page_idx, std::sync::Arc::new(data), width, height));
+    // rayon's work-stealing pool needs OS threads; wasm32 has none, so this falls back to a
+    // sequential iterator there, matching `render_selected_pages_from_document`. ~keep
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+    {
+        use rayon::prelude::*;
+        page_range
+            .into_par_iter()
+            .map(|page_idx| render_one_full_pdf_ocr_page(doc, page_rotations, page_idx, security_limits, images_config))
+            .collect()
     }
-    Ok(encoded)
+    #[cfg(any(not(feature = "tokio-runtime"), target_arch = "wasm32"))]
+    {
+        page_range
+            .map(|page_idx| render_one_full_pdf_ocr_page(doc, page_rotations, page_idx, security_limits, images_config))
+            .collect()
+    }
 }
 #[cfg(all(any(feature = "ocr", feature = "ocr-pipeline"), feature = "pdf"))]
 pub(super) fn valid_page_indices(page_indices: &[usize], page_count: usize) -> Vec<usize> {
