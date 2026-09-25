@@ -17923,6 +17923,13 @@ char *xberg_ocr_config_vlm_prompt(XBERGAlefHandle handle);
 char *xberg_ocr_config_tessdata_path(XBERGAlefHandle handle);
 
 /**
+ * Get the `numeric_repair` field from a `OcrConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t xberg_ocr_config_numeric_repair(XBERGAlefHandle handle);
+
+/**
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */

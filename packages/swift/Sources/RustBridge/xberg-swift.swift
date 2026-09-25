@@ -17808,6 +17808,10 @@ extension OcrConfigRef {
     public func tessdataPath() -> Optional<RustString> {
         { let val = __swift_bridge__$OcrConfig$tessdata_path(ptr); if val != nil { return RustString(ptr: val!) } else { return nil } }()
     }
+
+    public func numericRepair() -> Bool {
+        __swift_bridge__$OcrConfig$numeric_repair(ptr)
+    }
 }
 extension OcrConfig: Vectorizable {
     public static func vecOfSelfNew() -> UnsafeMutableRawPointer {

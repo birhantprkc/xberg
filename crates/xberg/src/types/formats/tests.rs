@@ -40,8 +40,7 @@ fn should_describe_binding_dtos_as_named_object_schemas() {
 fn should_serialize_presentation_hyperlink_as_named_object() {
     let legacy = json!(["https://xberg.io", "Xberg"]);
     let named_json = json!({"url": "https://xberg.io", "label": "Xberg"});
-    let hyperlink: PresentationHyperlink =
-        serde_json::from_value(legacy).expect("legacy hyperlink must deserialize");
+    let hyperlink: PresentationHyperlink = serde_json::from_value(legacy).expect("legacy hyperlink must deserialize");
     let named: PresentationHyperlink =
         serde_json::from_value(named_json.clone()).expect("named hyperlink must deserialize");
 
@@ -62,8 +61,7 @@ fn should_serialize_presentation_hyperlink_as_named_object() {
 fn should_serialize_missing_hyperlink_label_as_named_null() {
     let legacy = json!(["https://xberg.io", null]);
     let named_json = json!({"url": "https://xberg.io", "label": null});
-    let positional: PresentationHyperlink =
-        serde_json::from_value(legacy).expect("legacy null label must deserialize");
+    let positional: PresentationHyperlink = serde_json::from_value(legacy).expect("legacy null label must deserialize");
     let named: PresentationHyperlink =
         serde_json::from_value(json!({"url": "https://xberg.io"})).expect("omitted named label must deserialize");
 
@@ -137,8 +135,8 @@ fn should_serialize_preprocessing_metadata_with_named_nested_types() {
     });
     let metadata: ImagePreprocessingMetadata =
         serde_json::from_value(legacy).expect("legacy preprocessing metadata must deserialize");
-    let named_dimensions: PixelDimensions = serde_json::from_value(json!({"width": 1200, "height": 800}))
-        .expect("named pixel dimensions must deserialize");
+    let named_dimensions: PixelDimensions =
+        serde_json::from_value(json!({"width": 1200, "height": 800})).expect("named pixel dimensions must deserialize");
     let named_dpi: ImageDpi = serde_json::from_value(json!({"horizontal": 72.0, "vertical": 96.0}))
         .expect("named image DPI must deserialize");
 

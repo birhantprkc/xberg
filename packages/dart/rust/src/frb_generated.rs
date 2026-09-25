@@ -13901,6 +13901,7 @@ const _: fn() = || {
         let _: Option<crate::SecurityLimits> = OcrConfig.security_limits;
         let _: Option<std::collections::HashMap<String, Vec<u8>>> = OcrConfig.tessdata_bytes;
         let _: Option<String> = OcrConfig.tessdata_path;
+        let _: bool = OcrConfig.numeric_repair;
     }
     {
         let OcrElement = None::<crate::OcrElement>.unwrap();
@@ -21574,6 +21575,7 @@ impl SseDecode for crate::OcrConfig {
         let mut var_securityLimits = <Option<crate::SecurityLimits>>::sse_decode(deserializer);
         let mut var_tessdataBytes = <Option<std::collections::HashMap<String, Vec<u8>>>>::sse_decode(deserializer);
         let mut var_tessdataPath = <Option<String>>::sse_decode(deserializer);
+        let mut var_numericRepair = <bool>::sse_decode(deserializer);
         return crate::OcrConfig {
             enabled: var_enabled,
             backend: var_backend,
@@ -21593,6 +21595,7 @@ impl SseDecode for crate::OcrConfig {
             security_limits: var_securityLimits,
             tessdata_bytes: var_tessdataBytes,
             tessdata_path: var_tessdataPath,
+            numeric_repair: var_numericRepair,
         };
     }
 }
@@ -31151,6 +31154,7 @@ impl flutter_rust_bridge::IntoDart for FrbWrapper<crate::OcrConfig> {
             self.0.security_limits.into_into_dart().into_dart(),
             self.0.tessdata_bytes.into_into_dart().into_dart(),
             self.0.tessdata_path.into_into_dart().into_dart(),
+            self.0.numeric_repair.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -38749,6 +38753,7 @@ impl SseEncode for crate::OcrConfig {
         <Option<crate::SecurityLimits>>::sse_encode(self.security_limits, serializer);
         <Option<std::collections::HashMap<String, Vec<u8>>>>::sse_encode(self.tessdata_bytes, serializer);
         <Option<String>>::sse_encode(self.tessdata_path, serializer);
+        <bool>::sse_encode(self.numeric_repair, serializer);
     }
 }
 

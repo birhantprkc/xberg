@@ -13007,6 +13007,18 @@ class OcrConfig {
   /// the standard resolution chain: TESSDATA_PREFIX env, cache dir, system paths.
   final String? tessdataPath;
 
+  /// Repair OCR tokens that are clearly numeric but mis-punctuated: a dropped thousands
+  /// separator, a decimal point misread for a grouping comma, or one number split into two
+  /// tokens at a rendering gap (GH#1789).
+  ///
+  /// Defaults to `false`. Unlike the always-on list-marker repair
+  /// (`crate::extractors::pdf::ocr::scoring::repair_ocr_list_markers`), this repair has no
+  /// table-column context available at the point OCR text comes back as a flat string, so it
+  /// cannot tell `"1.234,56"` (European) from `"1,234.56"` (US) apart on its own -- it always
+  /// assumes the US/UK convention (comma groups, period decimals). Enable it only for
+  /// documents known to use that convention.
+  final bool numericRepair;
+
   const OcrConfig({
     required this.enabled,
     required this.backend,
@@ -13026,6 +13038,7 @@ class OcrConfig {
     this.securityLimits,
     this.tessdataBytes,
     this.tessdataPath,
+    required this.numericRepair,
   });
 
   @override
@@ -13047,7 +13060,8 @@ class OcrConfig {
       acceleration.hashCode ^
       securityLimits.hashCode ^
       tessdataBytes.hashCode ^
-      tessdataPath.hashCode;
+      tessdataPath.hashCode ^
+      numericRepair.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -13071,7 +13085,8 @@ class OcrConfig {
           acceleration == other.acceleration &&
           securityLimits == other.securityLimits &&
           tessdataBytes == other.tessdataBytes &&
-          tessdataPath == other.tessdataPath;
+          tessdataPath == other.tessdataPath &&
+          numericRepair == other.numericRepair;
 }
 
 /// A unified OCR element representing detected text with full metadata.
