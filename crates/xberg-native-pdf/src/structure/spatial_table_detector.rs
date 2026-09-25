@@ -438,6 +438,11 @@ fn looks_like_cjk_prose(table: &Table) -> bool {
 /// grid. Ruled / author-marked tables never reach this path.
 fn looks_like_bulleted_list(table: &Table) -> bool {
     /// An unambiguous bullet glyph (never a legitimate data value).
+    ///
+    /// Deliberately a separate list from `xberg`'s `pdf::structure::list_marker::BULLET_GLYPHS`,
+    /// which lives in the dependent crate and cannot be imported here. Keep the two in step when
+    /// adding a glyph; the arrowheads were added for GH#1790, where an arrow-bullet list was read
+    /// as a table. Widening only ever stops a list becoming a table, never the reverse. ~keep
     fn is_bullet_glyph(c: char) -> bool {
         matches!(
             c,
@@ -450,6 +455,11 @@ fn looks_like_bulleted_list(table: &Table) -> bool {
                 | '\u{25E6}'
                 | '\u{00B7}'
                 | '\u{2024}'
+                | '\u{27A2}'
+                | '\u{27A4}'
+                | '\u{25BA}'
+                | '\u{25B6}'
+                | '\u{25CB}'
         )
     }
     fn is_list_item(t: &str) -> bool {

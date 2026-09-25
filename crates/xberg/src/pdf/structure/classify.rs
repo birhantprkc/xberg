@@ -1042,7 +1042,7 @@ fn infer_section_level(text: &str) -> u8 {
 /// [`reads_as_tabular_row`]. ~keep
 pub(super) fn reads_as_body_content(text: &str, word_count: usize) -> bool {
     let trimmed = text.trim();
-    if trimmed.starts_with(['\u{2022}', '\u{00B7}', '\u{25E6}', '\u{25AA}']) {
+    if trimmed.starts_with(super::list_marker::BULLET_GLYPHS) {
         return true;
     }
     if is_section_pattern(trimmed) || word_count <= MAX_TITLE_WORD_COUNT {

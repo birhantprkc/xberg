@@ -1,4 +1,34 @@
-//! Shared parsing for ordered-list marker syntax.
+//! Shared parsing for ordered-list marker syntax, and the shared unordered-bullet glyph set.
+
+/// Glyphs a PDF producer uses to mark an unordered list item.
+///
+/// This exists because the set was enumerated independently at a dozen sites across list
+/// detection, list normalisation, paragraph splitting and the table guards, and those copies
+/// drifted: `\u{27A4}` appeared in exactly one of them and `\u{27A2}` in none, which is GH#1790 --
+/// an arrow-bullet list folded into the paragraph above it. Adding a glyph here reaches every
+/// consumer at once. The contents are the union of what the list-detection sites already
+/// accepted, plus `\u{27A2}`, so routing them here changes no other glyph's behaviour.
+///
+/// Dashes (`-`, en/em dash and friends) are deliberately NOT here: they are ambiguous with
+/// ordinary punctuation and each site gates them differently, usually on a trailing space. ~keep
+pub(super) const BULLET_GLYPHS: &[char] = &[
+    '\u{2022}', // bullet
+    '\u{00B7}', // middle dot
+    '\u{25E6}', // white bullet
+    '\u{25AA}', // black small square
+    '\u{2023}', // triangular bullet
+    '\u{27A2}', // three-d top-lighted rightwards arrowhead (GH#1790)
+    '\u{27A4}', // black rightwards arrowhead
+    '\u{25BA}', // black right-pointing pointer
+    '\u{25B6}', // black right-pointing triangle
+    '\u{25CB}', // white circle
+    '\u{25CF}', // black circle
+];
+
+/// True when `candidate` is one of [`BULLET_GLYPHS`]. ~keep
+pub(crate) fn is_bullet_glyph(candidate: char) -> bool {
+    BULLET_GLYPHS.contains(&candidate)
+}
 
 const MAX_NUMERIC_MARKER_DIGITS: usize = 3;
 const MAX_ROMAN_MARKER_CHARS: usize = 4;

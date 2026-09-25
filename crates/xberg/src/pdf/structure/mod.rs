@@ -21,4 +21,5 @@ pub(crate) mod types;
 
 #[allow(unused_imports)]
 pub(crate) use assembly::assemble_internal_document;
+pub(crate) use list_marker::is_bullet_glyph;
 pub(crate) use pipeline::{SegmentStructureConfig, extract_document_structure_from_segments};

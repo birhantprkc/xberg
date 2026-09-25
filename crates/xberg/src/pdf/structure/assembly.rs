@@ -1210,9 +1210,8 @@ fn normalize_list_text(text: &str) -> (&str, usize) {
         return (normalized, marker.content_start);
     }
     let trimmed = text.trim_start();
-    const BULLET_CHARS: &[char] = &['\u{2022}', '\u{00B7}', '➢'];
     let mut normalized = trimmed;
-    for &ch in BULLET_CHARS {
+    for &ch in super::list_marker::BULLET_GLYPHS {
         if trimmed.starts_with(ch) {
             normalized = trimmed[ch.len_utf8()..].trim_start();
             return (normalized, text.len() - normalized.len());
@@ -1226,7 +1225,9 @@ fn normalize_list_text(text: &str) -> (&str, usize) {
         normalized = stripped;
         return (normalized, text.len() - normalized.len());
     }
-    const DASH_BULLETS: &[char] = &['–', '—', '−', '‐', '‑', '‒', '―', '➤', '►', '▶', '○', '●', '◦'];
+    // Dashes only: the bullet glyphs this list used to also carry now come from
+    // `list_marker::BULLET_GLYPHS`, handled by the loop above. ~keep
+    const DASH_BULLETS: &[char] = &['–', '—', '−', '‐', '‑', '‒', '―'];
     for &ch in DASH_BULLETS {
         if trimmed.starts_with(ch) {
             normalized = trimmed[ch.len_utf8()..].trim_start();

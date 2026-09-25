@@ -449,7 +449,11 @@ fn is_list_marker_cell(text: &str) -> bool {
             let rest = chars.as_str();
             rest == "." || rest == ")"
         }
-        Some('•' | '-' | '–' | '*') => chars.as_str().is_empty(),
+        // Widened to the shared bullet set for GH#1790: this guard only ever stops a
+        // list being reconstructed as a table, so accepting more markers cannot
+        // fabricate a table -- it can only avoid one. ~keep
+        Some(first) if crate::pdf::structure::is_bullet_glyph(first) => chars.as_str().is_empty(),
+        Some('-' | '–' | '*') => chars.as_str().is_empty(),
         _ => false,
     }
 }

@@ -3024,7 +3024,11 @@ pub(super) fn is_bare_list_marker(text: &str) -> bool {
     if t.is_empty() || t.chars().count() > 5 {
         return false;
     }
-    if matches!(t, "•" | "·" | "◦" | "▪" | "➢" | "–" | "—" | "-" | "*") {
+    let mut marker_chars = t.chars();
+    if marker_chars.next().is_some_and(super::list_marker::is_bullet_glyph) && marker_chars.next().is_none() {
+        return true;
+    }
+    if matches!(t, "–" | "—" | "-" | "*") {
         return true;
     }
     super::list_marker::parse_ordered_list_marker(t).is_some_and(|marker| !marker.has_content)
@@ -3038,8 +3042,7 @@ pub(super) fn is_bare_list_marker(text: &str) -> bool {
 pub(crate) fn looks_like_list_item(text: &str) -> bool {
     let t = text.trim_start();
 
-    if t.starts_with('•') || t.starts_with('·') || t.starts_with('◦') || t.starts_with('▪') || t.starts_with('➢')
-    {
+    if t.starts_with(super::list_marker::BULLET_GLYPHS) {
         return true;
     }
 
