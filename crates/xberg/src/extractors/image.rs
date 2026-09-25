@@ -1778,10 +1778,16 @@ impl ImageExtractor {
         // detection) used to be dropped here entirely: nothing on the
         // standalone-image path ever read it, so a table found in a bare
         // image never reached the output.
-        #[cfg(feature = "ocr")]
+        // Only the GH#1789 repair below mutates these two, and it is gated on `ocr` + `pdf`,
+        // so binding them `mut` under `ocr` alone is a dead `mut` on the ocr-without-pdf leg. ~keep
+        #[cfg(all(feature = "ocr", feature = "pdf"))]
         let mut ocr_tables = ocr_result.tables;
-        #[cfg(feature = "ocr")]
+        #[cfg(all(feature = "ocr", feature = "pdf"))]
         let mut ocr_internal_document = ocr_result.ocr_internal_document;
+        #[cfg(all(feature = "ocr", not(feature = "pdf")))]
+        let ocr_tables = ocr_result.tables;
+        #[cfg(all(feature = "ocr", not(feature = "pdf")))]
+        let ocr_internal_document = ocr_result.ocr_internal_document;
 
         // GH#1789: opt-in, same gate and rationale as the PDF mixed-OCR route
         // (`extractors::pdf::ocr::pipeline::numeric_repair_enabled`). See
