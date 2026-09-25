@@ -604,6 +604,253 @@ pub(super) fn repaired_marker_line(line: &str, kind: &LineMarkerKind) -> String 
     out.push_str(rest);
     out
 }
+/// Minimum digit count a bare integer must have before it is treated as a grouped value by
+/// [`repair_ocr_numeric_tokens`]'s separator rule (GH#1789). Below this, a 1-3 digit number is
+/// too common as a small quantity, a percentage, or a short id to safely re-punctuate. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+const NUMERIC_REPAIR_MIN_SEPARATOR_DIGITS: usize = 4;
+/// Maximum digit count the separator rule will re-punctuate. Above this the token is more
+/// likely an account or reference number than a currency amount, and grouping it would assert
+/// a scale ("hundred million") the source never claimed. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+const NUMERIC_REPAIR_MAX_SEPARATOR_DIGITS: usize = 9;
+/// Digits after the decimal point the period rule requires before treating a misread comma as
+/// restored. Financial schedules in this corpus group in exactly three digits (`7,812`); a
+/// different fraction length (`7.81`) is a real decimal, not an OCR miss. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+const NUMERIC_REPAIR_GROUP_WIDTH: usize = 3;
+/// Maximum digits before the decimal point the period rule will treat as the misread leading
+/// group of a grouped number (`7.812` -> `7,812`, `812.812` -> `812,812`). Four or more digits
+/// before the point is already an ordinary decimal (`1234.5`), not a split thousands group.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+const NUMERIC_REPAIR_PERIOD_LEAD_DIGITS: usize = 3;
+/// Maximum digits the join rule's second (already-grouped) token may carry before its comma
+/// (`2 2,411` -> `22,411`, capturing `2,411`). A three-or-more digit leading group would make
+/// the "lone digit" on its own a implausible split -- a real 3-digit group does not usually
+/// tear a single leading digit off across a rendering gap.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+const NUMERIC_REPAIR_JOIN_LEAD_DIGITS: usize = 2;
+/// `true` if `ch` is a character that, immediately adjacent to a digit run, means the run is
+/// already part of a larger token (a longer number, a decimal, an identifier) and must not be
+/// treated as a repair candidate on its own. Shared by every rule in
+/// [`repair_ocr_numeric_tokens`] as the baseline "already inside a word" boundary; individual
+/// rules layer additional forbidden neighbors on top (see each rule's own comment).
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn numeric_repair_blocks_word_boundary(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == ','
+}
+/// Group a base-10 digit string with `NUMERIC_REPAIR_GROUP_WIDTH`-digit thousands separators
+/// (`"1172"` -> `"1,172"`). Leading zeros are dropped, matching the reference implementation's
+/// `int(...)` round trip: a token is a magnitude here, not a preserved digit sequence.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn numeric_repair_group_digits(digits: &str) -> String {
+    let normalized = digits.parse::<u64>().map(|value| value.to_string()).unwrap_or_default();
+    let bytes = normalized.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / NUMERIC_REPAIR_GROUP_WIDTH);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 && (bytes.len() - index) % NUMERIC_REPAIR_GROUP_WIDTH == 0 {
+            out.push(',');
+        }
+        out.push(*byte as char);
+    }
+    out
+}
+/// Attempt the join rule (`repair.py`'s `J`) at `chars[start]`: a lone digit, a single literal
+/// space, and a `\d{1,2},\d{3}` group join into one number (`"2 2,411"` -> `"22,411"`).
+///
+/// Returns the number of input characters consumed and the replacement text, or `None` if no
+/// match starts here. The lone digit must not itself sit inside a larger token (checked by the
+/// caller via [`numeric_repair_blocks_word_boundary`] on the preceding character), and the
+/// matched group must not be immediately followed by another digit -- otherwise `"2 22,411"`
+/// would wrongly absorb only part of a longer run.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn numeric_repair_match_join(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let lone_digit = *chars.get(start)?;
+    if !lone_digit.is_ascii_digit() || chars.get(start + 1) != Some(&' ') {
+        return None;
+    }
+    let group_start = start + 2;
+    let mut lead_digits = 0usize;
+    while lead_digits < NUMERIC_REPAIR_JOIN_LEAD_DIGITS
+        && chars.get(group_start + lead_digits).is_some_and(char::is_ascii_digit)
+    {
+        lead_digits += 1;
+    }
+    for lead_len in (1..=lead_digits).rev() {
+        let comma_at = group_start + lead_len;
+        if chars.get(comma_at) != Some(&',') {
+            continue;
+        }
+        let tail_start = comma_at + 1;
+        let tail_end = tail_start + NUMERIC_REPAIR_GROUP_WIDTH;
+        if tail_end > chars.len() || !chars[tail_start..tail_end].iter().all(char::is_ascii_digit) {
+            continue;
+        }
+        if chars.get(tail_end).is_some_and(char::is_ascii_digit) {
+            continue;
+        }
+        let joined: String = chars[group_start..tail_end].iter().collect();
+        let mut replacement = String::with_capacity(1 + joined.len());
+        replacement.push(lone_digit);
+        replacement.push_str(&joined);
+        return Some((tail_end - start, replacement));
+    }
+    None
+}
+/// Attempt the period rule (`repair.py`'s `P`) at `chars[start]`: a 1-3 digit leading group,
+/// optionally prefixed by `(` and/or `$`, followed by a period and exactly
+/// `NUMERIC_REPAIR_GROUP_WIDTH` digits, is a comma the OCR engine misread as a period
+/// (`"7.812"` -> `"7,812"`). A trailing digit, `%`, `.`, or `,` means this is actually a longer
+/// decimal or percentage, not a grouped amount, and is left alone.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn numeric_repair_match_period(chars: &[char], start: usize) -> Option<(usize, String)> {
+    let mut lead_start = start;
+    if chars.get(lead_start) == Some(&'(') {
+        lead_start += 1;
+    }
+    if chars.get(lead_start) == Some(&'$') {
+        lead_start += 1;
+    }
+    let mut lead_digits = 0usize;
+    while lead_digits < NUMERIC_REPAIR_PERIOD_LEAD_DIGITS
+        && chars.get(lead_start + lead_digits).is_some_and(char::is_ascii_digit)
+    {
+        lead_digits += 1;
+    }
+    for lead_len in (1..=lead_digits).rev() {
+        let dot_at = lead_start + lead_len;
+        if chars.get(dot_at) != Some(&'.') {
+            continue;
+        }
+        let frac_start = dot_at + 1;
+        let frac_end = frac_start + NUMERIC_REPAIR_GROUP_WIDTH;
+        if frac_end > chars.len() || !chars[frac_start..frac_end].iter().all(char::is_ascii_digit) {
+            continue;
+        }
+        let blocked_after = chars
+            .get(frac_end)
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '%' | '.' | ','));
+        if blocked_after {
+            continue;
+        }
+        let prefix: String = chars[start..dot_at].iter().collect();
+        let fraction: String = chars[frac_start..frac_end].iter().collect();
+        let mut replacement = String::with_capacity(prefix.len() + 1 + fraction.len());
+        replacement.push_str(&prefix);
+        replacement.push(',');
+        replacement.push_str(&fraction);
+        return Some((frac_end - start, replacement));
+    }
+    None
+}
+/// Attempt the separator rule (`repair.py`'s `S`) at `chars[start]`: a bare `NUMERIC_REPAIR_MIN
+/// _SEPARATOR_DIGITS`-to-`NUMERIC_REPAIR_MAX_SEPARATOR_DIGITS`-digit integer, optionally
+/// parenthesized, gets thousands separators (`"1172"` -> `"1,172"`). Never applied directly
+/// after a `FY` header token (`"FY 2025"` stays a year), which the generic word-boundary check
+/// alone would not catch because the character right before the digits is a space, not a word
+/// character.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn numeric_repair_match_separator(chars: &[char], start: usize) -> Option<(usize, String)> {
+    if start >= 3 && chars[start - 3] == 'F' && chars[start - 2] == 'Y' && chars[start - 1] == ' ' {
+        return None;
+    }
+    let has_open = chars.get(start) == Some(&'(');
+    let digits_start = if has_open { start + 1 } else { start };
+    let mut digit_count = 0usize;
+    while digit_count < NUMERIC_REPAIR_MAX_SEPARATOR_DIGITS
+        && chars.get(digits_start + digit_count).is_some_and(char::is_ascii_digit)
+    {
+        digit_count += 1;
+    }
+    if digit_count < NUMERIC_REPAIR_MIN_SEPARATOR_DIGITS {
+        return None;
+    }
+    let digits_end = digits_start + digit_count;
+    let has_close = chars.get(digits_end) == Some(&')');
+    let after = if has_close { digits_end + 1 } else { digits_end };
+    let blocked_after = chars
+        .get(after)
+        .is_some_and(|&c| numeric_repair_blocks_word_boundary(c) || matches!(c, '%' | '-' | '/'));
+    if blocked_after {
+        return None;
+    }
+    let digits: String = chars[digits_start..digits_end].iter().collect();
+    let mut replacement = String::new();
+    if has_open {
+        replacement.push('(');
+    }
+    replacement.push_str(&numeric_repair_group_digits(&digits));
+    if has_close {
+        replacement.push(')');
+    }
+    Some((after - start, replacement))
+}
+/// Run one repair rule over `chars` left to right, calling `matcher` at every position whose
+/// preceding character does not already block a match. Shared driver for the three
+/// [`repair_ocr_numeric_tokens`] rules, which differ only in `matcher` and in which characters
+/// additionally block the position on the left (`extra_left_block`).
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+fn numeric_repair_apply_rule(
+    text: &str,
+    extra_left_block: impl Fn(char) -> bool,
+    matcher: impl Fn(&[char], usize) -> Option<(usize, String)>,
+) -> (String, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let left_blocked =
+            index > 0 && (numeric_repair_blocks_word_boundary(chars[index - 1]) || extra_left_block(chars[index - 1]));
+        if !left_blocked && let Some((consumed, replacement)) = matcher(&chars, index) {
+            out.push_str(&replacement);
+            index += consumed;
+            changed = true;
+            continue;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    (out, changed)
+}
+/// Repair OCR tokens that are clearly numeric but were mis-recognized in one of three shapes
+/// Tesseract reliably produces on financial tables (GH#1789): a dropped thousands separator
+/// (`"1172"` for `"1,172"`), a decimal-point misread of a grouping comma (`"7.812"` for
+/// `"7,812"`), and a single number split at a rendering gap into two tokens (`"2 2,411"` for
+/// `"22,411"`). The digits Tesseract reads are correct; only the punctuation is wrong, so this
+/// is a punctuation repair, never a digit correction.
+///
+/// This is deliberately **not** wired in unconditionally the way [`repair_ocr_list_markers`]
+/// is: `[ocr] numeric_repair = true` gates every call site (see
+/// `OcrConfig::numeric_repair`, default `false`). The list-marker repairs above are safe
+/// unconditionally because every ambiguous case is resolved by looking at neighboring list
+/// markers on the same page; this repair has no equivalent column-level context available at
+/// the point OCR text comes back as a flat string; `"1.234,56"` and `"1,234.56"` both mean the
+/// same number and it cannot tell which convention a given page used. Each rule keeps its
+/// pattern deliberately narrow (see the per-rule doc comments), and the issue's own measurement
+/// -- 165 repaired tokens across 33 OCR runs with zero corruptions -- is evidence for those
+/// specific rules on that specific corpus, not a proof that no locale or corpus can defeat
+/// them. Until this can consult table/column context to infer the locale in play, it stays
+/// opt-in.
+///
+/// Applied in the same order as the reference implementation: join, then period, then
+/// separator, so a split grouped number is reassembled before either punctuation rule looks at
+/// it.
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(crate) fn repair_ocr_numeric_tokens(text: &str) -> std::borrow::Cow<'_, str> {
+    let (joined, join_changed) = numeric_repair_apply_rule(text, |_| false, numeric_repair_match_join);
+    let (period_fixed, period_changed) = numeric_repair_apply_rule(&joined, |_| false, numeric_repair_match_period);
+    let (separated, separator_changed) = numeric_repair_apply_rule(
+        &period_fixed,
+        |c: char| matches!(c, '-' | '/'),
+        numeric_repair_match_separator,
+    );
+    if join_changed || period_changed || separator_changed {
+        std::borrow::Cow::Owned(separated)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
 /// The backend-native-scale confidence floor a page's confidence must clear, or `false` if
 /// this backend's confidence cannot be used as a calibrated diagnostic at all.
 ///

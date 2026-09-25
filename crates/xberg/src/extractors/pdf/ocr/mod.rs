@@ -10,8 +10,8 @@
 //! and [`pipeline`] (the top-level mixed-OCR and per-page pipeline orchestrators). Items used
 //! across submodule boundaries are `pub(super)`; items already reachable from outside `ocr`
 //! keep their original visibility and are re-exported here so external call sites are
-//! unaffected by the split. Unit tests live in `tests.rs`, `recognition_noise_tests.rs`, and
-//! `plausibility_tests.rs`, not inline here.
+//! unaffected by the split. Unit tests live in `tests.rs`, `recognition_noise_tests.rs`,
+//! `numeric_repair_tests.rs`, and `plausibility_tests.rs`, not inline here.
 
 mod document;
 mod pipeline;
@@ -29,6 +29,14 @@ pub(crate) use scoring::{OcrGateOutcome, apply_flagged_pages, evaluate_ocr_skip_
 // `pub(super)`. They are pure readers/builders with no PDF dependency of their own.
 #[cfg(feature = "ocr")]
 pub(crate) use scoring::{mean_text_conf_of, page_ocr_confidence, word_count_of};
+
+// ~keep GH#1789's numeric-token repair has the same "no PDF dependency" shape as the three
+// above: `extractors::image`'s standalone OCR route needs it too (the issue's own reproduction
+// runs against a bare PNG, not a PDF), gated the same way `page_ocr_confidence` already is
+// there (`all(feature = "ocr", feature = "pdf")`, since this module tree only exists under
+// `feature = "pdf"`).
+#[cfg(feature = "ocr")]
+pub(crate) use scoring::repair_ocr_numeric_tokens;
 
 // ~keep These three are reachable only from `extractors::pdf`'s own `#[cfg(test)]` unit tests,
 // so a non-test build of this crate never exercises the re-export itself (the underlying items
@@ -57,6 +65,8 @@ pub(crate) use pipeline::extract_mixed_ocr_native;
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
 pub(crate) use pipeline::{extract_with_ocr, run_ocr_pipeline};
 
+#[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline")))]
+mod numeric_repair_tests;
 #[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline")))]
 mod plausibility_tests;
 #[cfg(all(test, any(feature = "ocr", feature = "ocr-pipeline")))]

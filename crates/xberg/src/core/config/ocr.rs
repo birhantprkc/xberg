@@ -969,6 +969,19 @@ pub struct OcrConfig {
     /// the standard resolution chain: TESSDATA_PREFIX env, cache dir, system paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tessdata_path: Option<PathBuf>,
+
+    /// Repair OCR tokens that are clearly numeric but mis-punctuated: a dropped thousands
+    /// separator, a decimal point misread for a grouping comma, or one number split into two
+    /// tokens at a rendering gap (GH#1789).
+    ///
+    /// Defaults to `false`. Unlike the always-on list-marker repair
+    /// (`crate::extractors::pdf::ocr::scoring::repair_ocr_list_markers`), this repair has no
+    /// table-column context available at the point OCR text comes back as a flat string, so it
+    /// cannot tell `"1.234,56"` (European) from `"1,234.56"` (US) apart on its own -- it always
+    /// assumes the US/UK convention (comma groups, period decimals). Enable it only for
+    /// documents known to use that convention.
+    #[serde(default)]
+    pub numeric_repair: bool,
 }
 
 impl Default for OcrConfig {
@@ -992,6 +1005,7 @@ impl Default for OcrConfig {
             security_limits: None,
             tessdata_bytes: None,
             tessdata_path: None,
+            numeric_repair: false,
         }
     }
 }

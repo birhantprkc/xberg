@@ -253,6 +253,7 @@ impl ExtractionOverrides {
                 security_limits: None,
                 tessdata_bytes: None,
                 tessdata_path: None,
+                numeric_repair: false,
                 backend_options,
             });
 
