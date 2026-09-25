@@ -19,11 +19,21 @@ const ROTATED_PNG_ENCODE_BYTES_PER_PIXEL: u64 = 4;
 #[cfg(any(feature = "ocr", feature = "ocr-pipeline", feature = "layout-detection"))]
 const ROTATED_PNG_ENCODE_FIXED_BYTES: u64 = 256 * 1024;
 
+/// One captured `xberg_native_pdf` `tracing::warn!` record: its message, plus the
+/// structured `error_code` field when the call site set one. GH#1794: the classifier
+/// needs `error_code` to tell a font-load diagnostic (e.g. `type3_font`) apart from an
+/// actual dropped-glyph warning (`glyph_dropped`) — the message text alone conflates
+/// them, since both are ordinary prose sentences with no shared substring to match on. ~keep
+struct CapturedEngineWarning {
+    message: String,
+    error_code: Option<String>,
+}
+
 thread_local! {
     /// Buffer for `xberg_native_pdf`'s `tracing::warn!` records emitted while a render
     /// call made by this thread is in flight. `None` when no render call is
     /// currently capturing (the default, and the state between calls).
-    static ENGINE_LOG_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static ENGINE_LOG_CAPTURE: RefCell<Option<Vec<CapturedEngineWarning>>> = const { RefCell::new(None) };
     /// Deduped warnings drained from completed render calls on this thread,
     /// awaiting collection by [`take_xberg_native_pdf_render_warnings`].
     static ENGINE_PENDING_WARNINGS: RefCell<Vec<ProcessingWarning>> = const { RefCell::new(Vec::new()) };
@@ -109,7 +119,7 @@ impl EngineWarningCapture {
     }
 }
 
-/// Pulls the `message` field out of a `tracing::Event`.
+/// Pulls the `message` and `error_code` fields out of a `tracing::Event`.
 ///
 /// A `tracing` event's message is a *field* (named `"message"`), not
 /// something `Event` exposes as a plain string. `tracing::warn!("{}", x)` —
@@ -123,19 +133,31 @@ impl EngineWarningCapture {
 /// Both are implemented so either form is captured. Same pattern as the
 /// `MessageVisitor` already used for tracing-capture tests elsewhere in this
 /// crate (`tests/gpu_acceleration.rs`).
+///
+/// `error_code` is always a `&'static str` field value at every current call
+/// site (a literal, or `Error::telemetry_code()`), so it only ever reaches
+/// `record_str` in practice; `record_debug` is still implemented for the same
+/// reason as `message` above — a future call site could format it differently. ~keep
 #[derive(Default)]
-struct MessageVisitor(String);
+struct MessageVisitor {
+    message: String,
+    error_code: Option<String>,
+}
 
 impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "error_code" => self.error_code = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.0 = value.to_string();
+        match field.name() {
+            "message" => self.message = value.to_string(),
+            "error_code" => self.error_code = Some(value.to_string()),
+            _ => {}
         }
     }
 }
@@ -172,7 +194,10 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EngineWarningCaptu
         event.record(&mut visitor);
         ENGINE_LOG_CAPTURE.with(|cell| {
             if let Some(buffer) = cell.borrow_mut().as_mut() {
-                buffer.push(visitor.0);
+                buffer.push(CapturedEngineWarning {
+                    message: visitor.message,
+                    error_code: visitor.error_code,
+                });
             }
         });
     }
@@ -298,6 +323,35 @@ fn image_render_failure_warning(page_index: usize, cause: &str) -> ProcessingWar
     )
 }
 
+/// Whether a captured engine warning is a font-*loading* diagnostic rather than a
+/// glyph the rasterizer actually failed to paint. GH#1794: the classifier used to
+/// assume every captured warning that was not [`indicates_unrenderable_image`] meant
+/// lost glyph ink, which misreported two warnings that drop nothing:
+///
+/// - The Type 3 glyph-name fallback (`fonts/font_dict.rs`), tagged
+///   `error_code = "type3_font"` — the font still loads and every glyph still paints,
+///   just via a name-based lookup instead of the usual code-based one.
+/// - GH#1795's "dictionary used where stream expected" warning (`object.rs`) — fired
+///   from a speculative `decode_stream_data` call on a `/Differences` encoding
+///   dictionary, nothing to do with painting. It carries no `error_code` field (the
+///   generic stream reader has no error-code convention), so it is matched by text.
+fn indicates_font_load_diagnostic(error_code: Option<&str>, cause: &str) -> bool {
+    matches!(error_code, Some("type3_font")) || cause.contains("dictionary used where stream expected")
+}
+
+/// A font-load diagnostic surfaced without the false "glyph ink is missing" claim.
+/// GH#1794: rendering was never affected by these causes, so the wording says so
+/// instead of describing content loss that did not happen.
+fn font_load_diagnostic_warning(page_index: usize, cause: &str) -> ProcessingWarning {
+    warning(
+        PDF_RENDER_WARNING_SOURCE,
+        format!(
+            "Page {} loaded a font with a diagnostic that did not affect the rendered output: {cause}",
+            page_index + 1
+        ),
+    )
+}
+
 /// Render a page while capturing any `xberg_native_pdf` render-degradation warnings it
 /// logs during the call — dropped glyphs and unrenderable image XObjects alike — deduping
 /// them into [`ENGINE_PENDING_WARNINGS`] for later collection via
@@ -325,9 +379,12 @@ fn render_page_capturing_glyph_drops(
             // so it can never reach here, and the substring match was a trap for whoever next
             // wrote a genuinely actionable warning that happened to share the phrase. Every
             // captured cause is classified below instead of pre-filtered. ~keep
-            for cause in captured.iter() {
+            for captured_warning in captured.iter() {
+                let cause = captured_warning.message.as_str();
                 let processing_warning = if indicates_unrenderable_image(cause) {
                     image_render_failure_warning(page_index, cause)
+                } else if indicates_font_load_diagnostic(captured_warning.error_code.as_deref(), cause) {
+                    font_load_diagnostic_warning(page_index, cause)
                 } else {
                     glyph_drop_warning(page_index, cause)
                 };

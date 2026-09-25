@@ -811,9 +811,19 @@ impl PdfDocument {
         current_index: &mut usize,
         inherited: &mut HashMap<String, Object>,
     ) -> Result<Object> {
-        self.get_page_from_tree_inner(node_ref, target_index, current_index, inherited, &mut HashSet::new(), 0)
+        self.get_page_from_tree_inner(node_ref, target_index, current_index, inherited, &mut HashSet::new(), 0)?
+            .ok_or_else(|| Error::InvalidPdf(format!("Page index {} not found in tree", target_index)))
     }
 
+    /// `Ok(None)` means "the target page is not under this node" — an ordinary
+    /// traversal outcome for a leaf that is not the target, a subtree the `/Count`
+    /// fast path proves cannot hold it, or a `Pages` node whose kids were all tried.
+    /// `Err` is reserved for a real fault: a load failure, a cycle, the depth limit,
+    /// or a node that fails a structural check (not a dictionary, missing `/Type`,
+    /// missing `/Kids`, an unresolvable kid, an unknown node type). GH#1798: before
+    /// this split, "not found here" and "real fault" were the same `Err` variant, so
+    /// the ordinary case logged as a warning once for every branch the walk passed —
+    /// up to n(n-1)/2 times for an n-page flat tree. ~keep
     fn get_page_from_tree_inner(
         &self,
         node_ref: ObjectRef,
@@ -822,7 +832,7 @@ impl PdfDocument {
         inherited: &mut HashMap<String, Object>,
         visited: &mut HashSet<ObjectRef>,
         depth: u32,
-    ) -> Result<Object> {
+    ) -> Result<Option<Object>> {
         if depth >= MAX_PAGE_TREE_DEPTH {
             tracing::warn!(target: LOG_TARGET,
                 object_id = node_ref.id,
@@ -857,15 +867,13 @@ impl PdfDocument {
 
         match node_type {
             "Pages" if *current_index < target_index => {
-                // Skip entire subtree if /Count shows target is past this node. ~keep
+                // Skip entire subtree if /Count shows target is past this node.
+                // Not found here, not a fault — the caller keeps walking siblings. ~keep
                 if let Some(count) = node_dict.get("Count").and_then(|c| c.as_integer()).filter(|&c| c > 0) {
                     let count = count as usize;
                     if *current_index + count <= target_index {
                         *current_index += count;
-                        return Err(Error::InvalidPdf(format!(
-                            "Page index {} not found in tree",
-                            target_index
-                        )));
+                        return Ok(None);
                     }
                 }
             }
@@ -902,13 +910,10 @@ impl PdfDocument {
                         }
                     }
 
-                    Ok(Object::Dictionary(page_dict))
+                    Ok(Some(Object::Dictionary(page_dict)))
                 } else {
                     *current_index += 1;
-                    Err(Error::InvalidPdf(format!(
-                        "Page index {} not found in tree",
-                        target_index
-                    )))
+                    Ok(None)
                 }
             }
             "Pages" => {
@@ -951,7 +956,11 @@ impl PdfDocument {
                         visited,
                         depth + 1,
                     ) {
-                        Ok(page) => return Ok(page),
+                        Ok(Some(page)) => return Ok(Some(page)),
+                        // Ordinary traversal: the target is not under this kid. GH#1798:
+                        // this used to be an `Err` arm and logged here on every branch
+                        // the walk passed, which is not a fault. ~keep
+                        Ok(None) => continue,
                         Err(Error::CircularReference(obj_ref)) => {
                             tracing::warn!(target: LOG_TARGET, "Circular reference in page tree at object {}, skipping", obj_ref);
                             continue;
@@ -972,7 +981,7 @@ impl PdfDocument {
                     }
                 }
 
-                Err(Error::InvalidPdf(format!("Page index {} not found", target_index)))
+                Ok(None)
             }
             _ => Err(Error::InvalidPdf(format!("Unknown page tree node type: {}", node_type))),
         }
@@ -994,10 +1003,15 @@ impl PdfDocument {
             .as_reference()
             .ok_or_else(|| Error::InvalidPdf("/Pages is not a reference".to_string()))?;
 
-        self.get_page_ref_recursive(pages_ref, page_index, &mut 0, &mut HashSet::new(), 0)
+        self.get_page_ref_recursive(pages_ref, page_index, &mut 0, &mut HashSet::new(), 0)?
+            .ok_or_else(|| Error::InvalidPdf(format!("Page {} not found", page_index)))
     }
 
     /// Recursively find page reference in the page tree.
+    ///
+    /// `Ok(None)` means the target is not under this node (an ordinary leaf mismatch
+    /// or an exhausted `Kids` array); `Err` is a real fault. Same shape as
+    /// [`Self::get_page_from_tree_inner`] — see GH#1798. ~keep
     pub(crate) fn get_page_ref_recursive(
         &self,
         node_ref: ObjectRef,
@@ -1005,7 +1019,7 @@ impl PdfDocument {
         current_index: &mut usize,
         visited: &mut HashSet<ObjectRef>,
         depth: u32,
-    ) -> Result<ObjectRef> {
+    ) -> Result<Option<ObjectRef>> {
         if depth >= MAX_PAGE_TREE_DEPTH {
             tracing::warn!(target: LOG_TARGET,
                 object_id = node_ref.id,
@@ -1041,10 +1055,10 @@ impl PdfDocument {
         match node_type {
             "Page" => {
                 if *current_index == target_index {
-                    Ok(node_ref)
+                    Ok(Some(node_ref))
                 } else {
                     *current_index += 1;
-                    Err(Error::InvalidPdf(format!("Page {} not found", target_index)))
+                    Ok(None)
                 }
             }
             "Pages" => {
@@ -1056,13 +1070,14 @@ impl PdfDocument {
                 for kid_obj in kids {
                     if let Some(kid_ref) = kid_obj.as_reference() {
                         match self.get_page_ref_recursive(kid_ref, target_index, current_index, visited, depth + 1) {
-                            Ok(page_ref) => return Ok(page_ref),
+                            Ok(Some(page_ref)) => return Ok(Some(page_ref)),
+                            Ok(None) => continue,
                             Err(_) => continue,
                         }
                     }
                 }
 
-                Err(Error::InvalidPdf(format!("Page {} not found", target_index)))
+                Ok(None)
             }
             _ => Err(Error::InvalidPdf(format!("Unknown node type: {}", node_type))),
         }
